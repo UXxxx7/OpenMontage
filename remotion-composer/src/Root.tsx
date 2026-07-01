@@ -16,6 +16,11 @@ import { ProductReveal, ProductRevealProps } from "./components/ProductReveal";
 import { CaptionOverlay, WordCaption } from "./components/CaptionOverlay";
 import { CollageBurst, CollageBurstProps } from "./CollageBurst";
 import { LyricOverlay, LyricOverlayProps } from "./LyricOverlay";
+import {
+  ReferenceStyleEdit,
+  ReferenceStyleEditProps,
+  calculateReferenceStyleEditMetadata,
+} from "./ReferenceStyleEdit";
 
 // ---------------------------------------------------------------------------
 // Theme System — prevents every video from looking like dark fintech
@@ -295,6 +300,103 @@ export const Root: React.FC = () => {
           lyrics: [],
           bottomY: 0.88,
         } as LyricOverlayProps}
+      />
+      <Composition
+        id="WhatsAppReferenceEdit"
+        component={ReferenceStyleEdit}
+        durationInFrames={Math.ceil(46.11 * 30)}
+        fps={30}
+        width={1280}
+        height={720}
+        defaultProps={{
+          videoSrc: "whatsapp-2026-06-26-edit/rough-cut.mp4",
+          videoFit: "contain",
+          durationSeconds: 46.11,
+          sourceStartSeconds: 0,
+          captions: [
+            {
+              start: 0.12,
+              end: 3.18,
+              text: "Hi there. It's David from Pacific Life.",
+            },
+            {
+              start: 3.7,
+              end: 11.0,
+              text: "Quick reminder, your policy is coming up for renewal in 30 days on the 28th of July.",
+            },
+            {
+              start: 11.0,
+              end: 18.24,
+              text: "Your current plan covers you for $1.5 million, and your annual premium is $8,400.",
+            },
+            {
+              start: 18.24,
+              end: 23.66,
+              text: "I've put the full breakdown in this video so you have everything in one place.",
+            },
+            {
+              start: 24.36,
+              end: 26.08,
+              text: "Renewing on time really matters.",
+            },
+            {
+              start: 26.52,
+              end: 34.98,
+              text: "If your policy lapses, you'd have to go through underwriting again, which could affect both your coverage and your rate.",
+            },
+            {
+              start: 35.64,
+              end: 41.38,
+              text: "If you have any questions, just WhatsApp me directly or scan the QR code below.",
+            },
+            {
+              start: 41.68,
+              end: 45.42,
+              text: "I'll get back to you right away. Looking forward to keeping you and your family protected.",
+            },
+            { start: 45.62, end: 46.11, text: "Take care." },
+          ],
+          infoCues: [
+            {
+              start: 0.4,
+              end: 6.8,
+              label: "Policy renewal reminder",
+              x: 76,
+              y: 118,
+              width: 410,
+            },
+            {
+              start: 11.4,
+              end: 18.5,
+              label: "$1.5M coverage | $8,400 premium",
+              x: 674,
+              y: 132,
+              width: 520,
+            },
+            {
+              start: 18.9,
+              end: 32.0,
+              label: "Renew on time to avoid lapse",
+              x: 674,
+              y: 132,
+              width: 480,
+            },
+            {
+              start: 35.0,
+              end: 42.8,
+              label: "Questions? Scan the QR code",
+              x: 674,
+              y: 132,
+              width: 470,
+            },
+          ],
+          layoutCues: [
+            { start: 0, end: 11.0, mode: "full" },
+            { start: 11.0, end: 46.11, mode: "left" },
+          ],
+          navItems: [],
+        } as ReferenceStyleEditProps}
+        calculateMetadata={calculateReferenceStyleEditMetadata}
       />
       <Composition
         id="EndTag"
