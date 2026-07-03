@@ -204,6 +204,17 @@ async def _handle_confirmation(job, wa: WhatsAppClient) -> None:
 # Queue helpers
 # ---------------------------------------------------------------------------
 
+def _run_in_background(func, *args) -> None:
+    """在后台线程运行长任务，让 HTTP 请求立即返回。
+
+    Node 网关侧本来就是轮询 GET /jobs/{id} 获取结果，因此 /confirm、/render
+    不应同步阻塞到管线跑完（否则会撞上 Node 的请求超时并触发重试 → 400）。
+    """
+    import threading
+
+    threading.Thread(target=func, args=args, daemon=True).start()
+
+
 def _enqueue_process(job_id: str) -> None:
     """入队任务。MVP阶段始终同步执行，生产环境配置 USE_RQ_WORKER=true 启用异步。"""
     import os
@@ -313,6 +324,14 @@ async def confirm_job_endpoint(job_id: str):
     job = get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
+    # 幂等：任务已在处理或已完成，直接返回当前状态，避免 Node 重试打到 400
+    if job.status in (
+        JobStatus.RUNNING_PIPELINE,
+        JobStatus.RENDERING,
+        JobStatus.PREVIEW_READY,
+        JobStatus.DONE,
+    ):
+        return {"job_id": job_id, "status": job.status.value}
     if job.status != JobStatus.WAITING_CONFIRMATION:
         raise HTTPException(
             status_code=400,
@@ -320,7 +339,8 @@ async def confirm_job_endpoint(job_id: str):
         )
 
     update_job_status(job_id, JobStatus.RUNNING_PIPELINE)
-    _enqueue_pipeline(job_id)
+    # 后台跑管线，立即返回；Node 侧通过轮询 GET /jobs/{id} 等待 PREVIEW_READY
+    _run_in_background(_enqueue_pipeline, job_id)
     return {"job_id": job_id, "status": "RUNNING_PIPELINE"}
 
 
@@ -330,7 +350,13 @@ async def render_job_endpoint(job_id: str):
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    _enqueue_final_render(job_id)
+    # 幂等：正在渲染或已完成，直接返回，避免重试重复触发
+    if job.status in (JobStatus.RENDERING, JobStatus.DONE):
+        return {"job_id": job_id, "status": job.status.value}
+
+    update_job_status(job_id, JobStatus.RENDERING)
+    # 后台跑最终导出，立即返回；Node 侧轮询等待 DONE
+    _run_in_background(_enqueue_final_render, job_id)
     return {"job_id": job_id, "status": "RENDERING"}
 
 

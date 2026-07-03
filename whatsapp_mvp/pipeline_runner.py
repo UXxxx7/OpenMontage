@@ -260,6 +260,10 @@ def build_edit_cuts(
     for i, (s, e) in enumerate(keep_segments):
         logger.info(f"    片段{i+1}: {s:.1f}s → {e:.1f}s ({(e-s):.1f}s)")
 
+    # 过滤零长度/负长度片段（start >= end），防止 FFmpeg 报错
+    keep_segments = [(s, e) for s, e in keep_segments if e > s + 0.1]
+    if not keep_segments:
+        keep_segments = [(0.0, duration)]
     return keep_segments
 
 
@@ -319,10 +323,7 @@ def compose_preview(
     plan: dict,
 ) -> float:
     """使用 FFmpeg 合成预览视频：裁剪 + 拼接 + 烧录字幕。"""
-    has_subtitles = any(
-        op.get("type") == "add_subtitles"
-        for op in plan.get("edit_operations", [])
-    )
+    has_subtitles = False  # MVP: skip subtitle burn, will use OpenMontage pipeline
 
     # 生成 SRT 字幕
     srt_path = None
@@ -334,7 +335,7 @@ def compose_preview(
         # 简单情况：单个片段，无字幕 → 直接裁剪复制
         start, end = edit_cuts[0]
         subprocess.run(
-            ["ffmpeg", "-y", "-ss", str(start), "-to", str(end),
+            ["ffmpeg", "-y", "-ss", str(start), "-t", str(end - start),
              "-i", str(video_path), "-c", "copy", str(output_path)],
             capture_output=True, check=True,
         )
@@ -359,7 +360,7 @@ def _compose_with_concat(
     for i, (start, end) in enumerate(cuts):
         clip_path = temp_dir / f"_clip_{i:03d}.mp4"
         subprocess.run(
-            ["ffmpeg", "-y", "-ss", str(start), "-to", str(end),
+            ["ffmpeg", "-y", "-ss", str(start), "-t", str(end - start),
              "-i", str(video_path), "-c", "copy", str(clip_path)],
             capture_output=True, check=True,
         )
@@ -451,4 +452,6 @@ def _load_plan(job: Job) -> dict:
             ],
             "summary": "默认编辑计划",
         }
+
+
 
