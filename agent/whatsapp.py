@@ -1,33 +1,55 @@
 """
-whatsapp.py — Publish progress events to Redis.
-Node.js worker.js subscribes and relays to WhatsApp Cloud API.
+whatsapp.py — Direct WhatsApp message sending from Python pipeline.
 
-We never call WhatsApp directly from Python — all outbound traffic
-goes through the Node.js layer that already holds the WA credentials.
+Replaces the old Redis pub/sub relay. The pipeline now calls
+WhatsAppClient and MediaManager directly instead of publishing events
+for Node.js to forward.
 """
 
-import json
-from state import JobState
+from __future__ import annotations
+
+import asyncio
+import logging
+
+from wa.client import WhatsAppClient
+from wa.media import MediaManager
+
+logger = logging.getLogger(__name__)
 
 
-def notify_text(state: JobState, body: str) -> None:
-    """Send a plain text message to the user."""
-    _publish(state, {"type": "text", "body": body})
+# ── Sync wrappers (pipeline is synchronous) ───────────────────────────────────
+
+def notify_text(state, body: str) -> None:
+    try:
+        asyncio.run(_send_text(state.wa_number, body))
+    except Exception as e:
+        logger.error("notify_text failed: %s", e)
 
 
-def notify_approval(state: JobState, body: str) -> None:
-    """
-    Send an approval prompt to the user.
-    The agent will then block on state.wait_for_approval().
-    """
-    _publish(state, {"type": "approval", "body": body})
+def notify_approval(state, body: str) -> None:
+    notify_text(state, body)
 
 
-def notify_video(state: JobState, path: str, caption: str = "") -> None:
-    """Notify Node worker that the final video is ready."""
-    _publish(state, {"type": "video", "path": path, "caption": caption})
+def notify_video(state, video_path: str, caption: str = "") -> None:
+    try:
+        asyncio.run(_send_video(state.wa_number, video_path, caption))
+    except Exception as e:
+        logger.error("notify_video failed: %s", e)
 
 
-def _publish(state: JobState, payload: dict) -> None:
-    channel = f"progress:{state.job_id}"
-    state.redis.publish(channel, json.dumps(payload, ensure_ascii=False))
+def notify_error(state, message: str = "抱歉，視頻製作失敗 😢 請稍後再試。") -> None:
+    notify_text(state, message)
+
+
+# ── Async implementations ─────────────────────────────────────────────────────
+
+async def _send_text(to: str, body: str) -> None:
+    client = WhatsAppClient()
+    await client.send_text(to, body)
+
+
+async def _send_video(to: str, video_path: str, caption: str) -> None:
+    media    = MediaManager()
+    client   = WhatsAppClient()
+    media_id = await media.upload(video_path, "video/mp4")
+    await client.send_video(to, video_id=media_id, caption=caption)

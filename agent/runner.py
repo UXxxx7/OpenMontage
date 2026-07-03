@@ -3,12 +3,6 @@ runner.py — Deterministic video production runner.
 
 Spawned by server/worker.js per job:
   python3 -m runner --job-id <id> --prompt "..." --wa-number "+852..."
-
-Delegates all pipeline logic to VideoService, which handles:
-  script → avatar → transcribe → compose → final.mp4
-
-Each step is checkpointed so retries skip completed work.
-Progress events flow to Redis → Node worker → WhatsApp.
 """
 
 import argparse
@@ -17,6 +11,7 @@ import traceback
 
 from state import JobState
 from service import VideoService
+from whatsapp import notify_error
 
 
 def run(job_id: str, prompt: str, wa_number: str) -> None:
@@ -37,4 +32,9 @@ if __name__ == "__main__":
         sys.exit(0)
     except Exception:
         traceback.print_exc()
+        try:
+            state = JobState(args.job_id, args.wa_number)
+            notify_error(state)
+        except Exception:
+            pass
         sys.exit(1)
