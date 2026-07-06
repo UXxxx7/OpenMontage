@@ -21,6 +21,7 @@ import {
   ReferenceStyleEditProps,
   calculateReferenceStyleEditMetadata,
 } from "./ReferenceStyleEdit";
+import { XiaojinEditorial, XiaojinEditorialProps } from "./XiaojinEditorial";
 
 // ---------------------------------------------------------------------------
 // Theme System — prevents every video from looking like dark fintech
@@ -397,6 +398,58 @@ export const Root: React.FC = () => {
           navItems: [],
         } as ReferenceStyleEditProps}
         calculateMetadata={calculateReferenceStyleEditMetadata}
+      />
+      {/*
+        XiaojinEditorial — the real xiaojin-editorial style (see this file's
+        header comment for how it differs from WhatsAppReferenceEdit above).
+        Default props use the same David/Pacific Life demo script as
+        WhatsAppReferenceEdit, so the two can be diffed side by side on the
+        same source content. Scene positions and objectPosition below are
+        ported from video-studio's validated build for this exact video —
+        do not reuse them for a different source video without recalibrating
+        (see SpeakerCard's doc comment).
+      */}
+      <Composition
+        id="XiaojinEditorial"
+        component={XiaojinEditorial}
+        durationInFrames={Math.ceil(44.9 * 30)}
+        fps={30}
+        width={1080}
+        height={1920}
+        defaultProps={{
+          videoSrc: "whatsapp-2026-06-26-edit/rough-cut.mp4",
+          colorMode: "warm",
+          speakerObjectPosition: "50% 35%",
+          scenes: [
+            { frame: 0, x: 60, y: 104, w: 960, h: 1100 },
+            { frame: 1200, x: 60, y: 104, w: 960, h: 1100 },
+          ],
+          chapters: [
+            { at: 0, zh: "提醒", en: "REMINDER" },
+            { at: 340, zh: "保障", en: "COVERAGE" },
+            { at: 700, zh: "续保", en: "RENEW" },
+            { at: 1000, zh: "联系", en: "CONTACT" },
+          ],
+          introOutFrame: 20,
+          captions: [
+            { text: "Hi there. It's David from Pacific Life.", startMs: 120, endMs: 3180 },
+            { text: "Quick reminder, your policy is coming up for renewal in 30 days on the 28th of July.", startMs: 3700, endMs: 11000 },
+            { text: "Your current plan covers you for $1.5 million, and your annual premium is $8,400.", startMs: 11000, endMs: 18240 },
+            { text: "I've put the full breakdown in this video so you have everything in one place.", startMs: 18240, endMs: 23660 },
+            { text: "Renewing on time really matters.", startMs: 24360, endMs: 26080 },
+            { text: "If your policy lapses, you'd have to go through underwriting again, which could affect both your coverage and your rate.", startMs: 26520, endMs: 34980 },
+            { text: "If you have any questions, just WhatsApp me directly or scan the QR code below.", startMs: 35640, endMs: 41380 },
+            { text: "I'll get back to you right away. Looking forward to keeping you and your family protected.", startMs: 41680, endMs: 45420 },
+            { text: "Take care.", startMs: 45620, endMs: 46110 },
+          ],
+          compliance: {
+            agentNameZh: "大卫",
+            agentNameEn: "David",
+            titleZh: "保险顾问",
+            licenseNo: "LIC-000000",
+            insurer: "Pacific Life",
+          },
+        } as XiaojinEditorialProps}
       />
       <Composition
         id="EndTag"
