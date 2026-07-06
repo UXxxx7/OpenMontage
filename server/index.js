@@ -3,10 +3,16 @@ import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 import crypto from "crypto";
 import express from "express";
+import axios from "axios";
 import { Queue } from "bullmq";
 import IORedis from "ioredis";
 
 config({ path: resolve(dirname(fileURLToPath(import.meta.url)), "../.env") });
+
+const PYTHON_API_BASE = env0("OPENMONTAGE_API_BASE", "http://localhost:8000").replace(/\/$/, "");
+function env0(name, fallback = "") {
+  return process.env[name] || fallback;
+}
 
 const REDIS_URL = env("REDIS_URL", "redis://localhost:6379/0");
 
@@ -54,6 +60,27 @@ app.get("/privacy", (_req, res) => {
 </body></html>`);
 });
 
+// worker.js builds download links as `${PUBLIC_BASE_URL}/files/{jobId}/{filename}`
+// (see fileUrl() there) — PUBLIC_BASE_URL is this gateway's public tunnel URL,
+// not the Python API's. The Python API (port 8000, not itself tunneled) is
+// what actually serves `/files/...`. Proxy it through here so the one tunnel
+// covers both the webhook and file downloads sent back to WhatsApp users —
+// without this, links sent to users 404 ("Cannot GET") since this Express
+// app had no route for the path at all.
+app.get("/files/:jobId/:filename", async (req, res) => {
+  const upstream = `${PYTHON_API_BASE}/files/${encodeURIComponent(req.params.jobId)}/${encodeURIComponent(req.params.filename)}`;
+  try {
+    const upstreamRes = await axios.get(upstream, { responseType: "stream", validateStatus: () => true });
+    res.status(upstreamRes.status);
+    if (upstreamRes.headers["content-type"]) res.setHeader("content-type", upstreamRes.headers["content-type"]);
+    if (upstreamRes.headers["content-length"]) res.setHeader("content-length", upstreamRes.headers["content-length"]);
+    upstreamRes.data.pipe(res);
+  } catch (err) {
+    console.error(`[files-proxy] failed to fetch ${upstream}:`, err.message);
+    res.sendStatus(502);
+  }
+});
+
 app.get(["/webhook", "/webhook/whatsapp"], (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
@@ -66,7 +93,9 @@ app.get(["/webhook", "/webhook/whatsapp"], (req, res) => {
 });
 
 app.post(["/webhook", "/webhook/whatsapp"], async (req, res) => {
+  console.log(`[webhook] POST received, sig header present=${!!req.get("x-hub-signature-256")}, body bytes=${req.rawBody?.length ?? 0}`);
   if (!verifySignature(req)) {
+    console.warn("[webhook] signature verification FAILED — rejecting with 401");
     return res.sendStatus(401);
   }
   const messages = extractMessages(req.body);

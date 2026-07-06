@@ -210,6 +210,52 @@ def _op_remove_silences(src: str, op: dict, workdir: Path) -> Optional[str]:
     return r.data.get("output") or (r.artifacts[0] if r.artifacts else None)
 
 
+def _op_remove_filler(src: str, op: dict, workdir: Path) -> Optional[str]:
+    """转写(词级) -> LLM 判断口误/重录 -> VideoTrimmer concat 只保留干净片段。
+
+    这是 video-use / edit-director.md 的思路："不用打分公式，让 LLM 读转写稿
+    自己判断哪里该剪"——跟 remove_silences 的纯静音检测是互补的两件事，静音
+    检测测不到有声的语气词、也测不到中间没停顿的重录。LLM 不可用或判断没有
+    需要剪的地方时，原样返回，不影响后续步骤。
+    """
+    import os as _os
+
+    from tools.analysis.transcriber import Transcriber
+    from tools.video.video_trimmer import VideoTrimmer
+
+    from .content_planner import plan_filler_removal
+
+    config = get_config()
+
+    _hf = _os.environ.pop("HF_TOKEN", None)
+    try:
+        t = Transcriber().execute({
+            "input_path": src,
+            "output_dir": str(workdir),
+            "model_size": config.faster_whisper_model,
+        })
+    finally:
+        if _hf is not None:
+            _os.environ["HF_TOKEN"] = _hf
+
+    if not t.success:
+        raise RuntimeError(f"remove_filler 转写失败: {t.error}")
+
+    words = t.data.get("word_timestamps") or []
+    duration = _probe_duration(Path(src))
+    keep_ranges = plan_filler_removal(words, duration)
+    if not keep_ranges:
+        logger.info("  remove_filler: 没有判断出需要剪的口误/重录，跳过（视频不变）")
+        return None
+
+    segments = [{"input_path": src, **r} for r in keep_ranges]
+    out = workdir / "_op_nofiller.mp4"
+    r = VideoTrimmer().execute({"operation": "concat", "segments": segments, "output_path": str(out)})
+    if not r.success:
+        raise RuntimeError(f"remove_filler 剪辑失败: {r.error}")
+    return r.data.get("output") or (r.artifacts[0] if r.artifacts else str(out))
+
+
 def _op_speed_up_silence(src: str, op: dict, workdir: Path) -> Optional[str]:
     """把静音段加速而非删除 -> SilenceCutter mode=speed_up。"""
     from tools.video.silence_cutter import SilenceCutter
@@ -318,16 +364,126 @@ def _op_add_subtitles(src: str, op: dict, workdir: Path) -> Optional[str]:
     return r.artifacts[0] if r.artifacts else str(out)
 
 
+def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
+    """转写 + 用 Remotion 渲染 post-xhs 风格（浮动卡片+章节条+卡拉OK字幕+品牌条+彩虹进度条）。
+
+    对应 VeLL-lab/video-studio 的 tools/directors/compose-director.md（"post-xhs
+    style"）——组件已按该文档规格移植到 remotion-composer/src/components/postxhs/
+    和 remotion-composer/src/PostXhsEditorial.tsx。
+
+    这是通用版本：只做转写驱动的字幕 + 固定的 Dominant 卡片模式，不做章节切分
+    也不生成 InfoCards 数据卡——判断"这条视频该分几个章节""哪些数字该做成
+    count-up 卡片"需要对内容做语义分析（对应 compose-director.md 的 Data
+    Display Analysis 步骤），这一步还没有自动化，需要显式传入
+    op["chapters"] / op["info_cards"] 才会渲染出来（见 MrBeast 演示那次是
+    手工写的）。没有传入时，产出的是"卡片+字幕+品牌条"的朴素版本——比纯
+    ffmpeg 裁剪好得多，但不是 compose-director.md 完整规格的效果。
+    """
+    import os as _os
+
+    from tools.analysis.transcriber import Transcriber
+
+    config = get_config()
+    src_path = Path(src)
+    w, h = _probe_dimensions(src_path)
+
+    _hf = _os.environ.pop("HF_TOKEN", None)
+    try:
+        t = Transcriber().execute({
+            "input_path": src,
+            "output_dir": str(workdir),
+            "model_size": config.faster_whisper_model,
+        })
+    finally:
+        if _hf is not None:
+            _os.environ["HF_TOKEN"] = _hf
+
+    if not t.success:
+        raise RuntimeError(f"apply_style 转写失败: {t.error}")
+
+    captions = [
+        {"text": seg["text"].strip(), "startMs": round(seg["start"] * 1000), "endMs": round(seg["end"] * 1000)}
+        for seg in (t.data.get("segments") or [])
+        if seg.get("text", "").strip()
+    ]
+
+    remotion_dir = Path(config.openmontage_root) / "remotion-composer"
+    job_slug = workdir.name
+    public_video_rel = f"jobs/{job_slug}/source.mp4"
+    public_video_abs = remotion_dir / "public" / "jobs" / job_slug / "source.mp4"
+    public_video_abs.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, public_video_abs)
+
+    duration = _probe_duration(src_path)
+
+    # Data Display Analysis / chapter planning (compose-director.md) — an
+    # explicit op["chapters"]/op["info_cards"] override still wins if given
+    # (e.g. a hand-authored build like the MrBeast demo); otherwise ask the
+    # LLM to do the same judgment call instead of rendering an empty shell.
+    if op.get("chapters") or op.get("info_cards"):
+        content_plan = {
+            "chapters": op.get("chapters") or [],
+            "info_cards": op.get("info_cards") or [],
+            "mode_schedule": op.get("mode_schedule") or [{"frame": 0, "mode": "dominant"}],
+        }
+    else:
+        from .content_planner import plan_content
+        logger.info("  apply_style: 内容规划中（章节 + 数据卡）...")
+        content_plan = plan_content(t.data.get("segments") or [], duration)
+        logger.info(
+            f"  apply_style: 规划出 {len(content_plan['chapters'])} 个章节、"
+            f"{len(content_plan['info_cards'])} 个数据卡"
+        )
+
+    props = {
+        "videoSrc": public_video_rel,
+        "durationSeconds": duration,
+        "sourceWidth": w,
+        "sourceHeight": h,
+        "dominantObjPos": op.get("dominant_obj_pos", 50),
+        "workflowObjPos": op.get("workflow_obj_pos", 50),
+        "modeSchedule": content_plan["mode_schedule"],
+        "chapters": content_plan["chapters"],
+        "captions": captions,
+        "infoCards": content_plan["info_cards"],
+        "brand": op.get("brand") or {"name": "", "tagline": ""},
+    }
+    props_path = workdir / "_op_apply_style_props.json"
+    props_path.write_text(json.dumps(props, ensure_ascii=False), encoding="utf-8")
+
+    # No --frames override: durationInFrames comes from calculateMetadata
+    # (see PostXhsEditorial.tsx), computed from props.durationSeconds above —
+    # a hardcoded --frames range here previously caused a real production
+    # failure ("frame range not inbetween") on any source video longer than
+    # the MrBeast demo clip the Composition was first registered against.
+    out = workdir / "_op_styled.mp4"
+    cmd = [
+        "npx", "remotion", "render", "PostXhsEditorial", str(out),
+        f"--props={props_path}",
+        "--crf=18",
+    ]
+    logger.info(f"  apply_style: rendering via {' '.join(cmd)} (cwd={remotion_dir})")
+    result = subprocess.run(cmd, cwd=str(remotion_dir), capture_output=True, text=True)
+    if result.returncode != 0:
+        logger.error(f"apply_style render stderr: {result.stderr[-4000:]}")
+        raise RuntimeError(f"apply_style 渲染失败 (exit {result.returncode})")
+
+    return str(out) if out.exists() else None
+
+
 _OP_HANDLERS: dict[str, Callable[[str, dict, Path], Optional[str]]] = {
     "trim_start": _op_trim_start,
     "trim_end": _op_trim_end,
     "keep_range": _op_keep_range,
     "remove_segment": _op_remove_segment,
     "remove_silences": _op_remove_silences,
+    "remove_filler": _op_remove_filler,
     "speed_up_silence": _op_speed_up_silence,
     "trim_leading_silence": _op_trim_leading_silence,
     "reframe": _op_reframe,
-    # add_subtitles 在主流程末尾单独处理（需要先转写）
+    "apply_style": _op_apply_style,
+    # add_subtitles 在主流程末尾单独处理（需要先转写）；apply_style 已经自带
+    # 转写+字幕烧录，跟 add_subtitles 同时出现时 planner 应该只选一个。
 }
 
 
@@ -345,6 +501,19 @@ def _probe_duration(path: Path) -> float:
         return float(probe.stdout.strip())
     except Exception:
         return 0.0
+
+
+def _probe_dimensions(path: Path) -> tuple[int, int]:
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height", "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, check=True,
+        )
+        w, h = probe.stdout.strip().split(",")
+        return int(w), int(h)
+    except Exception:
+        return (1080, 1920)
 
 
 def _num(v: Any) -> Optional[float]:

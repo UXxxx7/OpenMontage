@@ -1,0 +1,43 @@
+{
+  "videoSrc": "mrbeast-demo/source.mp4",
+  "sourceWidth": 720,
+  "sourceHeight": 1280,
+  "dominantObjPos": 50,
+  "workflowObjPos": 50,
+  "modeSchedule": [
+    { "frame": 0, "mode": "dominant" },
+    { "frame": 608, "mode": "workflow" }
+  ],
+  "chapters": [
+    { "at": 0, "label": "Ideation" },
+    { "at": 248, "label": "Timeline" },
+    { "at": 535, "label": "Total" },
+    { "at": 608, "label": "Budget" }
+  ],
+  "captions": [
+    { "text": "We work on videos probably three to four months in advance,", "startMs": 0, "endMs": 2800 },
+    { "text": "but before that, like, there's an ideation where we brainstorm what they are for a month or two.", "startMs": 3280, "endMs": 7800 },
+    { "text": "So from start to when they get uploaded, it's probably like one to two months.", "startMs": 8260, "endMs": 11140 },
+    { "text": "Coming up with the idea,", "startMs": 11640, "endMs": 12460 },
+    { "text": "three to four months working on the idea,", "startMs": 12860, "endMs": 14520 },
+    { "text": "and then a couple weeks filming,", "startMs": 14720, "endMs": 15820 },
+    { "text": "and then like three weeks editing.", "startMs": 16200, "endMs": 17460 },
+    { "text": "So probably five months from start to finish.", "startMs": 17820, "endMs": 20020 },
+    { "text": "Two years ago, we were spending a hundred grand a video,", "startMs": 20280, "endMs": 21840 },
+    { "text": "now we're spending probably 1.5 million a video.", "startMs": 21960, "endMs": 24020 }
+  ],
+  "infoCards": [
+    {
+      "title": "Budget per video",
+      "x": 80,
+      "y": 900,
+      "width": 920,
+      "mountFrame": 588,
+      "rows": [
+        { "label": "2 YEARS AGO", "value": 100000, "prefix": "$", "divideBy": 1000, "unit": "K", "tone": "bad", "mountOffset": 0 },
+        { "label": "NOW", "value": 1500000, "prefix": "$", "divideBy": 1000000, "decimals": 1, "unit": "M", "tone": "accent", "mountOffset": 57 }
+      ]
+    }
+  ],
+  "brand": { "name": "MRBEAST", "tagline": "Style Study · Not Sponsored" }
+}

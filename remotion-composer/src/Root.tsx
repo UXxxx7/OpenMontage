@@ -21,6 +21,8 @@ import {
   ReferenceStyleEditProps,
   calculateReferenceStyleEditMetadata,
 } from "./ReferenceStyleEdit";
+import { PostXhsEditorial, PostXhsEditorialProps, calculatePostXhsEditorialMetadata } from "./PostXhsEditorial";
+import mrbeastDemoProps from "./mrbeast-demo-props.json";
 
 // ---------------------------------------------------------------------------
 // Theme System — prevents every video from looking like dark fintech
@@ -397,6 +399,27 @@ export const Root: React.FC = () => {
           navItems: [],
         } as ReferenceStyleEditProps}
         calculateMetadata={calculateReferenceStyleEditMetadata}
+      />
+      {/*
+        PostXhsEditorial — canonical current xiaojin-editorial style
+        (compose-director.md's "post-xhs" spec: Dominant/Workflow card
+        modes, 48px karaoke captions). Demo props are the real MrBeast
+        production-timeline/budget clip already scoped in video-studio's
+        motion/mrbeast-clip/production-brief.md (that project never got
+        past the brief stage — this is the first actual render attempt
+        against that brief). dominantObjPos/workflowObjPos default to 50;
+        per compose-director.md this MUST be calibrated with a still render
+        before treating the output as final — not yet done here.
+      */}
+      <Composition
+        id="PostXhsEditorial"
+        component={PostXhsEditorial}
+        durationInFrames={Math.ceil(24.2 * 30)}
+        fps={30}
+        width={1080}
+        height={1920}
+        defaultProps={{ durationSeconds: 24.2, ...mrbeastDemoProps } as unknown as PostXhsEditorialProps}
+        calculateMetadata={calculatePostXhsEditorialMetadata}
       />
       <Composition
         id="EndTag"
