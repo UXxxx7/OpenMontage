@@ -167,7 +167,18 @@ def _run_llm_planner(job: Any) -> None:
 
     from .llm_planner import plan_edit
 
-    plan = plan_edit(job.edit_request)
+    # 探测视频时长，帮助规划器把"中间三十秒 / 前半段"等模糊位置解析成具体秒数，避免追问
+    duration = None
+    try:
+        from .pipeline_runner import _probe_duration
+
+        input_path = job.job_dir / "input.mp4"
+        if input_path.exists():
+            duration = _probe_duration(input_path) or None
+    except Exception:
+        duration = None
+
+    plan = plan_edit(job.edit_request, video_duration=duration)
 
     # 保存规划结果
     update_job_fields(job.id, planned_edit=json.dumps(plan, ensure_ascii=False))
@@ -186,11 +197,13 @@ def _send_confirmation(job: Any, wa: WhatsAppClient) -> None:
     except (json.JSONDecodeError, TypeError):
         plan = {"summary": "编辑计划已生成", "edit_operations": []}
 
-    # 检查是否需要澄清
+    # 检查是否需要澄清 → 进入 NEEDS_CLARIFICATION，由 Node 把问题发给用户、等用户回复
     if plan.get("clarification_needed"):
         question = plan.get("clarification_question", "请提供更多信息")
         _safe_send(wa, job.user.whatsapp_id, f"需要确认：{question}")
-        return  # 不改变状态，等待用户回复
+        update_job_status(job.id, JobStatus.NEEDS_CLARIFICATION)
+        logger.info(f"任务 {job.id} 需要澄清: {question}")
+        return
 
     # 构建确认消息
     summary = plan.get("summary", "编辑计划已生成")
@@ -238,7 +251,13 @@ def _send_confirmation(job: Any, wa: WhatsAppClient) -> None:
 # ---------------------------------------------------------------------------
 
 def _safe_send(wa: WhatsAppClient, to: str, text: str) -> None:
-    """安全发送 WhatsApp 消息，忽略网络错误。"""
+    """安全发送 WhatsApp 消息，忽略网络错误。
+
+    网关模式下真正的用户消息由 Node worker 发送；Python 侧的收件人是占位的
+    'api_user'，发它必然失败，直接跳过以消除无害的 400 噪音。
+    """
+    if not to or to == "api_user":
+        return
     try:
         wa.send_text_message(to, text)
     except Exception as e:

@@ -97,11 +97,16 @@ async function editVideo({ waNumber, mediaId, editRequest }) {
       Number(env("WA_ACTIVE_JOB_TTL", "86400")));
 
     const status = await waitForStatus(jobId,
-      ["WAITING_CONFIRMATION", "PREVIEW_READY", "ERROR"],
+      ["WAITING_CONFIRMATION", "NEEDS_CLARIFICATION", "PREVIEW_READY", "ERROR"],
       Number(env("WA_PLAN_TIMEOUT_MS", "120000")));
 
     if (status.status === "ERROR") {
       throw new Error(status.error_message || "Python planning failed");
+    }
+    if (status.status === "NEEDS_CLARIFICATION") {
+      const q = status.planned_edit?.clarification_question || "我需要更多信息才能编辑这段视频。";
+      await sendText(waNumber, `${q}\n\n请补充具体细节（例如从第几秒到第几秒），然后重新发送这段视频。`);
+      return;
     }
     if (status.status === "PREVIEW_READY") {
       await sendText(waNumber, `Preview ready: ${fileUrl(jobId, "preview.mp4")}\nReply export to generate final video.`);
@@ -135,8 +140,12 @@ async function renderJob({ waNumber, jobId }) {
     throw new Error(status.error_message || "Python render failed");
   }
 
-  // 成品通常 > 16MB，超出 WhatsApp 视频消息上限，统一以链接投递（走 PUBLIC_BASE_URL）
-  await sendText(waNumber, `Your final video is ready: ${fileUrl(jobId, "final.mp4")}`);
+  const finalPath = status.final_path;
+  if (finalPath && fs.existsSync(finalPath)) {
+    await sendVideo(waNumber, finalPath, "Your final video is ready.");
+  } else {
+    await sendText(waNumber, `Final video: ${fileUrl(jobId, "final.mp4")}`);
+  }
   await redis.del(activeJobKey(waNumber));
 }
 

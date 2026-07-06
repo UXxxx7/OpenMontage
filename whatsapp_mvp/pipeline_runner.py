@@ -162,6 +162,41 @@ def _op_keep_range(src: str, op: dict, workdir: Path) -> Optional[str]:
     return r.artifacts[0] if r.artifacts else str(out)
 
 
+def _op_remove_segment(src: str, op: dict, workdir: Path) -> Optional[str]:
+    """删除中间某段 [start, end] -> 保留两侧再 concat（只剩一侧则直接 cut）。"""
+    from tools.video.video_trimmer import VideoTrimmer
+    a = _num(op.get("start_seconds"))
+    b = _num(op.get("end_seconds"))
+    if a is None or b is None or b <= a:
+        return None
+    dur = _probe_duration(Path(src))
+    keep: list[dict] = []
+    if a > 0.1:
+        keep.append({"input_path": src, "start_seconds": 0, "end_seconds": a})
+    if dur <= 0 or b < dur - 0.1:
+        keep.append({"input_path": src, "start_seconds": b})
+    if not keep:
+        return None
+    out = workdir / "_op_remove_seg.mp4"
+    if len(keep) == 1:
+        seg = keep[0]
+        inputs = {
+            "operation": "cut", "input_path": src,
+            "start_seconds": seg.get("start_seconds", 0),
+            "codec": "libx264", "output_path": str(out),
+        }
+        if "end_seconds" in seg:
+            inputs["end_seconds"] = seg["end_seconds"]
+        r = VideoTrimmer().execute(inputs)
+    else:
+        r = VideoTrimmer().execute({
+            "operation": "concat", "segments": keep, "output_path": str(out),
+        })
+    if not r.success:
+        raise RuntimeError(f"remove_segment 失败: {r.error}")
+    return r.data.get("output") or (r.artifacts[0] if r.artifacts else str(out))
+
+
 def _op_remove_silences(src: str, op: dict, workdir: Path) -> Optional[str]:
     """去掉所有静音/停顿使更紧凑 -> SilenceCutter mode=remove。"""
     from tools.video.silence_cutter import SilenceCutter
@@ -221,6 +256,30 @@ def _op_trim_leading_silence(src: str, op: dict, workdir: Path) -> Optional[str]
     return tr.artifacts[0] if tr.artifacts else str(out)
 
 
+def _op_reframe(src: str, op: dict, workdir: Path) -> Optional[str]:
+    """转换画幅（默认竖屏 9:16）-> AutoReframe，自带人脸跟踪居中。"""
+    from tools.video.auto_reframe import AutoReframe
+    aspect = str(op.get("aspect") or "portrait").lower()
+    alias = {
+        "9:16": "portrait", "vertical": "portrait", "竖屏": "portrait",
+        "shorts": "portrait", "reels": "portrait", "tiktok": "portrait",
+        "1:1": "square", "方形": "square",
+        "16:9": "landscape", "横屏": "landscape",
+        "21:9": "cinematic", "4:5": "vertical_4_5",
+    }
+    aspect = alias.get(aspect, aspect)
+    if aspect not in ("portrait", "square", "landscape", "cinematic", "vertical_4_5"):
+        aspect = "portrait"
+    out = workdir / "_op_reframe.mp4"
+    r = AutoReframe().execute({
+        "input_path": src, "target_aspect": aspect, "output_path": str(out),
+    })
+    if not r.success:
+        raise RuntimeError(f"reframe 失败: {r.error}")
+    # 源画幅已匹配时工具会返回原文件路径
+    return r.data.get("output") or (r.artifacts[0] if r.artifacts else None)
+
+
 def _op_add_subtitles(src: str, op: dict, workdir: Path) -> Optional[str]:
     """转写 -> 烧录字幕（原语言）。翻译成其他语言暂不支持（见 planner 的 unsupported）。"""
     import os as _os
@@ -263,9 +322,11 @@ _OP_HANDLERS: dict[str, Callable[[str, dict, Path], Optional[str]]] = {
     "trim_start": _op_trim_start,
     "trim_end": _op_trim_end,
     "keep_range": _op_keep_range,
+    "remove_segment": _op_remove_segment,
     "remove_silences": _op_remove_silences,
     "speed_up_silence": _op_speed_up_silence,
     "trim_leading_silence": _op_trim_leading_silence,
+    "reframe": _op_reframe,
     # add_subtitles 在主流程末尾单独处理（需要先转写）
 }
 

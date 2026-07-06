@@ -22,9 +22,11 @@ SUPPORTED_OPERATIONS = [
     "trim_start",            # 剪掉开头 N 秒        {"seconds": N}
     "trim_end",              # 剪掉结尾 N 秒        {"seconds": N}
     "keep_range",            # 只保留某段          {"start_seconds": S, "end_seconds": E}
+    "remove_segment",        # 删掉中间某段        {"start_seconds": S, "end_seconds": E}
     "remove_silences",       # 去掉所有静音/停顿    （无参）
     "trim_leading_silence",  # 只去掉开头的静音     （无参）
     "speed_up_silence",      # 静音段加速而非删除   {"factor": F} 可选
+    "reframe",               # 转换画幅/竖屏        {"aspect": "portrait|square|landscape|cinematic"}
     "add_subtitles",         # 转写并烧录字幕(原语言){"language": "..."} 可选
 ]
 
@@ -42,6 +44,7 @@ EDIT_PLAN_SCHEMA = {
                     "seconds": {"type": "number"},
                     "start_seconds": {"type": "number"},
                     "end_seconds": {"type": "number"},
+                    "aspect": {"type": "string"},
                     "language": {"type": "string"},
                     "factor": {"type": "number"},
                     "description": {"type": "string"},
@@ -61,26 +64,31 @@ You can ONLY use these operations. Do NOT invent any others:
 - trim_start: remove the first N seconds. params: {"seconds": N}
 - trim_end: remove the last N seconds. params: {"seconds": N}
 - keep_range: keep only one time range, drop the rest. params: {"start_seconds": S, "end_seconds": E}
+- remove_segment: remove ONE middle time range, keep everything else. params: {"start_seconds": S, "end_seconds": E}
 - remove_silences: remove ALL silent pauses / dead air to make the video compact. no params.
 - trim_leading_silence: remove ONLY the silent gap at the very beginning. no params.
 - speed_up_silence: speed up silent pauses instead of cutting them. params: {"factor": F} (optional).
+- reframe: change the aspect ratio / orientation. params: {"aspect": "portrait"} where portrait = 9:16 vertical (TikTok/Reels/Shorts), square = 1:1, landscape = 16:9, cinematic = 21:9.
 - add_subtitles: transcribe the spoken audio and burn captions onto the video. params: {"language": "..."} (optional).
 
 Mapping guidance (examples):
 - "减掉/剪掉/去掉开头10秒" / "cut the first 10 seconds" -> trim_start {"seconds": 10}
 - "去掉结尾5秒" / "remove last 5 seconds" -> trim_end {"seconds": 5}
 - "只保留第30到60秒" -> keep_range {"start_seconds": 30, "end_seconds": 60}
+- "把中间第30到40秒删掉/去掉30到40秒" -> remove_segment {"start_seconds": 30, "end_seconds": 40}
 - "去掉停顿/删掉空白/让它更紧凑连贯/流畅一点" -> remove_silences
 - "去掉开头的空白/开头静音" -> trim_leading_silence
 - "把停顿加速" -> speed_up_silence
+- "转成竖屏/9:16/发抖音/做成Shorts/Reels" -> reframe {"aspect": "portrait"}
+- "转成横屏/16:9" -> reframe {"aspect": "landscape"}；"转成方形/1:1" -> reframe {"aspect": "square"}
 - "加字幕/配字幕" -> add_subtitles
 
 Rules:
 1. Map the user's intent to the operations above. Every operation object must have a "type" and a short "description" written in the SAME language as the user.
-2. If the user asks for something NOT in the list (e.g. remove repeated sentences / stutters / filler words, TRANSLATE subtitles to another language, add background music, change/replace the background, reframe/crop to vertical, color grading, add titles/logos/overlays), DO NOT fake it. Put a short human-readable description of each unsupported request into the "unsupported" array, and only put the operations you CAN do into "edit_operations".
+2. If the user asks for something NOT in the list (e.g. remove repeated sentences / stutters / filler words, TRANSLATE subtitles to another language, add background music, change/replace the background, color grading, add titles/logos/overlays), DO NOT fake it. Put a short human-readable description of each unsupported request into the "unsupported" array, and only put the operations you CAN do into "edit_operations".
 3. About subtitles: add_subtitles transcribes the SPOKEN language only — it cannot translate. If the user asks for subtitles in a language that is likely different from the speech (e.g. "加中文字幕" on an English-spoken video), still include add_subtitles, but ALSO add a note to "unsupported" such as "翻译字幕到中文（当前只支持原语言字幕）".
 4. "summary" is one short friendly sentence in the user's language describing what you will do (and briefly what you cannot, if anything).
-5. If the request is too vague to map to any operation, set "clarification_needed": true and ask exactly ONE question in "clarification_question".
+5. Prefer to PROCEED. If a video duration is provided, use it to resolve clearly-positioned requests into concrete second ranges (e.g. "删掉中间三十秒 / remove the middle 30s" on a D-second video -> remove_segment {"start_seconds": (D-30)/2, "end_seconds": (D+30)/2}; "后面十秒 / last 10s" -> trim_end {"seconds": 10}). ONLY when the request is genuinely ambiguous about WHAT or WHERE to edit and any guess would likely be wrong (e.g. "删掉不好的那段 / cut the boring part" — impossible to know which part), set "clarification_needed": true and put exactly ONE short question (in the user's language) in "clarification_question", with "edit_operations" empty.
 6. Always output valid JSON only, matching the schema. No markdown, no prose outside the JSON."""
 
 
@@ -157,7 +165,7 @@ class LLMPlanner:
             resp.raise_for_status()
             data = resp.json()
             content = data["choices"][0]["message"]["content"]
-            return self._parse_and_validate(content)
+            return self._parse_and_validate(content, edit_request)
         except Exception as e:
             logger.error(f"Custom LLM call failed: {e}")
             if hasattr(e, "response") and getattr(e, "response", None) is not None:
@@ -215,7 +223,7 @@ class LLMPlanner:
             resp.raise_for_status()
             data = resp.json()
             content = data["choices"][0]["message"]["content"]
-            return self._parse_and_validate(content)
+            return self._parse_and_validate(content, edit_request)
         except Exception as e:
             logger.error(f"LLM call failed: {e}")
             return self._default_plan(edit_request)
@@ -250,7 +258,7 @@ class LLMPlanner:
             resp.raise_for_status()
             data = resp.json()
             content = data["content"][0]["text"]
-            return self._parse_and_validate(content)
+            return self._parse_and_validate(content, edit_request)
         except Exception as e:
             logger.error(f"Claude call failed: {e}")
             return self._default_plan(edit_request)
@@ -266,8 +274,8 @@ class LLMPlanner:
         parts.append("Output the JSON edit plan.")
         return "\n".join(parts)
 
-    def _parse_and_validate(self, raw_content: str) -> dict:
-        """解析 LLM 输出并规整。过滤掉不支持的操作类型，防止执行器拿到未知 op。"""
+    def _parse_and_validate(self, raw_content: str, edit_request: str = "") -> dict:
+        """解析 LLM 输出并规整。展平嵌套 params、过滤不支持的操作类型。"""
         plan = None
         try:
             plan = json.loads(raw_content)
@@ -301,6 +309,9 @@ class LLMPlanner:
             elif op.get("type"):
                 plan["unsupported"].append(f"未支持的操作: {op.get('type')}")
         plan["edit_operations"] = clean_ops
+        # 若模型既没给出可执行操作、也没标 unsupported、也没要求澄清 → 退回关键词兜底
+        if not clean_ops and not plan.get("unsupported") and not plan.get("clarification_needed"):
+            return self._default_plan(edit_request)
         return plan
 
     # ------------------------------------------------------------------
@@ -312,9 +323,17 @@ class LLMPlanner:
         ops: list[dict] = []
         unsupported: list[str] = []
 
-        # 剪掉开头 N 秒（数字）
+        # 删掉中间某段（两个数字 + 到/-/to）
+        mseg = re.search(r"(\d+)\s*(?:到|至|-|~|to)\s*(\d+)\s*秒", req) or \
+            re.search(r"(\d+)\s*(?:to|-)\s*(\d+)\s*sec", req)
+        if mseg and any(w in req for w in ("删", "去掉", "remove", "cut out", "中间", "掉")):
+            a, b = mseg.group(1), mseg.group(2)
+            ops.append({"type": "remove_segment", "start_seconds": float(a),
+                        "end_seconds": float(b), "description": f"删掉第 {a}-{b} 秒"})
+
+        # 剪掉开头 N 秒
         m = re.search(r"(?:开头|前面?)[^\d]{0,4}(\d+)\s*秒", req) or re.search(r"first\s*(\d+)\s*sec", req)
-        if m:
+        if m and not any(o["type"] == "remove_segment" for o in ops):
             n = float(m.group(1))
             ops.append({"type": "trim_start", "seconds": n, "description": f"剪掉开头 {int(n)} 秒"})
         elif any(w in req for w in ("开头空白", "开头静音", "去掉开头", "trim beginning", "leading silence")):
@@ -325,6 +344,14 @@ class LLMPlanner:
         if me:
             n = float(me.group(1))
             ops.append({"type": "trim_end", "seconds": n, "description": f"剪掉结尾 {int(n)} 秒"})
+
+        # 竖屏/画幅
+        if any(w in req for w in ("竖屏", "9:16", "抖音", "shorts", "reels", "tiktok", "vertical")):
+            ops.append({"type": "reframe", "aspect": "portrait", "description": "转成竖屏 9:16"})
+        elif any(w in req for w in ("横屏", "16:9", "landscape")):
+            ops.append({"type": "reframe", "aspect": "landscape", "description": "转成横屏 16:9"})
+        elif any(w in req for w in ("方形", "1:1", "square")):
+            ops.append({"type": "reframe", "aspect": "square", "description": "转成方形 1:1"})
 
         # 去静音
         if any(w in req for w in ("停顿", "静音", "空白", "紧凑", "连贯", "流畅",
@@ -346,8 +373,8 @@ class LLMPlanner:
             unsupported.append("删除重复/结巴/口误片段（需要语义分析，暂不支持）")
         if any(w in req for w in ("配乐", "音乐", "背景音乐", "music", "bgm")):
             unsupported.append("添加背景音乐（暂不支持）")
-        if any(w in req for w in ("竖屏", "横屏", "reframe", "裁剪画面", "crop", "9:16")):
-            unsupported.append("画面重构图/竖屏（暂不支持）")
+        if any(w in req for w in ("调色", "滤镜", "color grade", "lut")):
+            unsupported.append("调色/滤镜（暂不支持）")
 
         if not ops:
             ops = [{"type": "remove_silences", "description": "去掉停顿使视频更紧凑"}]
