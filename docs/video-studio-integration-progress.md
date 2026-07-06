@@ -29,7 +29,11 @@ is a separate, non-trivial task — see "What's NOT done" below.
 | Rainbow progress bar | `remotion-composer/src/components/xiaojin/RainbowProgressBar.tsx` | Ported as-is (was already generic) |
 | Karaoke captions | `remotion-composer/src/components/xiaojin/Captions.tsx` | Ported, using the direct-lookup method video-studio's own CLAUDE-v2.md documents as the fix for a real CJK sync bug in `createTikTokStyleCaptions` |
 | Shared theme tokens (warm/dark) | `remotion-composer/src/components/xiaojin/theme.ts` | New — generalizes what was a single hardcoded palette in the source project |
-| Composition wrapper | `remotion-composer/src/XiaojinEditorial.tsx` | New, assembles the above |
+| Content zone (graphic side opposite the card) | `remotion-composer/src/components/xiaojin/ContentZone.tsx` | Ported as a generic beat-driven slot — see its doc comment for why the per-project section content itself (calendars, quote cards, etc.) was NOT ported |
+| Intro title card ("Pattern 2" dark open) | `remotion-composer/src/components/xiaojin/IntroTitle.tsx` | Ported, generalized. The other 3 intro patterns from CLAUDE-xiaojin-editorial.md (stats hook, title+atmosphere, straight-in-with-chips) are not ported |
+| Brand strip (non-regulatory) | `remotion-composer/src/components/xiaojin/BrandBar.tsx` | Ported, generalized. Counterpart to ComplianceBar — use exactly one of the two |
+| Outro CTA section | `remotion-composer/src/components/xiaojin/OutroSection.tsx` | Ported, generalized. vell-renewal-reminder's QR-code/contact-card outro variant was NOT ported (business-data-driven, needs its own component against a real fact-sheet schema) |
+| Composition wrapper | `remotion-composer/src/XiaojinEditorial.tsx` | New, assembles all of the above; `contentBeats`/`intro`/`outro`/`brand` are optional so a chrome-only build still works |
 | Registered in Root.tsx | `remotion-composer/src/Root.tsx` | `id="XiaojinEditorial"`, default props reuse the same David/Pacific Life demo script already present in `WhatsAppReferenceEdit` |
 | Style playbook | `styles/xiaojin-editorial.yaml` | New, translated from `CLAUDE-xiaojin-editorial.md` into OpenMontage's playbook schema |
 | Style playbook | `styles/daja-default.yaml` | New, translated from `CLAUDE-daja-default.md` — **no composition ported for this one** (see below) |
@@ -59,6 +63,21 @@ independently risks a third, further-diverged variant appearing later.
 
 ## What's NOT done (accepted gaps, not oversights)
 
+- **Remaining components, not ported (bespoke, not reusable templates):**
+  every video-studio motion project also has its own one-off content
+  graphics — `CalendarGraphic`/`ShieldGraphic`/`RenewalSection`/
+  `CoverageSection`/`LapseSection`/`ContactSection` (vell-renewal-reminder),
+  `QuoteSection` (chris-quote), `CollectionSection`/`OriginSection`/
+  `RevealSection` (iman-watches), `CTAGraphics`/`MoneyRedirect`/
+  `PayoutGraphics`/`TaxDeduction`/`AgentCredential` (retirement-fund). These
+  are inherently tied to one video's specific business content (an
+  insurance calendar, a watch collection reveal, a tax-deduction graphic) —
+  porting them as "xiaojin" library components would mean generalizing
+  business content that was never meant to be generic. Use `ContentZone`'s
+  `beats` prop to supply your own equivalents per project instead.
+- **Only 1 of 4 documented intro patterns has a component** (`IntroTitle` =
+  Pattern 2). Stats-hook, title+atmosphere, and straight-in-with-chips
+  (Patterns 1, 3, 4 in `CLAUDE-xiaojin-editorial.md`) have no component yet.
 - **No pipeline wiring.** Nothing in `pipeline_defs/talking-head.yaml`'s
   `compose` stage or `whatsapp_mvp/pipeline_runner.py` invokes this
   composition. Today, requesting `xiaojin-editorial` style via the WhatsApp

@@ -71,6 +71,11 @@ export const PALETTES: Record<ColorMode, XiaojinPalette> = {
 // them (see CLAUDE-v2.md's pre-render checklist this ports from).
 export const NAV = { h: 88 };
 export const COMPLIANCE = { y: 1824, h: 88 };
+// Lighter, non-regulatory equivalent of COMPLIANCE — used by BrandBar for
+// content that isn't under a disclosure requirement (ported from
+// video-studio's chris-quote/iman-watches/retirement-fund theme.ts, which
+// all use this exact zone for their BrandBar).
+export const BRAND = { y: 1848, h: 64 };
 export const PROGRESS = { y: 1912, h: 8 };
 export const CAPTION_BOTTOM = 90;
 

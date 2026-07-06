@@ -442,6 +442,11 @@ export const Root: React.FC = () => {
             { text: "I'll get back to you right away. Looking forward to keeping you and your family protected.", startMs: 41680, endMs: 45420 },
             { text: "Take care.", startMs: 45620, endMs: 46110 },
           ],
+          intro: {
+            eyebrow: "POLICY RENEWAL REMINDER",
+            title: "保單續期提醒",
+            subtitle: "Pacific Life 太平洋人壽",
+          },
           compliance: {
             agentNameZh: "大卫",
             agentNameEn: "David",
