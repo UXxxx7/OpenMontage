@@ -424,9 +424,12 @@ def _op_add_subtitles(src: str, op: dict, workdir: Path) -> Optional[str]:
         return None
 
     out = workdir / "_op_subtitled.mp4"
+    # 不再 force_ffmpeg：这台机器的 ffmpeg 没编 libass（subtitles 滤镜不存在，
+    # 实测 exit 234/Filter not found），而 Remotion 路径已全程验证可用。让工具
+    # 自己选（Remotion 优先，ffmpeg 只作为 Remotion 不可用时的兜底）。
     r = RemotionCaptionBurn().execute({
         "input_path": src, "output_path": str(out),
-        "segments": segments, "force_ffmpeg": True,
+        "segments": segments,
     })
     if not r.success:
         raise RuntimeError(f"字幕烧录失败: {r.error}")
