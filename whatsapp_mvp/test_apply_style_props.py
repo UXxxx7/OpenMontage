@@ -135,6 +135,30 @@ def main():
     assert no_reframe is None, no_reframe
     print("PASS [portrait example + portrait source -> no reframe needed]")
 
+    # --- Beat-driven scenes: props with dataCards get a multi-keyframe scene
+    # schedule (card docks for the card, returns after) and still pass the
+    # contract schema; a plan with no cards keeps a single static keyframe.
+    with_cards = build_xiaojin_render_props(
+        "jobs/case-scenes/source.mp4", 60.0,
+        [{"text": "x", "startMs": 0, "endMs": 1000}],
+        {"chapters": [], "dataCards": [
+            {"title": "T", "mountFrame": 300, "rows": [{"label": "A", "value": 9, "mountOffset": 50}]},
+        ]}, {},
+    )
+    _assert_valid("beat-driven scenes (with dataCards)", with_cards, validator)
+    assert len(with_cards["scenes"]) >= 4, with_cards["scenes"]
+    assert with_cards["dataCards"][0]["y"] >= 1044, with_cards["dataCards"][0]
+    print(f"PASS [dataCards -> {len(with_cards['scenes'])} scene keyframes, card placed in content zone]")
+
+    without_cards = build_xiaojin_render_props(
+        "jobs/case-noscenes/source.mp4", 60.0,
+        [{"text": "x", "startMs": 0, "endMs": 1000}],
+        {"chapters": [], "dataCards": []}, {},
+    )
+    _assert_valid("static full-screen scenes (no dataCards)", without_cards, validator)
+    assert len(without_cards["scenes"]) == 1, without_cards["scenes"]
+    print("PASS [no dataCards -> single full-screen scene keyframe]")
+
 
 if __name__ == "__main__":
     main()

@@ -397,12 +397,104 @@ def _op_add_subtitles(src: str, op: dict, workdir: Path) -> Optional[str]:
 # correctly yet; that integration happens once P3 finishes their half.
 # ---------------------------------------------------------------------------
 
-# Fallback scene/objectPosition when no source-video face calibration has
-# been run yet (P2 MVP scope — see contracts/README.md: "P2 runs
-# face_tracker on the source" is the eventual real version of this).
+# Fallback objectPosition when no source-video face calibration has been run
+# yet (P2 MVP scope — see contracts/README.md: "P2 runs face_tracker on the
+# source" is the eventual real version of this).
 _DEFAULT_SPEAKER_OBJECT_POSITION = "50% 35%"
-_DEFAULT_SCENE = {"frame": 0, "x": 60, "y": 104, "w": 960, "h": 1100}
 _DEFAULT_INTRO_OUT_FRAME = 20
+
+# ---------------------------------------------------------------------------
+# Canvas / chrome geometry + beat-driven scene generation.
+#
+# Numbers come from video-studio's compose-director.md style codex (1080x1920,
+# ChapterNav 0-88, BrandBar y=1848, captions pinned bottom:90) — that codex is
+# what produced the reference-quality builds, and the core rule this encodes
+# is: the speaker card only shrinks WHEN content needs the canvas, and returns
+# to full when it doesn't. A fixed scene schedule (the previous _DEFAULT_SCENE)
+# leaves most of the canvas empty for most of the video, which is exactly the
+# "under-edited" failure video-studio's docs call out.
+# ---------------------------------------------------------------------------
+_FPS = 30
+# Card boxes. FULL: near-full portrait (bottom=1800, clears BrandBar@1848).
+# CONTENT: card docked to the top so the zone below is free for data cards
+# (codex: workflow card min height 900 — shorter crops a portrait source to
+# head-only).
+_FULL_BOX = {"x": 60, "y": 104, "w": 960, "h": 1696}
+_CONTENT_BOX = {"x": 40, "y": 104, "w": 1000, "h": 900}
+_CONTENT_TOP = 1044          # 40px gap below CONTENT box bottom (1004)
+_CAPTION_SAFE_TOP = 1680     # caption pill zone starts around here; content must end above
+_TRANSITION_FRAMES = 20      # codex: APPLE easing over 20 frames
+_CARD_HOLD_FRAMES = 150      # ~5s reading hold after the last row lands
+_MERGE_GAP_FRAMES = 60       # gaps shorter than this stay in content mode (no thrash)
+_DATA_CARD_ROW_H = 64        # InfoCard row height estimate for overflow clamping
+_DATA_CARD_CHROME_H = 96     # title + padding estimate
+
+
+def _data_card_end_frame(card: dict) -> int:
+    """Frame at which a card's content has fully landed and been read."""
+    last_row = max((r.get("mountOffset", 0) for r in card.get("rows", [])), default=0)
+    return card["mountFrame"] + last_row + _CARD_HOLD_FRAMES
+
+
+def build_xiaojin_scenes(content_plan: dict, duration_seconds: float) -> list[dict]:
+    """dataCards 的 beat -> SpeakerCard 的 scenes 关键帧。纯函数。
+
+    规则（对齐 compose-director 的实际做法）：卡片默认全屏漂浮；只在某张数据卡
+    需要画布时，提前 20 帧过渡到 CONTENT 盒（顶部停靠），数据卡读完（最后一行
+    落位 + ~5s）再过渡回全屏。相邻数据卡间隔太短就保持 CONTENT 不来回抖。
+    没有任何数据卡（很常见、完全正常）-> 单关键帧全屏，卡片全程不动。
+
+    SpeakerCard 对 scenes 做的是全序列 interpolate（帧号必须严格递增），所以
+    "停留"要靠成对关键帧表达：{f,box} {f+20,box'} 之间是过渡，其余区间保持。
+    """
+    duration_frames = max(1, round(duration_seconds * _FPS))
+    cards = sorted(content_plan.get("dataCards") or [], key=lambda c: c["mountFrame"])
+    if not cards:
+        return [{"frame": 0, **_FULL_BOX}]
+
+    # Shrink intervals [start, end] in frames, merged when nearly adjacent.
+    intervals: list[list[int]] = []
+    for card in cards:
+        start = max(card["mountFrame"] - _TRANSITION_FRAMES, 1)
+        end = _data_card_end_frame(card)
+        if intervals and start - intervals[-1][1] <= _MERGE_GAP_FRAMES + 2 * _TRANSITION_FRAMES:
+            intervals[-1][1] = max(intervals[-1][1], end)
+        else:
+            intervals.append([start, end])
+
+    scenes: list[dict] = [{"frame": 0, **_FULL_BOX}]
+    for start, end in intervals:
+        # Guarantee strictly increasing frames even for a card mounting at ~0.
+        start = max(start, scenes[-1]["frame"] + 1)
+        end = max(end, start + _TRANSITION_FRAMES + 1)
+        scenes.append({"frame": start, **_FULL_BOX})
+        scenes.append({"frame": start + _TRANSITION_FRAMES, **_CONTENT_BOX})
+        if end + _TRANSITION_FRAMES >= duration_frames:
+            break  # video ends while in content mode — stay docked, no return
+        scenes.append({"frame": end, **_CONTENT_BOX})
+        scenes.append({"frame": end + _TRANSITION_FRAMES, **_FULL_BOX})
+    return scenes
+
+
+def place_data_cards(data_cards: list[dict]) -> list[dict]:
+    """给数据卡补默认坐标并夹进安全区。纯函数，不改传入的列表。
+
+    契约②里 dataCards 的 schema 默认 y=900——但卡片 CONTENT 盒底在 1004，
+    y=900 会被说话人卡片压住；底部还有字幕带(~1680 起)/BrandBar(1848)。这里
+    统一放进内容区(_CONTENT_TOP 起)，并按行数估高夹住 y 保证不进字幕带。
+    """
+    placed = []
+    for card in data_cards:
+        c = dict(card)
+        est_h = _DATA_CARD_CHROME_H + len(c.get("rows", [])) * _DATA_CARD_ROW_H
+        c.setdefault("x", 80)
+        c.setdefault("width", 920)
+        y = c.get("y", _CONTENT_TOP + 56)
+        y = max(y, _CONTENT_TOP)
+        y = min(y, _CAPTION_SAFE_TOP - est_h)
+        c["y"] = y
+        placed.append(c)
+    return placed
 
 
 def calibrate_speaker_object_position(src: str, workdir: Path) -> str:
@@ -495,13 +587,13 @@ def build_xiaojin_render_props(
         "durationSeconds": duration_seconds,
         "colorMode": op.get("colorMode", "warm"),
         "speakerObjectPosition": op.get("speakerObjectPosition", _DEFAULT_SPEAKER_OBJECT_POSITION),
-        "scenes": op.get("scenes") or [dict(_DEFAULT_SCENE)],
+        "scenes": op.get("scenes") or build_xiaojin_scenes(content_plan, duration_seconds),
         "introOutFrame": op.get("introOutFrame", _DEFAULT_INTRO_OUT_FRAME),
         "chapters": content_plan.get("chapters", []),
         "captions": captions,
     }
     if content_plan.get("dataCards"):
-        props["dataCards"] = content_plan["dataCards"]
+        props["dataCards"] = place_data_cards(content_plan["dataCards"])
     if op.get("compliance"):
         props["compliance"] = op["compliance"]
     if op.get("brand"):
@@ -515,6 +607,50 @@ def build_xiaojin_render_props(
     if op.get("labelFont"):
         props["labelFont"] = op["labelFont"]
     return props
+
+
+_MAX_CAPTION_WORDS = 7
+_MAX_CAPTION_CHARS = 42
+
+
+def build_caption_phrases(words: list[dict], segments: list[dict]) -> list[dict]:
+    """词级时间戳 -> 短语级字幕。纯函数。
+
+    直接用转写 segment 当字幕，一条能到 200+ 字符、屏幕上 5-6 行，把画面压掉
+    小半截——codex 明确要求 phrase-level captions。这里按词重组：满 7 词/42 字
+    符、或遇到句读（.?!，。？！）就断一条。没有词级数据时退回 segment 级
+    （长，但有总比没有好）。
+    """
+    if not words:
+        return [
+            {"text": seg["text"].strip(), "startMs": round(seg["start"] * 1000), "endMs": round(seg["end"] * 1000)}
+            for seg in segments
+            if seg.get("text", "").strip()
+        ]
+
+    phrases: list[dict] = []
+    cur: list[dict] = []
+
+    def flush():
+        if not cur:
+            return
+        text = "".join(w["word"] for w in cur).strip()
+        if text:
+            phrases.append({
+                "text": text,
+                "startMs": round(cur[0]["start"] * 1000),
+                "endMs": round(cur[-1]["end"] * 1000),
+            })
+        cur.clear()
+
+    for w in words:
+        cur.append(w)
+        text = "".join(x["word"] for x in cur).strip()
+        ends_sentence = text.endswith((".", "?", "!", "。", "？", "！", ",", "，"))
+        if len(cur) >= _MAX_CAPTION_WORDS or len(text) >= _MAX_CAPTION_CHARS or ends_sentence:
+            flush()
+    flush()
+    return phrases
 
 
 def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
@@ -545,11 +681,9 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         captions: list[dict] = []
         content_plan = {"chapters": [], "dataCards": []}
     else:
-        captions = [
-            {"text": seg["text"].strip(), "startMs": round(seg["start"] * 1000), "endMs": round(seg["end"] * 1000)}
-            for seg in (t.data.get("segments") or [])
-            if seg.get("text", "").strip()
-        ]
+        captions = build_caption_phrases(
+            t.data.get("word_timestamps") or [], t.data.get("segments") or []
+        )
         logger.info("  apply_style: 内容规划中（章节 + 数据卡）...")
         content_plan = plan_content(t.data.get("segments") or [], duration)
         logger.info(
@@ -573,6 +707,15 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
     props = build_xiaojin_render_props(video_src_rel, duration, captions, content_plan, op)
     props_path = workdir / "_op_apply_style_props.json"
     props_path.write_text(json.dumps(props, ensure_ascii=False), encoding="utf-8")
+
+    # 渲染整片前先抽 QA stills 做机器检查（video-studio CLAUDE-v2 §8 的自动化
+    # 部分）。findings 目前只记录不阻断——空画布这类问题是布局生成的 bug 信号，
+    # 值得暴露在日志里，但半成品总好过整条失败。stills 和 qa_report.json 留在
+    # workdir，后续 P1 的 agent 可拿去做有眼睛的复审。
+    if not op.get("skipQaStills"):
+        from .qa_stills import run_props_qa
+
+        run_props_qa(props, props_path, remotion_dir, workdir / "qa_stills")
 
     out = workdir / "_op_styled.mp4"
     cmd = [

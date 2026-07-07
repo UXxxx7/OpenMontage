@@ -170,3 +170,48 @@ P1 agent emit 正确 ops 把 remove_filler/apply_style 串起来 ✅ → WhatsAp
 - 仍然阻塞:P3 的 `feat/template-and-gateway` 分支还没建(GitHub 上仍是
   404),Task 1(真渲染联调)没法做;本地借用 `video-studio-style-integration`
   分支的 XiaojinEditorial 做单方验证也还没执行。
+
+### 第三轮(真渲染打通 + 内容驱动布局)
+
+**背景**:用户确认标杆是 `mrbeast-postxhs-final.mp4` 那种效果,而 WhatsApp 自动管
+线出不来。诊断结论:video-studio 的提示词体系(compose-director.md 306 行法典 +
+CLAUDE-v2 的 §4b/§8/§9)在 WhatsApp 路径里没有任何代码在用——好效果来自"agent 读
+法典 + QA stills + 自评迭代"的过程,whatsapp_mvp 把它压成了"一次小模型调用 + 固定
+模板一次渲染"。本轮把法典里**机器可自动化的部分**移植进管线:
+
+- **build_xiaojin_scenes(P2 核心)**:scenes 不再是固定默认值,由 dataCards 的
+  beat 推导——卡片默认全屏,数据卡 mount 前 20 帧过渡到顶部停靠,读完(最后一行
+  +5s)回全屏;相邻卡合并区间防抖;无数据卡的视频全程全屏。这就是"每条视频按
+  自身内容拿到不同布局"的机制。
+- **place_data_cards**:数据卡坐标夹进安全区(章节条 88 以下、停靠卡底 1004 以下
+  的内容区、字幕带 1680 以上),契约 schema 默认的 y=900 会被停靠卡压住,已修正。
+- **build_caption_phrases**:字幕从 segment 级(200+ 字符、屏上 5-6 行)改为词级
+  时间戳重组的短语级(≤7 词/42 字符或句读断句),对齐 codex 的 phrase-level 要求。
+- **qa_stills.py**:渲染整片前抽 QA stills(intro 落位/每张数据卡展开/全屏中点/
+  片尾)+ 机器检查(停靠帧内容区空画布检测)。stills + qa_report.json 留在
+  workdir,P1 的 L2 agent 以后可以拿去做有眼睛的复审——这是 CLAUDE-v2 §8 清单里
+  机器可查部分的自动化,查不了的(脸位/图形语义)留给 agent。
+- **人脸校准真的跑起来了**:opencv 装上(注意:必须 `opencv-python<5`,5.0 wheel
+  不带 Haar cascade XML;mediapipe 0.10.30+ 移除了 solutions API 也不能用,已卸),
+  MrBeast 源片校准出 `50% 25%`(默认值是 35%),69 帧检出取中位数。
+- **本地真渲染 e2e 全通**(MrBeastRaw.mp4 24s):转写(98 词)→ 规划(3 章节
+  PLANNING/TIMELINE/COST + 1 数据卡 2 行)→ 人脸校准 → beat 驱动 scenes(5 关键
+  帧)→ QA stills(4 张,0 findings)→ `npx remotion render` 出 17.5MB mp4。
+  成片人肉复核:章节栏正确高亮、停靠帧卡片+数据卡+字幕零重叠、count-up 正常、
+  取景不裁头。
+
+**联调发现(P3 注意)**:
+1. `remotion-composer` 借了 c9472ee 的 xiaojin 组件做本地验证,其中 **ChapterNav
+   的 Chapter 接口是 {at, zh, en},早于契约②冻结的 {atFrame, label, labelEn?}**
+   ——已按契约改组件(契约是冻结的,组件迁就契约)。
+2. **DataCards 组件是 P2 代笔的本地验证版**(`components/xiaojin/DataCards.tsx`,
+   按 codex InfoCards 规格:暗色面板/pill 行/spring 入场/count-up/tone 分色),
+   文件头有标注,P3 接手后定稿。
+3. Root.tsx 的注册补了 **calculateMetadata 按 durationSeconds 算时长**(c9472ee
+   的注册是写死 44.9s 的,不符合契约②)。
+4. 24s/crf18 成片 17.5MB,略超 WhatsApp ~16MB 内联上限——网关走 /files 链接
+   没问题,要内联发送的话渲染后需要一道压缩。
+
+**仍开放**:mode 更丰富的图形词汇(gauge/calendar/quote,契约②扩展,需三方对齐);
+L2 agent 读法典做规划 + 看 stills 复审(P1);"两条人脸位置不同的视频"的第二条
+实测(校准逻辑已在 MrBeast 片上验证,另一条待测)。
