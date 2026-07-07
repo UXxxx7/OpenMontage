@@ -132,6 +132,55 @@ def run_final_render(job_id: str) -> None:
         update_job_status(job_id, JobStatus.ERROR, str(e))
 
 
+def revise_plan(job_id: str, feedback: str) -> None:
+    """就地修订：带用户反馈 + 上一版方案重新规划，回到 WAITING_CONFIRMATION。"""
+    logger.info(f"就地修订 {job_id}: {feedback[:80]}")
+    job = get_job(job_id)
+    if job is None:
+        return
+
+    config = get_config()
+    wa = WhatsAppClient(config)
+    try:
+        try:
+            prev = json.loads(job.planned_edit) if job.planned_edit else {}
+        except (json.JSONDecodeError, TypeError):
+            prev = {}
+        history = [(prev.get("edit_operations", []), prev.get("summary", ""), feedback)]
+
+        input_path = job.job_dir / "input.mp4"
+        video_path = str(input_path) if input_path.exists() else None
+        transcript = []
+        try:
+            from .pipeline_runner import transcribe_segments
+
+            if input_path.exists():
+                transcript = transcribe_segments(str(input_path), job.job_dir)
+        except Exception:
+            transcript = []
+        try:
+            from .agent_editor import plan_video
+
+            new_plan = plan_video(job.edit_request, video_path, history=history,
+                                  transcript=transcript)
+        except Exception as e:
+            logger.warning(f"L2 修订规划失败，回退 L1.5: {e}")
+            from .llm_planner import plan_edit
+
+            new_plan = plan_edit(f"{job.edit_request}。补充：{feedback}")
+
+        update_job_fields(
+            job_id,
+            edit_request=f"{job.edit_request}。补充：{feedback}",
+            planned_edit=json.dumps(new_plan, ensure_ascii=False),
+        )
+        job = get_job(job_id)
+        _send_confirmation(job, wa)  # 设 WAITING_CONFIRMATION 或 NEEDS_CLARIFICATION
+    except Exception as e:
+        logger.exception(f"修订出错 {job_id}: {e}")
+        update_job_status(job_id, JobStatus.ERROR, str(e))
+
+
 # ---------------------------------------------------------------------------
 # Phase 3: 下载 WhatsApp 视频
 # ---------------------------------------------------------------------------
@@ -160,30 +209,73 @@ def _download_media(job: Any, wa: WhatsAppClient) -> None:
 # Phase 4: LLM 意图规划
 # ---------------------------------------------------------------------------
 
+def _script_stage(job: Any, input_path: Path) -> list:
+    """Script 阶段：转录原始视频，产出并保存 script artifact，返回转录段供规划使用。
+
+    失败不致命——返回空列表，规划照常进行（只是没有转录感知）。
+    """
+    if not input_path.exists():
+        return []
+    try:
+        from .pipeline_runner import (
+            _probe_duration,
+            build_script_artifact,
+            transcribe_segments,
+            validate_artifact,
+        )
+
+        transcript = transcribe_segments(str(input_path), job.job_dir)
+        if not transcript:
+            return []
+        duration = _probe_duration(input_path)
+        script = build_script_artifact(transcript, duration)
+        ok, err = validate_artifact(script, "script.schema.json")
+        (job.job_dir / "script.json").write_text(
+            json.dumps(script, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.info(
+            f"Script 阶段: {len(transcript)} 段, script.json 校验="
+            + ("通过" if ok else ("跳过" if ok is None else f"未通过({err})"))
+        )
+        return transcript
+    except Exception as e:
+        logger.warning(f"Script 阶段失败（继续无转录规划）: {e}")
+        return []
+
+
 def _run_llm_planner(job: Any) -> None:
-    """调用 LLM 将用户的自然语言编辑请求转换为结构化编辑计划。"""
-    logger.info(f"LLM 规划: {job.edit_request[:100]}...")
+    """用 L2 agent 规划编辑方案（读 manifest/skill + tool-calling + 自审 + schema 校验）。
+
+    agent 出错时回退到 L1.5 关键词/结构化规划器，保证任务不中断。
+    """
+    logger.info(f"Agent(L2) 规划: {job.edit_request[:100]}...")
     update_job_status(job.id, JobStatus.PLANNING)
 
-    from .llm_planner import plan_edit
+    input_path = job.job_dir / "input.mp4"
+    video_path = str(input_path) if input_path.exists() else None
 
-    # 探测视频时长，帮助规划器把"中间三十秒 / 前半段"等模糊位置解析成具体秒数，避免追问
-    duration = None
+    # Script 阶段：转录原始视频 + 产出 script artifact，转录喂给规划做转录感知剪辑
+    transcript = _script_stage(job, input_path)
+
     try:
-        from .pipeline_runner import _probe_duration
+        from .agent_editor import plan_video
 
-        input_path = job.job_dir / "input.mp4"
-        if input_path.exists():
-            duration = _probe_duration(input_path) or None
-    except Exception:
+        plan = plan_video(job.edit_request, video_path, transcript=transcript)
+    except Exception as e:
+        logger.warning(f"L2 agent 规划失败，回退 L1.5: {e}")
+        from .llm_planner import plan_edit
+
         duration = None
+        try:
+            from .pipeline_runner import _probe_duration
 
-    plan = plan_edit(job.edit_request, video_duration=duration)
+            if input_path.exists():
+                duration = _probe_duration(input_path) or None
+        except Exception:
+            duration = None
+        plan = plan_edit(job.edit_request, video_duration=duration)
 
-    # 保存规划结果
     update_job_fields(job.id, planned_edit=json.dumps(plan, ensure_ascii=False))
-
-    logger.info(f"LLM 规划完成: {json.dumps(plan, ensure_ascii=False)[:200]}")
+    logger.info(f"规划完成: {json.dumps(plan, ensure_ascii=False)[:200]}")
 
 
 # ---------------------------------------------------------------------------
