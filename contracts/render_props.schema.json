@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "openmontage/contracts/render_props",
+  "title": "XiaojinEditorial — Render Props",
+  "description": "Props produced by P2 and passed to `npx remotion render XiaojinEditorial --props=<json>`. Mirrors XiaojinEditorialProps, adding durationSeconds (drives calculateMetadata) and dataCards (P3 must add an InfoCard-equivalent to the xiaojin component set). Units: scenes/chapters/introOutFrame in frames; captions in milliseconds. A plain-but-correct result must render from the required fields alone.",
+  "type": "object",
+  "required": ["videoSrc", "durationSeconds", "colorMode", "speakerObjectPosition", "scenes", "introOutFrame", "chapters", "captions"],
+  "additionalProperties": false,
+  "properties": {
+    "videoSrc": { "type": "string", "description": "Path relative to remotion-composer/public/, e.g. jobs/<slug>/source.mp4" },
+    "durationSeconds": { "type": "number", "exclusiveMinimum": 0, "description": "Output length; P3 uses it in calculateMetadata: durationInFrames = ceil(durationSeconds*30)" },
+    "colorMode": { "type": "string", "enum": ["warm", "dark"] },
+    "speakerObjectPosition": { "type": "string", "description": "CSS object-position, e.g. \"50% 35%\"; calibrated on the SOURCE video's face, not the example video", "pattern": "^.+$" },
+    "scenes": {
+      "type": "array", "minItems": 1,
+      "items": { "type": "object", "required": ["frame", "x", "y", "w", "h"], "additionalProperties": false,
+        "properties": { "frame": { "type": "integer", "minimum": 0 }, "x": { "type": "number" }, "y": { "type": "number" }, "w": { "type": "number" }, "h": { "type": "number" } } },
+      "description": "Floating-card position schedule over time (frames). Minimum: one entry at frame 0."
+    },
+    "opacityKeyframes": {
+      "type": "array",
+      "items": { "type": "object", "required": ["frame", "opacity"], "properties": { "frame": { "type": "integer" }, "opacity": { "type": "number", "minimum": 0, "maximum": 1 } } }
+    },
+    "introOutFrame": { "type": "integer", "minimum": 0, "description": "Frame at which the intro title card exits; chrome/captions hidden before it" },
+    "chapters": {
+      "type": "array",
+      "items": { "type": "object", "required": ["atFrame", "label"], "additionalProperties": false,
+        "properties": { "atFrame": { "type": "integer", "minimum": 0 }, "label": { "type": "string", "maxLength": 20, "description": "Primary label (main chapter-bar text)" }, "labelEn": { "type": "string", "maxLength": 24, "description": "Optional secondary label (bilingual nav)" } } },
+      "description": "Chapter markers. Produced by content_planner (single label); P3's ChapterNav uses label (+ optional labelEn)."
+    },
+    "captions": {
+      "type": "array",
+      "items": { "type": "object", "required": ["text", "startMs", "endMs"], "additionalProperties": false,
+        "properties": { "text": { "type": "string" }, "startMs": { "type": "integer", "minimum": 0 }, "endMs": { "type": "integer", "minimum": 0 } } },
+      "description": "Per-phrase captions (milliseconds). Karaoke sweep is interpolated inside the component."
+    },
+    "dataCards": {
+      "type": "array",
+      "description": "[P3 NEW capability] count-up data cards. Mapped from content_planner's info_cards.",
+      "items": { "type": "object", "required": ["title", "mountFrame", "rows"], "additionalProperties": false,
+        "properties": {
+          "title": { "type": "string", "maxLength": 40 },
+          "x": { "type": "number", "default": 80 }, "y": { "type": "number", "default": 900 }, "width": { "type": "number", "default": 920 },
+          "mountFrame": { "type": "integer", "minimum": 0 },
+          "rows": { "type": "array", "items": { "type": "object", "required": ["label", "value"], "additionalProperties": false,
+            "properties": {
+              "label": { "type": "string", "maxLength": 24 },
+              "value": { "type": "number" },
+              "tone": { "type": "string", "enum": ["accent", "good", "bad", "normal"], "default": "normal" },
+              "mountOffset": { "type": "integer", "minimum": 0, "description": "Entrance offset (frames) relative to the card's mountFrame" },
+              "prefix": { "type": "string" }, "divideBy": { "type": "number" }, "decimals": { "type": "integer", "minimum": 0 }, "unit": { "type": "string" }
+            } } }
+        } }
+    },
+    "intro": { "type": "object", "additionalProperties": false, "properties": { "eyebrow": { "type": "string" }, "title": { "type": "string" }, "subtitle": { "type": "string" } } },
+    "outro": { "type": "object", "additionalProperties": false, "required": ["fromFrame"], "properties": { "kicker": { "type": "string" }, "headline": { "type": "string" }, "headlineAccent": { "type": "string" }, "subtext": { "type": "string" }, "ctaLabel": { "type": "string" }, "footerLabel": { "type": "string" }, "fromFrame": { "type": "integer", "minimum": 0 } } },
+    "compliance": { "type": "object", "additionalProperties": false, "properties": { "agentNameZh": { "type": "string" }, "agentNameEn": { "type": "string" }, "titleZh": { "type": "string" }, "licenseNo": { "type": "string" }, "insurer": { "type": "string" } }, "$comment": "compliance and brand are mutually exclusive" },
+    "brand": { "type": "object", "additionalProperties": false, "properties": { "company": { "type": "string" }, "label": { "type": "string" } } },
+    "headingFont": { "type": "string", "default": "Inter" },
+    "labelFont": { "type": "string", "default": "Inter" }
+  }
+}

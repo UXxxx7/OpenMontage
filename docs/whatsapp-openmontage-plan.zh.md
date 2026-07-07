@@ -1,0 +1,133 @@
+# WhatsApp × OpenMontage 剪辑系统 — 架构收口与三人分工
+
+## 0. 目标(一句话)
+
+用户在 WhatsApp 上传**原视频**(+可选**文字描述**/**示例视频**),后端用
+OpenMontage 的 pipeline 与工具完成剪辑;中间由一个 **L2 治理 agent** 理解需求、
+制定剪辑计划;内置 **XiaojinEditorial** 模板,保证即使**零指令**也能出一个效果
+不错的竖屏成片。
+
+## 1. 已确认的三个决策
+
+1. **示例视频** → 从中抽取**可量化风格参数**(配色/字幕位置/画幅/节奏/人物位置等),
+   映射到模板 props;不做逐像素复刻。
+2. **架构主干** = **L2 治理线**(agent 读 manifest/skill + tool-calling + 自审 +
+   schema),把 postxhs 的能力**移植进来**。
+3. **内置模板** = **XiaojinEditorial(唯一)**,废弃 ReferenceStyleEdit / PostXhsEditorial 两套。
+
+---
+
+## 2. 现状:已有可复用资产(分散在三条分支)
+
+| 资产 | 现在在哪 | 状态 | 归入目标 |
+|---|---|---|---|
+| L2 agent(manifest/skill 治理 + tool-calling + reviewer + schema) | 本地 `whatsapp-connection` | ✅ 可用 | **作主干** |
+| WhatsApp 网关(Node webhook + Python API + 队列 + confirm/render/revise) | 本地 | ✅ | 主干 |
+| op→handler 注册表 + 9 个基础剪辑算子 | 本地 | ✅ | 主干 |
+| 本轮修复(trim_leading_silence bug、静音阈值可调、confirm 超时后台化) | 本地(已写盘) | ✅ | 主干 |
+| 对话内修订(Phase B:revise) | 本地 | ✅ | 主干 |
+| T1 转录感知(把转写喂给 agent,做内容级选择/剪辑) | 容器工作副本 | 🟡 半成品 | **并入 P1** |
+| `content_planner`(章节 + 数据卡 + 逐词口误判断) | `postxhs` 分支 | ✅ 但接在 L1.5 | **P2 移植** |
+| `_op_remove_filler` / `_op_apply_style` handler | `postxhs` 分支 | ✅ handler 层可复用 | **P2 移植/改** |
+| 网关 `/files` 代理(一条隧道同时服务下载) | `postxhs` 分支 | ✅ | **P3 移植** |
+| 真机 e2e 修复经验(时长 calculateMetadata、SpeakerCard 插值) | `postxhs` 分支 | 参考 | P3 借鉴 |
+| XiaojinEditorial 模板 + xiaojin 组件 + 样式 YAML | `video-studio-style-integration` | 🟡 未接线/未构建验证/带 uv-init 噪音 | **P3 接手** |
+
+---
+
+## 3. 还要做什么(缺口,分三块)
+
+**A. 编排层(L2 agent)**
+- 把 `remove_filler`、`apply_style` 加进 agent 工具表(`ALL_TOOL_SCHEMAS`/`OP_TOOLS`)+
+  manifest 白名单 + reviewer/schema。
+- 完成 T1:把带时间戳转写喂给 agent,使其能做**内容级选择**("保留讲 X 那段""删掉跑题的 Y")。
+- 实现"**零指令 → 模板成片**"默认计划(默认 `remove_filler` → `apply_style`)。
+- 消费"示例视频风格参数",让 agent 把它并入剪辑计划与模板 props。
+
+**B. 后端能力(Python handler,规划器无关)**
+- 移植 `content_planner`(`plan_content` 章节/数据卡、`plan_filler_removal` 逐词口误)。
+- 移植 `_op_remove_filler`(词级保留段 concat)。
+- 把 `_op_apply_style` 改为渲染 **XiaojinEditorial**(而非 PostXhs),用
+  (内容计划 + 字幕 + 风格参数)拼 XiaojinEditorial 的 props。
+- **新建"示例视频 → 可量化风格参数"抽取模块**(用 OpenMontage 的
+  `frame_sampler`/`scene_detect`/`face_tracker`/配色分析,产出配色/画幅/字幕位置/
+  节奏/`objectPosition` 等)。
+
+**C. 模板 + 网关(TS/Node)**
+- XiaojinEditorial:清 uv-init 噪音 + **构建验证**(装依赖、`tsc --noEmit`、真渲一遍)。
+- 修时长/字幕不齐、`calculateMetadata` 按 `durationSeconds` 动态算(借 postxhs 的修法)。
+- 在 xiaojin 组件集里**补一个数据卡(InfoCard 等价件)**——否则 content_planner 的
+  数据卡计划渲染不出来。
+- 定义并冻结 **render props schema**(P2 按它拼 props)。
+- 移植网关 `/files` 代理,一条隧道同时服务 webhook + 文件下载。
+
+---
+
+## 4. 分支收口(先把混乱理平)
+
+1. 新建主干分支 **`whatsapp-studio`**,从本地 L2 线切出(切之前先把本轮修复 + T1 提交干净)。
+2. 三人各自 feature 分支 → PR 合入主干:
+   - `feat/agent-orchestration`(P1)
+   - `feat/pipeline-capabilities`(P2)
+   - `feat/template-and-gateway`(P3)
+3. **废弃**两条漂移分支(cherry-pick 需要的部分后不再并行维护):
+   - `video-studio-style-integration` → XiaojinEditorial + xiaojin 组件 cherry-pick 进 P3;
+     丢掉 `main.py`/`pyproject.toml` 的 uv-init 噪音、无关的字体加载改动、另两套合成。
+   - `whatsapp-connection-postxhs-content-planning` → `content_planner`/`remove_filler`/
+     `_op_apply_style` handler/`/files` 代理 cherry-pick 进 P2/P3;丢掉 PostXhs 合成、
+     L1.5 专属改动、`body.json` 残留。
+
+---
+
+## 5. 三人分工(可各自电脑并行)
+
+### P1 — Agent 编排 & 主干集成(Python / LLM 方向)
+**文件域**:`whatsapp_mvp/agent_editor.py`、`worker.py`、`webhook.py`、
+`pipeline_defs/talking-head.yaml`、`schemas/`
+**任务**
+- 把 `remove_filler`/`apply_style` 接进 L2 工具表 + manifest 白名单 + reviewer 审查点。
+- 完成 T1:转写喂给 agent,支持内容级选择性剪辑。
+- 实现"零指令 → 模板成片"默认计划;把"示例视频风格参数"并入计划与 props。
+- **主干 & 契约 owner**:维护 `whatsapp-studio`,主持定义下方 3 份契约,负责最终集成。
+**先做**:产出 3 份契约的 JSON schema + fixture,交给 P2/P3。
+**对外接口**:emit 一个 op 列表;按 op 名 + 参数调 handler。
+**依赖**:P2 的 handler 按名可调、P3 的 props schema——**用 fixture/stub 先并行,不阻塞**。
+
+### P2 — Pipeline 能力 & 示例分析(Python / 视频工具方向)
+**文件域**:`whatsapp_mvp/pipeline_runner.py`(handlers)、`content_planner.py`、
+**新建** `whatsapp_mvp/reference_analyzer.py`
+**任务**
+- 移植 `content_planner`(章节/数据卡 + 逐词口误)、`_op_remove_filler`。
+- 把 `_op_apply_style` 改成按**契约②**拼 XiaojinEditorial props 并调 P3 的渲染入口。
+- **示例视频抽取模块**(本组最大新活):示例视频/截图 → 可量化风格参数(**契约③**),
+  用 OpenMontage 分析工具实现。
+**先做**:先移植 `content_planner`/`remove_filler`(无外部依赖,可立即跑通并单测)。
+**依赖**:P3 的 render props schema——用契约②的 fixture 先写 `_op_apply_style`。
+
+### P3 — 模板 & 网关(TS / Node 方向)
+**文件域**:`remotion-composer/*`、`server/*`
+**任务**
+- XiaojinEditorial:清噪音 + 装依赖 + `tsc --noEmit` + 真渲(拿 David demo fixture)。
+- 修时长/字幕对齐、`calculateMetadata` 动态时长、`objectPosition` 按源视频入参。
+- xiaojin 组件集补数据卡(InfoCard 等价件)。
+- 冻结 **render props schema(契约②)**;移植 `/files` 代理。
+- 提供稳定 CLI 渲染入口:`npx remotion render XiaojinEditorial --props=<json>`。
+**先做**:**最先能独立开工**——不依赖别人,拿 David demo props 先把"能编能渲"打通。
+**依赖**:无强依赖(风格参数/内容计划都从 props 进,先用 fixture)。
+
+---
+
+## 6. 让三人真正并行的关键:先定 3 份契约(Day 0,约半天)
+
+| 契约 | 内容 | 谁定 | 谁消费 |
+|---|---|---|---|
+| ① 算子表 | `remove_filler`/`apply_style` 的 op 名 + 参数 JSON | P1 | P2 实现 handler |
+| ② 渲染 props | XiaojinEditorial 吃的 props JSON(videoSrc/durationSeconds/colorMode/speakerObjectPosition/scenes/chapters/captions/dataCards/compliance…) | P3 | P2 产出 |
+| ③ 风格参数 | 示例视频抽取出的可量化参数 JSON(palette/aspect/captionPosition/pacing/objectPosition…) | P2 | P1 消费入计划 |
+
+定完各自提交一个 **fixture 文件**,三人对着 fixture 独立开发,最后集成。
+
+## 7. 集成顺序(收尾)
+
+P3 独立渲染(fixture props)✅ → P2 handler 产出匹配 props 并成功调 P3 渲染 ✅ →
+P1 agent emit 正确 ops 把 remove_filler/apply_style 串起来 ✅ → WhatsApp 端到端联调。

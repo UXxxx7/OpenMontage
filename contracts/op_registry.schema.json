@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "openmontage/contracts/op_registry",
+  "title": "Edit Plan — Operation Registry",
+  "description": "The edit plan emitted by P1 (the agent). Every operation's `type` must be in this registry; params are flat on the object (not nested under a `params` key). P2 implements/reuses pipeline_runner handlers by `type`. Execution order: multiple remove_segment ops are run by the runner in descending start order; apply_style and add_subtitles are mutually exclusive (apply_style burns captions itself).",
+  "type": "object",
+  "required": ["edit_operations"],
+  "properties": {
+    "summary": { "type": "string", "description": "One-sentence, user-facing summary (in the user's language)" },
+    "clarification_needed": { "type": "boolean", "default": false },
+    "clarification_question": { "type": "string" },
+    "unsupported": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Requests the tools cannot do (e.g. translate subtitles, add music, color grade)"
+    },
+    "edit_operations": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/operation" }
+    }
+  },
+  "$defs": {
+    "operation": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": { "type": "string" },
+        "description": { "type": "string", "description": "One sentence in the user's language" }
+      },
+      "oneOf": [
+        { "properties": { "type": { "const": "trim_start" }, "description": {}, "seconds": { "type": "number", "exclusiveMinimum": 0 } }, "required": ["type", "seconds"], "additionalProperties": false },
+        { "properties": { "type": { "const": "trim_end" }, "description": {}, "seconds": { "type": "number", "exclusiveMinimum": 0 } }, "required": ["type", "seconds"], "additionalProperties": false },
+        { "properties": { "type": { "const": "keep_range" }, "description": {}, "start_seconds": { "type": "number", "minimum": 0 }, "end_seconds": { "type": "number", "minimum": 0 } }, "required": ["type", "start_seconds", "end_seconds"], "additionalProperties": false },
+        { "properties": { "type": { "const": "remove_segment" }, "description": {}, "start_seconds": { "type": "number", "minimum": 0 }, "end_seconds": { "type": "number", "minimum": 0 } }, "required": ["type", "start_seconds", "end_seconds"], "additionalProperties": false },
+        { "properties": { "type": { "const": "remove_silences" }, "description": {}, "min_silence_duration": { "type": "number", "exclusiveMinimum": 0, "description": "Cut only silences longer than this many seconds; default 0.35 removes almost all pauses, raise it to keep natural pauses" }, "silence_threshold_db": { "type": "number", "description": "Default -30" } }, "required": ["type"], "additionalProperties": false },
+        { "properties": { "type": { "const": "remove_filler" }, "description": {} }, "required": ["type"], "additionalProperties": false, "$comment": "No params. Handler transcribes (word-level) → LLM judges filler/false-starts/retakes → concat of kept ranges. Default first step for a zero-instruction request." },
+        { "properties": { "type": { "const": "trim_leading_silence" }, "description": {} }, "required": ["type"], "additionalProperties": false },
+        { "properties": { "type": { "const": "speed_up_silence" }, "description": {}, "factor": { "type": "number", "exclusiveMinimum": 1 } }, "required": ["type"], "additionalProperties": false },
+        { "properties": { "type": { "const": "reframe" }, "description": {}, "aspect": { "type": "string", "enum": ["portrait", "square", "landscape", "cinematic"] } }, "required": ["type", "aspect"], "additionalProperties": false },
+        { "properties": { "type": { "const": "add_subtitles" }, "description": {}, "language": { "type": "string" } }, "required": ["type"], "additionalProperties": false },
+        {
+          "properties": {
+            "type": { "const": "apply_style" },
+            "description": {},
+            "template": { "type": "string", "enum": ["xiaojin-editorial"], "default": "xiaojin-editorial" },
+            "colorMode": { "type": "string", "enum": ["warm", "dark"] },
+            "style": { "$ref": "style_params.schema.json", "description": "Contract ③ style-params object; if present, overrides automatic judgment" },
+            "brand": { "type": "object", "properties": { "company": { "type": "string" }, "label": { "type": "string" } } },
+            "compliance": { "type": "object", "properties": { "agentNameZh": { "type": "string" }, "agentNameEn": { "type": "string" }, "titleZh": { "type": "string" }, "licenseNo": { "type": "string" }, "insurer": { "type": "string" } } }
+          },
+          "required": ["type"],
+          "additionalProperties": false,
+          "$comment": "Transcribes and burns captions itself — do not combine with add_subtitles. Chapters/data cards are produced automatically by the handler's content_planner (overridable via style)."
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "openmontage/contracts/style_params",
+  "title": "Style Params — quantifiable style extracted from an example video/screenshot",
+  "description": "Extracted by P2 from the example video/screenshot; consumed by P1 (folded into the plan) and mapped by apply_style into render_props. Describes AESTHETICS only, not the source video's face geometry (objectPosition/scenes are computed by P2 on the SOURCE video via face_tracker). All fields optional; if not detected, omit and the renderer falls back to template defaults. `confidence` lets P1 decide whether to ask the user for clarification.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "source": {
+      "type": "object", "additionalProperties": false,
+      "properties": { "kind": { "type": "string", "enum": ["video", "screenshot", "description"] }, "ref": { "type": "string", "description": "Example file path or description text" } }
+    },
+    "aspect": { "type": "string", "enum": ["portrait", "square", "landscape", "cinematic"], "description": "Target aspect; portrait = 9:16" },
+    "colorMode": { "type": "string", "enum": ["warm", "dark"] },
+    "palette": {
+      "type": "object", "additionalProperties": false,
+      "description": "Optional finer palette (hex). If given, P3 may override the colorMode's built-in palette.",
+      "properties": { "primary": { "type": "array", "items": { "type": "string", "pattern": "^#" }, "maxItems": 2 }, "background": { "type": "string" }, "backgroundDeep": { "type": "string" }, "card": { "type": "string" }, "text": { "type": "string" }, "muted": { "type": "string" } }
+    },
+    "captions": {
+      "type": "object", "additionalProperties": false,
+      "properties": { "position": { "type": "string", "enum": ["bottom", "top", "center"] }, "bottomRatio": { "type": "number", "minimum": 0, "maximum": 1, "description": "Distance from bottom as a ratio (0 = flush bottom)" }, "karaoke": { "type": "boolean" }, "highlightColor": { "type": "string" } }
+    },
+    "typography": {
+      "type": "object", "additionalProperties": false,
+      "properties": { "headingFont": { "type": "string" }, "labelFont": { "type": "string" }, "weightHeading": { "type": "integer" }, "weightBody": { "type": "integer" } }
+    },
+    "speakerCard": {
+      "type": "object", "additionalProperties": false,
+      "description": "Card treatment (not geometric position) — floating, corner radius, border. The position schedule `scenes` is NOT here.",
+      "properties": { "floating": { "type": "boolean" }, "borderRadius": { "type": "number" }, "borderWidthPx": { "type": "number" }, "occupiesRatio": { "type": "number", "minimum": 0, "maximum": 1, "description": "Approx fraction of frame the card occupies; a sizing hint for P2 to generate scenes" } }
+    },
+    "chrome": {
+      "type": "object", "additionalProperties": false,
+      "description": "Which persistent UI bars appear in the example",
+      "properties": { "chapterNav": { "type": "boolean" }, "complianceBar": { "type": "boolean" }, "brandBar": { "type": "boolean" }, "progressBar": { "type": "boolean" } }
+    },
+    "pacing": {
+      "type": "object", "additionalProperties": false,
+      "properties": { "transition": { "type": "string", "enum": ["hard-cut", "crossfade"] }, "cardRepositionSeconds": { "type": "number" }, "energy": { "type": "string", "enum": ["calm", "moderate", "energetic"] } }
+    },
+    "music": {
+      "type": "object", "additionalProperties": false,
+      "properties": { "mood": { "type": "string" }, "volume": { "type": "number", "minimum": 0, "maximum": 1 } }
+    },
+    "confidence": {
+      "type": "object",
+      "description": "Per-field confidence 0..1 (set by P2 at extraction); P1 uses it to decide whether to clarify with the user",
+      "additionalProperties": { "type": "number", "minimum": 0, "maximum": 1 }
+    }
+  }
+}

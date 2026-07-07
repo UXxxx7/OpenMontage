@@ -1,0 +1,15 @@
+{
+  "summary": "I'll first cut the filler words and retakes, then apply our branded template. Next time you can also give me something more specific (e.g. trim to a length, or a different aspect ratio).",
+  "clarification_needed": false,
+  "unsupported": [],
+  "edit_operations": [
+    { "type": "remove_filler", "description": "Remove filler words, false starts and failed retakes" },
+    {
+      "type": "apply_style",
+      "description": "Apply the branded template (floating card + chapter bar + karaoke captions + compliance strip + progress bar)",
+      "template": "xiaojin-editorial",
+      "colorMode": "warm",
+      "compliance": { "agentNameZh": "大卫", "agentNameEn": "David", "titleZh": "保险顾问", "licenseNo": "LIC-000000", "insurer": "Pacific Life" }
+    }
+  ]
+}
