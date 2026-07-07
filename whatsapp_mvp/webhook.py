@@ -273,6 +273,12 @@ def _enqueue_final_render(job_id: str) -> None:
     run_final_render(job_id)
 
 
+def _enqueue_revise(job_id: str, text: str) -> None:
+    from .worker import revise_plan
+
+    revise_plan(job_id, text)
+
+
 # ---------------------------------------------------------------------------
 # Job API (internal)
 # ---------------------------------------------------------------------------
@@ -296,7 +302,10 @@ async def create_job_endpoint(
     update_job_fields(job.id, edit_request=edit_request, input_video_path=str(job_dir / "input.mp4"))
     update_job_status(job.id, JobStatus.RECEIVED)
 
-    _enqueue_process(job.id)
+    # 后台跑（下载 + L2 规划耗时可达 1~2 分钟），立即返回；否则会阻塞
+    # uvicorn 事件循环，导致同时到来的 /confirm 等请求撞上 Node 的 30s 超时。
+    # Node 侧本就通过轮询 GET /jobs/{id} 等待 WAITING_CONFIRMATION。
+    _run_in_background(_enqueue_process, job.id)
 
     return {"job_id": job.id, "status": job.status.value}
 
@@ -358,6 +367,18 @@ async def render_job_endpoint(job_id: str):
     # 后台跑最终导出，立即返回；Node 侧轮询等待 DONE
     _run_in_background(_enqueue_final_render, job_id)
     return {"job_id": job_id, "status": "RENDERING"}
+
+
+@app.post("/jobs/{job_id}/revise")
+async def revise_job_endpoint(job_id: str, text: str = Form("")):
+    """就地修订：带用户反馈重新规划编辑方案（方案阶段或预览阶段都可用）。"""
+    job = get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    update_job_status(job_id, JobStatus.PLANNING)
+    # 后台带反馈重规划，立即返回；Node 轮询等待新方案（WAITING_CONFIRMATION）
+    _run_in_background(_enqueue_revise, job_id, text)
+    return {"job_id": job_id, "status": "PLANNING"}
 
 
 # ---------------------------------------------------------------------------

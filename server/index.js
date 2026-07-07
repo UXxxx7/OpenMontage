@@ -154,6 +154,11 @@ async function handleMessage(message) {
       await videoQueue.add("cancel-job", { waNumber, jobId: activeJobId, msgId }, queueOptions(msgId));
       return;
     }
+    // 有活跃任务 + 非命令文本 → 视为对当前方案/预览的修改意见，就地重规划
+    if (activeJobId) {
+      await videoQueue.add("revise-job", { waNumber, jobId: activeJobId, text, msgId }, queueOptions(msgId));
+      return;
+    }
     await videoQueue.add("send-help", { waNumber, msgId }, queueOptions(msgId));
   }
 }

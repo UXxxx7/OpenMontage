@@ -53,6 +53,7 @@ const worker = new Worker(queueName, async (job) => {
       case "confirm-job": return confirmJob(job.data);
       case "render-job": return renderJob(job.data);
       case "cancel-job": return cancelJob(job.data);
+      case "revise-job": return reviseJob(job.data);
       case "send-help": return sendHelp(job.data.waNumber);
       default: throw new Error(`Unknown job type: ${job.name}`);
     }
@@ -98,7 +99,7 @@ async function editVideo({ waNumber, mediaId, editRequest }) {
 
     const status = await waitForStatus(jobId,
       ["WAITING_CONFIRMATION", "NEEDS_CLARIFICATION", "PREVIEW_READY", "ERROR"],
-      Number(env("WA_PLAN_TIMEOUT_MS", "120000")));
+      Number(env("WA_PLAN_TIMEOUT_MS", "180000")));
 
     if (status.status === "ERROR") {
       throw new Error(status.error_message || "Python planning failed");
@@ -140,12 +141,8 @@ async function renderJob({ waNumber, jobId }) {
     throw new Error(status.error_message || "Python render failed");
   }
 
-  const finalPath = status.final_path;
-  if (finalPath && fs.existsSync(finalPath)) {
-    await sendVideo(waNumber, finalPath, "Your final video is ready.");
-  } else {
-    await sendText(waNumber, `Final video: ${fileUrl(jobId, "final.mp4")}`);
-  }
+  // 成品通常 > 16MB，超出 WhatsApp 视频消息上限，统一以链接投递（走 PUBLIC_BASE_URL）
+  await sendText(waNumber, `Your final video is ready: ${fileUrl(jobId, "final.mp4")}`);
   await redis.del(activeJobKey(waNumber));
 }
 
@@ -185,6 +182,34 @@ async function postPython(pathname) {
     timeout: Number(env("WA_PYTHON_POST_TIMEOUT_MS", "30000")),
   });
   return resp.data;
+}
+
+async function postPythonForm(pathname, text) {
+  const params = new URLSearchParams();
+  params.append("text", text || "");
+  const resp = await axios.post(`${pythonApiBase}${pathname}`, params.toString(), {
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    timeout: Number(env("WA_PYTHON_POST_TIMEOUT_MS", "30000")),
+  });
+  return resp.data;
+}
+
+// 就地修订：用户在方案/预览阶段直接打字提意见 → Python 带反馈重规划 → 回新方案
+async function reviseJob({ waNumber, jobId, text }) {
+  await sendText(waNumber, "收到修改意见，正在重新规划...");
+  await postPythonForm(`/jobs/${encodeURIComponent(jobId)}/revise`, text);
+  const status = await waitForStatus(jobId,
+    ["WAITING_CONFIRMATION", "NEEDS_CLARIFICATION", "ERROR"],
+    Number(env("WA_PLAN_TIMEOUT_MS", "180000")));
+  if (status.status === "ERROR") {
+    throw new Error(status.error_message || "Revise failed");
+  }
+  if (status.status === "NEEDS_CLARIFICATION") {
+    const q = status.planned_edit?.clarification_question || "需要更多信息才能继续。";
+    await sendText(waNumber, q);
+    return;
+  }
+  await sendText(waNumber, formatPlanMessage(status));
 }
 
 async function waitForStatus(jobId, wanted, timeoutMs) {
