@@ -54,11 +54,30 @@ Output ONLY valid JSON matching this shape, no markdown, no prose:
 }"""
 
 
+# Bound the transcript text sent to the LLM so a very long source video (a
+# 30+ minute upload, say) can't blow the request past the model's practical
+# context window or make the call slow/expensive without anyone noticing.
+# ~12k chars is generous for chapter/data-point judgment (that's a coarse,
+# skimming read, not a word-for-word edit decision) while staying well clear
+# of typical context limits even for smaller models.
+_MAX_TRANSCRIPT_CHARS = 12000
+
+
 def _build_transcript_text(segments: list[dict]) -> str:
     lines = []
     for seg in segments:
         lines.append(f"[{seg['start']:.1f}s] {seg['text'].strip()}")
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    if len(text) > _MAX_TRANSCRIPT_CHARS:
+        logger.warning(
+            f"content_planner: transcript {len(text)} chars exceeds cap "
+            f"({_MAX_TRANSCRIPT_CHARS}); truncating to the first "
+            f"{_MAX_TRANSCRIPT_CHARS} chars for a long video. Chapters/data "
+            f"points past that point in the video will be missed — this is a "
+            f"known MVP limit for very long uploads, not a silent failure."
+        )
+        text = text[:_MAX_TRANSCRIPT_CHARS] + "\n[... transcript truncated — video continues past this point ...]"
+    return text
 
 
 def plan_content(segments: list[dict], duration: float) -> dict[str, Any]:
@@ -119,6 +138,8 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
     data_cards = []
 
     for dp in raw.get("data_points") or []:
+        if not isinstance(dp, dict):
+            continue  # tolerate a malformed/non-dict entry from the LLM response
         rows_in = dp.get("rows") or []
         if not rows_in:
             continue

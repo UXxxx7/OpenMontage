@@ -11,7 +11,11 @@ from pathlib import Path
 
 import jsonschema
 
-from whatsapp_mvp.pipeline_runner import build_xiaojin_render_props
+from whatsapp_mvp.pipeline_runner import (
+    apply_style_params_to_op,
+    build_xiaojin_render_props,
+    resolve_reframe_op,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_PATH = REPO_ROOT / "contracts" / "render_props.schema.json"
@@ -91,6 +95,45 @@ def main():
     assert "brand" in branded
 
     print("\nAll P2 Task 2 acceptance cases passed schema validation.")
+
+    # --- Task 4b acceptance: reference_analyzer's style_params actually
+    # drives build_xiaojin_render_props (a warm example -> warm output;
+    # explicit op.colorMode still wins over the example if both given). ---
+    warm_style = {"colorMode": "warm", "aspect": "portrait"}
+    dark_style = {"colorMode": "dark", "aspect": "portrait"}
+
+    op_from_warm_example = apply_style_params_to_op({}, warm_style)
+    props_warm = build_xiaojin_render_props(
+        "jobs/case-warm/source.mp4", 20.0,
+        [{"text": "x", "startMs": 0, "endMs": 1000}],
+        {"chapters": [], "dataCards": []}, op_from_warm_example,
+    )
+    assert props_warm["colorMode"] == "warm", props_warm["colorMode"]
+    print("PASS [warm example -> colorMode=warm in output props]")
+
+    op_from_dark_example = apply_style_params_to_op({}, dark_style)
+    props_dark = build_xiaojin_render_props(
+        "jobs/case-dark/source.mp4", 20.0,
+        [{"text": "x", "startMs": 0, "endMs": 1000}],
+        {"chapters": [], "dataCards": []}, op_from_dark_example,
+    )
+    assert props_dark["colorMode"] == "dark", props_dark["colorMode"]
+    print("PASS [dark example -> colorMode=dark in output props]")
+
+    # explicit op.colorMode overrides the example's judgment
+    op_explicit_wins = apply_style_params_to_op({"colorMode": "dark"}, warm_style)
+    assert op_explicit_wins["colorMode"] == "dark"
+    print("PASS [explicit op.colorMode overrides example's colorMode]")
+
+    # --- reframe trigger: portrait example + landscape source -> reframe op;
+    # matching aspect -> no reframe. ---
+    reframe = resolve_reframe_op(warm_style, source_aspect="landscape")
+    assert reframe == {"type": "reframe", "aspect": "portrait", "description": "按示例视频画幅转成 portrait"}, reframe
+    print(f"PASS [portrait example + landscape source -> {reframe}]")
+
+    no_reframe = resolve_reframe_op(warm_style, source_aspect="portrait")
+    assert no_reframe is None, no_reframe
+    print("PASS [portrait example + portrait source -> no reframe needed]")
 
 
 if __name__ == "__main__":

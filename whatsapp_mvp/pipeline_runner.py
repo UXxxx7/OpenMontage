@@ -219,36 +219,57 @@ def _op_remove_silences(src: str, op: dict, workdir: Path) -> Optional[str]:
     return r.data.get("output") or (r.artifacts[0] if r.artifacts else None)
 
 
+def _safe_transcribe(src: str, workdir: Path, model_size: str):
+    """跑 Transcriber，把"工具报告失败"和"工具本身抛异常"这两种失败都统一
+    收敛成返回 None——Transcriber 底层用的 faster-whisper/PyAV 在遇到损坏或
+    非视频文件时，实测会直接抛 av.error.InvalidDataError 之类的异常，不会走
+    它自己 ToolResult(success=False) 那条路径。调用方不该因为转写这一步失败
+    就整个崩掉，应该拿到一个清楚的"没有转写结果"信号去走降级逻辑。
+    """
+    import os as _os
+
+    from tools.analysis.transcriber import Transcriber
+
+    config = get_config()
+    _hf = _os.environ.pop("HF_TOKEN", None)
+    try:
+        t = Transcriber().execute({
+            "input_path": src,
+            "output_dir": str(workdir),
+            "model_size": model_size,
+        })
+    except Exception as e:
+        logger.warning(f"  转写调用异常（非工具自身报告的失败，是真的抛异常）: {e}")
+        return None
+    finally:
+        if _hf is not None:
+            _os.environ["HF_TOKEN"] = _hf
+
+    if not t.success:
+        logger.warning(f"  转写失败: {t.error}")
+        return None
+    return t
+
+
 def _op_remove_filler(src: str, op: dict, workdir: Path) -> Optional[str]:
     """转写(词级) -> LLM 判断口误/重录 -> VideoTrimmer concat 只保留干净片段。
 
     这是 video-use / edit-director.md 的思路："不用打分公式，让 LLM 读转写稿
     自己判断哪里该剪"——跟 remove_silences 的纯静音检测是互补的两件事，静音
-    检测测不到有声的语气词、也测不到中间没停顿的重录。LLM 不可用或判断没有
-    需要剪的地方时，原样返回，不影响后续步骤。
+    检测测不到有声的语气词、也测不到中间没停顿的重录。LLM 不可用、判断没有
+    需要剪的地方、或者转写本身失败时，都原样返回，不影响后续步骤——这个操作
+    整体是锦上添花的精修，不应该因为它失败就搞垮整条剪辑流程。
     """
-    import os as _os
-
-    from tools.analysis.transcriber import Transcriber
     from tools.video.video_trimmer import VideoTrimmer
 
     from .content_planner import plan_filler_removal
 
     config = get_config()
 
-    _hf = _os.environ.pop("HF_TOKEN", None)
-    try:
-        t = Transcriber().execute({
-            "input_path": src,
-            "output_dir": str(workdir),
-            "model_size": config.faster_whisper_model,
-        })
-    finally:
-        if _hf is not None:
-            _os.environ["HF_TOKEN"] = _hf
-
-    if not t.success:
-        raise RuntimeError(f"remove_filler 转写失败: {t.error}")
+    t = _safe_transcribe(src, workdir, config.faster_whisper_model)
+    if t is None:
+        logger.info("  remove_filler: 转写不可用，跳过口误检测（视频不变）")
+        return None
 
     words = t.data.get("word_timestamps") or []
     duration = _probe_duration(Path(src))
@@ -336,28 +357,19 @@ def _op_reframe(src: str, op: dict, workdir: Path) -> Optional[str]:
 
 
 def _op_add_subtitles(src: str, op: dict, workdir: Path) -> Optional[str]:
-    """转写 -> 烧录字幕（原语言）。翻译成其他语言暂不支持（见 planner 的 unsupported）。"""
-    import os as _os
+    """转写 -> 烧录字幕（原语言）。翻译成其他语言暂不支持（见 planner 的 unsupported）。
 
-    from tools.analysis.transcriber import Transcriber
+    这里跟 apply_style/remove_filler 不同：字幕是用户显式要的东西，转写失败时
+    没有"降级但仍然有意义"的输出可给，所以仍然是 raise，不做静默兜底——但用
+    _safe_transcribe 统一收敛异常，让失败原因清楚可读，而不是让 av 库的原始
+    异常直接炸穿上层。
+    """
     from tools.video.remotion_caption_burn import RemotionCaptionBurn
 
     config = get_config()
-
-    # 临时移除可能含非 ASCII 的 HF_TOKEN，避免 httpx header 编码错误
-    _hf = _os.environ.pop("HF_TOKEN", None)
-    try:
-        t = Transcriber().execute({
-            "input_path": src,
-            "output_dir": str(workdir),
-            "model_size": config.faster_whisper_model,
-        })
-    finally:
-        if _hf is not None:
-            _os.environ["HF_TOKEN"] = _hf
-
-    if not t.success:
-        raise RuntimeError(f"转写失败: {t.error}")
+    t = _safe_transcribe(src, workdir, config.faster_whisper_model)
+    if t is None:
+        raise RuntimeError("转写失败，无法烧录字幕")
     segments = t.data.get("segments")
     if not segments:
         logger.warning("  转写无结果，跳过字幕")
@@ -391,6 +403,81 @@ def _op_add_subtitles(src: str, op: dict, workdir: Path) -> Optional[str]:
 _DEFAULT_SPEAKER_OBJECT_POSITION = "50% 35%"
 _DEFAULT_SCENE = {"frame": 0, "x": 60, "y": 104, "w": 960, "h": 1100}
 _DEFAULT_INTRO_OUT_FRAME = 20
+
+
+def calibrate_speaker_object_position(src: str, workdir: Path) -> str:
+    """对源视频跑 face_tracker，取人脸中心的中位数 -> CSS object-position 字符串。
+
+    compose-director.md 的校准公式：objPos ≈ (face_center_y_in_source /
+    source_height) * 100 —— FaceTracker 的 bbox 已经是按源视频宽高归一化过的
+    比例（0..1），所以人脸中心比例可以直接当百分比用，不需要再除一次源尺寸。
+
+    用中位数而不是均值：跟 clipper 技能的 smart_crop.py 一个思路——对偶尔的
+    误检测/头部转动更稳健。检测不到人脸时，原样退回旧的静态默认值
+    "50% 35%"，不让这一步的失败搞垮整条 apply_style。
+    """
+    try:
+        from tools.analysis.face_tracker import FaceTracker
+
+        out_json = workdir / "_op_apply_style_faces.json"
+        r = FaceTracker().execute({
+            "input_path": src, "output_path": str(out_json), "sample_fps": 3,
+        })
+        if not r.success:
+            logger.warning(f"  apply_style: face_tracker 失败，用默认取景: {r.error}")
+            return _DEFAULT_SPEAKER_OBJECT_POSITION
+
+        data = json.loads(Path(r.data["output"]).read_text(encoding="utf-8"))
+        faces = data.get("faces", [])
+        if not faces:
+            logger.warning("  apply_style: 没检测到人脸，用默认取景")
+            return _DEFAULT_SPEAKER_OBJECT_POSITION
+
+        centers_x = sorted(f["bbox"]["x"] + f["bbox"]["width"] / 2 for f in faces)
+        centers_y = sorted(f["bbox"]["y"] + f["bbox"]["height"] / 2 for f in faces)
+        mid = len(faces) // 2
+        cx = centers_x[mid]
+        cy = centers_y[mid]
+
+        obj_pos = f"{round(cx * 100)}% {round(cy * 100)}%"
+        logger.info(f"  apply_style: 人脸校准取景 -> {obj_pos}（{len(faces)}帧检出人脸，取中位数）")
+        return obj_pos
+    except Exception as e:
+        logger.warning(f"  apply_style: face_tracker 调用异常，用默认取景: {e}")
+        return _DEFAULT_SPEAKER_OBJECT_POSITION
+
+
+def apply_style_params_to_op(op: dict, style_params: dict) -> dict:
+    """契约③(style_params，来自 reference_analyzer 对示例视频的分析)-> 合并进
+    op 参数里，喂给 build_xiaojin_render_props。纯函数，不改动传入的 op。
+
+    contracts/README.md 说得很明确：style_params 只管审美（配色/字幕观感/画幅/
+    节奏），不管 speakerObjectPosition/scenes——那两个必须来自源视频本身的人脸
+    位置，不能被示例视频带偏。这里只把 colorMode 合并进去；explicit 的
+    op["colorMode"]（如果调用方直接传了）优先级更高，不会被示例视频覆盖。
+    """
+    merged = dict(op)
+    if style_params.get("colorMode") and "colorMode" not in op:
+        merged["colorMode"] = style_params["colorMode"]
+    return merged
+
+
+def resolve_reframe_op(style_params: dict, source_aspect: Optional[str]) -> Optional[dict]:
+    """判断示例视频的画幅要不要触发对源视频的 reframe。
+
+    XiaojinEditorial 目前只有一个固定竖屏画布（1080x1920，scenes 坐标是相对
+    这个画布写死的），所以"画幅"这个风格参数落不到 render_props 里任何字段
+    上——它真正的意义是："如果源视频本身不是竖屏，需要先跑一次 reframe 操作
+    再喂给 apply_style"。这是编排层（P1 的活）该往 edit_operations 里插的一
+    个操作，不是 apply_style 自己该做的事——这个函数只负责判断"要不要"，
+    返回一个可以直接放进 edit_operations 的 reframe op dict，不自己执行。
+    """
+    target = style_params.get("aspect")
+    if not target:
+        return None
+    if source_aspect and source_aspect == target:
+        return None
+    return {"type": "reframe", "aspect": target, "description": f"按示例视频画幅转成 {target}"}
 
 
 def build_xiaojin_render_props(
@@ -431,50 +518,50 @@ def build_xiaojin_render_props(
 
 
 def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
-    """转写 + content_planner 内容规划 -> 拼契约②的 props -> 渲染 XiaojinEditorial。
+    """转写 + content_planner 内容规划 + 人脸校准 -> 拼契约②的 props -> 渲染 XiaojinEditorial。
 
     跟 add_subtitles 是互斥的两个操作（这个已经自带转写+烧字幕），上游 planner
     不应该把两个都放进同一个 edit_operations 里。
 
-    speakerObjectPosition/scenes 目前是 MVP 默认值（见模块顶部注释），没有对
-    源视频做人脸校准——按 P2 任务说明，这是有意的分阶段简化，不是遗漏。
+    speakerObjectPosition 现在是对源视频真实跑 face_tracker 校准出来的（见
+    calibrate_speaker_object_position），不再是固定默认值——除非 op 里显式
+    传了 speakerObjectPosition，那种情况尊重调用方的显式覆盖。scenes 卡片
+    位置本身是画布坐标、跟源视频尺寸无关，仍用默认盒子。
     """
-    import os as _os
-
-    from tools.analysis.transcriber import Transcriber
-
     from .content_planner import plan_content
 
     config = get_config()
     src_path = Path(src)
 
-    _hf = _os.environ.pop("HF_TOKEN", None)
-    try:
-        t = Transcriber().execute({
-            "input_path": src,
-            "output_dir": str(workdir),
-            "model_size": config.faster_whisper_model,
-        })
-    finally:
-        if _hf is not None:
-            _os.environ["HF_TOKEN"] = _hf
-
-    if not t.success:
-        raise RuntimeError(f"apply_style 转写失败: {t.error}")
-
-    captions = [
-        {"text": seg["text"].strip(), "startMs": round(seg["start"] * 1000), "endMs": round(seg["end"] * 1000)}
-        for seg in (t.data.get("segments") or [])
-        if seg.get("text", "").strip()
-    ]
+    t = _safe_transcribe(src, workdir, config.faster_whisper_model)
 
     duration = _probe_duration(src_path)
-    logger.info("  apply_style: 内容规划中（章节 + 数据卡）...")
-    content_plan = plan_content(t.data.get("segments") or [], duration)
-    logger.info(
-        f"  apply_style: 规划出 {len(content_plan['chapters'])} 个章节、"
-        f"{len(content_plan['dataCards'])} 个数据卡"
-    )
+
+    if t is None:
+        # 转写失败（无论是工具报告失败，还是转写库本身抛异常）都不该搞垮整条
+        # apply_style——用户仍然应该拿到一条"有卡片+品牌条+进度条，但没有字幕/
+        # 章节/数据卡"的降级版本，好过什么都没有。
+        logger.warning("  apply_style: 转写不可用（降级为无字幕版本）")
+        captions: list[dict] = []
+        content_plan = {"chapters": [], "dataCards": []}
+    else:
+        captions = [
+            {"text": seg["text"].strip(), "startMs": round(seg["start"] * 1000), "endMs": round(seg["end"] * 1000)}
+            for seg in (t.data.get("segments") or [])
+            if seg.get("text", "").strip()
+        ]
+        logger.info("  apply_style: 内容规划中（章节 + 数据卡）...")
+        content_plan = plan_content(t.data.get("segments") or [], duration)
+        logger.info(
+            f"  apply_style: 规划出 {len(content_plan['chapters'])} 个章节、"
+            f"{len(content_plan['dataCards'])} 个数据卡"
+        )
+
+    if op.get("style"):
+        op = apply_style_params_to_op(op, op["style"])
+
+    if not op.get("speakerObjectPosition"):
+        op = {**op, "speakerObjectPosition": calibrate_speaker_object_position(src, workdir)}
 
     remotion_dir = Path(config.openmontage_root) / "remotion-composer"
     job_slug = workdir.name
