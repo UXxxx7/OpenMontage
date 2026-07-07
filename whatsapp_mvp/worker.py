@@ -48,25 +48,6 @@ def process_incoming_message(job_id: str) -> None:
         if job.edit_request and not job.planned_edit:
             _run_llm_planner(job)
             job = get_job(job_id)  # 重新加载，获取最新状态
-        elif not job.edit_request and not job.planned_edit:
-            # 零指令 → 模板成片（收口方案 A 节的默认计划）。没配任何文字的视频
-            # 以前会卡在这里（既不规划也不发确认）；现在给默认计划：先清口误、
-            # 再套 XiaojinEditorial 出成片。用户在确认消息里仍可取消/改需求。
-            # （注：这本是 P1 的活，先接通让端到端可测；P1 的 agent 线接入后可替换。）
-            update_job_status(job.id, JobStatus.PLANNING)
-            default_plan = {
-                "edit_operations": [
-                    {"type": "remove_filler", "description": "剪掉口误/语气词/重录"},
-                    {"type": "apply_style", "description": "套编辑模板出成片（章节+数据卡+卡拉OK字幕）"},
-                ],
-                "unsupported": [],
-                "summary": "没有收到文字指令，我会按默认方案：清理口误后套模板出一条带章节和数据卡的成片。",
-                "clarification_needed": False,
-                "clarification_question": None,
-            }
-            update_job_fields(job.id, planned_edit=json.dumps(default_plan, ensure_ascii=False))
-            logger.info(f"零指令默认计划已写入 {job.id}")
-            job = get_job(job_id)
 
         # ── 步骤3: 发送确认消息 ──
         if job.planned_edit and job.status == JobStatus.PLANNING:

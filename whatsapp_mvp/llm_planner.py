@@ -28,10 +28,6 @@ SUPPORTED_OPERATIONS = [
     "speed_up_silence",      # 静音段加速而非删除   {"factor": F} 可选
     "reframe",               # 转换画幅/竖屏        {"aspect": "portrait|square|landscape|cinematic"}
     "add_subtitles",         # 转写并烧录字幕(原语言){"language": "..."} 可选
-    # ↓ 契约①新增的两个算子（P2 handler 已实现；这里的注册本是 P1 的活，先接
-    # 上让 WhatsApp 端到端可测——P1 的 agent 工具表/manifest 白名单接入仍待做）
-    "remove_filler",         # LLM 判断口误/语气词/重录并剪掉（无参）
-    "apply_style",           # 套 XiaojinEditorial 模板出成片：章节+数据卡+卡拉OK字幕+浮动卡片
 ]
 
 EDIT_PLAN_SCHEMA = {
@@ -74,8 +70,6 @@ You can ONLY use these operations. Do NOT invent any others:
 - speed_up_silence: speed up silent pauses instead of cutting them. params: {"factor": F} (optional).
 - reframe: change the aspect ratio / orientation. params: {"aspect": "portrait"} where portrait = 9:16 vertical (TikTok/Reels/Shorts), square = 1:1, landscape = 16:9, cinematic = 21:9.
 - add_subtitles: transcribe the spoken audio and burn captions onto the video. params: {"language": "..."} (optional).
-- remove_filler: transcribe word-by-word and cut filler words, stutters, false starts and re-takes (the way a human editor would). no params.
-- apply_style: produce a fully styled vertical video using the built-in editorial template — floating speaker card, chapter nav, karaoke captions, auto-planned data cards for spoken numbers. Includes its own captions, so do NOT combine with add_subtitles. params (all optional): {"colorMode": "warm|dark", "brand": {"company": "...", "label": "..."}}.
 
 Mapping guidance (examples):
 - "减掉/剪掉/去掉开头10秒" / "cut the first 10 seconds" -> trim_start {"seconds": 10}
@@ -88,13 +82,10 @@ Mapping guidance (examples):
 - "转成竖屏/9:16/发抖音/做成Shorts/Reels" -> reframe {"aspect": "portrait"}
 - "转成横屏/16:9" -> reframe {"aspect": "landscape"}；"转成方形/1:1" -> reframe {"aspect": "square"}
 - "加字幕/配字幕" -> add_subtitles
-- "去掉口误/嗯啊/语气词/说错的地方" / "remove filler words / umms / stutters" -> remove_filler
-- "剪成成片/精修/套模板/做好看一点/编辑成小红书(抖音)风格那种/make it polished / full edit / styled video" -> remove_filler + apply_style (in that order: clean the take first, then style it)
-- "做成暗色/夜间风格" -> apply_style {"colorMode": "dark"}
 
 Rules:
 1. Map the user's intent to the operations above. Every operation object must have a "type" and a short "description" written in the SAME language as the user.
-2. If the user asks for something NOT in the list (e.g. TRANSLATE subtitles to another language, add background music, change/replace the background, color grading, add custom logos), DO NOT fake it. Put a short human-readable description of each unsupported request into the "unsupported" array, and only put the operations you CAN do into "edit_operations".
+2. If the user asks for something NOT in the list (e.g. remove repeated sentences / stutters / filler words, TRANSLATE subtitles to another language, add background music, change/replace the background, color grading, add titles/logos/overlays), DO NOT fake it. Put a short human-readable description of each unsupported request into the "unsupported" array, and only put the operations you CAN do into "edit_operations".
 3. About subtitles: add_subtitles transcribes the SPOKEN language only — it cannot translate. If the user asks for subtitles in a language that is likely different from the speech (e.g. "加中文字幕" on an English-spoken video), still include add_subtitles, but ALSO add a note to "unsupported" such as "翻译字幕到中文（当前只支持原语言字幕）".
 4. "summary" is one short friendly sentence in the user's language describing what you will do (and briefly what you cannot, if anything).
 5. Prefer to PROCEED. If a video duration is provided, use it to resolve clearly-positioned requests into concrete second ranges (e.g. "删掉中间三十秒 / remove the middle 30s" on a D-second video -> remove_segment {"start_seconds": (D-30)/2, "end_seconds": (D+30)/2}; "后面十秒 / last 10s" -> trim_end {"seconds": 10}). ONLY when the request is genuinely ambiguous about WHAT or WHERE to edit and any guess would likely be wrong (e.g. "删掉不好的那段 / cut the boring part" — impossible to know which part), set "clarification_needed": true and put exactly ONE short question (in the user's language) in "clarification_question", with "edit_operations" empty.
@@ -377,17 +368,9 @@ class LLMPlanner:
                 unsupported.append("翻译字幕到中文（当前只支持原语言字幕）")
             ops.append(op)
 
-        # 口误/语气词 -> remove_filler（曾经是 unsupported，现在有真 handler）
-        if any(w in req for w in ("重复", "结巴", "口误", "语气词", "嗯", "repeat", "repetition", "stutter", "filler", "umm")):
-            ops.append({"type": "remove_filler", "description": "剪掉口误/语气词/重录"})
-
-        # 成片/模板/精修 -> remove_filler + apply_style
-        if any(w in req for w in ("成片", "模板", "精修", "好看", "风格", "小红书", "style", "polish", "styled", "full edit")):
-            if not any(o["type"] == "remove_filler" for o in ops):
-                ops.append({"type": "remove_filler", "description": "剪掉口误/语气词/重录"})
-            ops.append({"type": "apply_style", "description": "套编辑模板出成片（章节+数据卡+字幕）"})
-
         # 明确标记做不了的常见需求
+        if any(w in req for w in ("重复", "结巴", "口误", "repeat", "repetition", "stutter", "filler")):
+            unsupported.append("删除重复/结巴/口误片段（需要语义分析，暂不支持）")
         if any(w in req for w in ("配乐", "音乐", "背景音乐", "music", "bgm")):
             unsupported.append("添加背景音乐（暂不支持）")
         if any(w in req for w in ("调色", "滤镜", "color grade", "lut")):
