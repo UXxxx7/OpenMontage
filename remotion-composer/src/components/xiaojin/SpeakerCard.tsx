@@ -43,6 +43,35 @@ export interface SpeakerCardProps {
   enterFrames?: number;
 }
 
+// A bare multi-point interpolate() over sparse, widely-spaced scenes glides
+// continuously across the ENTIRE gap between two keyframes (confirmed via
+// render test: a 400-frame gap produced a card still visibly resizing/
+// moving at every checked frame in between) — not the quick-transition-
+// then-hold behavior compose-director.md documents ("spring translate X,
+// not a cut") and video-studio's own SpeakerCard implementations already
+// give. Fix: insert a hold keyframe TRANSITION_FRAMES before every real
+// scene change, so interpolate() holds flat at the previous value and only
+// actually moves in a fixed window right before each entry. Already-dense/
+// duplicate-authored scenes (e.g. two identical entries marking a static
+// hold) pass through unaffected — the inserted hold point just duplicates
+// values that were already equal.
+const TRANSITION_FRAMES = 20;
+
+function withHoldKeyframes(scenes: SpeakerCardScene[]): SpeakerCardScene[] {
+  if (scenes.length <= 1) return scenes;
+  const expanded: SpeakerCardScene[] = [scenes[0]];
+  for (let i = 1; i < scenes.length; i++) {
+    const prev = scenes[i - 1];
+    const next = scenes[i];
+    const holdFrame = next.frame - TRANSITION_FRAMES;
+    if (holdFrame > prev.frame) {
+      expanded.push({ frame: holdFrame, x: prev.x, y: prev.y, w: prev.w, h: prev.h });
+    }
+    expanded.push(next);
+  }
+  return expanded;
+}
+
 export const SpeakerCard: React.FC<SpeakerCardProps> = ({
   videoSrc,
   scenes,
@@ -62,11 +91,12 @@ export const SpeakerCard: React.FC<SpeakerCardProps> = ({
     easing: APPLE,
   };
 
-  const frames = scenes.map((s) => s.frame);
-  const cx = interpolate(frame, frames, scenes.map((s) => s.x), opts);
-  const cy = interpolate(frame, frames, scenes.map((s) => s.y), opts);
-  const cw = interpolate(frame, frames, scenes.map((s) => s.w), opts);
-  const ch = interpolate(frame, frames, scenes.map((s) => s.h), opts);
+  const holdScenes = withHoldKeyframes(scenes);
+  const frames = holdScenes.map((s) => s.frame);
+  const cx = interpolate(frame, frames, holdScenes.map((s) => s.x), opts);
+  const cy = interpolate(frame, frames, holdScenes.map((s) => s.y), opts);
+  const cw = interpolate(frame, frames, holdScenes.map((s) => s.w), opts);
+  const ch = interpolate(frame, frames, holdScenes.map((s) => s.h), opts);
 
   const cardOpacity = opacityKeyframes && opacityKeyframes.length > 0
     ? interpolate(

@@ -52,6 +52,56 @@
             } } }
         } }
     },
+    "gauges": {
+      "type": "array",
+      "description": "Semicircle risk/status gauges — 'risk consequence' rows of compose-director.md's Data Display Analysis table.",
+      "items": { "type": "object", "required": ["title", "leftLabel", "rightLabel", "value", "mountFrame"], "additionalProperties": false,
+        "properties": {
+          "title": { "type": "string" }, "leftLabel": { "type": "string" }, "rightLabel": { "type": "string" },
+          "value": { "type": "number", "minimum": 0, "maximum": 1, "description": "Final fill fraction, 0-1" },
+          "mountFrame": { "type": "integer", "minimum": 0 },
+          "fillDelayFrames": { "type": "integer", "minimum": 0, "default": 20 },
+          "fillDurationFrames": { "type": "integer", "minimum": 0, "default": 50 },
+          "x": { "type": "number", "default": 80 }, "y": { "type": "number", "default": 900 }
+        } }
+    },
+    "countdowns": {
+      "type": "array",
+      "description": "Circular countdown rings — 'countdown days' rows of compose-director.md's Data Display Analysis table.",
+      "items": { "type": "object", "required": ["value", "unitLabel", "label", "headline", "mountFrame"], "additionalProperties": false,
+        "properties": {
+          "value": { "type": "number" }, "unitLabel": { "type": "string" }, "label": { "type": "string" },
+          "headline": { "type": "string" }, "headlineAccent": { "type": "string" },
+          "maxValue": { "type": "number", "description": "If given, ring fill = value/maxValue; omit for a full reveal regardless of value" },
+          "mountFrame": { "type": "integer", "minimum": 0 },
+          "revealFrames": { "type": "integer", "minimum": 0, "default": 40 },
+          "x": { "type": "number", "default": 80 }, "y": { "type": "number", "default": 900 }
+        } }
+    },
+    "calendarEvents": {
+      "type": "array",
+      "description": "Mini-calendars with a pulsing target-date marker — 'specific date' rows of compose-director.md's Data Display Analysis table. Grid is computed from real year/month, not hardcoded.",
+      "items": { "type": "object", "required": ["year", "month", "targetDay", "eventLabel", "mountFrame"], "additionalProperties": false,
+        "properties": {
+          "year": { "type": "integer" }, "month": { "type": "integer", "minimum": 1, "maximum": 12 },
+          "targetDay": { "type": "integer", "minimum": 1, "maximum": 31 },
+          "todayDay": { "type": "integer", "minimum": 1, "maximum": 31 },
+          "eventLabel": { "type": "string" },
+          "mountFrame": { "type": "integer", "minimum": 0 },
+          "x": { "type": "number", "default": 80 }, "y": { "type": "number", "default": 900 }
+        } }
+    },
+    "qrContact": {
+      "type": "object",
+      "description": "QR code + WhatsApp CTA close. Only include when a real contact URL was actually supplied — never fabricate one; qrSrc must point at a real generated QR image.",
+      "required": ["qrSrc", "contactName", "ctaLabel", "mountFrame"], "additionalProperties": false,
+      "properties": {
+        "qrSrc": { "type": "string", "description": "Path relative to remotion-composer/public/, e.g. jobs/<slug>/qr.png" },
+        "contactName": { "type": "string" }, "contactCompany": { "type": "string" }, "ctaLabel": { "type": "string" },
+        "mountFrame": { "type": "integer", "minimum": 0 },
+        "x": { "type": "number", "default": 80 }, "y": { "type": "number", "default": 780 }
+      }
+    },
     "intro": { "type": "object", "additionalProperties": false, "properties": { "eyebrow": { "type": "string" }, "title": { "type": "string" }, "subtitle": { "type": "string" } } },
     "outro": { "type": "object", "additionalProperties": false, "required": ["fromFrame"], "properties": { "kicker": { "type": "string" }, "headline": { "type": "string" }, "headlineAccent": { "type": "string" }, "subtext": { "type": "string" }, "ctaLabel": { "type": "string" }, "footerLabel": { "type": "string" }, "fromFrame": { "type": "integer", "minimum": 0 } } },
     "compliance": { "type": "object", "additionalProperties": false, "properties": { "agentNameZh": { "type": "string" }, "agentNameEn": { "type": "string" }, "titleZh": { "type": "string" }, "licenseNo": { "type": "string" }, "insurer": { "type": "string" } }, "$comment": "compliance and brand are mutually exclusive" },

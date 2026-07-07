@@ -8,9 +8,9 @@ import { ColorMode, NAV, PALETTES, W } from "./theme";
 
 export interface Chapter {
   /** Frame this chapter becomes active. */
-  at: number;
-  zh: string;
-  en: string;
+  atFrame: number;
+  label: string;
+  labelEn?: string;
 }
 
 export interface ChapterNavProps {
@@ -39,7 +39,7 @@ export const ChapterNav: React.FC<ChapterNavProps> = ({
 
   let active = 0;
   chapters.forEach((c, i) => {
-    if (frame >= c.at) active = i;
+    if (frame >= c.atFrame) active = i;
   });
 
   if (chapters.length === 0) return null;
@@ -67,7 +67,7 @@ export const ChapterNav: React.FC<ChapterNavProps> = ({
         const on = i === active;
         return (
           <div
-            key={c.en}
+            key={`${c.label}-${i}`}
             style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 2 }}
           >
             <span
@@ -78,20 +78,22 @@ export const ChapterNav: React.FC<ChapterNavProps> = ({
                 color: on ? palette.accent : palette.inkSoft,
               }}
             >
-              {c.zh}
+              {c.label}
             </span>
-            <span
-              style={{
-                fontFamily: labelFont,
-                fontSize: 11,
-                letterSpacing: 1.8,
-                fontWeight: 700,
-                color: on ? palette.accent : palette.inkSoft,
-                opacity: on ? 1 : 0.55,
-              }}
-            >
-              {c.en}
-            </span>
+            {c.labelEn ? (
+              <span
+                style={{
+                  fontFamily: labelFont,
+                  fontSize: 11,
+                  letterSpacing: 1.8,
+                  fontWeight: 700,
+                  color: on ? palette.accent : palette.inkSoft,
+                  opacity: on ? 1 : 0.55,
+                }}
+              >
+                {c.labelEn}
+              </span>
+            ) : null}
             {on && (
               <div
                 style={{

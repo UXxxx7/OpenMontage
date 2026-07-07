@@ -21,7 +21,7 @@ import {
   ReferenceStyleEditProps,
   calculateReferenceStyleEditMetadata,
 } from "./ReferenceStyleEdit";
-import { XiaojinEditorial, XiaojinEditorialProps } from "./XiaojinEditorial";
+import { XiaojinEditorial, XiaojinEditorialProps, calculateXiaojinEditorialMetadata } from "./XiaojinEditorial";
 
 // ---------------------------------------------------------------------------
 // Theme System — prevents every video from looking like dark fintech
@@ -412,12 +412,13 @@ export const Root: React.FC = () => {
       <Composition
         id="XiaojinEditorial"
         component={XiaojinEditorial}
-        durationInFrames={Math.ceil(44.9 * 30)}
+        calculateMetadata={calculateXiaojinEditorialMetadata}
         fps={30}
         width={1080}
         height={1920}
         defaultProps={{
           videoSrc: "whatsapp-2026-06-26-edit/rough-cut.mp4",
+          durationSeconds: 44.9,
           colorMode: "warm",
           speakerObjectPosition: "50% 35%",
           scenes: [
@@ -425,10 +426,10 @@ export const Root: React.FC = () => {
             { frame: 1200, x: 60, y: 104, w: 960, h: 1100 },
           ],
           chapters: [
-            { at: 0, zh: "提醒", en: "REMINDER" },
-            { at: 340, zh: "保障", en: "COVERAGE" },
-            { at: 700, zh: "续保", en: "RENEW" },
-            { at: 1000, zh: "联系", en: "CONTACT" },
+            { atFrame: 0, label: "提醒", labelEn: "REMINDER" },
+            { atFrame: 340, label: "保障", labelEn: "COVERAGE" },
+            { atFrame: 700, label: "续保", labelEn: "RENEW" },
+            { atFrame: 1000, label: "联系", labelEn: "CONTACT" },
           ],
           introOutFrame: 20,
           captions: [
@@ -442,17 +443,26 @@ export const Root: React.FC = () => {
             { text: "I'll get back to you right away. Looking forward to keeping you and your family protected.", startMs: 41680, endMs: 45420 },
             { text: "Take care.", startMs: 45620, endMs: 46110 },
           ],
+          // Deliberately generic, obviously-placeholder demo data — NOT a
+          // real client's info. A real job's props always fully replace
+          // these fields, but Remotion's CLI `--props` flag MERGES with
+          // defaultProps rather than replacing it wholesale — confirmed via
+          // a real render test where a Pacific-Life-specific defaultProps
+          // here silently leaked into an unrelated job's rendered video that
+          // never set compliance/intro itself. Keeping this section
+          // obviously-fake means an accidental leak reads as "demo data",
+          // not as a different real client's information.
           intro: {
-            eyebrow: "POLICY RENEWAL REMINDER",
-            title: "保單續期提醒",
-            subtitle: "Pacific Life 太平洋人壽",
+            eyebrow: "SAMPLE VIDEO",
+            title: "示例视频",
+            subtitle: "Demo Studio",
           },
           compliance: {
-            agentNameZh: "大卫",
-            agentNameEn: "David",
-            titleZh: "保险顾问",
-            licenseNo: "LIC-000000",
-            insurer: "Pacific Life",
+            agentNameZh: "示例",
+            agentNameEn: "Demo Agent",
+            titleZh: "示例顾问",
+            licenseNo: "DEMO-000000",
+            insurer: "Demo Studio",
           },
         } as XiaojinEditorialProps}
       />
