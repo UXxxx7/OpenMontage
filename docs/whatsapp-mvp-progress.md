@@ -38,7 +38,7 @@ POST /jobs（上传视频+编辑请求）
 
 | 文件 | 功能 |
 |---|---|
-| `index.js` | Express webhook（验证、验签、去重、BullMQ入队）+ Redis重连策略 |
+| `index.js` | Express webhook（验证、验签、去重、BullMQ入队）+ Redis重连策略；**新增** `GET /files/:jobId/:filename` 代理到 Python API（`OPENMONTAGE_API_BASE`，默认 `localhost:8000`）——worker.js 用这个网关的公网隧道 URL 拼下载链接，但只有 Python API 实际提供 `/files/...`，隧道只覆盖了网关，不加这个代理会 404 |
 | `worker.js` | BullMQ consumer（下载WhatsApp媒体、调Python API、发WhatsApp消息/视频） |
 | `package.json` | 依赖声明 |
 

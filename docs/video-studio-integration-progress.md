@@ -4,6 +4,11 @@
 > Does NOT touch `whatsapp-connection` or `wa-montage` — no files under
 > `whatsapp_mvp/` or `server/` are modified by this branch, intentionally,
 > so it can be reviewed/merged independently of that work.
+>
+> **2026-07-07 update:** this history continues on `feat/template-and-gateway`
+> (P3's branch), which implements contract② and adds a `server/index.js`
+> files-proxy route. See "Update 2026-07-07" below — that section documents
+> the new work; everything above it describes the original port as shipped.
 
 ## What this branch actually is
 
@@ -61,6 +66,26 @@ you're deciding which one to build on:
 Reconcile these before either gets wired into a real pipeline — shipping both
 independently risks a third, further-diverged variant appearing later.
 
+## Update 2026-07-07 — Contract② implementation
+
+Continues this branch as `feat/template-and-gateway`, implementing the P3 side
+of the Day-0 contracts plan (`contracts/README.md`): contract② (render props)
+is now enforced, not just documented.
+
+| Item | Path | Status |
+|---|---|---|
+| Contract② validation | `XiaojinEditorial.tsx` | `ajv` compiles `contracts/render_props.schema.json` and validates props inside `calculateXiaojinEditorialMetadata`, before any frame renders — malformed props now fail loudly instead of rendering blank/`undefined` text |
+| Duration-driven frame count | `XiaojinEditorial.tsx` | `calculateXiaojinEditorialMetadata` derives `durationInFrames` from the required `durationSeconds` prop (ported fix from postxhs); replaces the previous hardcoded `Math.ceil(44.9 * 30)` in `Root.tsx`, which would have silently truncated/looped any video of a different length |
+| Data cards | `components/xiaojin/InfoCard.tsx` (new) | Count-up stat cards for contract②'s `dataCards` field — the "[P3 NEW capability]" the schema already reserved space for |
+| Gauge / countdown / calendar / QR components | `components/xiaojin/{RiskGauge,CountdownRing,Calendar,QRContactCard}.tsx` (new) | Ported from `vell-renewal-reminder`/`vell-renewal-fresh`'s bespoke sections, generalized to props. Ported bugfixes along the way: `Calendar` now computes a real month grid instead of a hardcoded July-2025 array; `RiskGauge`'s needle direction was fixed to track the same left→right sweep as its own fill (previously swung opposite to it) |
+| Schema fields for the above | `contracts/render_props.schema.json` | Added `gauges` / `countdowns` / `calendarEvents` / `qrContact` — **not yet wired into `XiaojinEditorial.tsx`'s render tree.** Same incremental scoping `dataCards`/`InfoCard` used: schema + component first, render-tree wiring is a separate follow-up |
+| Chapter field rename | `components/xiaojin/ChapterNav.tsx` | `at`/`zh`/`en` → `atFrame`/`label`/`labelEn` to match contract② exactly (`labelEn` now optional, for non-bilingual builds) |
+| Speaker card motion fix | `components/xiaojin/SpeakerCard.tsx` | A bare multi-keyframe `interpolate()` over widely-spaced `scenes` was gliding continuously across the entire gap between two keyframes, not holding-then-transitioning like `compose-director.md` specifies. Fixed by inserting a hold keyframe 20 frames before every real scene change |
+| Paint order fix | `XiaojinEditorial.tsx` | `SpeakerCard` now renders first, so `contentBeats`/`dataCards`/`outro` paint on top of it — previously they painted first and were invisible behind an opaque Dominant-mode card (confirmed via render test) |
+| Build verification | — | `npx tsc --noEmit` now actually runs against this component set (previously undone — see below). No errors from any xiaojin/contract file; 19 pre-existing errors remain elsewhere in the repo (`ProviderChip.tsx`, `Explainer.tsx`, `Root.tsx`'s other compositions), unrelated to this work and not introduced by it |
+
+**Still not done:** the four new schema fields (`gauges`/`countdowns`/`calendarEvents`/`qrContact`) have components and schema but nothing in `XiaojinEditorial.tsx` reads or renders them yet — a caller supplying them today would have them silently ignored (ajv allows omission since they're optional, but doesn't get them on screen). Wire them into the render tree the same way `dataCards`/`InfoCard` was done, then re-run `tsc` + a real render before relying on any of them.
+
 ## What's NOT done (accepted gaps, not oversights)
 
 - **Remaining components, not ported (bespoke, not reusable templates):**
@@ -78,20 +103,24 @@ independently risks a third, further-diverged variant appearing later.
 - **Only 1 of 4 documented intro patterns has a component** (`IntroTitle` =
   Pattern 2). Stats-hook, title+atmosphere, and straight-in-with-chips
   (Patterns 1, 3, 4 in `CLAUDE-xiaojin-editorial.md`) have no component yet.
-- **No pipeline wiring.** Nothing in `pipeline_defs/talking-head.yaml`'s
-  `compose` stage or `whatsapp_mvp/pipeline_runner.py` invokes this
-  composition. Today, requesting `xiaojin-editorial` style via the WhatsApp
-  MVP branch would not produce this output — that branch's `pipeline_runner.py`
-  only exposes trim/reframe/caption-burn operations, no style-rendering step
-  at all (see the assessment that motivated this branch).
+- **No pipeline wiring in `main`.** Nothing merged yet invokes this
+  composition from `pipeline_defs/talking-head.yaml` or `whatsapp_mvp/pipeline_runner.py`.
+  **Update 2026-07-07:** a sibling, not-yet-merged branch
+  (`feat/pipeline-remove-filler-apply-style`, P2's continuation of
+  `feat/pipeline-capabilities`) now adds an `apply_style` operation to
+  `pipeline_runner.py` that builds contract② props and calls
+  `npx remotion render XiaojinEditorial` — but the two branches have not been
+  integration-tested against each other yet (P2 was built against this
+  branch's contract② schema, not against a merged `main`). Reconcile/merge
+  both before assuming end-to-end wiring works.
 - **`daja-default` has no composition.** Only the style tokens were ported.
   Video-studio itself never had a from-scratch daja-default Remotion build
   to port from (its reference edits were pre-Remotion ffmpeg overlays).
-- **Not build-verified.** `remotion-composer/node_modules` was not installed
-  and `npx tsc --noEmit` / a real Remotion Studio preview were not run
-  against these changes. The component set was written carefully against
-  the existing prop/import conventions in this codebase, but has not been
-  compiled or rendered. Do this before relying on it.
+- **Not render-verified.** **Update 2026-07-07:** `npx tsc --noEmit` now runs
+  clean against the xiaojin/contract file set (see above), but a real
+  Remotion Studio preview / actual render of `XiaojinEditorial` with real
+  props has still not been done. Compiling is not the same as looking right
+  on screen — do a real preview/render before relying on this.
 - **Scene schedule and `objectPosition` in `Root.tsx`'s default props are
   copied from video-studio's specific calibration for one specific source
   video.** Per `SpeakerCard.tsx`'s own doc comment (ported from video-studio's
@@ -103,19 +132,26 @@ independently risks a third, further-diverged variant appearing later.
   `quality_rules` list captures the same rules as text, but nothing in this
   branch executes them automatically — that would need a `visual_qa`-style
   tool extension, not a style playbook change.
-- **video-use's transcript-judgment filler removal was not ported.** The
-  WhatsApp MVP branch's `remove_silences` operation uses OpenMontage's
-  `SilenceCutter` tool, which is threshold-based silence detection, not
-  semantic judgment over a transcript. This branch doesn't touch that either
-  way — it's a pipeline-runner concern, out of scope for a styles-only branch.
+- **video-use's transcript-judgment filler removal was not ported here.**
+  Out of scope for this styles-only branch either way. **Update 2026-07-07:**
+  this now exists on the sibling `feat/pipeline-remove-filler-apply-style`
+  branch as a new `remove_filler` operation (LLM reads the transcript and
+  judges filler/retakes, complementing `remove_silences`'s pure silence
+  detection) — see that branch's `docs/whatsapp-mvp-progress.md`.
 
 ## Suggested next step for whoever picks this up
 
-1. Install `remotion-composer` deps and actually render `XiaojinEditorial`
-   with its default props — confirm it compiles and looks like the intended
-   style before anything else.
-2. Decide `ReferenceStyleEdit` vs. `XiaojinEditorial` (see above) — don't
+1. ~~Install `remotion-composer` deps and actually render `XiaojinEditorial`
+   with its default props — confirm it compiles~~ Partially done: deps were
+   already installed and `tsc --noEmit` passes clean on this file set as of
+   2026-07-07. **Still needed:** an actual Remotion Studio preview / render,
+   to confirm it *looks* like the intended style, not just that it compiles.
+2. Wire `gauges`/`countdowns`/`calendarEvents`/`qrContact` into
+   `XiaojinEditorial.tsx`'s render tree — schema and components exist
+   (2026-07-07 update above) but nothing reads them yet.
+3. Decide `ReferenceStyleEdit` vs. `XiaojinEditorial` (see above) — don't
    let both continue evolving independently.
-3. Only then consider wiring either into `whatsapp-connection`'s
-   `pipeline_runner.py` as a new `compose` operation — that's a separate,
-   larger task than this branch, and should probably be its own branch too.
+4. Reconcile this branch with `feat/pipeline-remove-filler-apply-style`
+   (P2's `apply_style` operation already targets this branch's contract②
+   schema, but the two have never been integration-tested together) before
+   merging either toward `main`.
