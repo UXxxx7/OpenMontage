@@ -198,16 +198,71 @@ def _op_remove_segment(src: str, op: dict, workdir: Path) -> Optional[str]:
 
 
 def _op_remove_silences(src: str, op: dict, workdir: Path) -> Optional[str]:
-    """去掉所有静音/停顿使更紧凑 -> SilenceCutter mode=remove。"""
+    """去掉所有静音/停顿使更紧凑 -> SilenceCutter mode=remove。
+
+    min_silence_duration/silence_threshold_db 是契约①（op_registry）里
+    remove_silences 的可选参数——SilenceCutter 工具本身早就支持这两个输入，
+    只是 handler 之前没转发，这里补上。不传时工具自己的默认值生效
+    （min_silence_duration=0.5, silence_threshold_db=-35）。
+    """
     from tools.video.silence_cutter import SilenceCutter
     out = workdir / "_op_nosilence.mp4"
-    r = SilenceCutter().execute({
-        "input_path": src, "mode": "remove", "output_path": str(out),
-    })
+    inputs = {"input_path": src, "mode": "remove", "output_path": str(out)}
+    if op.get("min_silence_duration") is not None:
+        inputs["min_silence_duration"] = op["min_silence_duration"]
+    if op.get("silence_threshold_db") is not None:
+        inputs["silence_threshold_db"] = op["silence_threshold_db"]
+    r = SilenceCutter().execute(inputs)
     if not r.success:
         raise RuntimeError(f"remove_silences 失败: {r.error}")
     # 无静音时工具会把 output 设为原文件路径
     return r.data.get("output") or (r.artifacts[0] if r.artifacts else None)
+
+
+def _op_remove_filler(src: str, op: dict, workdir: Path) -> Optional[str]:
+    """转写(词级) -> LLM 判断口误/重录 -> VideoTrimmer concat 只保留干净片段。
+
+    这是 video-use / edit-director.md 的思路："不用打分公式，让 LLM 读转写稿
+    自己判断哪里该剪"——跟 remove_silences 的纯静音检测是互补的两件事，静音
+    检测测不到有声的语气词、也测不到中间没停顿的重录。LLM 不可用或判断没有
+    需要剪的地方时，原样返回，不影响后续步骤。
+    """
+    import os as _os
+
+    from tools.analysis.transcriber import Transcriber
+    from tools.video.video_trimmer import VideoTrimmer
+
+    from .content_planner import plan_filler_removal
+
+    config = get_config()
+
+    _hf = _os.environ.pop("HF_TOKEN", None)
+    try:
+        t = Transcriber().execute({
+            "input_path": src,
+            "output_dir": str(workdir),
+            "model_size": config.faster_whisper_model,
+        })
+    finally:
+        if _hf is not None:
+            _os.environ["HF_TOKEN"] = _hf
+
+    if not t.success:
+        raise RuntimeError(f"remove_filler 转写失败: {t.error}")
+
+    words = t.data.get("word_timestamps") or []
+    duration = _probe_duration(Path(src))
+    keep_ranges = plan_filler_removal(words, duration)
+    if not keep_ranges:
+        logger.info("  remove_filler: 没有判断出需要剪的口误/重录，跳过（视频不变）")
+        return None
+
+    segments = [{"input_path": src, **r} for r in keep_ranges]
+    out = workdir / "_op_nofiller.mp4"
+    r = VideoTrimmer().execute({"operation": "concat", "segments": segments, "output_path": str(out)})
+    if not r.success:
+        raise RuntimeError(f"remove_filler 剪辑失败: {r.error}")
+    return r.data.get("output") or (r.artifacts[0] if r.artifacts else str(out))
 
 
 def _op_speed_up_silence(src: str, op: dict, workdir: Path) -> Optional[str]:
@@ -318,16 +373,148 @@ def _op_add_subtitles(src: str, op: dict, workdir: Path) -> Optional[str]:
     return r.artifacts[0] if r.artifacts else str(out)
 
 
+# ---------------------------------------------------------------------------
+# apply_style — renders the branded XiaojinEditorial template (contract ②).
+#
+# Split into a pure prop-builder (`build_xiaojin_render_props`, no side
+# effects beyond the video copy, independently testable/schema-validatable)
+# and the handler itself (which also invokes the actual render). Per the P2
+# task spec: the acceptance bar for this task is "the props this function
+# builds pass contracts/render_props.schema.json" — NOT "the render
+# succeeds". XiaojinEditorial on P3's side may not consume these props
+# correctly yet; that integration happens once P3 finishes their half.
+# ---------------------------------------------------------------------------
+
+# Fallback scene/objectPosition when no source-video face calibration has
+# been run yet (P2 MVP scope — see contracts/README.md: "P2 runs
+# face_tracker on the source" is the eventual real version of this).
+_DEFAULT_SPEAKER_OBJECT_POSITION = "50% 35%"
+_DEFAULT_SCENE = {"frame": 0, "x": 60, "y": 104, "w": 960, "h": 1100}
+_DEFAULT_INTRO_OUT_FRAME = 20
+
+
+def build_xiaojin_render_props(
+    video_src_rel: str,
+    duration_seconds: float,
+    captions: list[dict],
+    content_plan: dict,
+    op: dict,
+) -> dict:
+    """拼契约②(render_props.schema.json)吃的 props dict。纯函数，方便脱离
+    真实渲染单独做 schema 校验（这个任务的验收门就是这个，不是渲染成功）。
+    """
+    props: dict = {
+        "videoSrc": video_src_rel,
+        "durationSeconds": duration_seconds,
+        "colorMode": op.get("colorMode", "warm"),
+        "speakerObjectPosition": op.get("speakerObjectPosition", _DEFAULT_SPEAKER_OBJECT_POSITION),
+        "scenes": op.get("scenes") or [dict(_DEFAULT_SCENE)],
+        "introOutFrame": op.get("introOutFrame", _DEFAULT_INTRO_OUT_FRAME),
+        "chapters": content_plan.get("chapters", []),
+        "captions": captions,
+    }
+    if content_plan.get("dataCards"):
+        props["dataCards"] = content_plan["dataCards"]
+    if op.get("compliance"):
+        props["compliance"] = op["compliance"]
+    if op.get("brand"):
+        props["brand"] = op["brand"]
+    if op.get("intro"):
+        props["intro"] = op["intro"]
+    if op.get("outro"):
+        props["outro"] = op["outro"]
+    if op.get("headingFont"):
+        props["headingFont"] = op["headingFont"]
+    if op.get("labelFont"):
+        props["labelFont"] = op["labelFont"]
+    return props
+
+
+def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
+    """转写 + content_planner 内容规划 -> 拼契约②的 props -> 渲染 XiaojinEditorial。
+
+    跟 add_subtitles 是互斥的两个操作（这个已经自带转写+烧字幕），上游 planner
+    不应该把两个都放进同一个 edit_operations 里。
+
+    speakerObjectPosition/scenes 目前是 MVP 默认值（见模块顶部注释），没有对
+    源视频做人脸校准——按 P2 任务说明，这是有意的分阶段简化，不是遗漏。
+    """
+    import os as _os
+
+    from tools.analysis.transcriber import Transcriber
+
+    from .content_planner import plan_content
+
+    config = get_config()
+    src_path = Path(src)
+
+    _hf = _os.environ.pop("HF_TOKEN", None)
+    try:
+        t = Transcriber().execute({
+            "input_path": src,
+            "output_dir": str(workdir),
+            "model_size": config.faster_whisper_model,
+        })
+    finally:
+        if _hf is not None:
+            _os.environ["HF_TOKEN"] = _hf
+
+    if not t.success:
+        raise RuntimeError(f"apply_style 转写失败: {t.error}")
+
+    captions = [
+        {"text": seg["text"].strip(), "startMs": round(seg["start"] * 1000), "endMs": round(seg["end"] * 1000)}
+        for seg in (t.data.get("segments") or [])
+        if seg.get("text", "").strip()
+    ]
+
+    duration = _probe_duration(src_path)
+    logger.info("  apply_style: 内容规划中（章节 + 数据卡）...")
+    content_plan = plan_content(t.data.get("segments") or [], duration)
+    logger.info(
+        f"  apply_style: 规划出 {len(content_plan['chapters'])} 个章节、"
+        f"{len(content_plan['dataCards'])} 个数据卡"
+    )
+
+    remotion_dir = Path(config.openmontage_root) / "remotion-composer"
+    job_slug = workdir.name
+    video_src_rel = f"jobs/{job_slug}/source.mp4"
+    video_src_abs = remotion_dir / "public" / "jobs" / job_slug / "source.mp4"
+    video_src_abs.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, video_src_abs)
+
+    props = build_xiaojin_render_props(video_src_rel, duration, captions, content_plan, op)
+    props_path = workdir / "_op_apply_style_props.json"
+    props_path.write_text(json.dumps(props, ensure_ascii=False), encoding="utf-8")
+
+    out = workdir / "_op_styled.mp4"
+    cmd = [
+        "npx", "remotion", "render", "XiaojinEditorial", str(out),
+        f"--props={props_path}",
+        "--crf=18",
+    ]
+    logger.info(f"  apply_style: rendering via {' '.join(cmd)} (cwd={remotion_dir})")
+    result = subprocess.run(cmd, cwd=str(remotion_dir), capture_output=True, text=True)
+    if result.returncode != 0:
+        logger.error(f"apply_style render stderr: {result.stderr[-4000:]}")
+        raise RuntimeError(f"apply_style 渲染失败 (exit {result.returncode})")
+
+    return str(out) if out.exists() else None
+
+
 _OP_HANDLERS: dict[str, Callable[[str, dict, Path], Optional[str]]] = {
     "trim_start": _op_trim_start,
     "trim_end": _op_trim_end,
     "keep_range": _op_keep_range,
     "remove_segment": _op_remove_segment,
     "remove_silences": _op_remove_silences,
+    "remove_filler": _op_remove_filler,
     "speed_up_silence": _op_speed_up_silence,
     "trim_leading_silence": _op_trim_leading_silence,
     "reframe": _op_reframe,
-    # add_subtitles 在主流程末尾单独处理（需要先转写）
+    "apply_style": _op_apply_style,
+    # add_subtitles 在主流程末尾单独处理（需要先转写）；apply_style
+    # 会自带转写+烧字幕，跟 add_subtitles 同时出现时上游 planner 应该只选一个。
 }
 
 
