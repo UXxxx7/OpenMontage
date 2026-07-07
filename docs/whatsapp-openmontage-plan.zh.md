@@ -131,3 +131,42 @@ OpenMontage 的 pipeline 与工具完成剪辑;中间由一个 **L2 治理 agent
 
 P3 独立渲染(fixture props)✅ → P2 handler 产出匹配 props 并成功调 P3 渲染 ✅ →
 P1 agent emit 正确 ops 把 remove_filler/apply_style 串起来 ✅ → WhatsApp 端到端联调。
+
+---
+
+## 8. P2 进度快照(`feat/pipeline-capabilities`,持续更新)
+
+### 第一轮(commit `7623b6f`)
+- 移植 `content_planner.py`(章节/数据卡 + 逐词口误判断),字段名对齐契约②,
+  不带 `mode_schedule`。
+- `_op_apply_style` 改为拼**契约②** props(目标 XiaojinEditorial,非 PostXhs)。
+  验收口径是"props 过 `render_props.schema.json` 校验",不要求真渲染成功
+  (P3 的模板此时还不存在)。
+- 新建 `reference_analyzer.py`:示例视频 → 契约③ `style_params`,用
+  `frame_sampler`/`scene_detect` + PIL 配色分析实现。
+- 诚实标注的缺口(留给下一轮):dark 模式未实测、`speakerObjectPosition` 是
+  MVP 静态默认、修了 ffprobe 输出尾逗号的真 bug。
+
+### 第二轮(commit `93aa41e`)
+- `calibrate_speaker_object_position`:用真实 `face_tracker` 对源视频取人脸
+  中心(中位数,抗离群帧)算 `speakerObjectPosition`,替掉静态默认值;
+  `opencv-python`/`mediapipe` 缺失或检测失败时兜底回默认值。
+  **未解决**:本地环境装 `opencv-python`/`mediapipe` 多次因网络问题失败,
+  这条校准逻辑目前是代码/单测验证过,但**没有拿两条真实人脸位置不同的视频
+  跑通**——验收标准里"两条视频都居中不裁头"这一条还欠着。
+- `apply_style_params_to_op` / `resolve_reframe_op`:把 `reference_analyzer`
+  抽出的 `style_params` 真正接进 `build_xiaojin_render_props`
+  (colorMode/aspect 跟着示例视频变),显式 `op` 字段仍优先。
+- dark 分支补测(用 xiaojin 暗色主题的真实 token `#0D1117` 合成样本,不是
+  随便的深灰占位)。字幕位置/常驻 UI 条检测**本轮未实现**——没有真测量,也没
+  有伪造一个 confidence 值充数,这块仍是明确的"暂不检测"缺口。
+- 健壮性:修了一个真 bug——`Transcriber().execute()` 对损坏/非视频输入会
+  直接抛 `av.error.InvalidDataError`,绕过 `t.success` 检查,导致
+  `_op_apply_style`/`_op_remove_filler` 直接崩溃。三处转写调用
+  (`apply_style`/`remove_filler`/`add_subtitles`)统一收敛到新的
+  `_safe_transcribe` helper;前两者转写失败时优雅降级,后者仍然 raise(字幕
+  是用户显式要的,没有"降级但有意义"的输出可给)但报错信息干净。
+  新增 `test_content_planner.py`(14 条单测,覆盖字段映射/排序/容错)。
+- 仍然阻塞:P3 的 `feat/template-and-gateway` 分支还没建(GitHub 上仍是
+  404),Task 1(真渲染联调)没法做;本地借用 `video-studio-style-integration`
+  分支的 XiaojinEditorial 做单方验证也还没执行。
