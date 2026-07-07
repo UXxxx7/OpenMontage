@@ -38,6 +38,8 @@ OP_TOOLS = {
     "trim_leading_silence": ["silence_cutter", "video_trimmer"],
     "reframe": ["auto_reframe"],
     "add_subtitles": ["transcriber", "remotion_caption_burn"],
+    "remove_filler": ["transcriber", "video_trimmer"],
+    "apply_style": ["transcriber", "remotion_caption_burn"],
 }
 
 # 工具 -> Layer 3 skill（与各工具 .agent_skills 一致）
@@ -69,6 +71,13 @@ ALL_TOOL_SCHEMAS = {
     "reframe": ("转换画幅：portrait=竖屏9:16, square=1:1, landscape=16:9, cinematic=21:9",
                 {"aspect": {"type": "string", "enum": ["portrait", "square", "landscape", "cinematic"]}}, []),
     "add_subtitles": ("转写并烧录字幕（原语言）", {"language": {"type": "string"}}, []),
+    "remove_filler": ("LLM 读转写判断口误/语气词/重录并剪掉；比 remove_silences 更细，"
+                      "能剪有声的“呃/嗯”和中间没停顿的重录（无参）", {}, []),
+    "apply_style": ("套用品牌模板出片（浮动卡片+章节+卡拉OK字幕+品牌/合规条+进度条）。"
+                    "自带转写并烧字幕，不能和 add_subtitles 同时用",
+                    {"template": {"type": "string", "enum": ["xiaojin-editorial"]},
+                     "colorMode": {"type": "string", "enum": ["warm", "dark"]}},
+                    []),
 }
 
 
@@ -77,12 +86,12 @@ ALL_TOOL_SCHEMAS = {
 # ---------------------------------------------------------------------------
 
 def load_manifest() -> dict | None:
-    path = ROOT / "pipeline_defs" / "talking-head.yaml"
-    if not path.exists():
-        return None
+    """加载 talking-head manifest —— 直接用 OpenMontage 自带的 lib.pipeline_loader，
+    它会顺带按 pipeline_manifest.schema.json 校验(比我们自己 yaml.safe_load 多一层治理)。
+    lib 不可用/校验失败时优雅返回 None，agent 退回"不限制"。"""
     try:
-        import yaml
-        return yaml.safe_load(path.read_text(encoding="utf-8"))
+        from lib.pipeline_loader import load_pipeline
+        return load_pipeline("talking-head", defs_dir=ROOT / "pipeline_defs")
     except Exception:
         return None
 
@@ -90,11 +99,10 @@ def load_manifest() -> dict | None:
 def allowed_tools_from_manifest(manifest: dict | None) -> set[str]:
     if not manifest:
         return set(sum(OP_TOOLS.values(), []))  # 无 manifest 时不限制
-    tools: set[str] = set()
-    for stage in manifest.get("stages", []):
-        tools.update(stage.get("tools_available", []) or [])
-        tools.update(stage.get("required_tools", []) or [])
-    return tools
+    # lib.get_required_tools 聚合 tools_available + preferred/fallback + sub_stages
+    # + reference 分析工具，比我们原来的更全。
+    from lib.pipeline_loader import get_required_tools
+    return get_required_tools(manifest)
 
 
 def allowed_ops(allowed_tools: set[str]) -> list[str]:
@@ -104,10 +112,8 @@ def allowed_ops(allowed_tools: set[str]) -> list[str]:
 def review_focus_for(manifest: dict | None, stage_name: str) -> list[str]:
     if not manifest:
         return []
-    for stage in manifest.get("stages", []):
-        if stage.get("name") == stage_name:
-            return stage.get("review_focus", []) or []
-    return []
+    from lib.pipeline_loader import get_stage_review_focus
+    return get_stage_review_focus(manifest, stage_name)
 
 
 def _excerpt(path: Path, limit: int) -> str:
@@ -168,10 +174,13 @@ SYSTEM_BASE = """你是 OpenMontage 的剪辑 agent，编辑用户上传的 talk
 
 治理要求（AGENT_GUIDE.md）：
 - Rule Zero：先读下面给出的 pipeline manifest、edit-director skill、Layer3 技术 skill，按其规范规划。
-- 只能用**给你的工具列表**里的工具（已按 manifest 的 tools_available 过滤）；用户要的、工具做不到的（翻译字幕、配乐、调色、删口误等），不要硬凑，在 finish 的 rationale 里点出做不了。
+- 只能用**给你的工具列表**里的工具（已按 manifest 的 tools_available 过滤）；用户要的、工具做不到的（翻译字幕、配乐、调色、换背景等），不要硬凑，在 finish 的 rationale 里点出做不了。
 - 字幕(add_subtitles)若用，放最后。
 - 关于停顿：用户若说"太紧/不自然/保留正常停顿"之类，不要直接放弃去静音，而是给 remove_silences 传更大的 min_silence_duration（如 1.0~1.5 秒），只剪明显偏长的静音、保留自然的句间停顿。
-- 若提供了逐句转录（带时间戳）：当用户要"剪掉重复句/口误/自我打断/呃嗯等废话/说错重说的部分"时，据转录定位对应片段，用 remove_segment(start_seconds, end_seconds) 精确剪除；用转录里的真实时间戳，可多次调用剪多处。没有明确要求就不要擅自删改说话内容。
+- 剪口误/语气词/重录：优先用 remove_filler（它读转写逐词判断，能剪有声的"呃/嗯"和无停顿的重录），不要用 remove_segment 去手动框口误。remove_silences 只删静音停顿，和 remove_filler 可叠加。
+- 基于内容的"选择性剪辑"：若提供了逐句转录（带时间戳），当用户要"只保留讲 X 的部分""删掉聊 Y 那段"这类**按内容选择**的诉求，用 remove_segment(start_seconds, end_seconds) 按转录里的真实时间戳精确剪除，可多次调用。没有明确要求就不要擅自删改说话内容。
+- 出片风格：用户说"剪好看点/精致/小红书风格/我们的品牌风格/做正式些"这类诉求，用 apply_style 套品牌模板出片。它**自带字幕**，选了它就不要再加 add_subtitles。
+- 零指令默认：用户只说"帮我剪一下/剪一下/edit this"这类**没有任何具体指令**的请求，不要问澄清，直接默认先 remove_filler 再 apply_style，并在 finish 的 rationale 里说明这是默认处理、下次可给更具体要求。
 
 现在是"规划阶段"：工具是**模拟执行**（只返回预计时长，不真剪）。按合理顺序调用工具，用给定时长推算模糊位置。规划完调用 finish 并在 rationale 说明依据。"""
 
@@ -197,6 +206,10 @@ def _simulate(name, args, duration):
         d = round(duration * 0.9, 1)
     elif name == "trim_leading_silence":
         d = max(0.0, duration - 1.0)
+    elif name == "remove_filler":
+        d = round(duration * 0.92, 1)  # 剪口误/重录，通常比去静音删得少
+    elif name == "apply_style":
+        d = duration  # 只 restyle，时长不变
     return {"ok": True, "estimated_duration_seconds": round(d, 1)}, d
 
 
@@ -237,9 +250,13 @@ def _format_transcript(transcript, limit_chars=4000):
     return block
 
 
-def build_messages(request, duration, skill_context, history, supported, transcript=None):
+def build_messages(request, duration, skill_context, history, supported, transcript=None, source_facts=""):
     msgs = [{"role": "system", "content": SYSTEM_BASE + "\n\n" + skill_context}]
     msgs.append({"role": "user", "content": f"视频时长 {duration:.1f} 秒。可用操作：{', '.join(supported)}。用户需求：{request}"})
+    if source_facts:
+        msgs.append({"role": "user", "content":
+            "素材审查(source_media_review)结论,规划时据此判断"
+            "(如已是竖屏就别再 reframe、有质量风险要留意):\n" + source_facts})
     tblock = _format_transcript(transcript)
     if tblock:
         msgs.append({"role": "user", "content":
@@ -395,7 +412,7 @@ def execute_plan(video, plan, art):
 
 def plan_video(request: str, video_path: str | None = None,
                duration: float | None = None, history: list | None = None,
-               transcript: list | None = None) -> dict:
+               transcript: list | None = None, source_facts: str = "") -> dict:
     """L2 规划：读 manifest/skill → agent tool-calling → reviewer 自审(critical 自动修)。
 
     返回与 L1.5 兼容的计划：{edit_operations, summary, edit_decisions, review_findings}。
@@ -425,8 +442,12 @@ def plan_video(request: str, video_path: str | None = None,
             break
         fb = "；".join(f.get("note", "") for f in crit)
         work_history.append((plan, note, f"[自审需修正] {fb}"))
-        messages = build_messages(request, duration, skill_context, work_history, ops, transcript)
+        messages = build_messages(request, duration, skill_context, work_history, ops, transcript, source_facts)
         plan, note = plan_once(config, messages, tools, supported, duration)
+
+    # apply_style 自带字幕：若同时冒出 add_subtitles，去掉后者，避免双字幕
+    if any(o.get("type") == "apply_style" for o in plan):
+        plan = [o for o in plan if o.get("type") != "add_subtitles"]
 
     art = build_edit_decisions(plan, Path(video_path) if video_path else Path("input.mp4"), duration, note)
     return {
