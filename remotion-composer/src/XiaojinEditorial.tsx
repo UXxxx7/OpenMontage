@@ -23,15 +23,22 @@
  * that recur across all 4 video-studio motion projects (see each
  * component's own doc comment for what did NOT get ported, and why).
  */
-import { AbsoluteFill } from "remotion";
+import Ajv2020 from "ajv/dist/2020";
+import { AbsoluteFill, CalculateMetadataFunction } from "remotion";
+import renderPropsSchema from "../../contracts/render_props.schema.json";
 import { BrandBar } from "./components/xiaojin/BrandBar";
+import { Calendar, CalendarProps } from "./components/xiaojin/Calendar";
 import { Captions, CaptionPhrase } from "./components/xiaojin/Captions";
 import { ChapterNav, Chapter } from "./components/xiaojin/ChapterNav";
 import { ComplianceBar } from "./components/xiaojin/ComplianceBar";
 import { ContentBeat, ContentZone } from "./components/xiaojin/ContentZone";
+import { CountdownRing, CountdownRingProps } from "./components/xiaojin/CountdownRing";
+import { InfoCard, InfoCardProps } from "./components/xiaojin/InfoCard";
 import { IntroTitle } from "./components/xiaojin/IntroTitle";
 import { OutroSection } from "./components/xiaojin/OutroSection";
+import { QRContactCard, QRContactCardProps } from "./components/xiaojin/QRContactCard";
 import { RainbowProgressBar } from "./components/xiaojin/RainbowProgressBar";
+import { RiskGauge, RiskGaugeProps } from "./components/xiaojin/RiskGauge";
 import { SpeakerCard, SpeakerCardOpacityKeyframe, SpeakerCardScene } from "./components/xiaojin/SpeakerCard";
 import { ColorMode } from "./components/xiaojin/theme";
 
@@ -54,6 +61,13 @@ export interface IntroInfo {
   subtitle: string;
 }
 
+/** Matches contract②'s dataCards item shape exactly — colorMode/fonts come from the parent. */
+export type DataCard = Omit<InfoCardProps, "colorMode" | "headingFont" | "labelFont">;
+export type Gauge = Omit<RiskGaugeProps, "colorMode" | "headingFont" | "labelFont">;
+export type Countdown = Omit<CountdownRingProps, "colorMode" | "headingFont" | "labelFont">;
+export type CalendarEvent = Omit<CalendarProps, "colorMode" | "headingFont" | "labelFont">;
+export type QRContact = Omit<QRContactCardProps, "colorMode" | "headingFont" | "labelFont">;
+
 export interface OutroInfo {
   kicker: string;
   headline: string;
@@ -67,6 +81,8 @@ export interface OutroInfo {
 
 export interface XiaojinEditorialProps {
   videoSrc: string;
+  /** Drives calculateXiaojinEditorialMetadata's durationInFrames — must match videoSrc's real length. */
+  durationSeconds: number;
   colorMode: ColorMode;
   /** Calibrated per source video — see SpeakerCard's doc comment. Required, no safe default. */
   speakerObjectPosition: string;
@@ -77,6 +93,16 @@ export interface XiaojinEditorialProps {
   captions: CaptionPhrase[];
   /** The graphic content side opposite the speaker card. Omit for a chrome-only build. */
   contentBeats?: ContentBeat[];
+  /** Count-up stat cards (contract② "[P3 NEW capability]"). Renders alongside contentBeats, not in place of it. */
+  dataCards?: DataCard[];
+  /** Semicircle risk/status gauges — Data Display Analysis "risk consequence" rows. */
+  gauges?: Gauge[];
+  /** Circular countdown rings — Data Display Analysis "countdown days" rows. */
+  countdowns?: Countdown[];
+  /** Mini-calendars with a pulsing target-date marker — Data Display Analysis "specific date" rows. */
+  calendarEvents?: CalendarEvent[];
+  /** QR + WhatsApp CTA close. Only set when a real contact URL was actually supplied. */
+  qrContact?: QRContact;
   /** "Pattern 2" dark title-card intro (see IntroTitle's doc comment). Omit to skip. */
   intro?: IntroInfo;
   /** Takes over the content zone from `fromFrame` onward. Omit to skip. */
@@ -94,6 +120,41 @@ export interface XiaojinEditorialProps {
   labelFont?: string;
 }
 
+// No CI currently validates props against contracts/render_props.schema.json anywhere
+// in the repo, and several xiaojin components (OutroSection/ComplianceBar/IntroTitle)
+// declare their sub-fields as required strings with no runtime guards — a partially
+// filled optional object (e.g. outro with only fromFrame) won't crash, it'll just
+// silently render blank/`undefined` text. Rather than scatter defensive guards through
+// every component, validate once here, before any frame renders, so malformed props
+// fail loudly instead of rendering garbage.
+const ajv = new Ajv2020({ allErrors: true, strict: false });
+const validateRenderProps = ajv.compile(renderPropsSchema);
+
+// durationSeconds (contract②, required) drives frame count directly — no probing the
+// video file, unlike ReferenceStyleEdit's calculateMetadata (that composition is slated
+// for retirement; don't anchor new code to its helper). Ported from postxhs's
+// calculatePostXhsEditorialMetadata, which solves the same contract-driven-duration problem.
+export const calculateXiaojinEditorialMetadata: CalculateMetadataFunction<
+  XiaojinEditorialProps
+> = async ({ props }) => {
+  if (!validateRenderProps(props)) {
+    throw new Error(
+      `XiaojinEditorial props failed contract② validation:\n${ajv.errorsText(
+        validateRenderProps.errors,
+        { separator: "\n" }
+      )}`
+    );
+  }
+
+  const fps = 30;
+  return {
+    durationInFrames: Math.max(1, Math.ceil((props.durationSeconds || 1) * fps)),
+    fps,
+    width: 1080,
+    height: 1920,
+  };
+};
+
 export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = ({
   videoSrc,
   colorMode,
@@ -104,6 +165,11 @@ export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = ({
   introOutFrame,
   captions,
   contentBeats,
+  dataCards,
+  gauges,
+  countdowns,
+  calendarEvents,
+  qrContact,
   intro,
   outro,
   compliance,
@@ -115,7 +181,71 @@ export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = ({
 
   return (
     <AbsoluteFill style={{ background: bg }}>
+      <SpeakerCard
+        videoSrc={videoSrc}
+        scenes={scenes}
+        opacityKeyframes={opacityKeyframes}
+        objectPosition={speakerObjectPosition}
+        colorMode={colorMode}
+      />
+      {/*
+        contentBeats/dataCards/outro all render AFTER SpeakerCard (not
+        before) so none of them are ever silently hidden behind it — confirmed
+        as a real bug via render test on two separate components: the
+        canonical fixture's data card (x:80,y:900) and a test outro
+        (fromFrame-gated, full CTA takeover) were both fully invisible when
+        painted before an opaque, Dominant-mode SpeakerCard (960x1100 at
+        y:104 → spans to y:1204, covering nearly all of either component's
+        content). Content-zone elements only make visual sense once the card
+        has shrunk out of the way (Workflow mode) or the outro has taken over
+        — painting them on top guarantees they're visible regardless of
+        whether the caller's scene schedule actually shrinks the card first.
+      */}
       {contentBeats ? <ContentZone beats={contentBeats} /> : null}
+      {dataCards?.map((card, i) => (
+        <InfoCard
+          key={i}
+          {...card}
+          colorMode={colorMode}
+          headingFont={headingFont}
+          labelFont={labelFont}
+        />
+      ))}
+      {gauges?.map((gauge, i) => (
+        <RiskGauge
+          key={i}
+          {...gauge}
+          colorMode={colorMode}
+          headingFont={headingFont}
+          labelFont={labelFont}
+        />
+      ))}
+      {countdowns?.map((countdown, i) => (
+        <CountdownRing
+          key={i}
+          {...countdown}
+          colorMode={colorMode}
+          headingFont={headingFont}
+          labelFont={labelFont}
+        />
+      ))}
+      {calendarEvents?.map((event, i) => (
+        <Calendar
+          key={i}
+          {...event}
+          colorMode={colorMode}
+          headingFont={headingFont}
+          labelFont={labelFont}
+        />
+      ))}
+      {qrContact ? (
+        <QRContactCard
+          {...qrContact}
+          colorMode={colorMode}
+          headingFont={headingFont}
+          labelFont={labelFont}
+        />
+      ) : null}
       {outro ? (
         <OutroSection
           kicker={outro.kicker}
@@ -129,13 +259,6 @@ export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = ({
           font={headingFont}
         />
       ) : null}
-      <SpeakerCard
-        videoSrc={videoSrc}
-        scenes={scenes}
-        opacityKeyframes={opacityKeyframes}
-        objectPosition={speakerObjectPosition}
-        colorMode={colorMode}
-      />
       {intro ? (
         <IntroTitle
           eyebrow={intro.eyebrow}
