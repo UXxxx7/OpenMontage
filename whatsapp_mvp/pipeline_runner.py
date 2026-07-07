@@ -242,6 +242,52 @@ def _op_remove_silences(src: str, op: dict, workdir: Path) -> Optional[str]:
     return r.data.get("output") or (r.artifacts[0] if r.artifacts else None)
 
 
+def _op_remove_filler(src: str, op: dict, workdir: Path) -> Optional[str]:
+    """转写(词级) -> LLM 判断口误/重录 -> VideoTrimmer concat 只保留干净片段。
+
+    这是 video-use / edit-director.md 的思路："不用打分公式，让 LLM 读转写稿
+    自己判断哪里该剪"——跟 remove_silences 的纯静音检测是互补的两件事，静音
+    检测测不到有声的语气词、也测不到中间没停顿的重录。LLM 不可用或判断没有
+    需要剪的地方时，原样返回，不影响后续步骤。
+    """
+    import os as _os
+
+    from tools.analysis.transcriber import Transcriber
+    from tools.video.video_trimmer import VideoTrimmer
+
+    from .content_planner import plan_filler_removal
+
+    config = get_config()
+
+    _hf = _os.environ.pop("HF_TOKEN", None)
+    try:
+        t = Transcriber().execute({
+            "input_path": src,
+            "output_dir": str(workdir),
+            "model_size": config.faster_whisper_model,
+        })
+    finally:
+        if _hf is not None:
+            _os.environ["HF_TOKEN"] = _hf
+
+    if not t.success:
+        raise RuntimeError(f"remove_filler 转写失败: {t.error}")
+
+    words = t.data.get("word_timestamps") or []
+    duration = _probe_duration(Path(src))
+    keep_ranges = plan_filler_removal(words, duration)
+    if not keep_ranges:
+        logger.info("  remove_filler: 没有判断出需要剪的口误/重录，跳过（视频不变）")
+        return None
+
+    segments = [{"input_path": src, **r} for r in keep_ranges]
+    out = workdir / "_op_nofiller.mp4"
+    r = VideoTrimmer().execute({"operation": "concat", "segments": segments, "output_path": str(out)})
+    if not r.success:
+        raise RuntimeError(f"remove_filler 剪辑失败: {r.error}")
+    return r.data.get("output") or (r.artifacts[0] if r.artifacts else str(out))
+
+
 def _op_speed_up_silence(src: str, op: dict, workdir: Path) -> Optional[str]:
     """把静音段加速而非删除 -> SilenceCutter mode=speed_up。"""
     from tools.video.silence_cutter import SilenceCutter
@@ -374,16 +420,143 @@ def _op_add_subtitles(src: str, op: dict, workdir: Path) -> Optional[str]:
     return r.artifacts[0] if r.artifacts else str(out)
 
 
+# Dominant/Workflow floating-card geometry — matches the numbers already used
+# across video-studio's own compose-director.md-driven builds and
+# XiaojinEditorial's own demo defaultProps (Root.tsx). content_planner only
+# reasons about WHEN to be in which mode (dominant vs workflow); the actual
+# pixel box a mode maps to is a rendering-layer concern, not a planning one.
+_DOMINANT_BOX = {"x": 60, "y": 104, "w": 960, "h": 1100}
+_WORKFLOW_BOX = {"x": 740, "y": 1200, "w": 300, "h": 531}
+
+
+def _mode_schedule_to_scenes(mode_schedule: list[dict]) -> list[dict]:
+    """content_planner 的 dominant/workflow 模式时间表 -> contract② 的 scenes（具体像素坐标）。"""
+    box_by_mode = {"dominant": _DOMINANT_BOX, "workflow": _WORKFLOW_BOX}
+    return [
+        {"frame": entry["frame"], **box_by_mode.get(entry.get("mode"), _DOMINANT_BOX)}
+        for entry in mode_schedule
+    ]
+
+
+def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
+    """转写 + 内容规划 + 用 Remotion 渲染 XiaojinEditorial（contract②）。
+
+    对应 VeLL-lab/video-studio 的 tools/directors/compose-director.md（"xiaojin-
+    editorial" style）——组件由 P3 移植/维护在 remotion-composer/src/XiaojinEditorial.tsx
+    + components/xiaojin/*，本函数只负责按 contracts/render_props.schema.json
+    构建 props 并调用 P3 的稳定渲染入口：
+    `npx remotion render XiaojinEditorial --props=<json>`。
+
+    章节/数据卡默认走 content_planner 的语义分析（Data Display Analysis）；
+    调用方也可以显式传 op["chapters"] / op["data_cards"] / op["mode_schedule"]
+    覆盖（例如手工编排的演示）。QR / 仪表盘 / 日历这类卡片 contract②
+    暂未定义字段（见 XiaojinEditorial.tsx 的 outro 文档注释）——不在这里硬塞，
+    需要时应作为 contract② 的扩展提给 P1/P3。
+    """
+    import os as _os
+
+    from tools.analysis.transcriber import Transcriber
+
+    from .content_planner import plan_content
+
+    config = get_config()
+    src_path = Path(src)
+
+    _hf = _os.environ.pop("HF_TOKEN", None)
+    try:
+        t = Transcriber().execute({
+            "input_path": src,
+            "output_dir": str(workdir),
+            "model_size": config.faster_whisper_model,
+        })
+    finally:
+        if _hf is not None:
+            _os.environ["HF_TOKEN"] = _hf
+
+    if not t.success:
+        raise RuntimeError(f"apply_style 转写失败: {t.error}")
+
+    segments = t.data.get("segments") or []
+    captions = [
+        {"text": seg["text"].strip(), "startMs": round(seg["start"] * 1000), "endMs": round(seg["end"] * 1000)}
+        for seg in segments
+        if seg.get("text", "").strip()
+    ]
+
+    duration = _probe_duration(src_path)
+
+    if op.get("chapters") or op.get("data_cards"):
+        chapters = op.get("chapters") or []
+        data_cards = op.get("data_cards") or []
+        mode_schedule = op.get("mode_schedule") or [{"frame": 0, "mode": "dominant"}]
+    else:
+        logger.info("  apply_style: 内容规划中（章节 + 数据卡）...")
+        content_plan = plan_content(segments, duration)
+        chapters = content_plan["chapters"]
+        data_cards = content_plan["data_cards"]
+        mode_schedule = content_plan["mode_schedule"]
+        logger.info(
+            f"  apply_style: 规划出 {len(chapters)} 个章节、{len(data_cards)} 个数据卡"
+        )
+
+    scenes = _mode_schedule_to_scenes(mode_schedule)
+
+    remotion_dir = Path(config.openmontage_root) / "remotion-composer"
+    job_slug = workdir.name
+    public_video_rel = f"jobs/{job_slug}/source.mp4"
+    public_video_abs = remotion_dir / "public" / "jobs" / job_slug / "source.mp4"
+    public_video_abs.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, public_video_abs)
+
+    props: dict[str, Any] = {
+        "videoSrc": public_video_rel,
+        "durationSeconds": duration,
+        "colorMode": op.get("colorMode", "warm"),
+        "speakerObjectPosition": op.get("speaker_object_position", "50% 35%"),
+        "scenes": scenes,
+        "introOutFrame": 20,
+        "chapters": chapters,
+        "captions": captions,
+    }
+    if data_cards:
+        props["dataCards"] = data_cards
+    if op.get("brand"):
+        props["brand"] = op["brand"]
+    elif op.get("compliance"):
+        props["compliance"] = op["compliance"]
+
+    props_path = workdir / "_op_apply_style_props.json"
+    props_path.write_text(json.dumps(props, ensure_ascii=False), encoding="utf-8")
+
+    out = workdir / "_op_styled.mp4"
+    npx_bin = shutil.which("npx") or "npx"  # Windows: subprocess needs the resolved npx.cmd, plain "npx" raises WinError 2
+    cmd = [
+        npx_bin, "remotion", "render", "XiaojinEditorial", str(out),
+        f"--props={props_path}",
+        "--crf=18",
+    ]
+    logger.info(f"  apply_style: rendering via {' '.join(cmd)} (cwd={remotion_dir})")
+    result = subprocess.run(cmd, cwd=str(remotion_dir), capture_output=True, text=True)
+    if result.returncode != 0:
+        logger.error(f"apply_style render stderr: {result.stderr[-4000:]}")
+        raise RuntimeError(f"apply_style 渲染失败 (exit {result.returncode})")
+
+    return str(out) if out.exists() else None
+
+
 _OP_HANDLERS: dict[str, Callable[[str, dict, Path], Optional[str]]] = {
     "trim_start": _op_trim_start,
     "trim_end": _op_trim_end,
     "keep_range": _op_keep_range,
     "remove_segment": _op_remove_segment,
     "remove_silences": _op_remove_silences,
+    "remove_filler": _op_remove_filler,
     "speed_up_silence": _op_speed_up_silence,
     "trim_leading_silence": _op_trim_leading_silence,
     "reframe": _op_reframe,
-    # add_subtitles 在主流程末尾单独处理（需要先转写）
+    "apply_style": _op_apply_style,
+    # add_subtitles 在主流程末尾单独处理（需要先转写）；apply_style 已经自带
+    # 转写+字幕烧录，跟 add_subtitles 同时出现时 planner 应该只选一个。
 }
 
 

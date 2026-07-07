@@ -23,11 +23,13 @@ SUPPORTED_OPERATIONS = [
     "trim_end",              # 剪掉结尾 N 秒        {"seconds": N}
     "keep_range",            # 只保留某段          {"start_seconds": S, "end_seconds": E}
     "remove_segment",        # 删掉中间某段        {"start_seconds": S, "end_seconds": E}
-    "remove_silences",       # 去掉所有静音/停顿    （无参）
+    "remove_silences",       # 去掉所有静音/停顿(纯静音检测)    （无参）
+    "remove_filler",         # LLM 读转写稿判断口误/语气词/重录并剪掉（无参，比 remove_silences 更细但更慢）
     "trim_leading_silence",  # 只去掉开头的静音     （无参）
     "speed_up_silence",      # 静音段加速而非删除   {"factor": F} 可选
     "reframe",               # 转换画幅/竖屏        {"aspect": "portrait|square|landscape|cinematic"}
     "add_subtitles",         # 转写并烧录字幕(原语言){"language": "..."} 可选
+    "apply_style",           # 渲染品牌风格(浮动卡片+字幕+章节+数据卡+品牌条+进度条) （无参，自带转写+烧字幕，不要跟 add_subtitles 一起用）
 ]
 
 EDIT_PLAN_SCHEMA = {
@@ -47,6 +49,7 @@ EDIT_PLAN_SCHEMA = {
                     "aspect": {"type": "string"},
                     "language": {"type": "string"},
                     "factor": {"type": "number"},
+                    "colorMode": {"type": "string"},
                     "description": {"type": "string"},
                 },
             },
@@ -65,11 +68,13 @@ You can ONLY use these operations. Do NOT invent any others:
 - trim_end: remove the last N seconds. params: {"seconds": N}
 - keep_range: keep only one time range, drop the rest. params: {"start_seconds": S, "end_seconds": E}
 - remove_segment: remove ONE middle time range, keep everything else. params: {"start_seconds": S, "end_seconds": E}
-- remove_silences: remove ALL silent pauses / dead air to make the video compact. no params.
+- remove_silences: remove ALL silent pauses / dead air to make the video compact (pure silence detection — fast, but can't catch a voiced "um"/"uh" or a retake with no pause around it). no params.
+- remove_filler: transcribes the video and has an editor-style LLM pass judge which words are filler ("um", "uh", "like"), false starts, or repeated/retake attempts, then cuts exactly those words at word boundaries. Slower than remove_silences (needs transcription + an LLM judgment pass) but catches what silence detection can't. no params.
 - trim_leading_silence: remove ONLY the silent gap at the very beginning. no params.
 - speed_up_silence: speed up silent pauses instead of cutting them. params: {"factor": F} (optional).
 - reframe: change the aspect ratio / orientation. params: {"aspect": "portrait"} where portrait = 9:16 vertical (TikTok/Reels/Shorts), square = 1:1, landscape = 16:9, cinematic = 21:9.
 - add_subtitles: transcribe the spoken audio and burn captions onto the video. params: {"language": "..."} (optional).
+- apply_style: render the video in the studio's signature branded look — floating rounded speaker card (never full-bleed), a chapter nav bar, count-up data cards for any numbers worth calling out, karaoke-highlighted captions, and a brand strip. This already transcribes and burns captions itself — do NOT combine it with add_subtitles in the same plan (pick one). params: {"colorMode": "warm"|"dark"} (optional, default warm).
 
 Mapping guidance (examples):
 - "减掉/剪掉/去掉开头10秒" / "cut the first 10 seconds" -> trim_start {"seconds": 10}
@@ -77,19 +82,22 @@ Mapping guidance (examples):
 - "只保留第30到60秒" -> keep_range {"start_seconds": 30, "end_seconds": 60}
 - "把中间第30到40秒删掉/去掉30到40秒" -> remove_segment {"start_seconds": 30, "end_seconds": 40}
 - "去掉停顿/删掉空白/让它更紧凑连贯/流畅一点" -> remove_silences
+- "剪掉口误/去掉呃啊嗯/剪掉结巴重录的部分/remove the ums and uhs/cut the stutters and retakes" -> remove_filler
 - "去掉开头的空白/开头静音" -> trim_leading_silence
 - "把停顿加速" -> speed_up_silence
 - "转成竖屏/9:16/发抖音/做成Shorts/Reels" -> reframe {"aspect": "portrait"}
 - "转成横屏/16:9" -> reframe {"aspect": "landscape"}；"转成方形/1:1" -> reframe {"aspect": "square"}
 - "加字幕/配字幕" -> add_subtitles
+- "剪成好看的样子/精致一点/小红书风格/加个卡片/我们的品牌风格/做成正式的样子" -> apply_style (do NOT also add add_subtitles — apply_style already includes captions)
 
 Rules:
 1. Map the user's intent to the operations above. Every operation object must have a "type" and a short "description" written in the SAME language as the user.
-2. If the user asks for something NOT in the list (e.g. remove repeated sentences / stutters / filler words, TRANSLATE subtitles to another language, add background music, change/replace the background, color grading, add titles/logos/overlays), DO NOT fake it. Put a short human-readable description of each unsupported request into the "unsupported" array, and only put the operations you CAN do into "edit_operations".
+2. If the user asks for something NOT in the list (e.g. TRANSLATE subtitles to another language, add background music, change/replace the background, color grading, add titles/logos/overlays beyond apply_style's own chrome), DO NOT fake it. Put a short human-readable description of each unsupported request into the "unsupported" array, and only put the operations you CAN do into "edit_operations".
 3. About subtitles: add_subtitles transcribes the SPOKEN language only — it cannot translate. If the user asks for subtitles in a language that is likely different from the speech (e.g. "加中文字幕" on an English-spoken video), still include add_subtitles, but ALSO add a note to "unsupported" such as "翻译字幕到中文（当前只支持原语言字幕）".
 4. "summary" is one short friendly sentence in the user's language describing what you will do (and briefly what you cannot, if anything).
 5. Prefer to PROCEED. If a video duration is provided, use it to resolve clearly-positioned requests into concrete second ranges (e.g. "删掉中间三十秒 / remove the middle 30s" on a D-second video -> remove_segment {"start_seconds": (D-30)/2, "end_seconds": (D+30)/2}; "后面十秒 / last 10s" -> trim_end {"seconds": 10}). ONLY when the request is genuinely ambiguous about WHAT or WHERE to edit and any guess would likely be wrong (e.g. "删掉不好的那段 / cut the boring part" — impossible to know which part), set "clarification_needed": true and put exactly ONE short question (in the user's language) in "clarification_question", with "edit_operations" empty.
-6. Always output valid JSON only, matching the schema. No markdown, no prose outside the JSON."""
+6. A generic request with NO specific edit instruction at all (e.g. "帮我剪辑这个视频" / "edit this video for me" / "剪一下" / "please edit this" — no mention of what, where, or how) is NOT ambiguous — it is the most common request and has a standard default. Do NOT ask for clarification in this case. Instead return edit_operations: [{"type": "remove_filler", "description": "..."}, {"type": "apply_style", "description": "..."}] — clean up filler words/retakes/dead air, then render in the studio's signature branded look — with a friendly summary explaining that's what you did by default, and mention the user can ask for something more specific (e.g. trim to a length, a different aspect ratio) next time. clarification_needed must be false here. Only fall back to the cheaper remove_silences instead when the user's own wording specifically asks for pauses/silence and nothing about filler words or mistakes.
+7. Always output valid JSON only, matching the schema. No markdown, no prose outside the JSON."""
 
 
 # ---------------------------------------------------------------------------
@@ -233,7 +241,7 @@ class LLMPlanner:
     # ------------------------------------------------------------------
 
     def _call_claude(self, edit_request: str, video_duration: Optional[float] = None) -> dict:
-        api_key = self.config.openai_api_key  # 或另配 ANTHROPIC_API_KEY
+        api_key = self.config.llm_api_key  # LLM_API_KEY (falls back to DEEPSEEK_API_KEY/OPENAI_API_KEY)
         if not api_key:
             logger.warning("No API key set; using keyword planner")
             return self._default_plan(edit_request)
@@ -368,16 +376,26 @@ class LLMPlanner:
                 unsupported.append("翻译字幕到中文（当前只支持原语言字幕）")
             ops.append(op)
 
-        # 明确标记做不了的常见需求
+        # 口误/重复/结巴
         if any(w in req for w in ("重复", "结巴", "口误", "repeat", "repetition", "stutter", "filler")):
-            unsupported.append("删除重复/结巴/口误片段（需要语义分析，暂不支持）")
+            ops.append({"type": "remove_filler", "description": "剪掉口误/语气词/重录的部分"})
+
+        # 品牌风格
+        if any(w in req for w in ("小红书", "xhs", "好看", "精致", "品牌", "style", "brand")):
+            if not any(o["type"] == "apply_style" for o in ops):
+                ops.append({"type": "apply_style", "description": "渲染品牌风格（浮动卡片+字幕+数据卡+品牌条）"})
+
+        # 明确标记做不了的常见需求
         if any(w in req for w in ("配乐", "音乐", "背景音乐", "music", "bgm")):
             unsupported.append("添加背景音乐（暂不支持）")
         if any(w in req for w in ("调色", "滤镜", "color grade", "lut")):
             unsupported.append("调色/滤镜（暂不支持）")
 
         if not ops:
-            ops = [{"type": "remove_silences", "description": "去掉停顿使视频更紧凑"}]
+            ops = [
+                {"type": "remove_filler", "description": "剪掉口误/语气词/重录的部分"},
+                {"type": "apply_style", "description": "渲染品牌风格（浮动卡片+字幕+数据卡+品牌条）"},
+            ]
 
         summary = "我会：" + "、".join(o["description"] for o in ops) + "。"
         if unsupported:
