@@ -25,6 +25,10 @@ const redis = new IORedis(REDIS_URL, {
     return Math.min(times * 200, 3000);
   },
 });
+// 同 index.js：没有 error 监听时 ioredis 抖动会直接炸掉进程
+redis.on("error", (err) => {
+  console.error("[worker] redis error (will retry):", err.message);
+});
 
 async function checkReadiness() {
   const results = {};

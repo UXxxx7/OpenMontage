@@ -24,6 +24,12 @@ function createRedis(name) {
 }
 
 const redis = createRedis("webhook");
+// ioredis 的 'error' 事件没有监听器时是未处理的 EventEmitter error，会直接
+// 炸掉整个 Node 进程（网关无声死亡的一类根因）——记录并继续，重连交给
+// retryStrategy。
+redis.on("error", (err) => {
+  console.error("[gateway] redis error (will retry):", err.message);
+});
 const videoQueue = new Queue(env("WA_QUEUE_NAME", "openmontage-video-jobs"), {
   connection: redis,
 });
