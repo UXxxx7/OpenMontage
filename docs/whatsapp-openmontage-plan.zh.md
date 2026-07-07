@@ -215,3 +215,33 @@ CLAUDE-v2 的 §4b/§8/§9)在 WhatsApp 路径里没有任何代码在用——�
 **仍开放**:mode 更丰富的图形词汇(gauge/calendar/quote,契约②扩展,需三方对齐);
 L2 agent 读法典做规划 + 看 stills 复审(P1);"两条人脸位置不同的视频"的第二条
 实测(校准逻辑已在 MrBeast 片上验证,另一条待测)。
+
+### 第四轮(车道修正:规划归 L2,L1.5 恢复冻结)
+
+**背景**:按《规划器车道:L1.5 vs L2》文档自查,第三轮为了让 WhatsApp 端到端
+可测,曾把 remove_filler/apply_style 接进了 L1.5(`llm_planner.py`)并在
+`worker.py` 规划路径塞了零指令默认计划(commit `ebad85e`)——两处都踩了文档的
+DON'T:L1.5 是冻结的兜底器,顶层规划编排只归 L2。根因是当时基于过时基线判断
+"worker 只走 L1.5",实际 P1 的 L2 工作已在上游。
+
+**本轮改动**:
+- **revert `ebad85e`**(`960b470`):L1.5 恢复冻结态,worker 规划路径还原。
+- **合并上游 `whatsapp-studio`(`8ff0838` → merge `53ed45b`)**:带进 P1 的
+  L2 主线——worker 主走 `agent_editor.plan_video`(L1.5 只兜底)、T1 转录感知
+  剪辑、Phase B 对话修订、静音/裁剪/超时修复。一处冲突
+  (`_op_remove_silences` 参数转发,双方同意图)取上游带显式默认值的版本。
+  合并后 P2 四套测试全过。
+- `/files` 代理(`322d8b3`)保留:P3 车道的移植修 bug(postxhs `f7a9f85`
+  原样移植),非规划逻辑,已在 WhatsApp 实测修通"链接 404"。待 P3 认领定稿。
+
+**给 P1 的接力棒(标准流程步骤 3,P2 已到位的部分都打好了桩)**:
+- `remove_filler`/`apply_style` 的 handler 已注册 `_OP_HANDLERS`、契约①已
+  收录(第一轮),端到端渲染已本地验证(第三轮)——**只差 L2 认识它们**:
+  `agent_editor.py` 的 `ALL_TOOL_SCHEMAS` + `OP_TOOLS` + `SYSTEM_BASE`
+  (注意:SYSTEM_BASE 里现在还写着"删口误做不了",要一并更新)+
+  `pipeline_defs/talking-head.yaml` 白名单。
+- **零指令(无文字视频)默认计划**也归 L2:当前 worker 对无 caption 的视频
+  仍会卡在规划步骤(既不规划也不发确认)。建议默认 remove_filler → apply_style
+  (契约①里 remove_filler 的注释已写明"零指令请求的默认第一步")。
+- 在 L2 接上之前,WhatsApp 发视频:带文字 → L2 规划但规划不出模板成片;
+  不带文字 → 卡住。模板效果的 WhatsApp 端到端验证在此之后即可恢复。
