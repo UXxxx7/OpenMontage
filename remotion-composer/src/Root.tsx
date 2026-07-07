@@ -21,6 +21,15 @@ import {
   ReferenceStyleEditProps,
   calculateReferenceStyleEditMetadata,
 } from "./ReferenceStyleEdit";
+import { XiaojinEditorial, XiaojinEditorialProps } from "./XiaojinEditorial";
+
+// Contract ②: durationSeconds drives durationInFrames via calculateMetadata
+// (P2 local-validation registration; P3 owns the final form of this block).
+type XiaojinRenderProps = XiaojinEditorialProps & { durationSeconds: number };
+const calculateXiaojinMetadata: CalculateMetadataFunction<XiaojinRenderProps> = ({ props }) => ({
+  durationInFrames: Math.max(1, Math.ceil(props.durationSeconds * 30)),
+  props,
+});
 
 // ---------------------------------------------------------------------------
 // Theme System — prevents every video from looking like dark fintech
@@ -431,6 +440,25 @@ export const Root: React.FC = () => {
           fadeOutSeconds: 1.5,
           overlay: true,
         } as EndTagProps}
+      />
+      <Composition
+        id="XiaojinEditorial"
+        component={XiaojinEditorial}
+        durationInFrames={30 * 30}
+        fps={30}
+        width={1080}
+        height={1920}
+        defaultProps={{
+          durationSeconds: 30,
+          videoSrc: "",
+          colorMode: "warm",
+          speakerObjectPosition: "50% 35%",
+          scenes: [{ frame: 0, x: 60, y: 104, w: 960, h: 1696 }],
+          chapters: [],
+          introOutFrame: 20,
+          captions: [],
+        } as XiaojinRenderProps}
+        calculateMetadata={calculateXiaojinMetadata}
       />
     </>
   );

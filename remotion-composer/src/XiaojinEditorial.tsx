@@ -25,6 +25,7 @@
  */
 import { AbsoluteFill } from "remotion";
 import { BrandBar } from "./components/xiaojin/BrandBar";
+import { DataCard, DataCards } from "./components/xiaojin/DataCards";
 import { Captions, CaptionPhrase } from "./components/xiaojin/Captions";
 import { ChapterNav, Chapter } from "./components/xiaojin/ChapterNav";
 import { ComplianceBar } from "./components/xiaojin/ComplianceBar";
@@ -77,6 +78,8 @@ export interface XiaojinEditorialProps {
   captions: CaptionPhrase[];
   /** The graphic content side opposite the speaker card. Omit for a chrome-only build. */
   contentBeats?: ContentBeat[];
+  /** Contract ② dataCards — count-up InfoCard clusters, JSON-serializable (unlike contentBeats). */
+  dataCards?: DataCard[];
   /** "Pattern 2" dark title-card intro (see IntroTitle's doc comment). Omit to skip. */
   intro?: IntroInfo;
   /** Takes over the content zone from `fromFrame` onward. Omit to skip. */
@@ -104,6 +107,7 @@ export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = ({
   introOutFrame,
   captions,
   contentBeats,
+  dataCards,
   intro,
   outro,
   compliance,
@@ -116,6 +120,7 @@ export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = ({
   return (
     <AbsoluteFill style={{ background: bg }}>
       {contentBeats ? <ContentZone beats={contentBeats} /> : null}
+      {dataCards && dataCards.length > 0 ? <DataCards cards={dataCards} font={headingFont} /> : null}
       {outro ? (
         <OutroSection
           kicker={outro.kicker}
