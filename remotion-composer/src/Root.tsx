@@ -443,27 +443,6 @@ export const Root: React.FC = () => {
             { text: "I'll get back to you right away. Looking forward to keeping you and your family protected.", startMs: 41680, endMs: 45420 },
             { text: "Take care.", startMs: 45620, endMs: 46110 },
           ],
-          // Deliberately generic, obviously-placeholder demo data — NOT a
-          // real client's info. A real job's props always fully replace
-          // these fields, but Remotion's CLI `--props` flag MERGES with
-          // defaultProps rather than replacing it wholesale — confirmed via
-          // a real render test where a Pacific-Life-specific defaultProps
-          // here silently leaked into an unrelated job's rendered video that
-          // never set compliance/intro itself. Keeping this section
-          // obviously-fake means an accidental leak reads as "demo data",
-          // not as a different real client's information.
-          intro: {
-            eyebrow: "SAMPLE VIDEO",
-            title: "示例视频",
-            subtitle: "Demo Studio",
-          },
-          compliance: {
-            agentNameZh: "示例",
-            agentNameEn: "Demo Agent",
-            titleZh: "示例顾问",
-            licenseNo: "DEMO-000000",
-            insurer: "Demo Studio",
-          },
         } as XiaojinEditorialProps}
       />
       <Composition

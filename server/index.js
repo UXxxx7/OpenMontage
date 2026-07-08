@@ -20,7 +20,7 @@ const REDIS_URL = env("REDIS_URL", "redis://localhost:6379/0");
 const PYTHON_API_BASE = env("OPENMONTAGE_API_BASE", "http://localhost:8000").replace(/\/$/, "");
 
 function createRedis(name) {
-  return new IORedis(REDIS_URL, {
+  const client = new IORedis(REDIS_URL, {
     maxRetriesPerRequest: null,
     connectTimeout: Number(env("WA_REDIS_CONNECT_TIMEOUT_MS", "5000")),
     retryStrategy(times) {
@@ -29,6 +29,10 @@ function createRedis(name) {
     },
     lazyConnect: false,
   });
+  client.on("error", (err) => {
+    console.error(`[redis:${name}] ${err.message}`);
+  });
+  return client;
 }
 
 const redis = createRedis("webhook");
