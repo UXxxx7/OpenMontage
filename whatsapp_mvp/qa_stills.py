@@ -30,9 +30,12 @@ _SCALE = 0.5
 _STILL_TIMEOUT_S = 120
 
 # Must match pipeline_runner's geometry (single source of truth would be a
-# circular import; these mirror compose-director.md, change together).
-_CONTENT_BOX_H = 900
-_CONTENT_ZONE = {"x0": 40, "y0": 1044, "x1": 1040, "y1": 1680}
+# circular import; these mirror _DOMINANT_BOX/_WORKFLOW_BOX, change together).
+# Workflow mode: card docks small at bottom-right (740,1200 300x531); the
+# graphics (dataCards/gauges/countdowns/calendars, default y=900) occupy the
+# freed canvas — the fill check samples that region.
+_WORKFLOW_BOX_H = 531
+_CONTENT_ZONE = {"x0": 60, "y0": 860, "x1": 1020, "y1": 1190}
 _BG = {"warm": (0xF2, 0xEB, 0xE0), "dark": (0x0D, 0x11, 0x17)}
 _MIN_CONTENT_FILL = 0.06  # below this, a docked frame's content zone is "empty canvas"
 
@@ -54,7 +57,7 @@ def _card_h_at(scenes: list[dict], frame: int) -> float:
 
 
 def is_docked(scenes: list[dict], frame: int) -> bool:
-    return abs(_card_h_at(scenes, frame) - _CONTENT_BOX_H) < 1
+    return abs(_card_h_at(scenes, frame) - _WORKFLOW_BOX_H) < 1
 
 
 def pick_qa_frames(props: dict) -> list[int]:

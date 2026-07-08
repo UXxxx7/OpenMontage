@@ -45,7 +45,9 @@ def process_incoming_message(job_id: str) -> None:
             job = get_job(job_id)  # 重新加载，获取最新状态
 
         # ── 步骤2: LLM 规划 ──
-        if job.edit_request and not job.planned_edit:
+        # 零指令（视频不带文字）同样进 L2 规划：SYSTEM_BASE 定义了默认方案
+        # （remove_filler → apply_style 出模板成片），无文字任务不再卡死在这一步。
+        if not job.planned_edit:
             _run_llm_planner(job)
             job = get_job(job_id)  # 重新加载，获取最新状态
 
@@ -300,7 +302,10 @@ def _run_llm_planner(job: Any) -> None:
 
     agent 出错时回退到 L1.5 关键词/结构化规划器，保证任务不中断。
     """
-    logger.info(f"Agent(L2) 规划: {job.edit_request[:100]}...")
+    # 零指令：给 agent 一句明确的默认需求描述而不是空串（SYSTEM_BASE 定义了
+    # 零指令默认方案：remove_filler → apply_style）
+    request = job.edit_request or "（用户没有文字指令）按默认方案出一条模板成片"
+    logger.info(f"Agent(L2) 规划: {request[:100]}...")
     update_job_status(job.id, JobStatus.PLANNING)
 
     input_path = job.job_dir / "input.mp4"
@@ -316,7 +321,7 @@ def _run_llm_planner(job: Any) -> None:
     try:
         from .agent_editor import plan_video
 
-        plan = plan_video(job.edit_request, video_path, transcript=transcript,
+        plan = plan_video(request, video_path, transcript=transcript,
                           source_facts=source_facts)
     except Exception as e:
         logger.warning(f"L2 agent 规划失败，回退 L1.5: {e}")

@@ -60,11 +60,23 @@ Output ONLY valid JSON matching this shape, no markdown, no prose:
 }"""
 
 
+# 超长转写截断：30+ 分钟的上传不能把请求撑爆模型上下文/悄悄变得又慢又贵。
+# ~12k 字符对章节/数据点判断（粗读，不是逐词剪辑决策）绰绰有余。
+_MAX_TRANSCRIPT_CHARS = 12000
+
+
 def _build_transcript_text(segments: list[dict]) -> str:
     lines = []
     for seg in segments:
         lines.append(f"[{seg['start']:.1f}s] {seg['text'].strip()}")
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    if len(text) > _MAX_TRANSCRIPT_CHARS:
+        logger.warning(
+            f"content_planner: 转写 {len(text)} 字符超过 {_MAX_TRANSCRIPT_CHARS} 上限，"
+            f"截断处理——超出部分的章节/数据点会漏掉（超长视频的已知 MVP 限制，非静默失败）"
+        )
+        text = text[:_MAX_TRANSCRIPT_CHARS] + "\n[... transcript truncated — video continues past this point ...]"
+    return text
 
 
 def plan_content(segments: list[dict], duration: float) -> dict[str, Any]:
@@ -118,6 +130,10 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
     workflow_ranges: list[tuple[int, int]] = []
 
     for dp in raw.get("data_points") or []:
+        if not isinstance(dp, dict):
+            # LLM 偶发在数组里塞非 dict 条目（实测出过 str）——跳过而不是
+            # AttributeError 炸掉整个规划。
+            continue
         visual = dp.get("visual") or "count_up"  # backward-compatible default
         try:
             if visual == "gauge":

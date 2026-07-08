@@ -409,8 +409,35 @@ export const Root: React.FC = () => {
         do not reuse them for a different source video without recalibrating
         (see SpeakerCard's doc comment).
       */}
+      {/*
+        Production entry point — the pipeline renders THIS id. defaultProps
+        here must stay minimal: Remotion's CLI `--props` MERGES with
+        defaultProps per top-level key rather than replacing wholesale, so
+        any demo `compliance`/`intro` placed here leaks into every real job
+        that doesn't explicitly set those keys (reproduced on a real render:
+        the demo compliance strip appeared in an unrelated job's video).
+        Full demo data lives on XiaojinEditorialDemo below for Studio preview.
+      */}
       <Composition
         id="XiaojinEditorial"
+        component={XiaojinEditorial}
+        calculateMetadata={calculateXiaojinEditorialMetadata}
+        fps={30}
+        width={1080}
+        height={1920}
+        defaultProps={{
+          videoSrc: "",
+          durationSeconds: 30,
+          colorMode: "warm",
+          speakerObjectPosition: "50% 35%",
+          scenes: [{ frame: 0, x: 60, y: 104, w: 960, h: 1100 }],
+          chapters: [],
+          introOutFrame: 20,
+          captions: [],
+        } as XiaojinEditorialProps}
+      />
+      <Composition
+        id="XiaojinEditorialDemo"
         component={XiaojinEditorial}
         calculateMetadata={calculateXiaojinEditorialMetadata}
         fps={30}
