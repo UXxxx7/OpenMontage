@@ -10,6 +10,14 @@ import IORedis from "ioredis";
 config({ path: resolve(dirname(fileURLToPath(import.meta.url)), "../.env") });
 
 const REDIS_URL = env("REDIS_URL", "redis://localhost:6379/0");
+// worker.js builds download links as `${PUBLIC_BASE_URL}/files/{jobId}/{filename}`
+// (see fileUrl() there) — PUBLIC_BASE_URL is this gateway's public tunnel URL,
+// not the Python API's. The Python API (port 8000, not itself tunneled) is
+// what actually serves `/files/...`. Proxy it through here so the one tunnel
+// covers both the webhook and file downloads sent back to WhatsApp users —
+// without this, links sent to users 404 ("Cannot GET") since this Express
+// app had no route for the path at all.
+const PYTHON_API_BASE = env("OPENMONTAGE_API_BASE", "http://localhost:8000").replace(/\/$/, "");
 
 function createRedis(name) {
   return new IORedis(REDIS_URL, {
@@ -50,14 +58,17 @@ app.get("/health", async (_req, res) => {
   res.json({ status: "ok", redis: redisStatus });
 });
 
-// worker.js builds download links as `${PUBLIC_BASE_URL}/files/{jobId}/{filename}`
-// — PUBLIC_BASE_URL is this gateway's public tunnel URL, not the Python API's.
-// The Python API (port 8000, not itself tunneled) is what actually serves
-// `/files/...`. Proxy it through here so the one tunnel covers both the
-// webhook and file downloads sent back to WhatsApp users — without this,
-// links sent to users 404 ("Cannot GET") since this Express app had no route
-// for the path at all. (Ported from the postxhs branch, f7a9f85.)
-const PYTHON_API_BASE = env("OPENMONTAGE_API_BASE", "http://localhost:8000");
+app.get("/privacy", (_req, res) => {
+  res.type("html").send(`<!doctype html>
+<html><head><meta charset="utf-8"><title>Privacy Policy</title></head>
+<body style="font-family:sans-serif;max-width:680px;margin:40px auto;padding:0 20px;line-height:1.5">
+<h1>Privacy Policy</h1>
+<p>OpenMontage WhatsApp Gateway receives WhatsApp messages and videos only to process the video editing request you send.</p>
+<p>Input media, generated previews, and final renders are retained temporarily for job processing and delivery.</p>
+<p>Contact the service owner to request deletion of your submitted media and generated outputs.</p>
+</body></html>`);
+});
+
 app.get("/files/:jobId/:filename", async (req, res) => {
   const upstream = `${PYTHON_API_BASE}/files/${encodeURIComponent(req.params.jobId)}/${encodeURIComponent(req.params.filename)}`;
   try {
@@ -70,17 +81,6 @@ app.get("/files/:jobId/:filename", async (req, res) => {
     console.error(`[files-proxy] failed to fetch ${upstream}:`, err.message);
     res.sendStatus(502);
   }
-});
-
-app.get("/privacy", (_req, res) => {
-  res.type("html").send(`<!doctype html>
-<html><head><meta charset="utf-8"><title>Privacy Policy</title></head>
-<body style="font-family:sans-serif;max-width:680px;margin:40px auto;padding:0 20px;line-height:1.5">
-<h1>Privacy Policy</h1>
-<p>OpenMontage WhatsApp Gateway receives WhatsApp messages and videos only to process the video editing request you send.</p>
-<p>Input media, generated previews, and final renders are retained temporarily for job processing and delivery.</p>
-<p>Contact the service owner to request deletion of your submitted media and generated outputs.</p>
-</body></html>`);
 });
 
 app.get(["/webhook", "/webhook/whatsapp"], (req, res) => {

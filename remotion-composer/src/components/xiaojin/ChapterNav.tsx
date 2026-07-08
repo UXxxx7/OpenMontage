@@ -6,9 +6,6 @@
 import { interpolate, useCurrentFrame } from "remotion";
 import { ColorMode, NAV, PALETTES, W } from "./theme";
 
-// Field names follow contract ② (contracts/render_props.schema.json):
-// atFrame + label (+ optional labelEn for a bilingual second line). The
-// original video-studio port used {at, zh, en}, which predates the freeze.
 export interface Chapter {
   /** Frame this chapter becomes active. */
   atFrame: number;
@@ -76,9 +73,7 @@ export const ChapterNav: React.FC<ChapterNavProps> = ({
             <span
               style={{
                 fontFamily: headingFont,
-                fontSize: c.labelEn ? 26 : 20,
-                letterSpacing: c.labelEn ? 0 : 2,
-                textTransform: c.labelEn ? undefined : "uppercase",
+                fontSize: 26,
                 fontWeight: on ? 700 : 500,
                 color: on ? palette.accent : palette.inkSoft,
               }}

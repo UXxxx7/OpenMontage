@@ -36,8 +36,13 @@ orchestration:
 compatible_playbooks:
   recommended:
     - clean-professional
-  also_works: []
+    - xiaojin-editorial
+  also_works:
+    - daja-default
   custom_allowed: true
+  # xiaojin-editorial has a dedicated composition (remotion-composer's
+  # XiaojinEditorial.tsx). daja-default does not yet — selecting it currently
+  # falls back to a generic composition. See this branch's PROGRESS doc.
 
 stages:
   - name: idea
