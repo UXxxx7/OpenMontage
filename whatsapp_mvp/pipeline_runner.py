@@ -220,7 +220,6 @@ def _op_remove_silences(src: str, op: dict, workdir: Path) -> Optional[str]:
 
     min_silence_duration 可由上层（agent）传入：默认 0.35s 几乎剪掉所有停顿；
     调大（如 1.0~1.5s）则只剪明显偏长的静音、保留自然的句间停顿，说话更自然。
-    这两个参数同时也是契约①（op_registry）里 remove_silences 的可选参数。
     """
     from tools.video.silence_cutter import SilenceCutter
     min_dur = _num(op.get("min_silence_duration"))
@@ -243,57 +242,36 @@ def _op_remove_silences(src: str, op: dict, workdir: Path) -> Optional[str]:
     return r.data.get("output") or (r.artifacts[0] if r.artifacts else None)
 
 
-def _safe_transcribe(src: str, workdir: Path, model_size: str):
-    """跑 Transcriber，把"工具报告失败"和"工具本身抛异常"这两种失败都统一
-    收敛成返回 None——Transcriber 底层用的 faster-whisper/PyAV 在遇到损坏或
-    非视频文件时，实测会直接抛 av.error.InvalidDataError 之类的异常，不会走
-    它自己 ToolResult(success=False) 那条路径。调用方不该因为转写这一步失败
-    就整个崩掉，应该拿到一个清楚的"没有转写结果"信号去走降级逻辑。
-    """
-    import os as _os
-
-    from tools.analysis.transcriber import Transcriber
-
-    config = get_config()
-    _hf = _os.environ.pop("HF_TOKEN", None)
-    try:
-        t = Transcriber().execute({
-            "input_path": src,
-            "output_dir": str(workdir),
-            "model_size": model_size,
-        })
-    except Exception as e:
-        logger.warning(f"  转写调用异常（非工具自身报告的失败，是真的抛异常）: {e}")
-        return None
-    finally:
-        if _hf is not None:
-            _os.environ["HF_TOKEN"] = _hf
-
-    if not t.success:
-        logger.warning(f"  转写失败: {t.error}")
-        return None
-    return t
-
-
 def _op_remove_filler(src: str, op: dict, workdir: Path) -> Optional[str]:
     """转写(词级) -> LLM 判断口误/重录 -> VideoTrimmer concat 只保留干净片段。
 
     这是 video-use / edit-director.md 的思路："不用打分公式，让 LLM 读转写稿
     自己判断哪里该剪"——跟 remove_silences 的纯静音检测是互补的两件事，静音
-    检测测不到有声的语气词、也测不到中间没停顿的重录。LLM 不可用、判断没有
-    需要剪的地方、或者转写本身失败时，都原样返回，不影响后续步骤——这个操作
-    整体是锦上添花的精修，不应该因为它失败就搞垮整条剪辑流程。
+    检测测不到有声的语气词、也测不到中间没停顿的重录。LLM 不可用或判断没有
+    需要剪的地方时，原样返回，不影响后续步骤。
     """
+    import os as _os
+
+    from tools.analysis.transcriber import Transcriber
     from tools.video.video_trimmer import VideoTrimmer
 
     from .content_planner import plan_filler_removal
 
     config = get_config()
 
-    t = _safe_transcribe(src, workdir, config.faster_whisper_model)
-    if t is None:
-        logger.info("  remove_filler: 转写不可用，跳过口误检测（视频不变）")
-        return None
+    _hf = _os.environ.pop("HF_TOKEN", None)
+    try:
+        t = Transcriber().execute({
+            "input_path": src,
+            "output_dir": str(workdir),
+            "model_size": config.faster_whisper_model,
+        })
+    finally:
+        if _hf is not None:
+            _os.environ["HF_TOKEN"] = _hf
+
+    if not t.success:
+        raise RuntimeError(f"remove_filler 转写失败: {t.error}")
 
     words = t.data.get("word_timestamps") or []
     duration = _probe_duration(Path(src))
@@ -405,372 +383,241 @@ def _op_reframe(src: str, op: dict, workdir: Path) -> Optional[str]:
 
 
 def _op_add_subtitles(src: str, op: dict, workdir: Path) -> Optional[str]:
-    """转写 -> 烧录字幕（原语言）。翻译成其他语言暂不支持（见 planner 的 unsupported）。
+    """转写 -> 烧录字幕（原语言）。翻译成其他语言暂不支持（见 planner 的 unsupported）。"""
+    import os as _os
 
-    这里跟 apply_style/remove_filler 不同：字幕是用户显式要的东西，转写失败时
-    没有"降级但仍然有意义"的输出可给，所以仍然是 raise，不做静默兜底——但用
-    _safe_transcribe 统一收敛异常，让失败原因清楚可读，而不是让 av 库的原始
-    异常直接炸穿上层。
-    """
+    from tools.analysis.transcriber import Transcriber
     from tools.video.remotion_caption_burn import RemotionCaptionBurn
 
     config = get_config()
-    t = _safe_transcribe(src, workdir, config.faster_whisper_model)
-    if t is None:
-        raise RuntimeError("转写失败，无法烧录字幕")
+
+    # 临时移除可能含非 ASCII 的 HF_TOKEN，避免 httpx header 编码错误
+    _hf = _os.environ.pop("HF_TOKEN", None)
+    try:
+        t = Transcriber().execute({
+            "input_path": src,
+            "output_dir": str(workdir),
+            "model_size": config.faster_whisper_model,
+        })
+    finally:
+        if _hf is not None:
+            _os.environ["HF_TOKEN"] = _hf
+
+    if not t.success:
+        raise RuntimeError(f"转写失败: {t.error}")
     segments = t.data.get("segments")
     if not segments:
         logger.warning("  转写无结果，跳过字幕")
         return None
 
     out = workdir / "_op_subtitled.mp4"
-    # 不再 force_ffmpeg：这台机器的 ffmpeg 没编 libass（subtitles 滤镜不存在，
-    # 实测 exit 234/Filter not found），而 Remotion 路径已全程验证可用。让工具
-    # 自己选（Remotion 优先，ffmpeg 只作为 Remotion 不可用时的兜底）。
     r = RemotionCaptionBurn().execute({
         "input_path": src, "output_path": str(out),
-        "segments": segments,
+        "segments": segments, "force_ffmpeg": True,
     })
     if not r.success:
         raise RuntimeError(f"字幕烧录失败: {r.error}")
     return r.artifacts[0] if r.artifacts else str(out)
 
 
-# ---------------------------------------------------------------------------
-# apply_style — renders the branded XiaojinEditorial template (contract ②).
-#
-# Split into a pure prop-builder (`build_xiaojin_render_props`, no side
-# effects beyond the video copy, independently testable/schema-validatable)
-# and the handler itself (which also invokes the actual render). Per the P2
-# task spec: the acceptance bar for this task is "the props this function
-# builds pass contracts/render_props.schema.json" — NOT "the render
-# succeeds". XiaojinEditorial on P3's side may not consume these props
-# correctly yet; that integration happens once P3 finishes their half.
-# ---------------------------------------------------------------------------
-
-# Fallback objectPosition when no source-video face calibration has been run
-# yet (P2 MVP scope — see contracts/README.md: "P2 runs face_tracker on the
-# source" is the eventual real version of this).
-_DEFAULT_SPEAKER_OBJECT_POSITION = "50% 35%"
-_DEFAULT_INTRO_OUT_FRAME = 20
-
-# ---------------------------------------------------------------------------
-# Canvas / chrome geometry + beat-driven scene generation.
-#
-# Numbers come from video-studio's compose-director.md style codex (1080x1920,
-# ChapterNav 0-88, BrandBar y=1848, captions pinned bottom:90) — that codex is
-# what produced the reference-quality builds, and the core rule this encodes
-# is: the speaker card only shrinks WHEN content needs the canvas, and returns
-# to full when it doesn't. A fixed scene schedule (the previous _DEFAULT_SCENE)
-# leaves most of the canvas empty for most of the video, which is exactly the
-# "under-edited" failure video-studio's docs call out.
-# ---------------------------------------------------------------------------
-_FPS = 30
-# Card boxes. FULL: near-full portrait (bottom=1800, clears BrandBar@1848).
-# CONTENT: card docked to the top so the zone below is free for data cards
-# (codex: workflow card min height 900 — shorter crops a portrait source to
-# head-only).
-_FULL_BOX = {"x": 60, "y": 104, "w": 960, "h": 1696}
-_CONTENT_BOX = {"x": 40, "y": 104, "w": 1000, "h": 900}
-_CONTENT_TOP = 1044          # 40px gap below CONTENT box bottom (1004)
-_CAPTION_SAFE_TOP = 1680     # caption pill zone starts around here; content must end above
-_TRANSITION_FRAMES = 20      # codex: APPLE easing over 20 frames
-_CARD_HOLD_FRAMES = 150      # ~5s reading hold after the last row lands
-_MERGE_GAP_FRAMES = 60       # gaps shorter than this stay in content mode (no thrash)
-_DATA_CARD_ROW_H = 64        # InfoCard row height estimate for overflow clamping
-_DATA_CARD_CHROME_H = 96     # title + padding estimate
+# Dominant/Workflow floating-card geometry — matches the numbers already used
+# across video-studio's own compose-director.md-driven builds and
+# XiaojinEditorial's own demo defaultProps (Root.tsx). content_planner only
+# reasons about WHEN to be in which mode (dominant vs workflow); the actual
+# pixel box a mode maps to is a rendering-layer concern, not a planning one.
+_DOMINANT_BOX = {"x": 60, "y": 104, "w": 960, "h": 1100}
+_WORKFLOW_BOX = {"x": 740, "y": 1200, "w": 300, "h": 531}
 
 
-def _data_card_end_frame(card: dict) -> int:
-    """Frame at which a card's content has fully landed and been read."""
-    last_row = max((r.get("mountOffset", 0) for r in card.get("rows", [])), default=0)
-    return card["mountFrame"] + last_row + _CARD_HOLD_FRAMES
+def _mode_schedule_to_scenes(mode_schedule: list[dict]) -> list[dict]:
+    """content_planner 的 dominant/workflow 模式时间表 -> contract② 的 scenes（具体像素坐标）。"""
+    box_by_mode = {"dominant": _DOMINANT_BOX, "workflow": _WORKFLOW_BOX}
+    return [
+        {"frame": entry["frame"], **box_by_mode.get(entry.get("mode"), _DOMINANT_BOX)}
+        for entry in mode_schedule
+    ]
 
 
-def build_xiaojin_scenes(content_plan: dict, duration_seconds: float) -> list[dict]:
-    """dataCards 的 beat -> SpeakerCard 的 scenes 关键帧。纯函数。
+def _run_enhancement_chain(src: str, workdir: Path) -> str:
+    """face_enhance -> color_grade -> audio_enhance，best-effort（单步失败不影响其它步骤）。
 
-    规则（对齐 compose-director 的实际做法）：卡片默认全屏漂浮；只在某张数据卡
-    需要画布时，提前 20 帧过渡到 CONTENT 盒（顶部停靠），数据卡读完（最后一行
-    落位 + ~5s）再过渡回全屏。相邻数据卡间隔太短就保持 CONTENT 不来回抖。
-    没有任何数据卡（很常见、完全正常）-> 单关键帧全屏，卡片全程不动。
-
-    SpeakerCard 对 scenes 做的是全序列 interpolate（帧号必须严格递增），所以
-    "停留"要靠成对关键帧表达：{f,box} {f+20,box'} 之间是过渡，其余区间保持。
+    对应 compose-director.md Step 1（"Attempt every step if the tool is
+    available — do not skip steps without a reason"）。三个工具都是纯 FFmpeg
+    滤镜链，无需 GPU、无需标准安装之外的依赖。eye_enhance 故意不在这里接入——
+    全仓库零测试覆盖，且需要标准安装里没有的 mediapipe/opencv-python 才能做到
+    比"全局调亮"更精细的效果，等它被真正跑过一次再考虑接入。
     """
-    duration_frames = max(1, round(duration_seconds * _FPS))
-    cards = sorted(content_plan.get("dataCards") or [], key=lambda c: c["mountFrame"])
-    if not cards:
-        return [{"frame": 0, **_FULL_BOX}]
+    from tools.audio.audio_enhance import AudioEnhance
+    from tools.enhancement.color_grade import ColorGrade
+    from tools.enhancement.face_enhance import FaceEnhance
 
-    # Shrink intervals [start, end] in frames, merged when nearly adjacent.
-    intervals: list[list[int]] = []
-    for card in cards:
-        start = max(card["mountFrame"] - _TRANSITION_FRAMES, 1)
-        end = _data_card_end_frame(card)
-        if intervals and start - intervals[-1][1] <= _MERGE_GAP_FRAMES + 2 * _TRANSITION_FRAMES:
-            intervals[-1][1] = max(intervals[-1][1], end)
-        else:
-            intervals.append([start, end])
+    steps: list[tuple[str, type, dict]] = [
+        ("face_enhance", FaceEnhance, {"preset": "talking_head_standard"}),
+        ("color_grade", ColorGrade, {"profile": "cinematic_warm", "intensity": 0.85}),
+        ("audio_enhance", AudioEnhance, {"preset": "clean_speech"}),
+    ]
 
-    scenes: list[dict] = [{"frame": 0, **_FULL_BOX}]
-    for start, end in intervals:
-        # Guarantee strictly increasing frames even for a card mounting at ~0.
-        start = max(start, scenes[-1]["frame"] + 1)
-        end = max(end, start + _TRANSITION_FRAMES + 1)
-        scenes.append({"frame": start, **_FULL_BOX})
-        scenes.append({"frame": start + _TRANSITION_FRAMES, **_CONTENT_BOX})
-        if end + _TRANSITION_FRAMES >= duration_frames:
-            break  # video ends while in content mode — stay docked, no return
-        scenes.append({"frame": end, **_CONTENT_BOX})
-        scenes.append({"frame": end + _TRANSITION_FRAMES, **_FULL_BOX})
-    return scenes
-
-
-def place_data_cards(data_cards: list[dict]) -> list[dict]:
-    """给数据卡补默认坐标并夹进安全区。纯函数，不改传入的列表。
-
-    契约②里 dataCards 的 schema 默认 y=900——但卡片 CONTENT 盒底在 1004，
-    y=900 会被说话人卡片压住；底部还有字幕带(~1680 起)/BrandBar(1848)。这里
-    统一放进内容区(_CONTENT_TOP 起)，并按行数估高夹住 y 保证不进字幕带。
-    """
-    placed = []
-    for card in data_cards:
-        c = dict(card)
-        est_h = _DATA_CARD_CHROME_H + len(c.get("rows", [])) * _DATA_CARD_ROW_H
-        c.setdefault("x", 80)
-        c.setdefault("width", 920)
-        y = c.get("y", _CONTENT_TOP + 56)
-        y = max(y, _CONTENT_TOP)
-        y = min(y, _CAPTION_SAFE_TOP - est_h)
-        c["y"] = y
-        placed.append(c)
-    return placed
-
-
-def calibrate_speaker_object_position(src: str, workdir: Path) -> str:
-    """对源视频跑 face_tracker，取人脸中心的中位数 -> CSS object-position 字符串。
-
-    compose-director.md 的校准公式：objPos ≈ (face_center_y_in_source /
-    source_height) * 100 —— FaceTracker 的 bbox 已经是按源视频宽高归一化过的
-    比例（0..1），所以人脸中心比例可以直接当百分比用，不需要再除一次源尺寸。
-
-    用中位数而不是均值：跟 clipper 技能的 smart_crop.py 一个思路——对偶尔的
-    误检测/头部转动更稳健。检测不到人脸时，原样退回旧的静态默认值
-    "50% 35%"，不让这一步的失败搞垮整条 apply_style。
-    """
-    try:
-        from tools.analysis.face_tracker import FaceTracker
-
-        out_json = workdir / "_op_apply_style_faces.json"
-        r = FaceTracker().execute({
-            "input_path": src, "output_path": str(out_json), "sample_fps": 3,
-        })
+    for name, tool_cls, extra_inputs in steps:
+        out = workdir / f"_op_{name}.mp4"
+        inputs = {"input_path": src, "output_path": str(out), **extra_inputs}
+        try:
+            r = tool_cls().execute(inputs)
+        except Exception as e:
+            logger.warning(f"  apply_style: {name} 出错，跳过（沿用未增强的视频): {e}")
+            continue
         if not r.success:
-            logger.warning(f"  apply_style: face_tracker 失败，用默认取景: {r.error}")
-            return _DEFAULT_SPEAKER_OBJECT_POSITION
+            logger.warning(f"  apply_style: {name} 失败，跳过（沿用未增强的视频): {r.error}")
+            continue
+        new_src = r.data.get("output") or (r.artifacts[0] if r.artifacts else None)
+        if new_src and Path(new_src).exists():
+            logger.info(f"  apply_style: {name} 完成")
+            src = new_src
+        else:
+            logger.warning(f"  apply_style: {name} 未产出文件，跳过")
 
-        data = json.loads(Path(r.data["output"]).read_text(encoding="utf-8"))
-        faces = data.get("faces", [])
-        if not faces:
-            logger.warning("  apply_style: 没检测到人脸，用默认取景")
-            return _DEFAULT_SPEAKER_OBJECT_POSITION
-
-        centers_x = sorted(f["bbox"]["x"] + f["bbox"]["width"] / 2 for f in faces)
-        centers_y = sorted(f["bbox"]["y"] + f["bbox"]["height"] / 2 for f in faces)
-        mid = len(faces) // 2
-        cx = centers_x[mid]
-        cy = centers_y[mid]
-
-        obj_pos = f"{round(cx * 100)}% {round(cy * 100)}%"
-        logger.info(f"  apply_style: 人脸校准取景 -> {obj_pos}（{len(faces)}帧检出人脸，取中位数）")
-        return obj_pos
-    except Exception as e:
-        logger.warning(f"  apply_style: face_tracker 调用异常，用默认取景: {e}")
-        return _DEFAULT_SPEAKER_OBJECT_POSITION
-
-
-def apply_style_params_to_op(op: dict, style_params: dict) -> dict:
-    """契约③(style_params，来自 reference_analyzer 对示例视频的分析)-> 合并进
-    op 参数里，喂给 build_xiaojin_render_props。纯函数，不改动传入的 op。
-
-    contracts/README.md 说得很明确：style_params 只管审美（配色/字幕观感/画幅/
-    节奏），不管 speakerObjectPosition/scenes——那两个必须来自源视频本身的人脸
-    位置，不能被示例视频带偏。这里只把 colorMode 合并进去；explicit 的
-    op["colorMode"]（如果调用方直接传了）优先级更高，不会被示例视频覆盖。
-    """
-    merged = dict(op)
-    if style_params.get("colorMode") and "colorMode" not in op:
-        merged["colorMode"] = style_params["colorMode"]
-    return merged
-
-
-def resolve_reframe_op(style_params: dict, source_aspect: Optional[str]) -> Optional[dict]:
-    """判断示例视频的画幅要不要触发对源视频的 reframe。
-
-    XiaojinEditorial 目前只有一个固定竖屏画布（1080x1920，scenes 坐标是相对
-    这个画布写死的），所以"画幅"这个风格参数落不到 render_props 里任何字段
-    上——它真正的意义是："如果源视频本身不是竖屏，需要先跑一次 reframe 操作
-    再喂给 apply_style"。这是编排层（P1 的活）该往 edit_operations 里插的一
-    个操作，不是 apply_style 自己该做的事——这个函数只负责判断"要不要"，
-    返回一个可以直接放进 edit_operations 的 reframe op dict，不自己执行。
-    """
-    target = style_params.get("aspect")
-    if not target:
-        return None
-    if source_aspect and source_aspect == target:
-        return None
-    return {"type": "reframe", "aspect": target, "description": f"按示例视频画幅转成 {target}"}
-
-
-def build_xiaojin_render_props(
-    video_src_rel: str,
-    duration_seconds: float,
-    captions: list[dict],
-    content_plan: dict,
-    op: dict,
-) -> dict:
-    """拼契约②(render_props.schema.json)吃的 props dict。纯函数，方便脱离
-    真实渲染单独做 schema 校验（这个任务的验收门就是这个，不是渲染成功）。
-    """
-    props: dict = {
-        "videoSrc": video_src_rel,
-        "durationSeconds": duration_seconds,
-        "colorMode": op.get("colorMode", "warm"),
-        "speakerObjectPosition": op.get("speakerObjectPosition", _DEFAULT_SPEAKER_OBJECT_POSITION),
-        "scenes": op.get("scenes") or build_xiaojin_scenes(content_plan, duration_seconds),
-        "introOutFrame": op.get("introOutFrame", _DEFAULT_INTRO_OUT_FRAME),
-        "chapters": content_plan.get("chapters", []),
-        "captions": captions,
-    }
-    if content_plan.get("dataCards"):
-        props["dataCards"] = place_data_cards(content_plan["dataCards"])
-    if op.get("compliance"):
-        props["compliance"] = op["compliance"]
-    if op.get("brand"):
-        props["brand"] = op["brand"]
-    if op.get("intro"):
-        props["intro"] = op["intro"]
-    if op.get("outro"):
-        props["outro"] = op["outro"]
-    if op.get("headingFont"):
-        props["headingFont"] = op["headingFont"]
-    if op.get("labelFont"):
-        props["labelFont"] = op["labelFont"]
-    return props
-
-
-_MAX_CAPTION_WORDS = 7
-_MAX_CAPTION_CHARS = 42
-
-
-def build_caption_phrases(words: list[dict], segments: list[dict]) -> list[dict]:
-    """词级时间戳 -> 短语级字幕。纯函数。
-
-    直接用转写 segment 当字幕，一条能到 200+ 字符、屏幕上 5-6 行，把画面压掉
-    小半截——codex 明确要求 phrase-level captions。这里按词重组：满 7 词/42 字
-    符、或遇到句读（.?!，。？！）就断一条。没有词级数据时退回 segment 级
-    （长，但有总比没有好）。
-    """
-    if not words:
-        return [
-            {"text": seg["text"].strip(), "startMs": round(seg["start"] * 1000), "endMs": round(seg["end"] * 1000)}
-            for seg in segments
-            if seg.get("text", "").strip()
-        ]
-
-    phrases: list[dict] = []
-    cur: list[dict] = []
-
-    def flush():
-        if not cur:
-            return
-        text = "".join(w["word"] for w in cur).strip()
-        if text:
-            phrases.append({
-                "text": text,
-                "startMs": round(cur[0]["start"] * 1000),
-                "endMs": round(cur[-1]["end"] * 1000),
-            })
-        cur.clear()
-
-    for w in words:
-        cur.append(w)
-        text = "".join(x["word"] for x in cur).strip()
-        ends_sentence = text.endswith((".", "?", "!", "。", "？", "！", ",", "，"))
-        if len(cur) >= _MAX_CAPTION_WORDS or len(text) >= _MAX_CAPTION_CHARS or ends_sentence:
-            flush()
-    flush()
-    return phrases
+    return src
 
 
 def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
-    """转写 + content_planner 内容规划 + 人脸校准 -> 拼契约②的 props -> 渲染 XiaojinEditorial。
+    """转写 + 内容规划 + 用 Remotion 渲染 XiaojinEditorial（contract②）。
 
-    跟 add_subtitles 是互斥的两个操作（这个已经自带转写+烧字幕），上游 planner
-    不应该把两个都放进同一个 edit_operations 里。
+    对应 VeLL-lab/video-studio 的 tools/directors/compose-director.md（"xiaojin-
+    editorial" style）——组件由 P3 移植/维护在 remotion-composer/src/XiaojinEditorial.tsx
+    + components/xiaojin/*，本函数只负责按 contracts/render_props.schema.json
+    构建 props 并调用 P3 的稳定渲染入口：
+    `npx remotion render XiaojinEditorial --props=<json>`。
 
-    speakerObjectPosition 现在是对源视频真实跑 face_tracker 校准出来的（见
-    calibrate_speaker_object_position），不再是固定默认值——除非 op 里显式
-    传了 speakerObjectPosition，那种情况尊重调用方的显式覆盖。scenes 卡片
-    位置本身是画布坐标、跟源视频尺寸无关，仍用默认盒子。
+    章节/数据卡/仪表盘/倒计时/日历默认都走 content_planner 的完整 Data Display
+    Analysis（按 compose-director.md 的表格把每个数据点分到该用的图形，不再只有
+    count-up 一种）；调用方也可以显式传 op["chapters"] / op["data_cards"] /
+    op["gauges"] / op["countdowns"] / op["calendar_events"] / op["mode_schedule"]
+    覆盖（例如手工编排的演示）。
+
+    QR + 联系方式（props["qrContact"]）不经过 content_planner 的语义判断——
+    是否显示 QR 完全取决于调用方是否在 op["qr_contact"] 里给了真实联系方式，
+    绝不凭空编造一个。
     """
+    import os as _os
+
+    from tools.analysis.transcriber import Transcriber
+
     from .content_planner import plan_content
 
     config = get_config()
+
+    # Enhancement chain (compose-director.md Step 1: "attempt every step if the
+    # tool is available — do not skip steps without a reason"). Order matches
+    # the doc exactly: face -> eye -> color -> audio, then everything else
+    # (transcription/captions/render) runs on the enhanced video. eye_enhance
+    # is deliberately excluded here — unlike the other three, it has zero test
+    # coverage anywhere in this codebase and needs mediapipe/opencv-python
+    # (not part of the standard install) to do anything beyond a crude global
+    # brightness fallback; revisit once it's actually been exercised once.
+    # Each step is best-effort: if a tool errors unexpectedly, log and keep
+    # going with the pre-that-step video rather than failing the whole edit —
+    # matching the "attempt, don't hard-fail" philosophy already used
+    # throughout this file for optional refinement steps.
+    src = _run_enhancement_chain(src, workdir)
     src_path = Path(src)
 
-    t = _safe_transcribe(src, workdir, config.faster_whisper_model)
+    _hf = _os.environ.pop("HF_TOKEN", None)
+    try:
+        t = Transcriber().execute({
+            "input_path": src,
+            "output_dir": str(workdir),
+            "model_size": config.faster_whisper_model,
+        })
+    finally:
+        if _hf is not None:
+            _os.environ["HF_TOKEN"] = _hf
+
+    if not t.success:
+        raise RuntimeError(f"apply_style 转写失败: {t.error}")
+
+    segments = t.data.get("segments") or []
+    captions = [
+        {"text": seg["text"].strip(), "startMs": round(seg["start"] * 1000), "endMs": round(seg["end"] * 1000)}
+        for seg in segments
+        if seg.get("text", "").strip()
+    ]
 
     duration = _probe_duration(src_path)
 
-    if t is None:
-        # 转写失败（无论是工具报告失败，还是转写库本身抛异常）都不该搞垮整条
-        # apply_style——用户仍然应该拿到一条"有卡片+品牌条+进度条，但没有字幕/
-        # 章节/数据卡"的降级版本，好过什么都没有。
-        logger.warning("  apply_style: 转写不可用（降级为无字幕版本）")
-        captions: list[dict] = []
-        content_plan = {"chapters": [], "dataCards": []}
+    if op.get("chapters") or op.get("data_cards"):
+        chapters = op.get("chapters") or []
+        data_cards = op.get("data_cards") or []
+        gauges = op.get("gauges") or []
+        countdowns = op.get("countdowns") or []
+        calendar_events = op.get("calendar_events") or []
+        mode_schedule = op.get("mode_schedule") or [{"frame": 0, "mode": "dominant"}]
     else:
-        captions = build_caption_phrases(
-            t.data.get("word_timestamps") or [], t.data.get("segments") or []
-        )
-        logger.info("  apply_style: 内容规划中（章节 + 数据卡）...")
-        content_plan = plan_content(t.data.get("segments") or [], duration)
+        logger.info("  apply_style: 内容规划中（章节 + 数据展示分析）...")
+        content_plan = plan_content(segments, duration)
+        chapters = content_plan["chapters"]
+        data_cards = content_plan["data_cards"]
+        gauges = content_plan["gauges"]
+        countdowns = content_plan["countdowns"]
+        calendar_events = content_plan["calendar_events"]
+        mode_schedule = content_plan["mode_schedule"]
         logger.info(
-            f"  apply_style: 规划出 {len(content_plan['chapters'])} 个章节、"
-            f"{len(content_plan['dataCards'])} 个数据卡"
+            f"  apply_style: 规划出 {len(chapters)} 个章节、{len(data_cards)} 个数据卡、"
+            f"{len(gauges)} 个仪表盘、{len(countdowns)} 个倒计时、{len(calendar_events)} 个日历"
         )
 
-    if op.get("style"):
-        op = apply_style_params_to_op(op, op["style"])
-
-    if not op.get("speakerObjectPosition"):
-        op = {**op, "speakerObjectPosition": calibrate_speaker_object_position(src, workdir)}
+    scenes = _mode_schedule_to_scenes(mode_schedule)
 
     remotion_dir = Path(config.openmontage_root) / "remotion-composer"
     job_slug = workdir.name
-    video_src_rel = f"jobs/{job_slug}/source.mp4"
-    video_src_abs = remotion_dir / "public" / "jobs" / job_slug / "source.mp4"
-    video_src_abs.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(src, video_src_abs)
+    public_video_rel = f"jobs/{job_slug}/source.mp4"
+    public_video_abs = remotion_dir / "public" / "jobs" / job_slug / "source.mp4"
+    public_video_abs.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, public_video_abs)
 
-    props = build_xiaojin_render_props(video_src_rel, duration, captions, content_plan, op)
+    props: dict[str, Any] = {
+        "videoSrc": public_video_rel,
+        "durationSeconds": duration,
+        "colorMode": op.get("colorMode", "warm"),
+        "speakerObjectPosition": op.get("speaker_object_position", "50% 35%"),
+        "scenes": scenes,
+        "introOutFrame": 20,
+        "chapters": chapters,
+        "captions": captions,
+    }
+    if data_cards:
+        props["dataCards"] = data_cards
+    if gauges:
+        props["gauges"] = gauges
+    if countdowns:
+        props["countdowns"] = countdowns
+    if calendar_events:
+        props["calendarEvents"] = calendar_events
+    qr_input = op.get("qr_contact") or {}
+    if qr_input.get("contact_url"):
+        from .qr_gen import generate_qr
+        qr_rel = f"jobs/{job_slug}/qr.png"
+        qr_abs = remotion_dir / "public" / qr_rel
+        if generate_qr(qr_input["contact_url"], qr_abs):
+            qr_contact: dict[str, Any] = {
+                "qrSrc": qr_rel,
+                "contactName": qr_input.get("contact_name", ""),
+                "ctaLabel": qr_input.get("cta_label", "WhatsApp Now"),
+                "mountFrame": qr_input.get("mount_frame", max(0, round(duration * 30) - 200)),
+            }
+            if qr_input.get("contact_company"):
+                qr_contact["contactCompany"] = qr_input["contact_company"]
+            props["qrContact"] = qr_contact
+    if op.get("brand"):
+        props["brand"] = op["brand"]
+    elif op.get("compliance"):
+        props["compliance"] = op["compliance"]
+
     props_path = workdir / "_op_apply_style_props.json"
     props_path.write_text(json.dumps(props, ensure_ascii=False), encoding="utf-8")
 
-    # 渲染整片前先抽 QA stills 做机器检查（video-studio CLAUDE-v2 §8 的自动化
-    # 部分）。findings 目前只记录不阻断——空画布这类问题是布局生成的 bug 信号，
-    # 值得暴露在日志里，但半成品总好过整条失败。stills 和 qa_report.json 留在
-    # workdir，后续 P1 的 agent 可拿去做有眼睛的复审。
-    if not op.get("skipQaStills"):
-        from .qa_stills import run_props_qa
-
-        run_props_qa(props, props_path, remotion_dir, workdir / "qa_stills")
-
     out = workdir / "_op_styled.mp4"
+    npx_bin = shutil.which("npx") or "npx"  # Windows: subprocess needs the resolved npx.cmd, plain "npx" raises WinError 2
     cmd = [
-        "npx", "remotion", "render", "XiaojinEditorial", str(out),
+        npx_bin, "remotion", "render", "XiaojinEditorial", str(out),
         f"--props={props_path}",
         "--crf=18",
     ]
@@ -794,8 +641,8 @@ _OP_HANDLERS: dict[str, Callable[[str, dict, Path], Optional[str]]] = {
     "trim_leading_silence": _op_trim_leading_silence,
     "reframe": _op_reframe,
     "apply_style": _op_apply_style,
-    # add_subtitles 在主流程末尾单独处理（需要先转写）；apply_style
-    # 会自带转写+烧字幕，跟 add_subtitles 同时出现时上游 planner 应该只选一个。
+    # add_subtitles 在主流程末尾单独处理（需要先转写）；apply_style 已经自带
+    # 转写+字幕烧录，跟 add_subtitles 同时出现时 planner 应该只选一个。
 }
 
 
