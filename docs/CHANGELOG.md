@@ -15,6 +15,13 @@
 
 ---
 
+## 2026-07-08 — P3 hotfix: stop demo defaultProps leaking into real renders; ioredis error listener
+- **Who**: P3
+- **Branch/commit**: feat/template-and-gateway / d53bfdd
+- **What changed**: Removed the demo `intro`/`compliance` keys from `XiaojinEditorial`'s `defaultProps` in `Root.tsx` (Remotion's `--props` merges per-key rather than replacing wholesale, so a real job that didn't set these was falling back to "示例视频"/"Demo Agent"). Added a `client.on("error", ...)` listener in `createRedis()` (`server/index.js`) so a Redis connection drop logs and lets the existing `retryStrategy` reconnect instead of crashing the gateway process.
+- **Why / impact**: Fix ① would otherwise put demo data on every real render P1 tries during the Step 3 end-to-end acceptance. Fix ② addresses the gateway silently dying that P2 hit twice during testing. No contract change.
+- **Status**: ✅ Both fixes verified — tsc clean; rendered stills confirm compliance/intro chrome only appears when supplied, never as demo fallback; `server/index.js` syntax-checked. Landed as commits on the still-open PR #1 (`feat/template-and-gateway` → `whatsapp-studio`).
+
 ## 2026-07-08 — P3 closes out template-and-gateway: build proven, fixture coverage, rebased
 - **Who**: P3
 - **Branch/commit**: feat/template-and-gateway / 887a31e
