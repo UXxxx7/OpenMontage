@@ -5,10 +5,19 @@ import crypto from "crypto";
 import express from "express";
 import { Queue } from "bullmq";
 import IORedis from "ioredis";
+import axios from "axios";
 
 config({ path: resolve(dirname(fileURLToPath(import.meta.url)), "../.env") });
 
 const REDIS_URL = env("REDIS_URL", "redis://localhost:6379/0");
+// worker.js builds download links as `${PUBLIC_BASE_URL}/files/{jobId}/{filename}`
+// (see fileUrl() there) — PUBLIC_BASE_URL is this gateway's public tunnel URL,
+// not the Python API's. The Python API (port 8000, not itself tunneled) is
+// what actually serves `/files/...`. Proxy it through here so the one tunnel
+// covers both the webhook and file downloads sent back to WhatsApp users —
+// without this, links sent to users 404 ("Cannot GET") since this Express
+// app had no route for the path at all.
+const PYTHON_API_BASE = env("OPENMONTAGE_API_BASE", "http://localhost:8000").replace(/\/$/, "");
 
 function createRedis(name) {
   return new IORedis(REDIS_URL, {
@@ -52,6 +61,20 @@ app.get("/privacy", (_req, res) => {
 <p>Input media, generated previews, and final renders are retained temporarily for job processing and delivery.</p>
 <p>Contact the service owner to request deletion of your submitted media and generated outputs.</p>
 </body></html>`);
+});
+
+app.get("/files/:jobId/:filename", async (req, res) => {
+  const upstream = `${PYTHON_API_BASE}/files/${encodeURIComponent(req.params.jobId)}/${encodeURIComponent(req.params.filename)}`;
+  try {
+    const upstreamRes = await axios.get(upstream, { responseType: "stream", validateStatus: () => true });
+    res.status(upstreamRes.status);
+    if (upstreamRes.headers["content-type"]) res.setHeader("content-type", upstreamRes.headers["content-type"]);
+    if (upstreamRes.headers["content-length"]) res.setHeader("content-length", upstreamRes.headers["content-length"]);
+    upstreamRes.data.pipe(res);
+  } catch (err) {
+    console.error(`[files-proxy] failed to fetch ${upstream}:`, err.message);
+    res.sendStatus(502);
+  }
 });
 
 app.get(["/webhook", "/webhook/whatsapp"], (req, res) => {

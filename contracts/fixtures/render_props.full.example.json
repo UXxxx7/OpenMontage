@@ -1,0 +1,83 @@
+{
+  "videoSrc": "jobs/demo-david/source.mp4",
+  "durationSeconds": 46.2,
+  "colorMode": "warm",
+  "speakerObjectPosition": "50% 35%",
+  "scenes": [
+    { "frame": 0, "x": 60, "y": 104, "w": 960, "h": 1100 },
+    { "frame": 1200, "x": 60, "y": 104, "w": 960, "h": 1100 }
+  ],
+  "introOutFrame": 20,
+  "chapters": [
+    { "atFrame": 0, "label": "提醒", "labelEn": "REMINDER" },
+    { "atFrame": 340, "label": "保障", "labelEn": "COVERAGE" },
+    { "atFrame": 700, "label": "续保", "labelEn": "RENEW" },
+    { "atFrame": 1000, "label": "联系", "labelEn": "CONTACT" }
+  ],
+  "captions": [
+    { "text": "Hi there. It's David from Pacific Life.", "startMs": 120, "endMs": 3180 },
+    { "text": "Quick reminder, your policy is coming up for renewal in 30 days on the 28th of July.", "startMs": 3700, "endMs": 11000 },
+    { "text": "Your current plan covers you for $1.5 million, and your annual premium is $8,400.", "startMs": 11000, "endMs": 18240 },
+    { "text": "I've put the full breakdown in this video so you have everything in one place.", "startMs": 18240, "endMs": 23660 },
+    { "text": "Renewing on time really matters.", "startMs": 24360, "endMs": 26080 },
+    { "text": "If your policy lapses, you'd have to go through underwriting again, which could affect both your coverage and your rate.", "startMs": 26520, "endMs": 34980 },
+    { "text": "If you have any questions, just WhatsApp me directly or scan the QR code below.", "startMs": 35640, "endMs": 41380 },
+    { "text": "I'll get back to you right away. Looking forward to keeping you and your family protected.", "startMs": 41680, "endMs": 45420 },
+    { "text": "Take care.", "startMs": 45620, "endMs": 46110 }
+  ],
+  "dataCards": [
+    {
+      "title": "Your policy",
+      "mountFrame": 280,
+      "endFrame": 480,
+      "x": 80, "y": 900, "width": 920,
+      "rows": [
+        { "label": "COVERAGE", "value": 1500000, "prefix": "$", "divideBy": 1000000, "decimals": 1, "unit": "M", "tone": "good", "mountOffset": 0 },
+        { "label": "ANNUAL PREMIUM", "value": 8400, "prefix": "$", "divideBy": 1000, "decimals": 1, "unit": "K", "tone": "normal", "mountOffset": 40 }
+      ]
+    }
+  ],
+  "gauges": [
+    {
+      "title": "如逾期未续保 / IF RENEWAL LAPSES",
+      "leftLabel": "低风险 LOW",
+      "rightLabel": "高风险 HIGH",
+      "value": 0.8,
+      "mountFrame": 500,
+      "endFrame": 700
+    }
+  ],
+  "countdowns": [
+    {
+      "value": 30,
+      "unitLabel": "天 DAYS",
+      "label": "距离续保 / UNTIL RENEWAL",
+      "headline": "30",
+      "headlineAccent": "即将到期 / DUE SOON",
+      "maxValue": 30,
+      "mountFrame": 720,
+      "endFrame": 920
+    }
+  ],
+  "calendarEvents": [
+    {
+      "year": 2026,
+      "month": 7,
+      "targetDay": 28,
+      "eventLabel": "续保到期日 / RENEWAL DUE",
+      "mountFrame": 940,
+      "endFrame": 1140
+    }
+  ],
+  "qrContact": {
+    "qrSrc": "jobs/demo-david/qr-test.png",
+    "contactName": "David",
+    "contactCompany": "Pacific Life 太平洋人壽",
+    "ctaLabel": "WhatsApp Now",
+    "mountFrame": 1160
+  },
+  "intro": { "eyebrow": "POLICY RENEWAL REMINDER", "title": "保單續期提醒", "subtitle": "Pacific Life 太平洋人壽" },
+  "compliance": { "agentNameZh": "大卫", "agentNameEn": "David", "titleZh": "保险顾问", "licenseNo": "LIC-000000", "insurer": "Pacific Life" },
+  "headingFont": "Inter",
+  "labelFont": "Inter"
+}
