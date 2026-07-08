@@ -94,9 +94,3 @@ remotion-composer/public/demo-props/caption-burn-*
 
 venv/
 .venv/
-
-# WhatsApp MVP runtime artifacts
-storage/
-*.db
-.tmp/
-.pnpm-store/

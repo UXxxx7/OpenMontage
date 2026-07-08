@@ -48,7 +48,7 @@ export interface CollageClip {
   seed?: number;
 }
 
-export interface CollageBurstProps extends Record<string, unknown> {
+export interface CollageBurstProps {
   backgroundSrc: string;
   backgroundInSeconds?: number;
   curtainStartSeconds: number;

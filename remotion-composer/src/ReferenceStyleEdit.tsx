@@ -33,7 +33,7 @@ type LayoutCue = {
   mode: "full" | "left" | "right";
 };
 
-export interface ReferenceStyleEditProps extends Record<string, unknown> {
+export interface ReferenceStyleEditProps {
   videoSrc: string;
   videoFit?: "cover" | "contain";
   durationSeconds?: number;
