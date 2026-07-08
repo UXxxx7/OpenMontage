@@ -12,7 +12,7 @@
  * month/year a real job's content-plan gives it, not just the one video both
  * references were built for.
  */
-import { useCurrentFrame, useVideoConfig, spring } from "remotion";
+import { useCurrentFrame, useVideoConfig, spring, interpolate } from "remotion";
 import { ColorMode, PALETTES } from "./theme";
 
 export interface CalendarProps {
@@ -26,6 +26,8 @@ export interface CalendarProps {
   /** e.g. "Renewal Deadline" — the component appends "— <Month> <targetDay>". */
   eventLabel: string;
   mountFrame: number;
+  /** Frame this card starts fading out (15-frame fade). Omit to stay on screen for the rest of the video. */
+  endFrame?: number;
   x?: number;
   y?: number;
   colorMode: ColorMode;
@@ -62,6 +64,7 @@ export const Calendar: React.FC<CalendarProps> = ({
   todayDay,
   eventLabel,
   mountFrame,
+  endFrame,
   x = 80,
   y = 900,
   colorMode,
@@ -72,6 +75,11 @@ export const Calendar: React.FC<CalendarProps> = ({
   const { fps } = useVideoConfig();
   const local = frame - mountFrame;
   if (local < 0) return null;
+  if (endFrame !== undefined && frame >= endFrame) return null;
+  const exitFade =
+    endFrame !== undefined
+      ? interpolate(frame, [endFrame - 15, endFrame], [1, 0], { extrapolateLeft: "clamp", extrapolateRight: "clamp" })
+      : 1;
 
   const palette = PALETTES[colorMode];
   const cardEntry = spring({ frame: local, fps, config: { damping: 14, stiffness: 200 } });
@@ -85,7 +93,7 @@ export const Calendar: React.FC<CalendarProps> = ({
         position: "absolute",
         left: x,
         top: y,
-        opacity: cardEntry,
+        opacity: cardEntry * exitFade,
         transform: `translateX(${(1 - cardEntry) * -40}px)`,
         background: palette.card,
         borderRadius: 24,

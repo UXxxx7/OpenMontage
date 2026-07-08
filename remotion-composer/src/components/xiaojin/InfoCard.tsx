@@ -61,6 +61,16 @@ export interface InfoCardProps {
   width?: number;
   /** Frame this card starts entering. Caller should set this to keyword_frame - 50. */
   mountFrame: number;
+  /**
+   * Frame this card starts fading out (15-frame fade, fully gone by
+   * endFrame). Omit to keep the card on screen for the rest of the video —
+   * but note that omitting this on a build with more than one dataCard
+   * means every card mounted so far stays visible forever, stacking on top
+   * of each other (confirmed real bug: a "From Idea to Upload" card was
+   * still fully rendered, unfaded, underneath a later "Video Budget" card
+   * because neither InfoCard had any exit logic at all).
+   */
+  endFrame?: number;
   colorMode: ColorMode;
   headingFont?: string;
   labelFont?: string;
@@ -77,6 +87,7 @@ export const InfoCard: React.FC<InfoCardProps> = ({
   y = 900,
   width = 920,
   mountFrame,
+  endFrame,
   colorMode,
   headingFont = "inherit",
   labelFont = "inherit",
@@ -85,6 +96,11 @@ export const InfoCard: React.FC<InfoCardProps> = ({
   const { fps } = useVideoConfig();
   const local = frame - mountFrame;
   if (local < 0) return null;
+  if (endFrame !== undefined && frame >= endFrame) return null;
+  const exitFade =
+    endFrame !== undefined
+      ? interpolate(frame, [endFrame - 15, endFrame], [1, 0], { extrapolateLeft: "clamp", extrapolateRight: "clamp" })
+      : 1;
 
   const palette = PALETTES[colorMode];
   // The card's own panel is always a fixed dark color (rgba(13,17,23,0.86)),
@@ -108,7 +124,7 @@ export const InfoCard: React.FC<InfoCardProps> = ({
         borderRadius: 16,
         padding: "20px 24px",
         boxShadow: "0 8px 32px rgba(0,0,0,0.32)",
-        opacity: cardEntry,
+        opacity: cardEntry * exitFade,
         transform: `translateY(${(1 - cardEntry) * 16}px)`,
       }}
     >

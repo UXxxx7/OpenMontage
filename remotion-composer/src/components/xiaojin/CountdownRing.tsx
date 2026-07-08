@@ -29,6 +29,8 @@ export interface CountdownRingProps {
   maxValue?: number;
   mountFrame: number;
   revealFrames?: number;
+  /** Frame this card starts fading out (15-frame fade). Omit to stay on screen for the rest of the video. */
+  endFrame?: number;
   x?: number;
   y?: number;
   colorMode: ColorMode;
@@ -45,6 +47,7 @@ export const CountdownRing: React.FC<CountdownRingProps> = ({
   maxValue,
   mountFrame,
   revealFrames = 40,
+  endFrame,
   x = 80,
   y = 900,
   colorMode,
@@ -55,6 +58,11 @@ export const CountdownRing: React.FC<CountdownRingProps> = ({
   const { fps } = useVideoConfig();
   const local = frame - mountFrame;
   if (local < 0) return null;
+  if (endFrame !== undefined && frame >= endFrame) return null;
+  const exitFade =
+    endFrame !== undefined
+      ? interpolate(frame, [endFrame - 15, endFrame], [1, 0], { extrapolateLeft: "clamp", extrapolateRight: "clamp" })
+      : 1;
 
   const palette = PALETTES[colorMode];
   const cardEntry = spring({ frame: local, fps, config: { damping: 14, stiffness: 220 } });
@@ -75,7 +83,7 @@ export const CountdownRing: React.FC<CountdownRingProps> = ({
         position: "absolute",
         left: x,
         top: y,
-        opacity: cardEntry,
+        opacity: cardEntry * exitFade,
         transform: `translateX(${(1 - cardEntry) * -40}px)`,
         background: "rgba(13,17,23,0.86)",
         borderRadius: 24,
