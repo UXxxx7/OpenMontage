@@ -1,0 +1,13 @@
+{
+  "source": { "kind": "video", "ref": "reference/xhs-sample.mp4" },
+  "aspect": "portrait",
+  "colorMode": "warm",
+  "palette": { "primary": ["#C4714A", "#E0552F"], "background": "#F2EBE0", "backgroundDeep": "#E7DCC9", "card": "#FFFFFF", "text": "#2A2620", "muted": "#7A7060" },
+  "captions": { "position": "bottom", "bottomRatio": 0.05, "karaoke": true, "highlightColor": "#C4714A" },
+  "typography": { "headingFont": "Inter", "labelFont": "Inter", "weightHeading": 700, "weightBody": 500 },
+  "speakerCard": { "floating": true, "borderRadius": 28, "borderWidthPx": 5, "occupiesRatio": 0.55 },
+  "chrome": { "chapterNav": true, "complianceBar": true, "brandBar": false, "progressBar": true },
+  "pacing": { "transition": "hard-cut", "cardRepositionSeconds": 0.6, "energy": "calm" },
+  "music": { "mood": "minimal", "volume": 0.05 },
+  "confidence": { "colorMode": 0.9, "aspect": 0.95, "captions": 0.8 }
+}
