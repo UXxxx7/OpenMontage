@@ -15,6 +15,13 @@
 
 ---
 
+## 2026-07-08 — P3 closes out template-and-gateway: build proven, fixture coverage, rebased
+- **Who**: P3
+- **Branch/commit**: feat/template-and-gateway / 887a31e
+- **What changed**: XiaojinEditorial template + 15 components, contract-② (gauges/countdowns/calendarEvents/qrContact), gateway `/files/:jobId/:filename` proxy, styles. This round: fixed `tsc --noEmit` (21 errors — every composition's Props interface was missing the index signature Remotion's `Composition<Props extends Record<string, unknown>>` requires; added `extends Record<string, unknown>` to all 9, plus two unrelated pre-existing bugs in ProviderChip/Explainer); confirmed `npx remotion render XiaojinEditorial` produces a valid mp4; added `contracts/fixtures/render_props.full.example.json` exercising gauges/countdowns/calendarEvents/qrContact (previously untested — rendered + spot-checked stills, all four appear correctly); verified contract-② is already in sync with P2's `_op_apply_style`/`content_planner.py` (field names and required sub-keys match exactly); confirmed no duplicate `XiaojinEditorial.tsx` or `/files` proxy exists on P2's side; rebased onto latest `whatsapp-studio` (kept `whatsapp-mvp-progress.md` deleted).
+- **Why / impact**: Unblocks `apply_style` end-to-end — P2's planner output can now actually render through to a playable video via a build-verified template. No contract change (schema was already correct; the gap was verification, not shape).
+- **Status**: ✅ Tasks 1–5 of `P3-instructions.md` complete (tsc clean, render proven, fixture coverage, contract sync confirmed, dedup confirmed, rebased). Ready for P1/P2 to re-verify end-to-end with a real WhatsApp job.
+
 ## 2026-07-07 — Canonical docs established: STATUS + this CHANGELOG
 - **Who**: P1
 - **Branch/commit**: whatsapp-studio
@@ -73,7 +80,7 @@
 
 ## Backlog (move up + fill in when done)
 - [ ] P1: `apply_style` graceful degradation (don't crash on render failure)
-- [ ] P3: create `feat/template-and-gateway`, build-verify XiaojinEditorial, consume contract-② props ⏸ **critical path**
+- [x] P3: create `feat/template-and-gateway`, build-verify XiaojinEditorial, consume contract-② props (2026-07-08)
 - [ ] P1: wire `resolve_reframe_op` into L2; consume reference style_params
 - [ ] P1+P3: multi-media job model + reference upload / role assignment
 - [ ] P1/P2: wire compose-stage OM tools (color_grade / audio_enhance first)

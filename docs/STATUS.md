@@ -1,6 +1,6 @@
 # WhatsApp × OpenMontage — Project Status (single source of truth)
 
-> Last updated: 2026-07-07 | Trunk: `whatsapp-studio`
+> Last updated: 2026-07-08 (P3 template build-verified) | Trunk: `whatsapp-studio`
 > This file is the one authoritative status. The old `whatsapp-mvp-progress.md` (early codex leftover) and per-round snapshots are **retired** — this file wins.
 > Companion docs: `docs/L1.5-vs-L2.md` (planner lane), `contracts/` (the 3 contracts), `whatsapp_mvp/CLAUDE.md` (working conventions).
 
@@ -8,7 +8,7 @@
 
 ## 0. Current state in one line
 
-**We can plan and execute "cleanup" edits (trim leading silence / filler / pauses / content-based selection / subtitles / vertical) end-to-end and deliver a finished cut. "Render a branded template (apply_style)" can be planned, but the real render is blocked on P3's template not being ready.**
+**We can plan and execute "cleanup" edits (trim leading silence / filler / pauses / content-based selection / subtitles / vertical) end-to-end and deliver a finished cut. "Render a branded template (apply_style)" is now build-verified — `tsc --noEmit` clean, `npx remotion render XiaojinEditorial` produces a real mp4, and all contract-② fields (gauges/countdowns/calendarEvents/qrContact) have fixture coverage — but has not yet been exercised through a live WhatsApp job end-to-end.**
 
 ---
 
@@ -27,7 +27,7 @@
 |---|---|---|
 | `whatsapp-studio` | **trunk** | L2 planning + merged pipeline_runner + contracts + docs; L2 wiring (agent_editor/worker) just committed |
 | `feat/pipeline-capabilities` (P2) | active | Reverted L1.5, merged upstream, worker→L2, ported /files proxy, 4 test suites pass; **re-merge once** after P1's L2 wiring lands |
-| `feat/template-and-gateway` (P3) | **not created** ⚠️ | **critical-path blocker** — see §5 |
+| `feat/template-and-gateway` (P3) | active, build-verified ✅ | tsc clean, real render confirmed, fixture coverage added, rebased onto trunk — see CHANGELOG 2026-07-08 |
 | `feat/integrate-p2` (P1 integration) | temporary | merge working branch |
 | `video-studio-style-integration` / `...-postxhs-...` | retired | needed parts cherry-picked, no longer maintained |
 
@@ -51,6 +51,11 @@
 - Node gateway + confirm/render/revise; **/files proxy** (ported by P2).
 - Fixes: `trim_leading_silence` (the always-no-op bug), `remove_silences` adjustable threshold, confirm 30s-timeout backgrounded, Phase B in-conversation revision.
 
+**Template (P3)**
+- `XiaojinEditorial.tsx` + 15 components, registered in `Root.tsx`; `tsc --noEmit` clean; real render confirmed (`npx remotion render XiaojinEditorial`).
+- Fixture coverage for all contract-② fields, including previously-untested `gauges`/`countdowns`/`calendarEvents`/`qrContact` (`contracts/fixtures/render_props.full.example.json`).
+- Contract-② confirmed in sync with P2's `_op_apply_style`/`content_planner.py` — field names and required sub-keys match exactly.
+
 ---
 
 ## 4. In progress / TODO
@@ -70,16 +75,16 @@
 
 ## 5. Blockers
 
-1. **P3 critical path**: `feat/template-and-gateway` not created → XiaojinEditorial not build-verified, `apply_style` real render fails. **This is the single highest-leverage item for moving the project forward.** P3 needs to: create the branch → install remotion-composer deps → tsc + real-render a fixture → consume contract-② props (durationSeconds/dataCards/beat scenes).
-2. **face calibration**: opencv/mediapipe won't install over the local network; calibration is written but untested on real footage.
+1. **face calibration**: opencv/mediapipe won't install over the local network; calibration is written but untested on real footage.
+2. **apply_style live e2e**: template is build-verified in isolation (Task 1-5 above), but hasn't been run through an actual WhatsApp job yet — first live run may still surface integration issues (path resolution, job slug plumbing, etc.).
 
 ---
 
 ## 6. What you can test now
 
 - ✅ **Cleanup edits** (testable end-to-end, and you can feel the improvement): "trim the silent opening" (trim fix), "cut the uh/um / filler / retakes" (`remove_filler`, new), "remove pauses for flow", "keep only the part where I talk about X" (T1), go vertical, add subtitles.
-- ❌ **Template render (apply_style)**: blocked on P3.
-- ⚠️ **Gotcha**: a zero-instruction "just edit it for me" and words like "make it nice / xiaohongshu / branded" trigger apply_style → real render fails → job errors. For testing, give a concrete edit instruction, or land apply_style graceful degradation first.
+- ✅ **Template render (apply_style)**: build-verified in isolation — not yet run through a live WhatsApp job (see §5 blocker 2).
+- ⚠️ **Gotcha**: a zero-instruction "just edit it for me" and words like "make it nice / xiaohongshu / branded" trigger apply_style. Now that the template renders, this path is worth a real end-to-end test rather than assuming failure — but land apply_style graceful degradation first in case the first live run hits something the isolated fixtures didn't cover.
 - Before testing, restart the Python worker + Node worker; needs a DeepSeek key + faster-whisper.
 
 ---
