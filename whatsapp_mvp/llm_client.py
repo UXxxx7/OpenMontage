@@ -104,6 +104,17 @@ def call_llm_chat(system_prompt: str, user_message: str, *, temperature: float =
                 continue
             resp.raise_for_status()
             return resp.json()["choices"][0]["message"]["content"]
+        except requests.exceptions.RequestException as e:
+            # 连接层故障（Response ended prematurely / 超时 / 断连）是暂时的，
+            # 重试一次往往就过——直接放弃会让整条内容规划降级为空。
+            if attempt < 2:
+                import time as _time
+
+                logger.warning(f"LLM 连接层错误，5s 后重试（第 {attempt + 1} 次）: {e}")
+                _time.sleep(5)
+                continue
+            logger.error(f"LLM call failed ({provider}): {e}")
+            return None
         except Exception as e:
             logger.error(f"LLM call failed ({provider}): {e}")
             return None

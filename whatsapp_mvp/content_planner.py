@@ -39,7 +39,9 @@ SYSTEM_PROMPT = """You analyze a talking-head video's transcript and produce a c
 
 **This video could be about absolutely anything** — cooking, fitness, finance, a product review, a story, a tutorial, a rant. Do not default to any one domain or topic. Every chapter label, and whether there are any data points at all, must come ONLY from what THIS specific transcript actually says — never reuse a pattern, label, or topic from any other video you've seen. A video with no notable moments should get an empty data_points array; that is a completely normal, common outcome, not a failure.
 
-1. Chapters: split the video into 2-5 chapters based on the ACTUAL topic shifts in THIS transcript. Each chapter needs a short 1-2 word UPPERCASE label that names what THAT PART of THIS video is actually about (e.g. a cooking video might get "INGREDIENTS"/"TECHNIQUE"/"PLATING", a workout video might get "WARMUP"/"SETS"/"COOLDOWN", a story might get "SETUP"/"TWIST"/"ENDING" — these are just illustrations of the LABEL STYLE, not topics to look for) and the second it starts.
+1. Chapters: split the video into 2-5 chapters based on the ACTUAL topic shifts in THIS transcript. Each chapter needs a short label in the video's PRIMARY SPOKEN LANGUAGE (2-4 characters if Chinese, 1-2 UPPERCASE words if English) in "label", plus a 1-2 word UPPERCASE English label in "label_en" (e.g. a Chinese cooking video: {"label":"食材","label_en":"INGREDIENTS"}; an English workout video: {"label":"WARMUP","label_en":"WARMUP"}). These are just illustrations of the LABEL STYLE, not topics to look for. Also give the second each chapter starts.
+1b. Intro title card: from the transcript, write an opening title card — "eyebrow": a 2-5 word UPPERCASE English tagline of what this video IS (e.g. "POLICY RENEWAL REMINDER", "WORKOUT PLAN", "PRODUCT REVIEW"); "title": the video's one-line headline in its primary spoken language (<=10 Chinese chars or <=6 English words); "subtitle": who/what it's from if the speaker names themselves/company, else a short secondary line. Ground every word in what the transcript actually says.
+1c. Outro CTA: a closing call-to-action card matching what the SPEAKER actually asks or the video's natural close — "kicker": short UPPERCASE English, "headline": short line in primary language, "headline_accent": optional second line, "subtext": one supporting sentence, "cta_label": short imperative pill text (e.g. "留言告訴我！" / "Follow for more"). Do NOT invent contact info or promises the speaker never made.
 2. Data Display Analysis: scan the transcript for hard data points worth a visual callout, of ANY kind this video actually mentions — money, reps, distances, times, scores, percentages, quantities, counts, dates, countdowns, risks. Only flag a moment if it's genuinely the point of that sentence (a dramatic reveal, a before/after comparison, a key stat, a warning) — most videos have zero to two such moments, not one per sentence. A number mentioned in passing that isn't the point of the sentence is NOT a data point.
 3. For each flagged moment, classify it into exactly the visual that fits it — do not default everything to count-up:
    - A countdown / time-remaining figure ("30 days left", "2 weeks to go", "one month until...") -> "countdown"
@@ -55,7 +57,9 @@ SYSTEM_PROMPT = """You analyze a talking-head video's transcript and produce a c
 
 Output ONLY valid JSON matching this shape, no markdown, no prose:
 {
-  "chapters": [{"at_seconds": 0, "label": "..."}],
+  "chapters": [{"at_seconds": 0, "label": "...", "label_en": "..."}],
+  "intro": {"eyebrow": "...", "title": "...", "subtitle": "..."},
+  "outro": {"kicker": "...", "headline": "...", "headline_accent": "...", "subtext": "...", "cta_label": "..."},
   "data_points": [ /* each item is exactly one of the 4 shapes above, tagged by "visual" */ ]
 }"""
 
@@ -88,6 +92,7 @@ def plan_content(segments: list[dict], duration: float) -> dict[str, Any]:
     empty = {
         "chapters": [], "data_cards": [], "gauges": [], "countdowns": [], "calendar_events": [],
         "mode_schedule": [{"frame": 0, "mode": "dominant"}],
+        "intro": None, "outro": None,
     }
 
     transcript_text = _build_transcript_text(segments)
@@ -115,7 +120,10 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
     chapters = []
     for c in raw.get("chapters") or []:
         try:
-            chapters.append({"atFrame": max(0, round(float(c["at_seconds"]) * FPS)), "label": str(c["label"])[:20]})
+            entry = {"atFrame": max(0, round(float(c["at_seconds"]) * FPS)), "label": str(c["label"])[:20]}
+            if c.get("label_en"):
+                entry["labelEn"] = str(c["label_en"])[:24]
+            chapters.append(entry)
         except (KeyError, TypeError, ValueError):
             continue
     chapters.sort(key=lambda c: c["atFrame"])
@@ -173,9 +181,27 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
             continue
         dedup.append(entry)
 
+    intro = None
+    ri = raw.get("intro")
+    if isinstance(ri, dict) and ri.get("title"):
+        intro = {"eyebrow": str(ri.get("eyebrow", ""))[:40].upper(),
+                 "title": str(ri["title"])[:36],
+                 "subtitle": str(ri.get("subtitle", ""))[:40]}
+    outro = None
+    ro = raw.get("outro")
+    if isinstance(ro, dict) and ro.get("headline"):
+        outro = {"kicker": str(ro.get("kicker", ""))[:30].upper(),
+                 "headline": str(ro["headline"])[:30],
+                 "subtext": str(ro.get("subtext", ""))[:80],
+                 "ctaLabel": str(ro.get("cta_label", ""))[:24],
+                 "footerLabel": str(ro.get("footer_label", ""))[:40]}
+        if ro.get("headline_accent"):
+            outro["headlineAccent"] = str(ro["headline_accent"])[:30]
+
     return {
         "chapters": chapters, "data_cards": data_cards, "gauges": gauges,
         "countdowns": countdowns, "calendar_events": calendar_events, "mode_schedule": dedup,
+        "intro": intro, "outro": outro,
     }
 
 

@@ -648,6 +648,8 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         countdowns = op.get("countdowns") or []
         calendar_events = op.get("calendar_events") or []
         mode_schedule = op.get("mode_schedule") or [{"frame": 0, "mode": "dominant"}]
+        plan_intro = None
+        plan_outro = None
     else:
         logger.info("  apply_style: 内容规划中（章节 + 数据展示分析）...")
         content_plan = plan_content(segments, duration)
@@ -657,6 +659,8 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         countdowns = content_plan["countdowns"]
         calendar_events = content_plan["calendar_events"]
         mode_schedule = content_plan["mode_schedule"]
+        plan_intro = content_plan.get("intro")
+        plan_outro = content_plan.get("outro")
         logger.info(
             f"  apply_style: 规划出 {len(chapters)} 个章节、{len(data_cards)} 个数据卡、"
             f"{len(gauges)} 个仪表盘、{len(countdowns)} 个倒计时、{len(calendar_events)} 个日历"
@@ -682,6 +686,39 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         "chapters": chapters,
         "captions": captions,
     }
+    # 开场标题卡/片尾 CTA：模板一直支持（IntroTitle/OutroSection），此前管线从不
+    # 生成——这是与 video-studio 手工参考成片(VeLL)最大的一块可自动化差距。
+    # op 显式传入优先；否则用 content_planner 从转写里写的文案。
+    intro = op.get("intro") or plan_intro
+    if intro:
+        props["intro"] = intro
+        # codex：intro 约占开场 ~3s，期间隐藏 chrome/字幕
+        intro_out = int(op.get("introOutFrame", 80))
+        props["introOutFrame"] = intro_out
+        # intro 期间卡片必须保持 Dominant(近全屏)——标题是压在大卡上的
+        # (VeLL 参考)。把 introOutFrame 之前开始的 workflow 段推迟到 intro
+        # 结束后 20 帧，避免标题叠在停靠小卡+背景上。
+        clamped = []
+        for m in mode_schedule:
+            m = dict(m)
+            if m.get("mode") == "workflow" and m["frame"] < intro_out + 20:
+                m["frame"] = intro_out + 20
+            clamped.append(m)
+        # 保持严格递增（推迟后可能与后续项撞帧）
+        mode_schedule = []
+        for m in sorted(clamped, key=lambda x: x["frame"]):
+            if mode_schedule and m["frame"] <= mode_schedule[-1]["frame"]:
+                continue
+            mode_schedule.append(m)
+        props["scenes"] = _mode_schedule_to_scenes(mode_schedule)
+    outro = op.get("outro") or plan_outro
+    if outro:
+        duration_frames = max(1, round(duration * 30))
+        # 片尾最后 ~5s 交给 outro（不足 12s 的视频不上 outro，避免喧宾夺主）
+        if duration_frames >= 360:
+            outro = dict(outro)
+            outro.setdefault("fromFrame", duration_frames - 150)
+            props["outro"] = outro
     if data_cards:
         props["dataCards"] = data_cards
     if gauges:
