@@ -40,6 +40,13 @@ def run_talking_head_pipeline(job: Job) -> dict[str, Any]:
 
     src = str(input_video)
     applied: list[str] = []
+    degraded: list[str] = []  # 非致命失败：跳过后仍交付上一步结果的操作
+
+    # 优雅降级：这些操作失败时不许拖垮整个 job——保留上一步剪好的视频继续交付。
+    # apply_style 是重量级 Remotion 渲染（失败面多：模板/字体/依赖/props）；零指令默认
+    # 是 [remove_filler, apply_style]，渲染挂了也必须把剪好的视频还给用户，而不是整单报错。
+    # 后续 compose 段算子（color_grade / audio_enhance 等）落地时按需加进来。
+    _DEGRADABLE_OPS = {"apply_style"}
 
     # 执行顺序：多个 remove_segment 按 start 降序“从后往前”切（转录给的是原始时间轴
     # 坐标；从后往前切，前面的刀就不会移动后面那刀之前的坐标）。其余视频操作保持原序，
@@ -65,7 +72,16 @@ def run_talking_head_pipeline(job: Job) -> dict[str, Any]:
             continue
         logger.info(f"  执行操作: {op_type}")
         before = _probe_duration(Path(src))
-        new_src = handler(src, op, job_dir)
+        try:
+            new_src = handler(src, op, job_dir)
+        except Exception as e:
+            if op_type in _DEGRADABLE_OPS:
+                logger.warning(
+                    f"    {op_type}: 执行失败，优雅降级——保留上一步结果继续交付。原因: {e}"
+                )
+                degraded.append(op_type)
+                continue
+            raise
         if new_src and Path(new_src).exists() and str(Path(new_src).resolve()) != str(Path(src).resolve()):
             after = _probe_duration(Path(new_src))
             logger.info(f"    {op_type}: 时长 {before:.1f}s → {after:.1f}s"
@@ -87,11 +103,14 @@ def run_talking_head_pipeline(job: Job) -> dict[str, Any]:
         shutil.copyfile(src, preview_path)
 
     duration = _probe_duration(preview_path)
+    if degraded:
+        logger.warning(f"=== 降级交付: {job.id} 跳过失败的 {degraded}，交付上一步结果 ===")
     logger.info(f"=== 管线完成: {job.id} → {preview_path} ({duration:.1f}s), 应用: {applied} ===")
     return {
         "preview_path": str(preview_path),
         "duration": duration,
         "applied_operations": applied,
+        "degraded_operations": degraded,
     }
 
 
@@ -483,6 +502,27 @@ def _op_reframe(src: str, op: dict, workdir: Path) -> Optional[str]:
     return r.data.get("output") or (r.artifacts[0] if r.artifacts else None)
 
 
+def _op_color_grade(src: str, op: dict, workdir: Path) -> Optional[str]:
+    """整片调色 -> OpenMontage ColorGrade（ffmpeg profile/LUT，薄封装）。
+    收尾类整片变换（像 reframe，不改时长），排在剪辑类操作之后。"""
+    from tools.enhancement.color_grade import ColorGrade
+    profile = str(op.get("profile") or "cinematic_warm").lower()
+    valid = {"cinematic_warm", "cinematic_cool", "moody_dark",
+             "bright_clean", "vintage_film", "high_contrast", "neutral"}
+    if profile not in valid:
+        profile = "cinematic_warm"
+    # 默认略低于 1.0：ColorGrade 自己的 review-focus 提醒防止肤色过饱和
+    intensity = op.get("intensity", 0.85)
+    out = workdir / "_op_color_grade.mp4"
+    r = ColorGrade().execute({
+        "input_path": src, "output_path": str(out),
+        "profile": profile, "intensity": intensity,
+    })
+    if not r.success:
+        raise RuntimeError(f"color_grade 失败: {r.error}")
+    return r.data.get("output") or (r.artifacts[0] if r.artifacts else None)
+
+
 def _op_add_subtitles(src: str, op: dict, workdir: Path) -> Optional[str]:
     """转写 -> 烧录字幕（原语言）。翻译成其他语言暂不支持（见 planner 的 unsupported）。
 
@@ -728,6 +768,7 @@ _OP_HANDLERS: dict[str, Callable[[str, dict, Path], Optional[str]]] = {
     "speed_up_silence": _op_speed_up_silence,
     "trim_leading_silence": _op_trim_leading_silence,
     "reframe": _op_reframe,
+    "color_grade": _op_color_grade,
     "apply_style": _op_apply_style,
     # add_subtitles 在主流程末尾单独处理（需要先转写）；apply_style 已经自带
     # 转写+字幕烧录，跟 add_subtitles 同时出现时 planner 应该只选一个。
