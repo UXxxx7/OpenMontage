@@ -148,6 +148,19 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
             logger.warning(f"content_planner: 跳过一个解析失败的数据点 (visual={visual}): {e}")
             continue
 
+    # 同位置图形的接力钳制（contract② endFrame，merge runbook 的 P2 任务）：
+    # 四种图形默认都落在同一个坑位（x=80,y=900），各自的 endFrame 只算了自己
+    # 的停留窗口——两个数据点挨得近时，前者的窗口会伸进后者的展示期，同位置
+    # 永久叠上（P3 修的 "cards never disappear" bug 的另一半）。按 mountFrame
+    # 排序后，把前者的 endFrame 钳到后者的 mountFrame（组件会做 15 帧淡出）。
+    slotted = sorted(
+        (g for g in (data_cards + gauges + countdowns + calendar_events)),
+        key=lambda g: g["mountFrame"],
+    )
+    for cur, nxt in zip(slotted, slotted[1:]):
+        if (cur.get("x", 80), cur.get("y", 900)) == (nxt.get("x", 80), nxt.get("y", 900)):
+            cur["endFrame"] = min(cur.get("endFrame", nxt["mountFrame"]), nxt["mountFrame"])
+
     mode_schedule = [{"frame": 0, "mode": "dominant"}]
     for start, end in sorted(workflow_ranges):
         mode_schedule.append({"frame": max(1, start - 10), "mode": "workflow"})

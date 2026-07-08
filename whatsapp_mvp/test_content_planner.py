@@ -49,6 +49,28 @@ def main():
           len(plan["gauges"]) == 1 and len(plan["countdowns"]) == 1 and len(plan["calendar_events"]) == 1,
           {k: len(plan[k]) for k in ("gauges", "countdowns", "calendar_events")})
 
+    # 5b. endFrame 接力钳制（merge runbook P2 任务）：同坑位的两个图形，
+    # 前者的 endFrame 必须被钳到后者的 mountFrame，否则永久重叠。
+    plan = _to_frame_plan({"chapters": [], "data_points": [
+        {"visual": "count_up", "title": "A",
+         "rows": [{"label": "X", "seconds": 5.0, "value": 1}]},
+        {"visual": "count_up", "title": "B",
+         "rows": [{"label": "Y", "seconds": 7.0, "value": 2}]},
+    ]}, duration=60.0)
+    a, b = sorted(plan["data_cards"], key=lambda c: c["mountFrame"])
+    check("被接替的卡 endFrame == 后一张的 mountFrame", a["endFrame"] == b["mountFrame"],
+          {"a_end": a["endFrame"], "b_mount": b["mountFrame"]})
+    check("最后一张卡保留自己的停留窗口 endFrame", b.get("endFrame", 0) > b["mountFrame"], b.get("endFrame"))
+
+    # 5c. 跨类型同坑位也钳制（count_up 后接 gauge）
+    plan = _to_frame_plan({"chapters": [], "data_points": [
+        {"visual": "count_up", "title": "A", "rows": [{"label": "X", "seconds": 5.0, "value": 1}]},
+        {"visual": "gauge", "seconds": 7.0, "title": "R", "leftLabel": "L", "rightLabel": "R", "value": 0.5},
+    ]}, duration=60.0)
+    card = plan["data_cards"][0]; gauge = plan["gauges"][0]
+    check("跨类型接力: 卡的 endFrame == 仪表盘 mountFrame", card["endFrame"] == gauge["mountFrame"],
+          {"card_end": card["endFrame"], "gauge_mount": gauge["mountFrame"]})
+
     # 5. 畸形条目容错：非 dict / 缺字段不炸、不产出
     plan = _to_frame_plan({"chapters": [{"label": "no at_seconds"}],
                            "data_points": ["not a dict", {"visual": "gauge"}]}, duration=30.0)
