@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from .config import get_config
 from .database import JobStatus, MessageDirection, MessageType
@@ -45,9 +45,7 @@ def process_incoming_message(job_id: str) -> None:
             job = get_job(job_id)  # 重新加载，获取最新状态
 
         # ── 步骤2: LLM 规划 ──
-        # 零指令（视频不带文字）同样进 L2 规划：SYSTEM_BASE 里已定义默认方案
-        # （remove_filler → apply_style 出模板成片），不再让无文字任务卡死在这一步。
-        if not job.planned_edit:
+        if job.edit_request and not job.planned_edit:
             _run_llm_planner(job)
             job = get_job(job_id)  # 重新加载，获取最新状态
 
@@ -211,6 +209,59 @@ def _download_media(job: Any, wa: WhatsAppClient) -> None:
 # Phase 4: LLM 意图规划
 # ---------------------------------------------------------------------------
 
+def _source_review_stage(job: Any, input_path: Path) -> Optional[dict]:
+    """source_media_review(OpenMontage 标准件):审查用户上传素材,产出并保存 artifact。
+
+    AGENT_GUIDE 契约:有用户上传素材时,创作性规划之前必须先做 source_media_review。
+    直接复用 lib/source_media_review.py(technical probe + 代表帧 + 质量风险 + 转写),
+    不自造。失败不致命——返回 None,规划照常进行。
+    """
+    if not input_path.exists():
+        return None
+    try:
+        from lib.source_media_review import review_source_media
+        from tools.tool_registry import registry
+
+        registry.ensure_discovered()
+        art = review_source_media(
+            [input_path],
+            {"pipeline_type": "talking-head", "project_dir": str(job.job_dir)},
+            registry,
+        )
+        (job.job_dir / "source_media_review.json").write_text(
+            json.dumps(art, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        from .pipeline_runner import validate_artifact
+
+        ok, err = validate_artifact(art, "source_media_review.schema.json")
+        logger.info(
+            f"source_media_review: {art.get('summary', '')[:120]} | schema="
+            + ("通过" if ok else ("跳过" if ok is None else f"未过({err})"))
+        )
+        return art
+    except Exception as e:
+        logger.warning(f"source_media_review 失败(继续无素材审查): {e}")
+        return None
+
+
+def _source_facts(art: Optional[dict]) -> str:
+    """把 source_media_review 提炼成给 agent 的一段事实(分辨率/时长/音频/质量风险)。"""
+    if not art:
+        return ""
+    lines = [art.get("summary", "")]
+    for f in art.get("files", []):
+        tp = f.get("technical_probe", {})
+        if tp:
+            lines.append(
+                f"技术参数: {tp.get('resolution', '?')}, {tp.get('fps', '?')}fps, "
+                f"{tp.get('duration_seconds', 0):.1f}s, 音频={tp.get('audio_codec') or '无'}"
+            )
+    impl = art.get("planning_implications", [])
+    if impl:
+        lines.append("素材提示: " + "；".join(impl[:4]))
+    return "\n".join(x for x in lines if x)
+
+
 def _script_stage(job: Any, input_path: Path) -> list:
     """Script 阶段：转录原始视频，产出并保存 script artifact，返回转录段供规划使用。
 
@@ -249,14 +300,15 @@ def _run_llm_planner(job: Any) -> None:
 
     agent 出错时回退到 L1.5 关键词/结构化规划器，保证任务不中断。
     """
-    # 零指令：给 agent 一句明确的默认需求描述，而不是空串（SYSTEM_BASE 里
-    # 定义了零指令的默认方案：remove_filler → apply_style）
-    request = job.edit_request or "（用户没有文字指令）按默认方案出一条模板成片"
-    logger.info(f"Agent(L2) 规划: {request[:100]}...")
+    logger.info(f"Agent(L2) 规划: {job.edit_request[:100]}...")
     update_job_status(job.id, JobStatus.PLANNING)
 
     input_path = job.job_dir / "input.mp4"
     video_path = str(input_path) if input_path.exists() else None
+
+    # source_media_review(AGENT_GUIDE 契约:有用户素材,创作性规划前必先做)
+    review = _source_review_stage(job, input_path)
+    source_facts = _source_facts(review)
 
     # Script 阶段：转录原始视频 + 产出 script artifact，转录喂给规划做转录感知剪辑
     transcript = _script_stage(job, input_path)
@@ -264,7 +316,8 @@ def _run_llm_planner(job: Any) -> None:
     try:
         from .agent_editor import plan_video
 
-        plan = plan_video(request, video_path, transcript=transcript)
+        plan = plan_video(job.edit_request, video_path, transcript=transcript,
+                          source_facts=source_facts)
     except Exception as e:
         logger.warning(f"L2 agent 规划失败，回退 L1.5: {e}")
         from .llm_planner import plan_edit
