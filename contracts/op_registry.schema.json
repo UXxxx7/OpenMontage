@@ -12,7 +12,7 @@
     "unsupported": {
       "type": "array",
       "items": { "type": "string" },
-      "description": "Requests the tools cannot do (e.g. translate subtitles, add music, color grade)"
+      "description": "Requests the tools cannot do (e.g. translate subtitles, add music, replace background)"
     },
     "edit_operations": {
       "type": "array",
@@ -51,6 +51,17 @@
           "required": ["type"],
           "additionalProperties": false,
           "$comment": "Transcribes and burns captions itself — do not combine with add_subtitles. Chapters/data cards are produced automatically by the handler's content_planner (overridable via style)."
+        },
+        {
+          "properties": {
+            "type": { "const": "color_grade" },
+            "description": {},
+            "profile": { "type": "string", "enum": ["cinematic_warm", "cinematic_cool", "moody_dark", "bright_clean", "vintage_film", "high_contrast", "neutral"], "default": "cinematic_warm" },
+            "intensity": { "type": "number", "minimum": 0, "maximum": 1, "description": "Blend 0=original .. 1=full grade; handler default 0.85 to keep skin tones natural" }
+          },
+          "required": ["type"],
+          "additionalProperties": false,
+          "$comment": "Whole-video color grade via OM ColorGrade (ffmpeg profile/LUT). Finishing pass -- runner applies it after cuts. Do NOT stack on apply_style (template owns the final look)."
         }
       ]
     }
