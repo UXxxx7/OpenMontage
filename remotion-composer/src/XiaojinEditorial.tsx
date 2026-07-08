@@ -79,7 +79,7 @@ export interface OutroInfo {
   fromFrame: number;
 }
 
-export interface XiaojinEditorialProps {
+export interface XiaojinEditorialProps extends Record<string, unknown> {
   videoSrc: string;
   /** Drives calculateXiaojinEditorialMetadata's durationInFrames — must match videoSrc's real length. */
   durationSeconds: number;

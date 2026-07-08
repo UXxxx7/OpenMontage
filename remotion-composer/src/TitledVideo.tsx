@@ -15,7 +15,7 @@ import { getVideoMetadata } from "@remotion/media-utils";
 // Loaded once at module scope so every render reuses the same font face.
 const fontFamily = "Playfair Display, Georgia, serif";
 
-export interface TitledVideoProps {
+export interface TitledVideoProps extends Record<string, unknown> {
   videoSrc: string;
   tagline: string;
   // When the tagline starts animating in, in seconds from the start of the video.
