@@ -76,23 +76,35 @@ def call_llm_chat(system_prompt: str, user_message: str, *, temperature: float =
         logger.warning(f"No API key set for provider '{provider}'")
         return None
 
-    try:
-        resp = requests.post(
-            endpoint,
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={
-                "model": config.llm_model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message},
-                ],
-                "temperature": temperature,
-                "response_format": {"type": "json_object"},
-            },
-            timeout=60,
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
-    except Exception as e:
-        logger.error(f"LLM call failed ({provider}): {e}")
-        return None
+    # 免费档 LLM（如 Gemini free tier：5-15 RPM）很容易被 L2 循环 + 内容规划
+    # 的连续调用打到 429。429 是"等一下再来"不是"坏了"——退避重试两次，
+    # 而不是直接放弃导致整条内容规划降级为空。
+    for attempt in range(3):
+        try:
+            resp = requests.post(
+                endpoint,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={
+                    "model": config.llm_model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_message},
+                    ],
+                    "temperature": temperature,
+                    "response_format": {"type": "json_object"},
+                },
+                timeout=60,
+            )
+            if resp.status_code == 429 and attempt < 2:
+                import time as _time
+
+                wait = 20 * (attempt + 1)
+                logger.warning(f"LLM 429 (rate limit)，{wait}s 后重试（第 {attempt + 1} 次）")
+                _time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"]
+        except Exception as e:
+            logger.error(f"LLM call failed ({provider}): {e}")
+            return None
+    return None
