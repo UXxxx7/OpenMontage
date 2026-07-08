@@ -438,6 +438,46 @@ def _mode_schedule_to_scenes(mode_schedule: list[dict]) -> list[dict]:
     ]
 
 
+def _run_enhancement_chain(src: str, workdir: Path) -> str:
+    """face_enhance -> color_grade -> audio_enhance，best-effort（单步失败不影响其它步骤）。
+
+    对应 compose-director.md Step 1（"Attempt every step if the tool is
+    available — do not skip steps without a reason"）。三个工具都是纯 FFmpeg
+    滤镜链，无需 GPU、无需标准安装之外的依赖。eye_enhance 故意不在这里接入——
+    全仓库零测试覆盖，且需要标准安装里没有的 mediapipe/opencv-python 才能做到
+    比"全局调亮"更精细的效果，等它被真正跑过一次再考虑接入。
+    """
+    from tools.audio.audio_enhance import AudioEnhance
+    from tools.enhancement.color_grade import ColorGrade
+    from tools.enhancement.face_enhance import FaceEnhance
+
+    steps: list[tuple[str, type, dict]] = [
+        ("face_enhance", FaceEnhance, {"preset": "talking_head_standard"}),
+        ("color_grade", ColorGrade, {"profile": "cinematic_warm", "intensity": 0.85}),
+        ("audio_enhance", AudioEnhance, {"preset": "clean_speech"}),
+    ]
+
+    for name, tool_cls, extra_inputs in steps:
+        out = workdir / f"_op_{name}.mp4"
+        inputs = {"input_path": src, "output_path": str(out), **extra_inputs}
+        try:
+            r = tool_cls().execute(inputs)
+        except Exception as e:
+            logger.warning(f"  apply_style: {name} 出错，跳过（沿用未增强的视频): {e}")
+            continue
+        if not r.success:
+            logger.warning(f"  apply_style: {name} 失败，跳过（沿用未增强的视频): {r.error}")
+            continue
+        new_src = r.data.get("output") or (r.artifacts[0] if r.artifacts else None)
+        if new_src and Path(new_src).exists():
+            logger.info(f"  apply_style: {name} 完成")
+            src = new_src
+        else:
+            logger.warning(f"  apply_style: {name} 未产出文件，跳过")
+
+    return src
+
+
 def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
     """转写 + 内容规划 + 用 Remotion 渲染 XiaojinEditorial（contract②）。
 
@@ -447,11 +487,15 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
     构建 props 并调用 P3 的稳定渲染入口：
     `npx remotion render XiaojinEditorial --props=<json>`。
 
-    章节/数据卡默认走 content_planner 的语义分析（Data Display Analysis）；
-    调用方也可以显式传 op["chapters"] / op["data_cards"] / op["mode_schedule"]
-    覆盖（例如手工编排的演示）。QR / 仪表盘 / 日历这类卡片 contract②
-    暂未定义字段（见 XiaojinEditorial.tsx 的 outro 文档注释）——不在这里硬塞，
-    需要时应作为 contract② 的扩展提给 P1/P3。
+    章节/数据卡/仪表盘/倒计时/日历默认都走 content_planner 的完整 Data Display
+    Analysis（按 compose-director.md 的表格把每个数据点分到该用的图形，不再只有
+    count-up 一种）；调用方也可以显式传 op["chapters"] / op["data_cards"] /
+    op["gauges"] / op["countdowns"] / op["calendar_events"] / op["mode_schedule"]
+    覆盖（例如手工编排的演示）。
+
+    QR + 联系方式（props["qrContact"]）不经过 content_planner 的语义判断——
+    是否显示 QR 完全取决于调用方是否在 op["qr_contact"] 里给了真实联系方式，
+    绝不凭空编造一个。
     """
     import os as _os
 
@@ -460,6 +504,20 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
     from .content_planner import plan_content
 
     config = get_config()
+
+    # Enhancement chain (compose-director.md Step 1: "attempt every step if the
+    # tool is available — do not skip steps without a reason"). Order matches
+    # the doc exactly: face -> eye -> color -> audio, then everything else
+    # (transcription/captions/render) runs on the enhanced video. eye_enhance
+    # is deliberately excluded here — unlike the other three, it has zero test
+    # coverage anywhere in this codebase and needs mediapipe/opencv-python
+    # (not part of the standard install) to do anything beyond a crude global
+    # brightness fallback; revisit once it's actually been exercised once.
+    # Each step is best-effort: if a tool errors unexpectedly, log and keep
+    # going with the pre-that-step video rather than failing the whole edit —
+    # matching the "attempt, don't hard-fail" philosophy already used
+    # throughout this file for optional refinement steps.
+    src = _run_enhancement_chain(src, workdir)
     src_path = Path(src)
 
     _hf = _os.environ.pop("HF_TOKEN", None)
@@ -488,15 +546,22 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
     if op.get("chapters") or op.get("data_cards"):
         chapters = op.get("chapters") or []
         data_cards = op.get("data_cards") or []
+        gauges = op.get("gauges") or []
+        countdowns = op.get("countdowns") or []
+        calendar_events = op.get("calendar_events") or []
         mode_schedule = op.get("mode_schedule") or [{"frame": 0, "mode": "dominant"}]
     else:
-        logger.info("  apply_style: 内容规划中（章节 + 数据卡）...")
+        logger.info("  apply_style: 内容规划中（章节 + 数据展示分析）...")
         content_plan = plan_content(segments, duration)
         chapters = content_plan["chapters"]
         data_cards = content_plan["data_cards"]
+        gauges = content_plan["gauges"]
+        countdowns = content_plan["countdowns"]
+        calendar_events = content_plan["calendar_events"]
         mode_schedule = content_plan["mode_schedule"]
         logger.info(
-            f"  apply_style: 规划出 {len(chapters)} 个章节、{len(data_cards)} 个数据卡"
+            f"  apply_style: 规划出 {len(chapters)} 个章节、{len(data_cards)} 个数据卡、"
+            f"{len(gauges)} 个仪表盘、{len(countdowns)} 个倒计时、{len(calendar_events)} 个日历"
         )
 
     scenes = _mode_schedule_to_scenes(mode_schedule)
@@ -520,6 +585,27 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
     }
     if data_cards:
         props["dataCards"] = data_cards
+    if gauges:
+        props["gauges"] = gauges
+    if countdowns:
+        props["countdowns"] = countdowns
+    if calendar_events:
+        props["calendarEvents"] = calendar_events
+    qr_input = op.get("qr_contact") or {}
+    if qr_input.get("contact_url"):
+        from .qr_gen import generate_qr
+        qr_rel = f"jobs/{job_slug}/qr.png"
+        qr_abs = remotion_dir / "public" / qr_rel
+        if generate_qr(qr_input["contact_url"], qr_abs):
+            qr_contact: dict[str, Any] = {
+                "qrSrc": qr_rel,
+                "contactName": qr_input.get("contact_name", ""),
+                "ctaLabel": qr_input.get("cta_label", "WhatsApp Now"),
+                "mountFrame": qr_input.get("mount_frame", max(0, round(duration * 30) - 200)),
+            }
+            if qr_input.get("contact_company"):
+                qr_contact["contactCompany"] = qr_input["contact_company"]
+            props["qrContact"] = qr_contact
     if op.get("brand"):
         props["brand"] = op["brand"]
     elif op.get("compliance"):
