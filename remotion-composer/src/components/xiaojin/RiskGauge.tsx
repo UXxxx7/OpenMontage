@@ -32,6 +32,8 @@ export interface RiskGaugeProps {
   fillDelayFrames?: number;
   /** How many frames the fill takes to animate from 0 to `value`. Default 50. */
   fillDurationFrames?: number;
+  /** Frame this card starts fading out (15-frame fade). Omit to stay on screen for the rest of the video. */
+  endFrame?: number;
   x?: number;
   y?: number;
   colorMode: ColorMode;
@@ -104,6 +106,7 @@ export const RiskGauge: React.FC<RiskGaugeProps> = ({
   mountFrame,
   fillDelayFrames = 20,
   fillDurationFrames = 50,
+  endFrame,
   x = 80,
   y = 900,
   colorMode,
@@ -113,6 +116,11 @@ export const RiskGauge: React.FC<RiskGaugeProps> = ({
   const { fps } = useVideoConfig();
   const local = frame - mountFrame;
   if (local < 0) return null;
+  if (endFrame !== undefined && frame >= endFrame) return null;
+  const exitFade =
+    endFrame !== undefined
+      ? interpolate(frame, [endFrame - 15, endFrame], [1, 0], { extrapolateLeft: "clamp", extrapolateRight: "clamp" })
+      : 1;
 
   const palette = PALETTES[colorMode];
   const cardEntry = spring({ frame: local, fps, config: { damping: 14, stiffness: 200 } });
@@ -129,7 +137,7 @@ export const RiskGauge: React.FC<RiskGaugeProps> = ({
         position: "absolute",
         left: x,
         top: y,
-        opacity: cardEntry,
+        opacity: cardEntry * exitFade,
         transform: `scale(${0.88 + 0.12 * cardEntry})`,
         transformOrigin: "top center",
         background: "rgba(13,17,23,0.88)",

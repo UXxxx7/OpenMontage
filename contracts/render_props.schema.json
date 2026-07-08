@@ -42,6 +42,7 @@
           "title": { "type": "string", "maxLength": 40 },
           "x": { "type": "number", "default": 80 }, "y": { "type": "number", "default": 900 }, "width": { "type": "number", "default": 920 },
           "mountFrame": { "type": "integer", "minimum": 0 },
+          "endFrame": { "type": "integer", "minimum": 0, "description": "Frame this card starts a 15-frame fade-out. Omit only if no later card ever occupies the same x/y — otherwise the two permanently overlap (confirmed bug: InfoCard had no exit logic at all)." },
           "rows": { "type": "array", "items": { "type": "object", "required": ["label", "value"], "additionalProperties": false,
             "properties": {
               "label": { "type": "string", "maxLength": 24 },
@@ -62,6 +63,7 @@
           "mountFrame": { "type": "integer", "minimum": 0 },
           "fillDelayFrames": { "type": "integer", "minimum": 0, "default": 20 },
           "fillDurationFrames": { "type": "integer", "minimum": 0, "default": 50 },
+          "endFrame": { "type": "integer", "minimum": 0, "description": "Frame this card starts a 15-frame fade-out. Omit only if no later card/gauge ever occupies the same x/y." },
           "x": { "type": "number", "default": 80 }, "y": { "type": "number", "default": 900 }
         } }
     },
@@ -75,6 +77,7 @@
           "maxValue": { "type": "number", "description": "If given, ring fill = value/maxValue; omit for a full reveal regardless of value" },
           "mountFrame": { "type": "integer", "minimum": 0 },
           "revealFrames": { "type": "integer", "minimum": 0, "default": 40 },
+          "endFrame": { "type": "integer", "minimum": 0, "description": "Frame this card starts a 15-frame fade-out. Omit only if no later card/ring ever occupies the same x/y." },
           "x": { "type": "number", "default": 80 }, "y": { "type": "number", "default": 900 }
         } }
     },
@@ -88,6 +91,7 @@
           "todayDay": { "type": "integer", "minimum": 1, "maximum": 31 },
           "eventLabel": { "type": "string" },
           "mountFrame": { "type": "integer", "minimum": 0 },
+          "endFrame": { "type": "integer", "minimum": 0, "description": "Frame this card starts a 15-frame fade-out. Omit only if no later card/calendar ever occupies the same x/y." },
           "x": { "type": "number", "default": 80 }, "y": { "type": "number", "default": 900 }
         } }
     },
