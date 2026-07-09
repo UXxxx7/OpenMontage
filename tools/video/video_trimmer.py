@@ -202,12 +202,38 @@ class VideoTrimmer(BaseTool):
 
                 if seg_start is not None or seg_end is not None:
                     temp_path = temp_dir / f"seg_{i:04d}{seg_input.suffix}"
-                    cmd = ["ffmpeg", "-y", "-i", str(seg_input)]
+                    # Re-encode each cut segment — NEVER stream-copy here.
+                    # Word-level cut points (remove_filler) almost never land
+                    # on a keyframe; `-c copy` cuts can only start at
+                    # keyframes, so the concat result plays continuing audio
+                    # over a FROZEN first frame until the next keyframe
+                    # (reproduced on real WhatsApp jobs). Frame-accurate:
+                    # input-seek + re-encode, CFR to keep concat PTS sane
+                    # (see CLAUDE-v2 "No frame found" gotcha), tiny audio
+                    # fades to avoid clicks at the joins (video-use does the
+                    # same with 30ms fades).
+                    cmd = ["ffmpeg", "-y"]
                     if seg_start is not None:
                         cmd.extend(["-ss", str(seg_start)])
+                    cmd.extend(["-i", str(seg_input)])
                     if seg_end is not None:
-                        cmd.extend(["-to", str(seg_end)])
-                    cmd.extend(["-c", "copy", str(temp_path)])
+                        dur = None
+                        if seg_start is not None:
+                            dur = max(0.0, float(seg_end) - float(seg_start))
+                        if dur is not None:
+                            cmd.extend(["-t", f"{dur:.3f}"])
+                        else:
+                            cmd.extend(["-to", str(seg_end)])
+                    cmd.extend([
+                        "-af", "afade=t=in:d=0.03,afade=t=out:st=9999:d=0.03"
+                        if seg_end is None or seg_start is None else
+                        f"afade=t=in:d=0.03,afade=t=out:st={max(0.0, float(seg_end) - float(seg_start)) - 0.03:.3f}:d=0.03",
+                        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                        "-pix_fmt", "yuv420p",
+                        "-fps_mode", "cfr",
+                        "-c:a", "aac", "-b:a", "192k",
+                        str(temp_path),
+                    ])
                     self.run_command(cmd)
                     temp_files.append(temp_path)
                 else:
