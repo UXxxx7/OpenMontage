@@ -114,13 +114,18 @@ class VideoTrimmer(BaseTool):
             inputs.get("output_path", str(input_path.with_stem(f"{input_path.stem}_cut")))
         )
 
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", str(input_path),
-            "-ss", str(start_s),
-        ]
+        # -ss before -i (input seeking) + -t (duration) instead of -to (end
+        # time) after -i — the reverse ordering is a confirmed bug class
+        # (video-studio's CLAUDE-v2.md): combined with certain filters it can
+        # silently truncate/zero out content past the seek point. This form
+        # doesn't reproduce it, and is also faster (input seek vs. decode-then-
+        # discard).
+        cmd = ["ffmpeg", "-y"]
+        if start_s:
+            cmd.extend(["-ss", str(start_s)])
+        cmd.extend(["-i", str(input_path)])
         if end_s is not None:
-            cmd.extend(["-to", str(end_s)])
+            cmd.extend(["-t", str(end_s - start_s)])
         if codec == "copy":
             cmd.extend(["-c", "copy"])
         else:
@@ -202,12 +207,20 @@ class VideoTrimmer(BaseTool):
 
                 if seg_start is not None or seg_end is not None:
                     temp_path = temp_dir / f"seg_{i:04d}{seg_input.suffix}"
-                    cmd = ["ffmpeg", "-y", "-i", str(seg_input)]
+                    # Segment boundaries here are arbitrary word-timestamp cut
+                    # points (e.g. filler-word removal), not keyframe-aligned —
+                    # -c copy can only cut at keyframes, so it silently snaps
+                    # each boundary to the nearest one instead of the exact
+                    # requested point. Re-encode instead for frame-accurate
+                    # cuts. -ss before -i + -t (not -to) after, per the same
+                    # bug class as _cut above.
+                    cmd = ["ffmpeg", "-y"]
                     if seg_start is not None:
                         cmd.extend(["-ss", str(seg_start)])
+                    cmd.extend(["-i", str(seg_input)])
                     if seg_end is not None:
-                        cmd.extend(["-to", str(seg_end)])
-                    cmd.extend(["-c", "copy", str(temp_path)])
+                        cmd.extend(["-t", str(seg_end - (seg_start or 0))])
+                    cmd.extend(["-c:v", "libx264", "-preset", "fast", "-c:a", "aac", str(temp_path)])
                     self.run_command(cmd)
                     temp_files.append(temp_path)
                 else:
@@ -221,11 +234,22 @@ class VideoTrimmer(BaseTool):
                     safe_path = str(tf.resolve()).replace("\\", "/")
                     f.write(f"file '{safe_path}'\n")
 
+            # Re-encode with a constant frame rate rather than -c copy —
+            # concatenating segments cut at arbitrary (non-keyframe) points
+            # can produce irregular timestamps that downstream frame-accurate
+            # readers (e.g. Remotion's OffthreadVideo) fail to seek through
+            # correctly past a certain point, silently holding the last
+            # decodable frame while audio continues (confirmed symptom on a
+            # real render). Same fix video-studio already validated for this
+            # exact bug class (CLAUDE-v2.md): re-encode at constant frame rate
+            # instead of stream-copying the concat.
+            fps = self._probe_fps(temp_files[0]) if temp_files else 30.0
             cmd = [
                 "ffmpeg", "-y",
                 "-f", "concat", "-safe", "0",
                 "-i", str(list_path),
-                "-c", "copy",
+                "-fps_mode", "cfr", "-r", str(fps),
+                "-c:v", "libx264", "-preset", "fast", "-c:a", "aac",
                 str(output_path),
             ]
             self.run_command(cmd)
@@ -251,6 +275,22 @@ class VideoTrimmer(BaseTool):
                     temp_dir.rmdir()
                 except OSError:
                     pass
+
+    def _probe_fps(self, path: Path) -> float:
+        """ffprobe the source frame rate, falling back to 30 if unavailable."""
+        cmd = [
+            "ffprobe", "-v", "quiet",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=r_frame_rate",
+            "-of", "json", str(path),
+        ]
+        try:
+            result = self.run_command(cmd)
+            stream = json.loads(result.stdout)["streams"][0]
+            num, _, den = stream["r_frame_rate"].partition("/")
+            return float(num) / float(den) if den else float(num)
+        except Exception:
+            return 30.0
 
     @staticmethod
     def _build_atempo_chain(factor: float) -> str:
