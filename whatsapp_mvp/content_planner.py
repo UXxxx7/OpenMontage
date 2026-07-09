@@ -21,6 +21,7 @@ import logging
 from datetime import date
 from typing import Any, Optional
 
+from .config import get_config
 from .llm_client import call_llm_chat
 
 logger = logging.getLogger(__name__)
@@ -103,7 +104,8 @@ def plan_content(segments: list[dict], duration: float) -> dict[str, Any]:
         f"Video duration: {duration:.1f}s\n\nTranscript:\n{transcript_text}"
     )
 
-    content = call_llm_chat(SYSTEM_PROMPT, user_message, temperature=0.2)
+    content = call_llm_chat(SYSTEM_PROMPT, user_message, temperature=0.2,
+                            model=get_config().llm_model_long_output)
     if content is None:
         logger.info("content_planner: 没配 LLM 或调用失败，跳过内容规划（返回空外壳计划）")
         return empty
@@ -391,7 +393,8 @@ def plan_filler_removal(words: list[dict], duration: float) -> list[dict]:
 
     numbered = "\n".join(f"{i}: {w['word']} [{w['start']:.2f}-{w['end']:.2f}]" for i, w in enumerate(words))
 
-    content = call_llm_chat(FILLER_SYSTEM_PROMPT, numbered, temperature=0.1)
+    content = call_llm_chat(FILLER_SYSTEM_PROMPT, numbered, temperature=0.1,
+                            model=get_config().llm_model_long_output)
     if content is None:
         logger.info("content_planner: 没配 LLM 或调用失败，跳过口误检测")
         return []

@@ -19,10 +19,14 @@ from .config import get_config
 logger = logging.getLogger(__name__)
 
 
-def call_llm_chat(system_prompt: str, user_message: str, *, temperature: float = 0.1) -> Optional[str]:
+def call_llm_chat(system_prompt: str, user_message: str, *, temperature: float = 0.1, model: Optional[str] = None) -> Optional[str]:
     """Send a single-turn system+user chat completion to the configured LLM provider.
 
     Returns the raw text content, or None if no provider is usable or the call failed.
+
+    model: 覆盖 config.llm_model。长 JSON 输出的调用（内容规划等）应传
+    config.llm_model_long_output —— DeepSeek 网关对非流式响应有 ~60s 硬时限，
+    v4-pro 写不完长 JSON（实测 60s 整被掐），v4-flash 37s 完成。
     """
     config = get_config()
     provider = config.llm_provider.lower()
@@ -41,7 +45,7 @@ def call_llm_chat(system_prompt: str, user_message: str, *, temperature: float =
                     "Content-Type": "application/json",
                 },
                 json={
-                    "model": config.llm_model,
+                    "model": model or config.llm_model,
                     "max_tokens": 1024,
                     "system": system_prompt,
                     "messages": [{"role": "user", "content": user_message}],
@@ -85,7 +89,7 @@ def call_llm_chat(system_prompt: str, user_message: str, *, temperature: float =
                 endpoint,
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
                 json={
-                    "model": config.llm_model,
+                    "model": model or config.llm_model,
                     "messages": [
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_message},
