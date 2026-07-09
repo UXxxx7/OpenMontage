@@ -42,6 +42,7 @@ def process_incoming_message(job_id: str) -> None:
         # ── 步骤1: 下载视频 ──
         if not job.input_video_path and job.whatsapp_media_id:
             _download_media(job, wa)
+            _download_broll_assets(job, wa)  # b-roll 资产（有就下，无则 no-op）
             job = get_job(job_id)  # 重新加载，获取最新状态
 
         # ── 步骤2: LLM 规划 ──
@@ -219,6 +220,29 @@ def _download_media(job: Any, wa: WhatsAppClient) -> None:
 
     update_job_fields(job.id, input_video_path=dest)
     logger.info(f"媒体下载完成: {dest}")
+
+
+def _download_broll_assets(job: Any, wa: WhatsAppClient) -> None:
+    """下载所有 b-roll 资产到 job_dir/assets/；单个失败只跳过该资产（b-roll 非必需，不拖垮 job）。"""
+    from .job_manager import get_assets, set_asset_local_path
+
+    broll = [a for a in get_assets(job) if a.get("role") == "broll"]
+    if not broll:
+        return
+    asset_dir = job.job_dir / "assets"
+    asset_dir.mkdir(parents=True, exist_ok=True)
+    for a in broll:
+        media_id = a.get("media_id")
+        if not media_id or a.get("local_path"):
+            continue
+        ext = "jpg" if a.get("kind") == "image" else "mp4"
+        dest = str(asset_dir / f"broll_{a.get('order', 0)}.{ext}")
+        try:
+            wa.download_media(media_id, dest)
+            set_asset_local_path(job.id, media_id, dest)
+            logger.info(f"b-roll 资产下载完成: {dest}")
+        except Exception as e:
+            logger.warning(f"b-roll 资产 {media_id} 下载失败，跳过: {e}")
 
 
 # ---------------------------------------------------------------------------
