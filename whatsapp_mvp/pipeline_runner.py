@@ -650,6 +650,7 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         mode_schedule = op.get("mode_schedule") or [{"frame": 0, "mode": "dominant"}]
         plan_intro = None
         plan_outro = None
+        plan_sections = op.get("sections") or []
     else:
         logger.info("  apply_style: 内容规划中（章节 + 数据展示分析）...")
         content_plan = plan_content(segments, duration)
@@ -661,6 +662,7 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         mode_schedule = content_plan["mode_schedule"]
         plan_intro = content_plan.get("intro")
         plan_outro = content_plan.get("outro")
+        plan_sections = content_plan.get("sections") or []
         logger.info(
             f"  apply_style: 规划出 {len(chapters)} 个章节、{len(data_cards)} 个数据卡、"
             f"{len(gauges)} 个仪表盘、{len(countdowns)} 个倒计时、{len(calendar_events)} 个日历"
@@ -686,6 +688,9 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         "chapters": chapters,
         "captions": captions,
     }
+    if plan_sections:
+        props["sections"] = plan_sections
+
     # 开场标题卡/片尾 CTA：模板一直支持（IntroTitle/OutroSection），此前管线从不
     # 生成——这是与 video-studio 手工参考成片(VeLL)最大的一块可自动化差距。
     # op 显式传入优先；否则用 content_planner 从转写里写的文案。
@@ -711,6 +716,16 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
                 continue
             mode_schedule.append(m)
         props["scenes"] = _mode_schedule_to_scenes(mode_schedule)
+        # 段落接管同样不得在 intro 期间开始
+        if props.get("sections"):
+            adjusted = []
+            for sec in props["sections"]:
+                sec = dict(sec)
+                if sec["fromFrame"] < intro_out + 20:
+                    sec["fromFrame"] = intro_out + 20
+                if sec["toFrame"] - sec["fromFrame"] >= 40:
+                    adjusted.append(sec)
+            props["sections"] = adjusted
     outro = op.get("outro") or plan_outro
     if outro:
         duration_frames = max(1, round(duration * 30))
