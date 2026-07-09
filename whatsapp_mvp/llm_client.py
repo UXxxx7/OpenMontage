@@ -119,3 +119,62 @@ def call_llm_chat(system_prompt: str, user_message: str, *, temperature: float =
             logger.error(f"LLM call failed ({provider}): {e}")
             return None
     return None
+
+
+def call_vision_chat(text_prompt: str, image_paths: list, timeout: int = 90):
+    """视觉子能力调用（独立于主 LLM 通道）。
+
+    主规划走 LLM_*（DeepSeek，纯文本模型）；这里走 VISION_LLM_*（如智谱
+    GLM-4V）——只在需要"看图"的环节使用（QA stills 复审等）。未配置
+    VISION_LLM_API_KEY 时返回 None，调用方按"没有眼睛"跳过，不影响主流程。
+
+    图片以 base64 data URL 内联（OpenAI 兼容 content-parts 格式，智谱/
+    Gemini/OpenAI 通用），不依赖公网可访问的图床。
+    """
+    import base64
+    from pathlib import Path
+
+    from .config import get_config
+
+    config = get_config()
+    if not config.vision_llm_api_key or not config.vision_llm_base_url:
+        logger.info("视觉 LLM 未配置（VISION_LLM_*），跳过看图环节")
+        return None
+
+    content: list = []
+    for p in image_paths:
+        p = Path(p)
+        if not p.exists():
+            continue
+        b64 = base64.b64encode(p.read_bytes()).decode()
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}})
+    if not content:
+        return None
+    content.append({"type": "text", "text": text_prompt})
+
+    endpoint = config.vision_llm_base_url.rstrip("/") + "/chat/completions"
+    for attempt in range(2):
+        try:
+            resp = requests.post(
+                endpoint,
+                headers={"Authorization": f"Bearer {config.vision_llm_api_key}",
+                         "Content-Type": "application/json"},
+                json={"model": config.vision_llm_model,
+                      "messages": [{"role": "user", "content": content}],
+                      "temperature": 0.2},
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"]
+        except requests.exceptions.RequestException as e:
+            if attempt == 0:
+                import time as _time
+                logger.warning(f"视觉 LLM 连接层错误，5s 后重试: {e}")
+                _time.sleep(5)
+                continue
+            logger.error(f"视觉 LLM 调用失败: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"视觉 LLM 调用失败: {e}")
+            return None
+    return None

@@ -72,6 +72,18 @@ class Config:
     llm_model: str = field(
         default_factory=lambda: os.getenv("LLM_MODEL", "deepseek-chat")
     )
+    # 视觉子能力（独立于主 LLM 通道）：主规划继续走 LLM_*（DeepSeek，文本），
+    # 需要"看图"的环节（QA stills 复审等）走 VISION_LLM_*（如智谱 GLM-4V）。
+    # 未配置时视觉环节整体跳过，不影响主流程。
+    vision_llm_base_url: str = field(
+        default_factory=lambda: os.getenv("VISION_LLM_BASE_URL", "")
+    )
+    vision_llm_api_key: str = field(
+        default_factory=lambda: os.getenv("VISION_LLM_API_KEY", "")
+    )
+    vision_llm_model: str = field(
+        default_factory=lambda: os.getenv("VISION_LLM_MODEL", "glm-4v-flash")
+    )
     # 保留兼容旧配置
     deepseek_api_key: str = field(
         default_factory=lambda: os.getenv("DEEPSEEK_API_KEY", "")
