@@ -28,6 +28,11 @@ logger = logging.getLogger(__name__)
 FPS = 30
 # compose-director.md 的 beat anchoring 规则：卡片在关键词被说出之前 50 帧上场。
 MOUNT_LEAD_FRAMES = 50
+# 前一个数据点结束后至少留这么多帧再上场下一个——避免连续报数据时后一个卡片
+# 提前 50 帧的偏移把它顶到前一个卡片还没结束、或者前一个数据点自己的话还没
+# 说完的时刻（CLAUDE-v2.md 记录过这个 bug：flat -50 offset 会让下一阶段的数字
+# 在上一阶段的话说到一半时就跳出来）。
+MIN_GAP_AFTER_PREVIOUS_FRAMES = 10
 # 图形展示完之后，Workflow 模式至少再停留这么久再切回 Dominant，避免切换过快。
 HOLD_AFTER_LAST_ROW_FRAMES = 90
 # 仪表盘/倒计时自身的入场+动画时长（对应组件默认值），决定它们各自的"活跃窗口"。
@@ -129,7 +134,19 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
     # SpeakerCard to be in Workflow (shrunk) mode while they're on screen.
     workflow_ranges: list[tuple[int, int]] = []
 
-    for dp in raw.get("data_points") or []:
+    # All 4 visual types share ONE content-zone lane (they all drive the same
+    # dominant/workflow mode_schedule below), so process data points in
+    # chronological order and floor each one's mount frame against the
+    # previous one's end — same rule the manual pipeline documents in
+    # CLAUDE-v2.md: "the standard 50-frames-early offset must be floored at
+    # previous_beat_end + ~8-10f", otherwise a rapid back-to-back run of data
+    # points (little/no pause between them in speech) either overlaps two
+    # visuals in the same screen position or pops the next one in mid-
+    # sentence on the one before it (confirmed bug, motion/mrbeast-clip).
+    data_points = sorted(raw.get("data_points") or [], key=_dp_seconds)
+    next_available_frame = 0
+
+    for dp in data_points:
         if not isinstance(dp, dict):
             # LLM 偶发在数组里塞非 dict 条目（实测出过 str）——跳过而不是
             # AttributeError 炸掉整个规划。
@@ -137,22 +154,29 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
         visual = dp.get("visual") or "count_up"  # backward-compatible default
         try:
             if visual == "gauge":
-                _plan_gauge(dp, gauges, workflow_ranges)
+                entry, target = _plan_gauge(dp, next_available_frame), gauges
             elif visual == "countdown":
-                _plan_countdown(dp, countdowns, workflow_ranges)
+                entry, target = _plan_countdown(dp, next_available_frame), countdowns
             elif visual == "calendar":
-                _plan_calendar(dp, calendar_events, workflow_ranges)
+                entry, target = _plan_calendar(dp, next_available_frame), calendar_events
             else:
-                _plan_count_up(dp, data_cards, workflow_ranges)
+                entry, target = _plan_count_up(dp, next_available_frame), data_cards
         except (KeyError, TypeError, ValueError) as e:
             logger.warning(f"content_planner: 跳过一个解析失败的数据点 (visual={visual}): {e}")
             continue
 
+        if entry is None:
+            continue
+        target.append(entry)
+        workflow_ranges.append((entry["mountFrame"], entry["endFrame"]))
+        next_available_frame = entry["endFrame"] + MIN_GAP_AFTER_PREVIOUS_FRAMES
+
     # 同位置图形的接力钳制（contract② endFrame，merge runbook 的 P2 任务）：
-    # 四种图形默认都落在同一个坑位（x=80,y=900），各自的 endFrame 只算了自己
-    # 的停留窗口——两个数据点挨得近时，前者的窗口会伸进后者的展示期，同位置
-    # 永久叠上（P3 修的 "cards never disappear" bug 的另一半）。按 mountFrame
-    # 排序后，把前者的 endFrame 钳到后者的 mountFrame（组件会做 15 帧淡出）。
+    # 上面的 chronological floor 已经让同坑位图形按顺序不重叠，这里是双重保险——
+    # 万一有别的路径（例如显式传入 op["data_cards"]）绕过了上面的排序/floor逻辑，
+    # 仍然按 mountFrame 排序后把前者的 endFrame 钳到后者的 mountFrame（组件会
+    # 做 15 帧淡出），不会同位置永久叠上（P3 修的 "cards never disappear" bug
+    # 的另一半）。
     slotted = sorted(
         (g for g in (data_cards + gauges + countdowns + calendar_events)),
         key=lambda g: g["mountFrame"],
@@ -179,13 +203,35 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
     }
 
 
-def _plan_count_up(dp: dict, out: list[dict], workflow_ranges: list[tuple[int, int]]) -> None:
+def _dp_seconds(dp: dict) -> float:
+    """Earliest spoken timestamp for a data point, for chronological sorting."""
+    if not isinstance(dp, dict):
+        # Same non-dict guard as the main loop — sorted() calls this key
+        # function on every element before the loop body ever runs, so a
+        # stray non-dict entry has to be handled here too, not just there.
+        return float("inf")
+    visual = dp.get("visual") or "count_up"
+    if visual == "count_up":
+        secs: list[float] = []
+        for r in dp.get("rows") or []:
+            try:
+                secs.append(float(r["seconds"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        return min(secs) if secs else float("inf")
+    try:
+        return float(dp["seconds"])
+    except (KeyError, TypeError, ValueError):
+        return float("inf")
+
+
+def _plan_count_up(dp: dict, min_mount_frame: int) -> Optional[dict]:
     rows_in = dp.get("rows") or []
     if not rows_in:
-        return
+        return None
     row_seconds = [float(r["seconds"]) for r in rows_in]
 
-    card_mount_frame = max(0, round(min(row_seconds) * FPS) - MOUNT_LEAD_FRAMES)
+    card_mount_frame = max(min_mount_frame, round(min(row_seconds) * FPS) - MOUNT_LEAD_FRAMES)
     rows = []
     for r, sec in zip(rows_in, row_seconds):
         value = _num(r.get("value"))
@@ -208,43 +254,41 @@ def _plan_count_up(dp: dict, out: list[dict], workflow_ranges: list[tuple[int, i
             row["unit"] = r["unit"]
         rows.append(row)
     if not rows:
-        return
+        return None
     last_row_frame = round(max(row_seconds) * FPS)
-    end_frame = last_row_frame + HOLD_AFTER_LAST_ROW_FRAMES
-    out.append({
+    end_frame = max(last_row_frame, card_mount_frame) + HOLD_AFTER_LAST_ROW_FRAMES
+    return {
         "title": str(dp.get("title", ""))[:40],
         "x": 80, "y": 900, "width": 920,
         "mountFrame": card_mount_frame,
         "endFrame": end_frame,
         "rows": rows,
-    })
-    workflow_ranges.append((card_mount_frame, end_frame))
+    }
 
 
-def _plan_gauge(dp: dict, out: list[dict], workflow_ranges: list[tuple[int, int]]) -> None:
+def _plan_gauge(dp: dict, min_mount_frame: int) -> Optional[dict]:
     sec = float(dp["seconds"])
     value = _num(dp.get("value"))
     if value is None:
-        return
-    mount_frame = max(0, round(sec * FPS) - MOUNT_LEAD_FRAMES)
+        return None
+    mount_frame = max(min_mount_frame, round(sec * FPS) - MOUNT_LEAD_FRAMES)
     end_frame = mount_frame + GAUGE_ANIMATION_FRAMES + HOLD_AFTER_LAST_ROW_FRAMES
-    out.append({
+    return {
         "title": str(dp.get("title", ""))[:60],
         "leftLabel": str(dp.get("leftLabel", ""))[:16],
         "rightLabel": str(dp.get("rightLabel", ""))[:16],
         "value": max(0.0, min(1.0, value)),
         "mountFrame": mount_frame,
         "endFrame": end_frame,
-    })
-    workflow_ranges.append((mount_frame, end_frame))
+    }
 
 
-def _plan_countdown(dp: dict, out: list[dict], workflow_ranges: list[tuple[int, int]]) -> None:
+def _plan_countdown(dp: dict, min_mount_frame: int) -> Optional[dict]:
     sec = float(dp["seconds"])
     value = _num(dp.get("value"))
     if value is None:
-        return
-    mount_frame = max(0, round(sec * FPS) - MOUNT_LEAD_FRAMES)
+        return None
+    mount_frame = max(min_mount_frame, round(sec * FPS) - MOUNT_LEAD_FRAMES)
     end_frame = mount_frame + COUNTDOWN_ANIMATION_FRAMES + HOLD_AFTER_LAST_ROW_FRAMES
     entry: dict[str, Any] = {
         "value": value,
@@ -256,26 +300,24 @@ def _plan_countdown(dp: dict, out: list[dict], workflow_ranges: list[tuple[int, 
     }
     if dp.get("headlineAccent"):
         entry["headlineAccent"] = str(dp["headlineAccent"])[:40]
-    out.append(entry)
-    workflow_ranges.append((mount_frame, end_frame))
+    return entry
 
 
-def _plan_calendar(dp: dict, out: list[dict], workflow_ranges: list[tuple[int, int]]) -> None:
+def _plan_calendar(dp: dict, min_mount_frame: int) -> Optional[dict]:
     sec = float(dp["seconds"])
     year = dp.get("year")
     month = dp.get("month")
     target_day = dp.get("targetDay")
     if year is None or month is None or target_day is None:
-        return
-    mount_frame = max(0, round(sec * FPS) - MOUNT_LEAD_FRAMES)
+        return None
+    mount_frame = max(min_mount_frame, round(sec * FPS) - MOUNT_LEAD_FRAMES)
     end_frame = mount_frame + CALENDAR_DISPLAY_FRAMES
-    out.append({
+    return {
         "year": int(year), "month": int(month), "targetDay": int(target_day),
         "eventLabel": str(dp.get("eventLabel", ""))[:60],
         "mountFrame": mount_frame,
         "endFrame": end_frame,
-    })
-    workflow_ranges.append((mount_frame, end_frame))
+    }
 
 
 def _num(v: Any) -> Optional[float]:
