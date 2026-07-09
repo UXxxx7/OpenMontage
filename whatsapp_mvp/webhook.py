@@ -246,7 +246,11 @@ def _enqueue_pipeline(job_id: str) -> None:
         try:
             redis_conn = Redis.from_url(config.redis_url, socket_connect_timeout=2, socket_timeout=2)
             q = rq.Queue("whatsapp_mvp", connection=redis_conn)
-            q.enqueue(run_pipeline, job_id, job_timeout=1800)
+            # 2700s (was 1800s) — apply_style's vision self-review can now retry
+            # once (one extra plan_content call + one extra bounded QA-stills
+            # pass + up to 2 vision calls) before falling through to graceful
+            # degradation; the old budget was sized for a single render only.
+            q.enqueue(run_pipeline, job_id, job_timeout=2700)
             logger.info(f"Enqueued pipeline {job_id} to RQ")
             return
         except Exception as e:

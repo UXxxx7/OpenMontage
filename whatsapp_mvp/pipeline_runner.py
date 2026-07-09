@@ -610,57 +610,19 @@ def _run_enhancement_chain(src: str, workdir: Path) -> str:
     return src
 
 
-def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
-    """转写 + 内容规划 + 用 Remotion 渲染 XiaojinEditorial（contract②）。
+def _build_apply_style_props(
+    op: dict, segments: list[dict], captions: list[dict], duration: float,
+    remotion_dir: Path, job_slug: str, *, feedback: Optional[str] = None,
+) -> dict[str, Any]:
+    """内容规划 + 组 contract② props（不含 speakerObjectPosition——那是确定性的
+    人脸校准结果，跟内容规划反馈无关，调用方单独算一次、单独设置）。
 
-    对应 VeLL-lab/video-studio 的 tools/directors/compose-director.md（"xiaojin-
-    editorial" style）——组件由 P3 移植/维护在 remotion-composer/src/XiaojinEditorial.tsx
-    + components/xiaojin/*，本函数只负责按 contracts/render_props.schema.json
-    构建 props 并调用 P3 的稳定渲染入口：
-    `npx remotion render XiaojinEditorial --props=<json>`。
-
-    章节/数据卡/仪表盘/倒计时/日历默认都走 content_planner 的完整 Data Display
-    Analysis（按 compose-director.md 的表格把每个数据点分到该用的图形，不再只有
-    count-up 一种）；调用方也可以显式传 op["chapters"] / op["data_cards"] /
-    op["gauges"] / op["countdowns"] / op["calendar_events"] / op["mode_schedule"]
-    覆盖（例如手工编排的演示）。
-
-    QR + 联系方式（props["qrContact"]）不经过 content_planner 的语义判断——
-    是否显示 QR 完全取决于调用方是否在 op["qr_contact"] 里给了真实联系方式，
-    绝不凭空编造一个。
+    抽成独立函数是为了让视觉复核重试只重新走这一步（一次 LLM 调用 + 一轮 QA
+    stills），不用重新跑 enhancement chain / 转写 / 完整 Remotion 渲染——那些
+    跟"这次数据点怎么摆"无关，重来一遍纯浪费（渲染整片是整条管线里最贵、也
+    没有 subprocess 超时保护的一步）。
     """
     from .content_planner import plan_content
-
-    config = get_config()
-
-    # Enhancement chain (compose-director.md Step 1: "attempt every step if the
-    # tool is available — do not skip steps without a reason"). Order matches
-    # the doc exactly: face -> eye -> color -> audio, then everything else
-    # (transcription/captions/render) runs on the enhanced video. eye_enhance
-    # is deliberately excluded here — unlike the other three, it has zero test
-    # coverage anywhere in this codebase and needs mediapipe/opencv-python
-    # (not part of the standard install) to do anything beyond a crude global
-    # brightness fallback; revisit once it's actually been exercised once.
-    # Each step is best-effort: if a tool errors unexpectedly, log and keep
-    # going with the pre-that-step video rather than failing the whole edit —
-    # matching the "attempt, don't hard-fail" philosophy already used
-    # throughout this file for optional refinement steps.
-    src = _run_enhancement_chain(src, workdir)
-    src_path = Path(src)
-
-    duration = _probe_duration(src_path)
-
-    t = _safe_transcribe(src, workdir, config.faster_whisper_model)
-    if t is None:
-        # 转写失败（工具报告失败或底层库抛异常）不该搞垮整条 apply_style——
-        # 降级为"有卡片+章节条+品牌条+进度条，但无字幕/图形"的版本，好过全失败。
-        logger.warning("  apply_style: 转写不可用（降级为无字幕/无图形版本）")
-        segments: list[dict] = []
-        captions: list[dict] = []
-    else:
-        segments = t.data.get("segments") or []
-        # 短语级字幕（词级时间戳重组），不是 5-6 行的 segment 大段
-        captions = build_caption_phrases(t.data.get("word_timestamps") or [], segments)
 
     if op.get("chapters") or op.get("data_cards"):
         chapters = op.get("chapters") or []
@@ -671,7 +633,7 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         mode_schedule = op.get("mode_schedule") or [{"frame": 0, "mode": "dominant"}]
     else:
         logger.info("  apply_style: 内容规划中（章节 + 数据展示分析）...")
-        content_plan = plan_content(segments, duration)
+        content_plan = plan_content(segments, duration, feedback=feedback)
         chapters = content_plan["chapters"]
         data_cards = content_plan["data_cards"]
         gauges = content_plan["gauges"]
@@ -684,20 +646,12 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         )
 
     scenes = _mode_schedule_to_scenes(mode_schedule)
-
-    remotion_dir = Path(config.openmontage_root) / "remotion-composer"
-    job_slug = workdir.name
     public_video_rel = f"jobs/{job_slug}/source.mp4"
-    public_video_abs = remotion_dir / "public" / "jobs" / job_slug / "source.mp4"
-    public_video_abs.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(src, public_video_abs)
 
     props: dict[str, Any] = {
         "videoSrc": public_video_rel,
         "durationSeconds": duration,
         "colorMode": op.get("colorMode", "warm"),
-        "speakerObjectPosition": op.get("speaker_object_position")
-            or calibrate_speaker_object_position(src, workdir),
         "scenes": scenes,
         "introOutFrame": 20,
         "chapters": chapters,
@@ -731,16 +685,99 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
     elif op.get("compliance"):
         props["compliance"] = op["compliance"]
 
-    props_path = workdir / "_op_apply_style_props.json"
-    props_path.write_text(json.dumps(props, ensure_ascii=False), encoding="utf-8")
+    return props
 
-    # 渲染整片前抽 QA stills 做机器检查（video-studio CLAUDE-v2 §8 的可自动化
-    # 部分）。findings 只记录不阻断；stills + qa_report.json 留在 workdir 供
-    # 有视觉的 agent 复审。
+
+def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
+    """转写 + 内容规划 + 用 Remotion 渲染 XiaojinEditorial（contract②）。
+
+    对应 VeLL-lab/video-studio 的 tools/directors/compose-director.md（"xiaojin-
+    editorial" style）——组件由 P3 移植/维护在 remotion-composer/src/XiaojinEditorial.tsx
+    + components/xiaojin/*，本函数只负责按 contracts/render_props.schema.json
+    构建 props 并调用 P3 的稳定渲染入口：
+    `npx remotion render XiaojinEditorial --props=<json>`。
+
+    章节/数据卡/仪表盘/倒计时/日历默认都走 content_planner 的完整 Data Display
+    Analysis（按 compose-director.md 的表格把每个数据点分到该用的图形，不再只有
+    count-up 一种）；调用方也可以显式传 op["chapters"] / op["data_cards"] /
+    op["gauges"] / op["countdowns"] / op["calendar_events"] / op["mode_schedule"]
+    覆盖（例如手工编排的演示）。
+
+    QR + 联系方式（props["qrContact"]）不经过 content_planner 的语义判断——
+    是否显示 QR 完全取决于调用方是否在 op["qr_contact"] 里给了真实联系方式，
+    绝不凭空编造一个。
+    """
+    config = get_config()
+
+    # Enhancement chain (compose-director.md Step 1: "attempt every step if the
+    # tool is available — do not skip steps without a reason"). Order matches
+    # the doc exactly: face -> eye -> color -> audio, then everything else
+    # (transcription/captions/render) runs on the enhanced video. eye_enhance
+    # is deliberately excluded here — unlike the other three, it has zero test
+    # coverage anywhere in this codebase and needs mediapipe/opencv-python
+    # (not part of the standard install) to do anything beyond a crude global
+    # brightness fallback; revisit once it's actually been exercised once.
+    # Each step is best-effort: if a tool errors unexpectedly, log and keep
+    # going with the pre-that-step video rather than failing the whole edit —
+    # matching the "attempt, don't hard-fail" philosophy already used
+    # throughout this file for optional refinement steps.
+    src = _run_enhancement_chain(src, workdir)
+    src_path = Path(src)
+
+    duration = _probe_duration(src_path)
+
+    t = _safe_transcribe(src, workdir, config.faster_whisper_model)
+    if t is None:
+        # 转写失败（工具报告失败或底层库抛异常）不该搞垮整条 apply_style——
+        # 降级为"有卡片+章节条+品牌条+进度条，但无字幕/图形"的版本，好过全失败。
+        logger.warning("  apply_style: 转写不可用（降级为无字幕/无图形版本）")
+        segments: list[dict] = []
+        captions: list[dict] = []
+    else:
+        segments = t.data.get("segments") or []
+        # 短语级字幕（词级时间戳重组），不是 5-6 行的 segment 大段
+        captions = build_caption_phrases(t.data.get("word_timestamps") or [], segments)
+
+    remotion_dir = Path(config.openmontage_root) / "remotion-composer"
+    job_slug = workdir.name
+    public_video_abs = remotion_dir / "public" / "jobs" / job_slug / "source.mp4"
+    public_video_abs.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, public_video_abs)
+
+    # 人脸裁剪校准是确定性的（同一段视频每次算出来的结果一样），跟内容规划反馈
+    # 无关，只需要在下面的重试循环外面算一次——重试它只会得到一模一样的值。
+    speaker_object_position = op.get("speaker_object_position") or calibrate_speaker_object_position(src, workdir)
+    props_path = workdir / "_op_apply_style_props.json"
+
+    def _build(feedback: Optional[str] = None) -> dict[str, Any]:
+        p = _build_apply_style_props(op, segments, captions, duration, remotion_dir, job_slug, feedback=feedback)
+        p["speakerObjectPosition"] = speaker_object_position
+        props_path.write_text(json.dumps(p, ensure_ascii=False), encoding="utf-8")
+        return p
+
+    props = _build()
+
+    # 渲染整片前抽 QA stills 做机器检查 + 视觉复核（video-studio CLAUDE-v2 §9
+    # "score before you ship" 自我修正循环的自动化版本）。发现"major"级问题就把
+    # 问题喂回内容规划重试一次——只重新走这一步（一次 LLM 调用 + 一轮 QA
+    # stills），不用重新渲染整片。重试后仍有问题就 raise，交给下面已有的
+    # _DEGRADABLE_OPS 降级交付逻辑处理——不是发明新的失败处理方式，是复用已经
+    # 存在、已经验证过的那一套（render 失败时走的就是同一条路）。
     if not op.get("skipQaStills"):
         from .qa_stills import run_props_qa
 
-        run_props_qa(props, props_path, remotion_dir, workdir / "qa_stills")
+        qa_result = run_props_qa(props, props_path, remotion_dir, workdir / "qa_stills")
+        major = [f for f in qa_result["findings"]
+                 if f.get("check") == "vision_review" and f.get("severity") == "major"]
+        if major:
+            feedback = "; ".join(f"frame {f['frame']}: {f['issue']}" for f in major)[:500]
+            logger.warning(f"  apply_style: 视觉复核发现问题，重新规划一次: {feedback}")
+            props = _build(feedback=feedback)
+            qa_result = run_props_qa(props, props_path, remotion_dir, workdir / "qa_stills")
+            major = [f for f in qa_result["findings"]
+                     if f.get("check") == "vision_review" and f.get("severity") == "major"]
+            if major:
+                raise RuntimeError(f"apply_style: 视觉复核重试后仍发现问题，触发降级交付: {major}")
 
     out = workdir / "_op_styled.mp4"
     npx_bin = shutil.which("npx") or "npx"  # Windows: subprocess needs the resolved npx.cmd, plain "npx" raises WinError 2

@@ -119,11 +119,15 @@ def _call_llm_json(label: str, system_prompt: str, user_message: str, *, tempera
         return None
 
 
-def plan_content(segments: list[dict], duration: float) -> dict[str, Any]:
+def plan_content(segments: list[dict], duration: float, *, feedback: Optional[str] = None) -> dict[str, Any]:
     """转写分段 -> 章节 + 四种图形的计划（已经是 frame 单位，可以直接喂给 XiaojinEditorial）。
 
     LLM 调用失败或没配 key 时，返回空计划——内容判断本来就是锦上添花，不应该
     因为它失败就搞垮整条剪辑流程。
+
+    feedback: 视觉复核（qa_stills.review_stills）发现问题后，_op_apply_style
+    重新规划一次时传入的具体问题描述——喂给同一个 LLM 调用，让它避开已知的
+    错误（例如某个数据卡跟另一个挤在一起），而不是盲目重跑一次一模一样的判断。
     """
     empty = {
         "chapters": [], "data_cards": [], "gauges": [], "countdowns": [], "calendar_events": [],
@@ -136,6 +140,11 @@ def plan_content(segments: list[dict], duration: float) -> dict[str, Any]:
         f"Reference date (for resolving relative/year-less dates): {today}\n"
         f"Video duration: {duration:.1f}s\n\nTranscript:\n{transcript_text}"
     )
+    if feedback:
+        user_message = (
+            f"NOTE: a previous rendering of this exact plan had the following visual "
+            f"problem — adjust the plan so it doesn't recur: {feedback}\n\n{user_message}"
+        )
 
     raw = _call_llm_json("内容规划", SYSTEM_PROMPT, user_message, temperature=0.2)
     if raw is None:
