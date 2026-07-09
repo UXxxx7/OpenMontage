@@ -80,6 +80,23 @@ class Config:
         default_factory=lambda: os.getenv("OPENAI_API_KEY", "")
     )
 
+    # 视觉复核（qa_stills 的 review_stills）——独立于上面的 LLM_PROVIDER/LLM_API_KEY
+    # 单独配置：生产环境的文字 provider（DeepSeek）没有视觉能力，这是完全不同的
+    # 一个 provider，只服务于"看渲染出来的 stills 判断画面对不对"这一个用途。
+    # 默认指向 GLM-4.6V-Flash（Zhipu/Z.AI）——verified 免费、支持多模态、允许
+    # 商用，见 docs.z.ai/guides/vlm/glm-4.6v。
+    vision_llm_api_key: str = field(
+        default_factory=lambda: os.getenv("VISION_LLM_API_KEY", "")
+    )
+    vision_llm_model: str = field(
+        default_factory=lambda: os.getenv("VISION_LLM_MODEL", "glm-4.6v-flash")
+    )
+    vision_llm_base_url: str = field(
+        default_factory=lambda: os.getenv(
+            "VISION_LLM_BASE_URL", "https://api.z.ai/api/paas/v4/chat/completions"
+        )
+    )
+
     # Transcription
     transcribe_provider: str = field(
         default_factory=lambda: os.getenv("TRANSCRIBE_PROVIDER", "faster_whisper")

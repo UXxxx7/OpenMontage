@@ -23,6 +23,8 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
+from .llm_client import call_llm_vision
+
 logger = logging.getLogger(__name__)
 
 _FPS = 30
@@ -123,11 +125,71 @@ def check_content_fill(png_path: Path, props: dict, frame: int) -> Optional[dict
     return None
 
 
-def run_props_qa(props: dict, props_path: Path, remotion_dir: Path, out_dir: Path) -> dict:
-    """渲 QA stills + 跑机器检查。永不 raise；渲染环境不可用时返回空结果。
+VISION_SYSTEM_PROMPT = """You are doing a final visual quality check on rendered
+frames from an automated talking-head video editor, before delivery to a real user.
+You will see one or more still frames, each preceded by a text label giving its
+frame number. For EACH frame, check only what a single static image can show:
 
-    返回 {"stills": [{"frame", "path"}...], "findings": [finding...]}——
-    stills 留在 out_dir 里，供有视觉的 agent（P1 的 L2 线）后续人工级审查。
+1. Speaker visibility: if a speaker/face card is shown, is the face (ideally chest/
+   shoulders too) actually visible — not cropped out, cut off, or fully obscured?
+2. Overlap: does any card/caption/chip/graphic visibly cover another piece of
+   content it shouldn't (e.g. a caption sitting on top of a data card's numbers,
+   two cards stacked on each other)?
+3. Completeness: does the frame look like a finished, intentional shot — not a
+   blank/empty canvas, not an obviously broken or half-rendered layout?
+
+Do NOT judge anything needing motion, audio, or multi-frame comparison (timing,
+animation smoothness, caption sync) — you only have static images.
+
+For each frame with a genuine problem, classify severity:
+- "major": the frame is actually broken (face cut off / cards unreadable due to
+  overlap / blank canvas where content should be)
+- "minor": a small aesthetic issue that doesn't make the frame unusable
+
+Output ONLY valid JSON, no markdown, no prose:
+{"findings": [{"frame": <number>, "issue": "short description", "severity": "major"|"minor"}]}
+If everything looks fine, return {"findings": []}."""
+
+
+def review_stills(stills: list[dict]) -> list[dict]:
+    """把已经渲染好的 stills 一次性丢给视觉 LLM 复核——video-studio CLAUDE-v2 §9
+    "score before you ship" 人工步骤里，机器测不了的那部分（"脸的位置对不对"、
+    "东西有没有叠在一起"）。跟 check_content_fill 那种像素统计不是一回事：那个
+    只能测"内容区是不是空的"，测不了语义层面的重叠/取景。
+
+    没配 VISION_LLM_API_KEY、调用失败、或解析失败时返回空列表——按这个文件
+    其余可选精修步骤同款的 best-effort 哲学，绝不让这一步搞垮渲染。findings
+    的 "check" 字段固定为 "vision_review"，方便调用方跟 check_content_fill
+    的 findings 区分开、只对这一类做重试判断。
+    """
+    if not stills:
+        return []
+    images = [(f"Frame {s['frame']}:", Path(s["path"])) for s in stills]
+    raw = call_llm_vision(VISION_SYSTEM_PROMPT, "Review all frames per the rules above.", images, temperature=0.1)
+    if raw is None:
+        return []
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        logger.warning(f"  qa_stills: 视觉复核结果解析失败，跳过: {e}")
+        return []
+    out = []
+    for f in (data.get("findings") or []):
+        if not isinstance(f, dict) or "frame" not in f:
+            continue
+        out.append({
+            "check": "vision_review",
+            "frame": f["frame"],
+            "issue": str(f.get("issue", ""))[:200],
+            "severity": f.get("severity") if f.get("severity") in ("major", "minor") else "minor",
+        })
+    return out
+
+
+def run_props_qa(props: dict, props_path: Path, remotion_dir: Path, out_dir: Path) -> dict:
+    """渲 QA stills + 跑机器检查 + 视觉复核。永不 raise；渲染环境不可用时返回空结果。
+
+    返回 {"stills": [{"frame", "path"}...], "findings": [finding...]}。
     """
     result: dict = {"stills": [], "findings": []}
     if not (remotion_dir / "package.json").exists():
@@ -144,6 +206,9 @@ def run_props_qa(props: dict, props_path: Path, remotion_dir: Path, out_dir: Pat
         finding = check_content_fill(png, props, frame)
         if finding:
             result["findings"].append(finding)
+
+    if result["stills"]:
+        result["findings"].extend(review_stills(result["stills"]))
 
     (out_dir / "qa_report.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"

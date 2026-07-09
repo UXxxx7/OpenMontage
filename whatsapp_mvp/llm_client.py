@@ -9,8 +9,10 @@
 
 from __future__ import annotations
 
+import base64
 import logging
 import time
+from pathlib import Path
 from typing import Optional
 
 import requests
@@ -146,4 +148,70 @@ def call_llm_chat(system_prompt: str, user_message: str, *, temperature: float =
         return data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as e:
         logger.error(f"{provider} response missing expected shape: {e}")
+        return None
+
+
+def call_llm_vision(
+    system_prompt: str,
+    user_message: str,
+    images: list[tuple[str, Path]],
+    *, temperature: float = 0.1,
+) -> Optional[str]:
+    """system+user 提示 + 一张或多张本地图片，发给独立配置的视觉 LLM（默认
+    GLM-4.6V-Flash，免费、多模态、允许商用，见 docs.z.ai/guides/vlm/glm-4.6v）。
+
+    跟 call_llm_chat 完全独立配置（VISION_LLM_*，不是 LLM_PROVIDER/LLM_API_KEY）
+    ——当前生产的文字 provider 是纯文本的 DeepSeek，没有视觉能力，这是单独的
+    一个 provider，只服务于"看图判断"这一个用途。
+
+    images: [(label, path), ...]——label 会紧跟在对应图片前面发给模型。视觉
+    模型看不到文件名，唯一能让"一次请求发多张图 + 一份 JSON 输出"按图片编号
+    对上号的办法，就是给每张图一段紧邻的文字标签（例如 "Frame 130:"）。
+
+    复用 _post_with_retries 同款的网络重试逻辑（429/5xx/超时重试，其余 4xx
+    不重试）。返回原始文本内容；没配 VISION_LLM_API_KEY、读图失败、或调用
+    失败时返回 None。
+    """
+    config = get_config()
+    api_key = config.vision_llm_api_key
+    if not api_key:
+        logger.info("No VISION_LLM_API_KEY configured, skipping vision call")
+        return None
+
+    content: list[dict] = []
+    for label, path in images:
+        try:
+            b64 = base64.b64encode(Path(path).read_bytes()).decode("ascii")
+        except OSError as e:
+            logger.warning(f"vision: 读取图片失败 {path}: {e}")
+            continue
+        mime = "image/png" if str(path).lower().endswith(".png") else "image/jpeg"
+        content.append({"type": "text", "text": label})
+        content.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+    if not content:
+        return None
+    content.append({"type": "text", "text": user_message})
+
+    data = _post_with_retries(
+        "vision",
+        config.vision_llm_base_url,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        body={
+            "model": config.vision_llm_model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": content},
+            ],
+            "temperature": temperature,
+            "thinking": {"type": "disabled"},
+            "response_format": {"type": "json_object"},
+        },
+        timeout=90,
+    )
+    if data is None:
+        return None
+    try:
+        return data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as e:
+        logger.error(f"vision response missing expected shape: {e}")
         return None
