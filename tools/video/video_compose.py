@@ -164,6 +164,8 @@ class VideoCompose(BaseTool):
                         "start_seconds": {"type": "number"},
                         "end_seconds": {"type": "number"},
                         "opacity": {"type": "number", "minimum": 0, "maximum": 1},
+                        "offset_seconds": {"type": "number", "description": "Delay the overlay input so its own frame 0 lands at base time = offset_seconds (clip plays from its start at the insertion point). Omit for the legacy time-locked behaviour."},
+                        "loop": {"type": "boolean", "description": "Loop a still image for the [start,end] window (adds -loop 1 -t). Use for image overlays."},
                     },
                 },
             },
@@ -2374,13 +2376,27 @@ class VideoCompose(BaseTool):
             if not asset_path.exists():
                 return ToolResult(success=False, error=f"Overlay asset not found: {asset_path}")
 
-            input_args.extend(["-i", str(asset_path)])
-
-            x = int(ov.get("x", 0))
-            y = int(ov.get("y", 0))
             start = ov.get("start_seconds", 0)
             end = ov.get("end_seconds")
             opacity = ov.get("opacity", 1.0)
+
+            # Per-overlay input options (backward-compatible; omit both = old behaviour):
+            #   loop=True        -> loop a still image, bounded to the [start,end] window
+            #   offset_seconds=T -> delay the clip so its own frame 0 lands at base time T,
+            #                       so the overlay PLAYS FROM ITS START at the insertion
+            #                       point instead of being time-locked to the base timeline.
+            pre_input: list = []
+            if ov.get("loop"):
+                pre_input += ["-loop", "1"]
+                if end is not None:
+                    pre_input += ["-t", str(max(0.1, float(end) - float(start)))]
+            offset = ov.get("offset_seconds")
+            if offset:
+                pre_input += ["-itsoffset", str(offset)]
+            input_args.extend(pre_input + ["-i", str(asset_path)])
+
+            x = int(ov.get("x", 0))
+            y = int(ov.get("y", 0))
 
             overlay_input = f"{i + 1}:v"
 

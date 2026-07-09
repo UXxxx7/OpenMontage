@@ -46,7 +46,7 @@ def run_talking_head_pipeline(job: Job) -> dict[str, Any]:
     # apply_style 是重量级 Remotion 渲染（失败面多：模板/字体/依赖/props）；零指令默认
     # 是 [remove_filler, apply_style]，渲染挂了也必须把剪好的视频还给用户，而不是整单报错。
     # 后续 compose 段算子（color_grade / audio_enhance 等）落地时按需加进来。
-    _DEGRADABLE_OPS = {"apply_style"}
+    _DEGRADABLE_OPS = {"apply_style", "insert_broll"}
 
     # 执行顺序：多个 remove_segment 按 start 降序“从后往前”切（转录给的是原始时间轴
     # 坐标；从后往前切，前面的刀就不会移动后面那刀之前的坐标）。其余视频操作保持原序，
@@ -523,6 +523,63 @@ def _op_color_grade(src: str, op: dict, workdir: Path) -> Optional[str]:
     return r.data.get("output") or (r.artifacts[0] if r.artifacts else None)
 
 
+def _op_insert_broll(src: str, op: dict, workdir: Path) -> Optional[str]:
+    """把用户上传的 b-roll 叠进成片（video_compose overlay，保留说话人原声，薄封装）。
+    资产文件在 workdir/assets/broll_<asset_ref>.*（Phase 1 已下载）。
+    默认 PiP 右下角小窗；mode=cutaway 时全屏。整片收尾类，排在剪辑之后。
+    offset_seconds=start 让素材从插入点开始播；图片 loop 填满窗口。"""
+    from tools.video.video_compose import VideoCompose
+    items = op.get("items") or []
+    if not items:
+        return None
+    assets_dir = workdir / "assets"
+    base_w, base_h = _probe_dimensions(Path(src))
+    if not base_w or not base_h:
+        raise RuntimeError("insert_broll: 无法读取主视频画幅")
+    overlays: list[dict] = []
+    for it in items:
+        ref = it.get("asset_ref")
+        start = _num(it.get("start_seconds"))
+        end = _num(it.get("end_seconds"))
+        if ref is None or start is None or end is None or end <= start:
+            continue
+        matches = sorted(assets_dir.glob(f"broll_{ref}.*"))
+        if not matches:
+            logger.warning(f"  insert_broll: 找不到资产 broll_{ref}.*，跳过")
+            continue
+        asset = matches[0]
+        is_image = asset.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")
+        # 视频素材：窗口收到不超过素材本身时长，避免叠加末尾冻帧
+        if not is_image:
+            clip_dur = _probe_duration(asset)
+            if clip_dur and (end - start) > clip_dur:
+                end = start + clip_dur
+        mode = str(it.get("mode") or "pip").lower()
+        if mode == "cutaway":
+            w, h, x, y = base_w, base_h, 0, 0
+        else:  # 默认 PiP：右下角小窗，留脸
+            w = int(base_w * 0.38)
+            h = int(w * 9 / 16)
+            x = base_w - w - 40
+            y = base_h - h - 40
+        overlays.append({
+            "asset_path": str(asset), "x": x, "y": y, "width": w, "height": h,
+            "start_seconds": start, "end_seconds": end,
+            "offset_seconds": start,        # 从插入点开始播（配合 video_compose 新参数）
+            "loop": bool(is_image),         # 图片循环填满窗口
+        })
+    if not overlays:
+        return None
+    out = workdir / "_op_insert_broll.mp4"
+    r = VideoCompose().execute({
+        "operation": "overlay", "input_path": src,
+        "overlays": overlays, "output_path": str(out),
+    })
+    if not r.success:
+        raise RuntimeError(f"insert_broll 失败: {r.error}")
+    return r.data.get("output") or (r.artifacts[0] if r.artifacts else None)
+
+
 def _op_add_subtitles(src: str, op: dict, workdir: Path) -> Optional[str]:
     """转写 -> 烧录字幕（原语言）。翻译成其他语言暂不支持（见 planner 的 unsupported）。
 
@@ -821,6 +878,7 @@ _OP_HANDLERS: dict[str, Callable[[str, dict, Path], Optional[str]]] = {
     "trim_leading_silence": _op_trim_leading_silence,
     "reframe": _op_reframe,
     "color_grade": _op_color_grade,
+    "insert_broll": _op_insert_broll,
     "apply_style": _op_apply_style,
     # add_subtitles 在主流程末尾单独处理（需要先转写）；apply_style 已经自带
     # 转写+字幕烧录，跟 add_subtitles 同时出现时 planner 应该只选一个。
@@ -841,6 +899,20 @@ def _probe_duration(path: Path) -> float:
         return float(probe.stdout.strip())
     except Exception:
         return 0.0
+
+
+def _probe_dimensions(path: Path) -> tuple:
+    """ffprobe 取视频宽高 (w, h)；失败返回 (0, 0)。用于 b-roll PiP 几何。"""
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", str(path)],
+            capture_output=True, text=True, check=True,
+        )
+        w, h = probe.stdout.strip().split("x")
+        return int(w), int(h)
+    except Exception:
+        return 0, 0
 
 
 def _num(v: Any) -> Optional[float]:
