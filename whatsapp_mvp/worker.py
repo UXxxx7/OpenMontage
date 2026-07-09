@@ -353,6 +353,17 @@ def _run_llm_planner(job: Any) -> None:
     review = _source_review_stage(job, input_path)
     source_facts = _source_facts(review)
 
+    # b-roll 事实块：把收集到的 b-roll 素材(编号+类型+标签)喂给 L2，让它按"标签↔转录"匹配放置。
+    # 没有 b-roll 就不加这块 —— L2 的 SYSTEM_BASE 规定只有事实里列了才 emit insert_broll。
+    from .job_manager import get_assets
+    broll = [a for a in get_assets(job) if a.get("role") == "broll"]
+    if broll:
+        lines = ["可用 b-roll 素材（用户上传，用 insert_broll 按需插入；asset_ref 用下面的编号）："]
+        for a in broll:
+            lines.append(f"[b{a.get('order')}] 类型={a.get('kind')} 说明=\"{a.get('label') or '(无说明)'}\"")
+        block = "\n".join(lines)
+        source_facts = (source_facts + "\n\n" + block) if source_facts else block
+
     # Script 阶段：转录原始视频 + 产出 script artifact，转录喂给规划做转录感知剪辑
     transcript = _script_stage(job, input_path)
 

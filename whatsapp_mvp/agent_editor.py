@@ -38,6 +38,7 @@ OP_TOOLS = {
     "trim_leading_silence": ["silence_cutter", "video_trimmer"],
     "reframe": ["auto_reframe"],
     "color_grade": ["color_grade"],
+    "insert_broll": ["video_compose"],
     "add_subtitles": ["transcriber", "remotion_caption_burn"],
     "remove_filler": ["transcriber", "video_trimmer"],
     "apply_style": ["transcriber", "remotion_caption_burn"],
@@ -78,6 +79,15 @@ ALL_TOOL_SCHEMAS = {
                     {"profile": {"type": "string", "enum": ["cinematic_warm", "cinematic_cool",
                      "moody_dark", "bright_clean", "vintage_film", "high_contrast", "neutral"]},
                      "intensity": {"type": "number"}}, []),
+    "insert_broll": ("把用户上传的 b-roll 素材叠进成片（默认 PiP 小窗留脸，保留原声）。"
+                     "**仅当 source_facts 里列出了可用 b-roll 素材时才用**。items 每项："
+                     "asset_ref=素材编号（见事实里的 [b<编号>]），start_seconds/end_seconds=放置时间窗，"
+                     "mode=pip(默认)|cutaway(全屏)",
+                     {"items": {"type": "array", "items": {"type": "object", "properties": {
+                        "asset_ref": {"type": "integer"},
+                        "start_seconds": {"type": "number"}, "end_seconds": {"type": "number"},
+                        "mode": {"type": "string", "enum": ["pip", "cutaway"]}}}}},
+                     ["items"]),
     "add_subtitles": ("转写并烧录字幕（原语言）", {"language": {"type": "string"}}, []),
     "remove_filler": ("LLM 读转写判断口误/语气词/重录并剪掉；比 remove_silences 更细，"
                       "能剪有声的“呃/嗯”和中间没停顿的重录（无参）", {}, []),
@@ -188,6 +198,7 @@ SYSTEM_BASE = """你是 OpenMontage 的剪辑 agent，编辑用户上传的 talk
 - 剪口误/语气词/重录：优先用 remove_filler（它读转写逐词判断，能剪有声的"呃/嗯"和无停顿的重录），不要用 remove_segment 去手动框口误。remove_silences 只删静音停顿，和 remove_filler 可叠加。
 - 基于内容的"选择性剪辑"：若提供了逐句转录（带时间戳），当用户要"只保留讲 X 的部分""删掉聊 Y 那段"这类**按内容选择**的诉求，用 remove_segment(start_seconds, end_seconds) 按转录里的真实时间戳精确剪除，可多次调用。没有明确要求就不要擅自删改说话内容。
 - 调色/画面质感：用户说"调暖/暖色/电影感"→ color_grade profile=cinematic_warm；"冷调/青橙"→ cinematic_cool；"暗黑/氛围感/压暗"→ moody_dark；"明亮干净/清新"→ bright_clean；"复古/胶片/怀旧"→ vintage_film；"高对比/浓郁/有冲击力"→ high_contrast；"轻微校色/自然"→ neutral。color_grade 是整片调色，可与剪辑类叠加；但**不要和 apply_style 叠加**（模板自带风格观感，套模板时就别再单独调色）。
+- b-roll 插入：**仅当 source_facts 里列出了"可用 b-roll 素材"时**才用 insert_broll，没列就绝不 emit。对每段素材，用它的说明（label）去转录里找**内容匹配**的那句话，取那句的时间窗，emit 一条 items 项 {asset_ref: 该素材编号, start_seconds, end_seconds, mode: "pip"}。默认 pip（小窗留脸），用户明说"全屏/切过去"才 cutaway。说明匹配不上任何一句就跳过该素材、不硬塞；两段 b-roll 不要时间重叠。用户没给具体位置说明时，可按素材说明与转录话题就近放置。
 - 出片风格：用户说"剪好看点/精致/小红书风格/我们的品牌风格/做正式些"这类诉求，用 apply_style 套品牌模板出片。它**自带字幕**，选了它就不要再加 add_subtitles。
 - 零指令默认：用户只说"帮我剪一下/剪一下/edit this"这类**没有任何具体指令**的请求，不要问澄清，直接默认先 remove_filler 再 apply_style，并在 finish 的 rationale 里说明这是默认处理、下次可给更具体要求。
 
@@ -454,7 +465,7 @@ def plan_video(request: str, video_path: str | None = None,
     supported = set(ops)
 
     work_history = list(history or [])
-    messages = build_messages(request, duration, skill_context, work_history, ops)
+    messages = build_messages(request, duration, skill_context, work_history, ops, transcript, source_facts)
     plan, note = plan_once(config, messages, tools, supported, duration)
 
     findings: list = []
