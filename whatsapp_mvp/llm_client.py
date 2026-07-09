@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional
 
 import requests
@@ -17,6 +18,52 @@ import requests
 from .config import get_config
 
 logger = logging.getLogger(__name__)
+
+# A single flaky attempt was silently turning into "content_planner ships an
+# empty plan" for real jobs even though the same call succeeds moments later
+# on retry (confirmed: two consecutive real WhatsApp jobs, same code, one
+# came back with zero chapters/data points, the next came back fully
+# populated). Retry transient failures a couple of times before giving up.
+_MAX_ATTEMPTS = 3
+_RETRY_BACKOFF_BASE_SECONDS = 1.5
+# 429/5xx are worth retrying (rate limit, transient server trouble). Other
+# 4xx (bad key, bad model, malformed request) will fail identically every
+# time, so retrying just adds latency for a guaranteed-to-fail call.
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+
+def _post_with_retries(
+    label: str, url: str, headers: dict, body: dict, timeout: int
+) -> Optional[dict]:
+    """POST with a small retry budget for transient failures only.
+
+    Returns the parsed JSON response body, or None if every attempt failed
+    (already logged) or the failure was non-retryable.
+    """
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
+        try:
+            resp = requests.post(url, headers=headers, json=body, timeout=timeout)
+        except (requests.ConnectionError, requests.Timeout) as e:
+            if attempt == _MAX_ATTEMPTS:
+                logger.error(f"{label} call failed after {attempt} attempts (network): {e}")
+                return None
+            logger.warning(f"{label} call network error, retrying ({attempt}/{_MAX_ATTEMPTS}): {e}")
+            time.sleep(_RETRY_BACKOFF_BASE_SECONDS * attempt)
+            continue
+
+        if resp.status_code in _RETRYABLE_STATUS_CODES and attempt < _MAX_ATTEMPTS:
+            logger.warning(f"{label} call got HTTP {resp.status_code}, retrying ({attempt}/{_MAX_ATTEMPTS})")
+            time.sleep(_RETRY_BACKOFF_BASE_SECONDS * attempt)
+            continue
+
+        try:
+            resp.raise_for_status()
+        except Exception as e:
+            logger.error(f"{label} call failed (HTTP {resp.status_code}, not retrying): {e}")
+            return None
+        return resp.json()
+
+    return None
 
 
 def call_llm_chat(system_prompt: str, user_message: str, *, temperature: float = 0.1) -> Optional[str]:
@@ -32,26 +79,28 @@ def call_llm_chat(system_prompt: str, user_message: str, *, temperature: float =
         if not api_key:
             logger.warning("No LLM_API_KEY set for claude provider")
             return None
+        data = _post_with_retries(
+            "Claude",
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            },
+            body={
+                "model": config.llm_model,
+                "max_tokens": 1024,
+                "system": system_prompt,
+                "messages": [{"role": "user", "content": user_message}],
+            },
+            timeout=60,
+        )
+        if data is None:
+            return None
         try:
-            resp = requests.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": api_key,
-                    "anthropic-version": "2023-06-01",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": config.llm_model,
-                    "max_tokens": 1024,
-                    "system": system_prompt,
-                    "messages": [{"role": "user", "content": user_message}],
-                },
-                timeout=60,
-            )
-            resp.raise_for_status()
-            return resp.json()["content"][0]["text"]
-        except Exception as e:
-            logger.error(f"Claude call failed: {e}")
+            return data["content"][0]["text"]
+        except (KeyError, IndexError, TypeError) as e:
+            logger.error(f"Claude response missing expected shape: {e}")
             return None
 
     # deepseek / openai / custom all speak the OpenAI-compatible chat/completions shape
@@ -76,23 +125,25 @@ def call_llm_chat(system_prompt: str, user_message: str, *, temperature: float =
         logger.warning(f"No API key set for provider '{provider}'")
         return None
 
+    data = _post_with_retries(
+        provider,
+        endpoint,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        body={
+            "model": config.llm_model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ],
+            "temperature": temperature,
+            "response_format": {"type": "json_object"},
+        },
+        timeout=60,
+    )
+    if data is None:
+        return None
     try:
-        resp = requests.post(
-            endpoint,
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={
-                "model": config.llm_model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message},
-                ],
-                "temperature": temperature,
-                "response_format": {"type": "json_object"},
-            },
-            timeout=60,
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
-    except Exception as e:
-        logger.error(f"LLM call failed ({provider}): {e}")
+        return data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as e:
+        logger.error(f"{provider} response missing expected shape: {e}")
         return None

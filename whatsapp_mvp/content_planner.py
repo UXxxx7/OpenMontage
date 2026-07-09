@@ -84,6 +84,38 @@ def _build_transcript_text(segments: list[dict]) -> str:
     return text
 
 
+def _call_llm_json(label: str, system_prompt: str, user_message: str, *, temperature: float) -> Optional[dict]:
+    """call_llm_chat + json.loads, with ONE retry of the whole call if the
+    response isn't valid JSON.
+
+    call_llm_chat already retries transient HTTP failures internally; this
+    is a different failure mode — the call succeeds but the model doesn't
+    return parseable JSON despite being asked to (a real, observed failure
+    mode: same prompt succeeded on a later attempt with no code changes).
+    Returns the parsed dict, or None if the LLM is unusable or two straight
+    attempts both failed to produce valid JSON.
+    """
+    content = call_llm_chat(system_prompt, user_message, temperature=temperature)
+    if content is None:
+        logger.info(f"content_planner: {label} 没配 LLM 或调用失败，跳过")
+        return None
+
+    try:
+        return json.loads(content)
+    except Exception as e:
+        logger.warning(f"content_planner: {label} 解析 LLM 输出失败，重试一次: {e}")
+
+    content = call_llm_chat(system_prompt, user_message, temperature=temperature)
+    if content is None:
+        logger.warning(f"content_planner: {label} 重试调用 LLM 失败，跳过")
+        return None
+    try:
+        return json.loads(content)
+    except Exception as e:
+        logger.warning(f"content_planner: {label} 重试后仍解析失败，跳过: {e}")
+        return None
+
+
 def plan_content(segments: list[dict], duration: float) -> dict[str, Any]:
     """转写分段 -> 章节 + 四种图形的计划（已经是 frame 单位，可以直接喂给 XiaojinEditorial）。
 
@@ -102,15 +134,8 @@ def plan_content(segments: list[dict], duration: float) -> dict[str, Any]:
         f"Video duration: {duration:.1f}s\n\nTranscript:\n{transcript_text}"
     )
 
-    content = call_llm_chat(SYSTEM_PROMPT, user_message, temperature=0.2)
-    if content is None:
-        logger.info("content_planner: 没配 LLM 或调用失败，跳过内容规划（返回空外壳计划）")
-        return empty
-
-    try:
-        raw = json.loads(content)
-    except Exception as e:
-        logger.warning(f"content_planner: 解析 LLM 输出失败，跳过内容规划: {e}")
+    raw = _call_llm_json("内容规划", SYSTEM_PROMPT, user_message, temperature=0.2)
+    if raw is None:
         return empty
 
     return _to_frame_plan(raw, duration)
@@ -370,13 +395,11 @@ def plan_filler_removal(words: list[dict], duration: float) -> list[dict]:
 
     numbered = "\n".join(f"{i}: {w['word']} [{w['start']:.2f}-{w['end']:.2f}]" for i, w in enumerate(words))
 
-    content = call_llm_chat(FILLER_SYSTEM_PROMPT, numbered, temperature=0.1)
-    if content is None:
-        logger.info("content_planner: 没配 LLM 或调用失败，跳过口误检测")
+    raw = _call_llm_json("口误检测", FILLER_SYSTEM_PROMPT, numbered, temperature=0.1)
+    if raw is None:
         return []
 
     try:
-        raw = json.loads(content)
         cut_indices = {int(i) for i in (raw.get("cut_word_indices") or []) if 0 <= int(i) < len(words)}
     except Exception as e:
         logger.warning(f"content_planner: 口误检测结果解析失败，跳过: {e}")
