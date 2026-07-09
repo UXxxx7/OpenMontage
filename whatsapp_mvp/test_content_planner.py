@@ -76,6 +76,31 @@ def main():
           card["endFrame"] <= gauge["mountFrame"] - MIN_GAP_AFTER_PREVIOUS_FRAMES,
           {"card_end": card["endFrame"], "gauge_mount": gauge["mountFrame"]})
 
+    # 5d. mode_schedule 不能在挨得近的两个图形之间漏掉 workflow 收起——第二个
+    # 图形的"提前收起"帧如果落在第一个图形"收起后长大"帧之前/相同，naive
+    # 逐段生成 + strict-increasing dedup 会把 workflow 段悄悄丢掉，SpeakerCard
+    # 全程停在 Dominant（卡片一直很大，第二个图形只能硬贴在卡片底部）——
+    # 实测过这个 bug：日历后紧跟一张数据卡，数据卡完全没收起过。直接检查：
+    # 数据卡上场那一帧，SpeakerCard 是不是真的已经处在 workflow。
+    def _mode_at(schedule, frame):
+        mode = "dominant"
+        for m in schedule:
+            if m["frame"] <= frame:
+                mode = m["mode"]
+            else:
+                break
+        return mode
+
+    plan = _to_frame_plan({"chapters": [], "data_points": [
+        {"visual": "calendar", "seconds": 9.0, "year": 2026, "month": 7, "targetDay": 28, "eventLabel": "E"},
+        {"visual": "count_up", "title": "T", "rows": [{"label": "X", "seconds": 11.5, "value": 1}]},
+    ]}, duration=40.0)
+    modes = plan["mode_schedule"]
+    card_mount = plan["data_cards"][0]["mountFrame"]
+    check("紧邻图形之间不漏 workflow 收起：数据卡上场时卡片必须已收起",
+          _mode_at(modes, card_mount) == "workflow",
+          {"mode_schedule": modes, "card_mount": card_mount})
+
     # 5. 畸形条目容错：非 dict / 缺字段不炸、不产出
     plan = _to_frame_plan({"chapters": [{"label": "no at_seconds"}],
                            "data_points": ["not a dict", {"visual": "gauge"}]}, duration=30.0)

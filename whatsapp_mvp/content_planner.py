@@ -35,6 +35,9 @@ MOUNT_LEAD_FRAMES = 50
 MIN_GAP_AFTER_PREVIOUS_FRAMES = 10
 # 图形展示完之后，Workflow 模式至少再停留这么久再切回 Dominant，避免切换过快。
 HOLD_AFTER_LAST_ROW_FRAMES = 90
+# SpeakerCard 提前这么多帧从 Dominant 收进 Workflow，好让图形上场时卡片已经
+# 让开位置。
+WORKFLOW_SHRINK_LEAD_FRAMES = 10
 # 仪表盘/倒计时自身的入场+动画时长（对应组件默认值），决定它们各自的"活跃窗口"。
 GAUGE_ANIMATION_FRAMES = 20 + 50  # fillDelayFrames + fillDurationFrames 默认值
 COUNTDOWN_ANIMATION_FRAMES = 40  # revealFrames 默认值
@@ -211,11 +214,13 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
             cur["endFrame"] = min(cur.get("endFrame", nxt["mountFrame"]), nxt["mountFrame"])
 
     mode_schedule = [{"frame": 0, "mode": "dominant"}]
-    for start, end in sorted(workflow_ranges):
-        mode_schedule.append({"frame": max(1, start - 10), "mode": "workflow"})
+    for start, end in _merge_workflow_ranges(workflow_ranges):
+        mode_schedule.append({"frame": max(1, start - WORKFLOW_SHRINK_LEAD_FRAMES), "mode": "workflow"})
         if round(end) < round(duration * FPS):
             mode_schedule.append({"frame": end, "mode": "dominant"})
-    # interpolate() requires strictly increasing frame numbers.
+    # interpolate() requires strictly increasing frame numbers. Ranges are
+    # already merged above so this shouldn't trigger for adjacent graphics
+    # anymore — kept as a backstop for anything unexpected.
     dedup: list[dict] = []
     for entry in mode_schedule:
         if dedup and entry["frame"] <= dedup[-1]["frame"]:
@@ -226,6 +231,35 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
         "chapters": chapters, "data_cards": data_cards, "gauges": gauges,
         "countdowns": countdowns, "calendar_events": calendar_events, "mode_schedule": dedup,
     }
+
+
+def _merge_workflow_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Merge workflow ranges close enough together that building the schedule
+    from them separately would collide.
+
+    Each range independently produces a "shrink to Workflow" transition at
+    (start - WORKFLOW_SHRINK_LEAD_FRAMES) and a "grow back to Dominant"
+    transition at (end). When two graphics are close together in time, the
+    next one's shrink transition can land at or before the previous one's
+    grow-back transition — interpolate() requires strictly increasing frame
+    numbers, so the later (larger) of the two colliding frames silently wins,
+    which is the *grow-back*, not the shrink. Confirmed bug: a data card
+    immediately following a calendar never got its own shrink at all — the
+    SpeakerCard stayed stuck in Dominant (large) mode for the entire data
+    card instead of shrinking to make room for it. Merging first means
+    back-to-back graphics keep the card continuously in Workflow mode
+    instead of a needless grow-then-immediately-shrink flicker, or worse,
+    no shrink happening at all.
+    """
+    if not ranges:
+        return []
+    merged = [list(sorted(ranges)[0])]
+    for start, end in sorted(ranges)[1:]:
+        if start - WORKFLOW_SHRINK_LEAD_FRAMES <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return [(s, e) for s, e in merged]
 
 
 def _dp_seconds(dp: dict) -> float:
