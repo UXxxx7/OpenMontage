@@ -37,6 +37,7 @@ OP_TOOLS = {
     "speed_up_silence": ["silence_cutter"],
     "trim_leading_silence": ["silence_cutter", "video_trimmer"],
     "reframe": ["auto_reframe"],
+    "color_grade": ["color_grade"],
     "add_subtitles": ["transcriber", "remotion_caption_burn"],
     "remove_filler": ["transcriber", "video_trimmer"],
     "apply_style": ["transcriber", "remotion_caption_burn"],
@@ -70,6 +71,13 @@ ALL_TOOL_SCHEMAS = {
     "trim_leading_silence": ("只去掉开头的静音/空白", {}, []),
     "reframe": ("转换画幅：portrait=竖屏9:16, square=1:1, landscape=16:9, cinematic=21:9",
                 {"aspect": {"type": "string", "enum": ["portrait", "square", "landscape", "cinematic"]}}, []),
+    "color_grade": ("整片调色/画面质感（ffmpeg 预设）。profile：cinematic_warm=电影暖调, "
+                    "cinematic_cool=冷调青橙, moody_dark=暗黑氛围, bright_clean=明亮干净, "
+                    "vintage_film=复古胶片, high_contrast=高对比, neutral=轻微校色。"
+                    "intensity 0~1 混合度（默认 0.85）",
+                    {"profile": {"type": "string", "enum": ["cinematic_warm", "cinematic_cool",
+                     "moody_dark", "bright_clean", "vintage_film", "high_contrast", "neutral"]},
+                     "intensity": {"type": "number"}}, []),
     "add_subtitles": ("转写并烧录字幕（原语言）", {"language": {"type": "string"}}, []),
     "remove_filler": ("LLM 读转写判断口误/语气词/重录并剪掉；比 remove_silences 更细，"
                       "能剪有声的“呃/嗯”和中间没停顿的重录（无参）", {}, []),
@@ -174,11 +182,12 @@ SYSTEM_BASE = """你是 OpenMontage 的剪辑 agent，编辑用户上传的 talk
 
 治理要求（AGENT_GUIDE.md）：
 - Rule Zero：先读下面给出的 pipeline manifest、edit-director skill、Layer3 技术 skill，按其规范规划。
-- 只能用**给你的工具列表**里的工具（已按 manifest 的 tools_available 过滤）；用户要的、工具做不到的（翻译字幕、配乐、调色、换背景等），不要硬凑，在 finish 的 rationale 里点出做不了。
+- 只能用**给你的工具列表**里的工具（已按 manifest 的 tools_available 过滤）；用户要的、工具做不到的（翻译字幕、配乐、换背景等），不要硬凑，在 finish 的 rationale 里点出做不了。
 - 字幕(add_subtitles)若用，放最后。
 - 关于停顿：用户若说"太紧/不自然/保留正常停顿"之类，不要直接放弃去静音，而是给 remove_silences 传更大的 min_silence_duration（如 1.0~1.5 秒），只剪明显偏长的静音、保留自然的句间停顿。
 - 剪口误/语气词/重录：优先用 remove_filler（它读转写逐词判断，能剪有声的"呃/嗯"和无停顿的重录），不要用 remove_segment 去手动框口误。remove_silences 只删静音停顿，和 remove_filler 可叠加。
 - 基于内容的"选择性剪辑"：若提供了逐句转录（带时间戳），当用户要"只保留讲 X 的部分""删掉聊 Y 那段"这类**按内容选择**的诉求，用 remove_segment(start_seconds, end_seconds) 按转录里的真实时间戳精确剪除，可多次调用。没有明确要求就不要擅自删改说话内容。
+- 调色/画面质感：用户说"调暖/暖色/电影感"→ color_grade profile=cinematic_warm；"冷调/青橙"→ cinematic_cool；"暗黑/氛围感/压暗"→ moody_dark；"明亮干净/清新"→ bright_clean；"复古/胶片/怀旧"→ vintage_film；"高对比/浓郁/有冲击力"→ high_contrast；"轻微校色/自然"→ neutral。color_grade 是整片调色，可与剪辑类叠加；但**不要和 apply_style 叠加**（模板自带风格观感，套模板时就别再单独调色）。
 - 出片风格：用户说"剪好看点/精致/小红书风格/我们的品牌风格/做正式些"这类诉求，用 apply_style 套品牌模板出片。它**自带字幕**，选了它就不要再加 add_subtitles。
 - 零指令默认：用户只说"帮我剪一下/剪一下/edit this"这类**没有任何具体指令**的请求，不要问澄清，直接默认先 remove_filler 再 apply_style，并在 finish 的 rationale 里说明这是默认处理、下次可给更具体要求。
 
@@ -459,9 +468,10 @@ def plan_video(request: str, video_path: str | None = None,
         messages = build_messages(request, duration, skill_context, work_history, ops, transcript, source_facts)
         plan, note = plan_once(config, messages, tools, supported, duration)
 
-    # apply_style 自带字幕：若同时冒出 add_subtitles，去掉后者，避免双字幕
+    # apply_style 自带字幕与整体观感：若同时冒出 add_subtitles / color_grade，去掉它们
+    # （模板拥有最终字幕和调色，避免双字幕 / 双重调色）
     if any(o.get("type") == "apply_style" for o in plan):
-        plan = [o for o in plan if o.get("type") != "add_subtitles"]
+        plan = [o for o in plan if o.get("type") not in ("add_subtitles", "color_grade")]
 
     art = build_edit_decisions(plan, Path(video_path) if video_path else Path("input.mp4"), duration, note)
     return {

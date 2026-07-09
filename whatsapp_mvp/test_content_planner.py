@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from whatsapp_mvp.content_planner import FPS, MOUNT_LEAD_FRAMES, _to_frame_plan
+from whatsapp_mvp.content_planner import FPS, MOUNT_LEAD_FRAMES, MIN_GAP_AFTER_PREVIOUS_FRAMES, _to_frame_plan
 
 FAILED = []
 
@@ -49,8 +49,11 @@ def main():
           len(plan["gauges"]) == 1 and len(plan["countdowns"]) == 1 and len(plan["calendar_events"]) == 1,
           {k: len(plan[k]) for k in ("gauges", "countdowns", "calendar_events")})
 
-    # 5b. endFrame 接力钳制（merge runbook P2 任务）：同坑位的两个图形，
-    # 前者的 endFrame 必须被钳到后者的 mountFrame，否则永久重叠。
+    # 5b. endFrame 接力钳制（merge runbook P2 任务）+ chronological mount floor
+    # （P3 补的另一半）：同坑位的两个图形不能重叠，且后者不能提前到前者还没
+    # 结束就上场——两者结合后，前者的 endFrame 到后者的 mountFrame 之间应该
+    # 有至少 MIN_GAP_AFTER_PREVIOUS_FRAMES 的间隔，而不是像只有钳制时那样
+    # 严格相等（严格相等会让两者的 15 帧淡出/上场动画紧贴甚至重叠）。
     plan = _to_frame_plan({"chapters": [], "data_points": [
         {"visual": "count_up", "title": "A",
          "rows": [{"label": "X", "seconds": 5.0, "value": 1}]},
@@ -58,7 +61,8 @@ def main():
          "rows": [{"label": "Y", "seconds": 7.0, "value": 2}]},
     ]}, duration=60.0)
     a, b = sorted(plan["data_cards"], key=lambda c: c["mountFrame"])
-    check("被接替的卡 endFrame == 后一张的 mountFrame", a["endFrame"] == b["mountFrame"],
+    check("被接替的卡不与后一张重叠，且留有最小间隔",
+          a["endFrame"] <= b["mountFrame"] - MIN_GAP_AFTER_PREVIOUS_FRAMES,
           {"a_end": a["endFrame"], "b_mount": b["mountFrame"]})
     check("最后一张卡保留自己的停留窗口 endFrame", b.get("endFrame", 0) > b["mountFrame"], b.get("endFrame"))
 
@@ -68,7 +72,8 @@ def main():
         {"visual": "gauge", "seconds": 7.0, "title": "R", "leftLabel": "L", "rightLabel": "R", "value": 0.5},
     ]}, duration=60.0)
     card = plan["data_cards"][0]; gauge = plan["gauges"][0]
-    check("跨类型接力: 卡的 endFrame == 仪表盘 mountFrame", card["endFrame"] == gauge["mountFrame"],
+    check("跨类型接力: 卡不与仪表盘重叠，且留有最小间隔",
+          card["endFrame"] <= gauge["mountFrame"] - MIN_GAP_AFTER_PREVIOUS_FRAMES,
           {"card_end": card["endFrame"], "gauge_mount": gauge["mountFrame"]})
 
     # 6. intro/outro/双语章节映射（对齐 VeLL 参考成片的可自动化元素）
@@ -86,6 +91,31 @@ def main():
 
     plan = _to_frame_plan({"chapters": [], "intro": {"eyebrow": "X"}, "outro": {"kicker": "Y"}}, duration=30.0)
     check("intro 无 title / outro 无 headline -> 不产出(None)", plan["intro"] is None and plan["outro"] is None)
+
+    # 5d. mode_schedule 不能在挨得近的两个图形之间漏掉 workflow 收起——第二个
+    # 图形的"提前收起"帧如果落在第一个图形"收起后长大"帧之前/相同，naive
+    # 逐段生成 + strict-increasing dedup 会把 workflow 段悄悄丢掉，SpeakerCard
+    # 全程停在 Dominant（卡片一直很大，第二个图形只能硬贴在卡片底部）——
+    # 实测过这个 bug：日历后紧跟一张数据卡，数据卡完全没收起过。直接检查：
+    # 数据卡上场那一帧，SpeakerCard 是不是真的已经处在 workflow。
+    def _mode_at(schedule, frame):
+        mode = "dominant"
+        for m in schedule:
+            if m["frame"] <= frame:
+                mode = m["mode"]
+            else:
+                break
+        return mode
+
+    plan = _to_frame_plan({"chapters": [], "data_points": [
+        {"visual": "calendar", "seconds": 9.0, "year": 2026, "month": 7, "targetDay": 28, "eventLabel": "E"},
+        {"visual": "count_up", "title": "T", "rows": [{"label": "X", "seconds": 11.5, "value": 1}]},
+    ]}, duration=40.0)
+    modes = plan["mode_schedule"]
+    card_mount = plan["data_cards"][0]["mountFrame"]
+    check("紧邻图形之间不漏 workflow 收起：数据卡上场时卡片必须已收起",
+          _mode_at(modes, card_mount) == "workflow",
+          {"mode_schedule": modes, "card_mount": card_mount})
 
     # 5. 畸形条目容错：非 dict / 缺字段不炸、不产出
     plan = _to_frame_plan({"chapters": [{"label": "no at_seconds"}],

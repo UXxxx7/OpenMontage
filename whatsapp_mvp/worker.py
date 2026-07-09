@@ -95,6 +95,20 @@ def run_pipeline(job_id: str) -> None:
                 "回复 'export' 导出最终视频，或回复 'retry' 重新编辑。",
             )
 
+            # 优雅降级提示：某些非致命步骤失败被跳过（见 pipeline_runner 的
+            # _DEGRADABLE_OPS），已交付上一步结果——把这件事显性告诉用户，
+            # 不让"样式没成"变成沉默失败（对齐 AGENT_GUIDE：runtime 警告要 surface）。
+            degraded = result.get("degraded_operations") or []
+            if degraded:
+                labels = {"apply_style": "品牌样式渲染"}
+                names = "、".join(labels.get(op, op) for op in degraded)
+                _safe_send(
+                    wa,
+                    job.user.whatsapp_id,
+                    f"提醒：{names}这一步没成功，已先把剪辑好的版本发你（其余编辑已完成）。"
+                    "可回复 'retry' 重试。",
+                )
+
     except Exception as e:
         logger.exception(f"管线运行出错 {job_id}: {e}")
         update_job_status(job_id, JobStatus.ERROR, str(e))
@@ -417,4 +431,3 @@ def _safe_send(wa: WhatsAppClient, to: str, text: str) -> None:
         wa.send_text_message(to, text)
     except Exception as e:
         logger.warning(f"发送 WhatsApp 消息失败: {e}")
-

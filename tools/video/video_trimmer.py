@@ -114,13 +114,18 @@ class VideoTrimmer(BaseTool):
             inputs.get("output_path", str(input_path.with_stem(f"{input_path.stem}_cut")))
         )
 
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", str(input_path),
-            "-ss", str(start_s),
-        ]
+        # -ss before -i (input seeking) + -t (duration) instead of -to (end
+        # time) after -i — the reverse ordering is a confirmed bug class
+        # (video-studio's CLAUDE-v2.md): combined with certain filters it can
+        # silently truncate/zero out content past the seek point. This form
+        # doesn't reproduce it, and is also faster (input seek vs. decode-then-
+        # discard).
+        cmd = ["ffmpeg", "-y"]
+        if start_s:
+            cmd.extend(["-ss", str(start_s)])
+        cmd.extend(["-i", str(input_path)])
         if end_s is not None:
-            cmd.extend(["-to", str(end_s)])
+            cmd.extend(["-t", str(end_s - start_s)])
         if codec == "copy":
             cmd.extend(["-c", "copy"])
         else:
@@ -202,35 +207,31 @@ class VideoTrimmer(BaseTool):
 
                 if seg_start is not None or seg_end is not None:
                     temp_path = temp_dir / f"seg_{i:04d}{seg_input.suffix}"
-                    # Re-encode each cut segment — NEVER stream-copy here.
-                    # Word-level cut points (remove_filler) almost never land
-                    # on a keyframe; `-c copy` cuts can only start at
-                    # keyframes, so the concat result plays continuing audio
-                    # over a FROZEN first frame until the next keyframe
-                    # (reproduced on real WhatsApp jobs). Frame-accurate:
-                    # input-seek + re-encode, CFR to keep concat PTS sane
-                    # (see CLAUDE-v2 "No frame found" gotcha), tiny audio
-                    # fades to avoid clicks at the joins (video-use does the
-                    # same with 30ms fades).
+                    # Segment boundaries here are arbitrary word-timestamp cut
+                    # points (e.g. filler-word removal), not keyframe-aligned —
+                    # -c copy can only cut at keyframes, so the concat result
+                    # plays continuing audio over a FROZEN first frame until
+                    # the next keyframe (reproduced on real WhatsApp jobs).
+                    # Re-encode instead for frame-accurate cuts: -ss before -i
+                    # + -t (not -to) after, per the same bug class as _cut
+                    # above; crf 18 pins quality (the final concat re-encodes
+                    # once more, so segments must not degrade on this pass);
+                    # 30ms audio fades avoid clicks at joins (same treatment
+                    # video-use applies at its cut points).
                     cmd = ["ffmpeg", "-y"]
                     if seg_start is not None:
                         cmd.extend(["-ss", str(seg_start)])
                     cmd.extend(["-i", str(seg_input)])
                     if seg_end is not None:
-                        dur = None
-                        if seg_start is not None:
-                            dur = max(0.0, float(seg_end) - float(seg_start))
-                        if dur is not None:
-                            cmd.extend(["-t", f"{dur:.3f}"])
-                        else:
-                            cmd.extend(["-to", str(seg_end)])
+                        cmd.extend(["-t", f"{max(0.0, float(seg_end) - float(seg_start or 0)):.3f}"])
+                    if seg_start is not None and seg_end is not None:
+                        fade_out_st = max(0.0, float(seg_end) - float(seg_start) - 0.03)
+                        cmd.extend(["-af", f"afade=t=in:d=0.03,afade=t=out:st={fade_out_st:.3f}:d=0.03"])
+                    else:
+                        cmd.extend(["-af", "afade=t=in:d=0.03"])
                     cmd.extend([
-                        "-af", "afade=t=in:d=0.03,afade=t=out:st=9999:d=0.03"
-                        if seg_end is None or seg_start is None else
-                        f"afade=t=in:d=0.03,afade=t=out:st={max(0.0, float(seg_end) - float(seg_start)) - 0.03:.3f}:d=0.03",
                         "-c:v", "libx264", "-preset", "fast", "-crf", "18",
                         "-pix_fmt", "yuv420p",
-                        "-fps_mode", "cfr",
                         "-c:a", "aac", "-b:a", "192k",
                         str(temp_path),
                     ])
@@ -247,11 +248,22 @@ class VideoTrimmer(BaseTool):
                     safe_path = str(tf.resolve()).replace("\\", "/")
                     f.write(f"file '{safe_path}'\n")
 
+            # Re-encode with a constant frame rate rather than -c copy —
+            # concatenating segments cut at arbitrary (non-keyframe) points
+            # can produce irregular timestamps that downstream frame-accurate
+            # readers (e.g. Remotion's OffthreadVideo) fail to seek through
+            # correctly past a certain point, silently holding the last
+            # decodable frame while audio continues (confirmed symptom on a
+            # real render). Same fix video-studio already validated for this
+            # exact bug class (CLAUDE-v2.md): re-encode at constant frame rate
+            # instead of stream-copying the concat.
+            fps = self._probe_fps(temp_files[0]) if temp_files else 30.0
             cmd = [
                 "ffmpeg", "-y",
                 "-f", "concat", "-safe", "0",
                 "-i", str(list_path),
-                "-c", "copy",
+                "-fps_mode", "cfr", "-r", str(fps),
+                "-c:v", "libx264", "-preset", "fast", "-c:a", "aac",
                 str(output_path),
             ]
             self.run_command(cmd)
@@ -277,6 +289,22 @@ class VideoTrimmer(BaseTool):
                     temp_dir.rmdir()
                 except OSError:
                     pass
+
+    def _probe_fps(self, path: Path) -> float:
+        """ffprobe the source frame rate, falling back to 30 if unavailable."""
+        cmd = [
+            "ffprobe", "-v", "quiet",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=r_frame_rate",
+            "-of", "json", str(path),
+        ]
+        try:
+            result = self.run_command(cmd)
+            stream = json.loads(result.stdout)["streams"][0]
+            num, _, den = stream["r_frame_rate"].partition("/")
+            return float(num) / float(den) if den else float(num)
+        except Exception:
+            return 30.0
 
     @staticmethod
     def _build_atempo_chain(factor: float) -> str:
