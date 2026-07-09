@@ -42,7 +42,7 @@ def _is_verify_call(system_prompt):
 def test_clean_first_pass():
     calls = []
 
-    def fake(system_prompt, user_message, *, temperature=0.1):
+    def fake(system_prompt, user_message, *, temperature=0.1, model=None):
         calls.append(system_prompt)
         if _is_filler_call(system_prompt):
             return json.dumps({"cut_word_indices": [1, 3]})
@@ -63,7 +63,7 @@ def test_clean_first_pass():
 def test_flagged_then_fixed_on_retry():
     calls = []
 
-    def fake(system_prompt, user_message, *, temperature=0.1):
+    def fake(system_prompt, user_message, *, temperature=0.1, model=None):
         calls.append(system_prompt)
         if _is_filler_call(system_prompt):
             if "NOTE: a previous pass" in user_message:
@@ -88,7 +88,7 @@ def test_flagged_then_fixed_on_retry():
 def test_flagged_still_flagged_after_retry():
     calls = []
 
-    def fake(system_prompt, user_message, *, temperature=0.1):
+    def fake(system_prompt, user_message, *, temperature=0.1, model=None):
         calls.append(system_prompt)
         if _is_filler_call(system_prompt):
             return json.dumps({"cut_word_indices": [1]})  # never catches "uh", even on retry
@@ -109,7 +109,7 @@ def test_flagged_still_flagged_after_retry():
 
 
 def test_llm_unconfigured():
-    def fake(system_prompt, user_message, *, temperature=0.1):
+    def fake(system_prompt, user_message, *, temperature=0.1, model=None):
         return None
 
     content_planner.call_llm_chat = fake

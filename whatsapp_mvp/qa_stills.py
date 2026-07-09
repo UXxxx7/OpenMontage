@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -76,8 +77,14 @@ def pick_qa_frames(props: dict) -> list[int]:
 
 
 def render_still(remotion_dir: Path, props_path: Path, frame: int, out_png: Path) -> bool:
+    # Windows: subprocess needs the resolved npx.cmd, plain "npx" raises
+    # WinError 2 (same fix already applied to the real render call in
+    # pipeline_runner.py's _op_apply_style — this one was missed, silently
+    # disabling QA stills AND the vision-review step that depends on them
+    # on any Windows deployment).
+    npx_bin = shutil.which("npx") or "npx"
     cmd = [
-        "npx", "remotion", "still", "XiaojinEditorial", str(out_png),
+        npx_bin, "remotion", "still", "XiaojinEditorial", str(out_png),
         f"--frame={frame}", f"--props={props_path}", f"--scale={_SCALE}",
     ]
     try:
