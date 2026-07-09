@@ -1,9 +1,11 @@
-# Ported from VeLL-lab/video-studio's CLAUDE-daja-default.md.
-# This was video-studio's original fallback style, used when no preset is
-# named. No dedicated Remotion composition ported yet — this playbook exists
-# so the tokens are available, but rendering it currently falls back to
-# whichever generic composition (e.g. TalkingHead) the pipeline selects.
-# See this branch's PROGRESS.md for what that gap means in practice.
+# Ported from VeLL-lab/video-studio's CLAUDE-daja-default.md, where it's the
+# manual pipeline's fallback style when no preset is named.
+#
+# For the WhatsApp bot specifically, this is NOT wired up as a fallback and
+# there is no plan to build one: xiaojin-editorial is the bot's actual (and
+# only) house style — apply_style always renders it, regardless of whether a
+# style was named. This file exists purely so the daja-default token palette
+# is preserved/documented for reference, not as a pending gap to close.
 
 identity:
   name: "DAJA Default"
