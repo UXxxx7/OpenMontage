@@ -98,9 +98,25 @@ export const SectionLayer: React.FC<{
                     fontFamily: headingFont, fontSize: 50, fontWeight: 800,
                     color: titleColor, lineHeight: 1,
                   }}>
-                    {s.title}
+                    {/* codex Animation Vocabulary: section header text uses a
+                        typing reveal (char-by-char), not a plain fade. */}
+                    {Array.from(s.title).map((ch, ci) => (
+                      <span key={ci} style={{
+                        opacity: local >= 6 + ci * 4 ? 1 : 0,
+                      }}>{ch}</span>
+                    ))}
+                    <span style={{
+                      opacity: local < 6 + s.title.length * 4 + 12 && Math.floor(local / 8) % 2 === 0 ? 0.8 : 0,
+                      color: accent, fontWeight: 400,
+                    }}>|</span>
                   </span>
                 ) : null}
+                {/* sweep divider — width animates 0 -> 180 after the title lands */}
+                <div style={{
+                  height: 3, marginTop: 14,
+                  width: Math.max(0, Math.min(1, (local - (8 + (s.title?.length || 0) * 4)) / 18)) * 180,
+                  background: `linear-gradient(90deg, ${accent}, transparent)`,
+                }} />
               </div>
             )}
 

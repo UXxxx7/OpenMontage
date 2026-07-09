@@ -729,6 +729,8 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         plan_intro = None
         plan_outro = None
         plan_sections = op.get("sections") or []
+        plan_quotes = op.get("quotes") or []
+        plan_atmosphere = op.get("atmosphere_keywords") or []
     else:
         logger.info("  apply_style: 内容规划中（章节 + 数据展示分析）...")
         content_plan = plan_content(segments, duration)
@@ -741,6 +743,8 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         plan_intro = content_plan.get("intro")
         plan_outro = content_plan.get("outro")
         plan_sections = content_plan.get("sections") or []
+        plan_quotes = content_plan.get("quotes") or []
+        plan_atmosphere = content_plan.get("atmosphere_keywords") or []
         logger.info(
             f"  apply_style: 规划出 {len(chapters)} 个章节、{len(data_cards)} 个数据卡、"
             f"{len(gauges)} 个仪表盘、{len(countdowns)} 个倒计时、{len(calendar_events)} 个日历"
@@ -768,6 +772,10 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
     }
     if plan_sections:
         props["sections"] = plan_sections
+    if plan_quotes:
+        props["quotes"] = plan_quotes
+    if plan_atmosphere:
+        props["atmosphereKeywords"] = plan_atmosphere
 
     # 开场标题卡/片尾 CTA：模板一直支持（IntroTitle/OutroSection），此前管线从不
     # 生成——这是与 video-studio 手工参考成片(VeLL)最大的一块可自动化差距。

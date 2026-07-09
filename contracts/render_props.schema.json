@@ -592,6 +592,54 @@
           }
         }
       }
+    },
+    "quotes": {
+      "type": "array",
+      "description": "[PROPOSED extension — P2 prototype] Pull-quote typography moments: verbatim spoken lines promoted to canvas graphics (the data-less video's equivalent of dataCards).",
+      "items": {
+        "type": "object",
+        "required": [
+          "text",
+          "mountFrame"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 80
+          },
+          "attribution": {
+            "type": "string",
+            "maxLength": 40
+          },
+          "mountFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "endFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "x": {
+            "type": "number"
+          },
+          "y": {
+            "type": "number"
+          },
+          "width": {
+            "type": "number"
+          }
+        }
+      }
+    },
+    "atmosphereKeywords": {
+      "type": "array",
+      "maxItems": 10,
+      "description": "[PROPOSED extension — P2 prototype] Faint drifting background keyword texture — words from THIS video's own vocabulary (planner-extracted).",
+      "items": {
+        "type": "string",
+        "maxLength": 16
+      }
     }
   }
 }

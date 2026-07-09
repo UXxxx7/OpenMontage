@@ -117,6 +117,16 @@ def main():
           _mode_at(modes, card_mount) == "workflow",
           {"mode_schedule": modes, "card_mount": card_mount})
 
+    # 7. quote 类型：无数据视频的画布动画来源；进 workflow 窗口；关键词透传
+    plan = _to_frame_plan({"chapters": [], "data_points": [
+        {"visual": "quote", "seconds": 8.0, "text": "this changed everything", "attribution": "David"},
+    ], "atmosphere_keywords": ["renewal", "保障", "coverage"]}, duration=30.0)
+    check("quote 映射 + 触发 workflow", len(plan["quotes"]) == 1
+          and plan["quotes"][0]["text"] == "this changed everything"
+          and any(m["mode"] == "workflow" for m in plan["mode_schedule"]),
+          {"quotes": plan["quotes"], "modes": plan["mode_schedule"]})
+    check("atmosphere 关键词透传", plan["atmosphere_keywords"] == ["renewal", "保障", "coverage"])
+
     # 5. 畸形条目容错：非 dict / 缺字段不炸、不产出
     plan = _to_frame_plan({"chapters": [{"label": "no at_seconds"}],
                            "data_points": ["not a dict", {"visual": "gauge"}]}, duration=30.0)

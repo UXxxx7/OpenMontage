@@ -33,6 +33,8 @@ import { ChapterNav, Chapter } from "./components/xiaojin/ChapterNav";
 import { ComplianceBar } from "./components/xiaojin/ComplianceBar";
 import { ContentBeat, ContentZone } from "./components/xiaojin/ContentZone";
 import { Section, SectionLayer } from "./components/xiaojin/SectionLayer";
+import { QuoteCard, QuoteCardProps } from "./components/xiaojin/QuoteCard";
+import { Atmosphere } from "./components/xiaojin/Atmosphere";
 import { CountdownRing, CountdownRingProps } from "./components/xiaojin/CountdownRing";
 import { InfoCard, InfoCardProps } from "./components/xiaojin/InfoCard";
 import { IntroTitle } from "./components/xiaojin/IntroTitle";
@@ -68,6 +70,7 @@ export type Gauge = Omit<RiskGaugeProps, "colorMode" | "headingFont" | "labelFon
 export type Countdown = Omit<CountdownRingProps, "colorMode" | "headingFont" | "labelFont">;
 export type CalendarEvent = Omit<CalendarProps, "colorMode" | "headingFont" | "labelFont">;
 export type QRContact = Omit<QRContactCardProps, "colorMode" | "headingFont" | "labelFont">;
+export type Quote = Omit<QuoteCardProps, "colorMode" | "headingFont" | "labelFont">;
 
 export interface OutroInfo {
   kicker: string;
@@ -96,6 +99,10 @@ export interface XiaojinEditorialProps extends Record<string, unknown> {
   contentBeats?: ContentBeat[];
   /** Full-canvas chapter takeovers (background + header + icon) — see SectionLayer. */
   sections?: Section[];
+  /** Pull-quote typography moments (data-less videos' canvas motion). */
+  quotes?: Quote[];
+  /** Faint drifting keyword texture behind everything (this video's own vocabulary). */
+  atmosphereKeywords?: string[];
   /** Count-up stat cards (contract② "[P3 NEW capability]"). Renders alongside contentBeats, not in place of it. */
   dataCards?: DataCard[];
   /** Semicircle risk/status gauges — Data Display Analysis "risk consequence" rows. */
@@ -169,6 +176,8 @@ export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = ({
   captions,
   contentBeats,
   sections,
+  quotes,
+  atmosphereKeywords,
   dataCards,
   gauges,
   countdowns,
@@ -185,6 +194,9 @@ export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = ({
 
   return (
     <AbsoluteFill style={{ background: bg }}>
+      {atmosphereKeywords?.length ? (
+        <Atmosphere keywords={atmosphereKeywords} colorMode={colorMode} headingFont={headingFont} />
+      ) : null}
       {/* Full-canvas section takeovers render FIRST — they are backgrounds;
           the card, graphics and chrome all sit above them. */}
       {sections?.length ? (
@@ -216,6 +228,9 @@ export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = ({
         whether the caller's scene schedule actually shrinks the card first.
       */}
       {contentBeats ? <ContentZone beats={contentBeats} /> : null}
+      {quotes?.map((q, i) => (
+        <QuoteCard key={`q${i}`} {...q} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+      ))}
       {dataCards?.map((card, i) => (
         <InfoCard
           key={i}

@@ -58,19 +58,23 @@ SYSTEM_PROMPT = """You analyze a talking-head video's transcript and produce a c
    - A specific calendar date ("July 28th", "by March 3rd", "expires on the 15th") -> "calendar"
    - A risk / negative-consequence framing (something that could go wrong, a warning, a "before it's too late", an "at risk" outcome) -> "gauge"
    - Any other number worth calling out (money, reps, distances, times, scores, percentages, quantities, counts) -> "count_up"
+   - A punchy spoken line worth showing as typography — the thesis, a strong claim, a memorable one-liner ("this changed everything", "never skip this step") -> "quote". This is the PRIMARY visual for videos with no numeric moments at all: a data-less video should still get 1-3 quote moments (its actual best lines, verbatim — never paraphrase or invent). Videos WITH plenty of numeric visuals need 0-1 quotes at most.
 4. Output shape per visual type (all times in seconds, matching when that number/date is actually spoken):
    - count_up: {"visual":"count_up","title":"...","rows":[{"label":"short label in the video's primary language","label_en":"1-3 word UPPERCASE ENGLISH","seconds":12.3,"value":42,"prefix":"","divideBy":1,"decimals":0,"unit":"","tone":"accent|good|bad|normal"}]} — group values that belong together (e.g. before/after of the same metric) into ONE card as multiple rows, not separate cards. prefix/divideBy/decimals/unit format the number so it's compact and readable (e.g. divideBy 1000000 + decimals 1 -> "1.5" for 1,500,000) — never a raw unformatted number.
    - gauge: {"visual":"gauge","seconds":12.3,"title":"...","leftLabel":"UPPERCASE","rightLabel":"UPPERCASE","value":0-1} — leftLabel is the safe/good end, rightLabel is the risk/bad end, value is how far toward the risk end this moment lands (1.0 = fully at risk).
    - countdown: {"visual":"countdown","seconds":12.3,"value":30,"unitLabel":"DAYS","label":"UPPERCASE short label","headline":"a short sentence","headlineAccent":"optional second line, e.g. the consequence"}
+   - quote: {"visual":"quote","seconds":12.3,"text":"the exact spoken line, verbatim, <=80 chars","attribution":"optional speaker name if they introduce themselves"}
    - calendar: {"visual":"calendar","seconds":12.3,"year":2026,"month":7,"targetDay":28,"eventLabel":"short label"} — if the transcript doesn't state a year explicitly, infer the correct one using the reference date given in the user message (e.g. a date mentioned as still upcoming should resolve to this year or next, not a past year).
-5. If the transcript has no genuinely dramatic/comparison-worthy moments, return an empty data_points array. Do not invent one to fill the response, and do not force a domain's framing (financial, fitness, etc.) onto content that isn't actually about that.
+4b. Atmosphere keywords: pick 6-10 short words/terms from THIS transcript's own vocabulary (the topic's nouns/verbs, both languages if bilingual) for a faint background texture — output as "atmosphere_keywords": ["...", ...].
+5. If the transcript has no genuinely dramatic/comparison-worthy moments AND no quote-worthy lines, return an empty data_points array. Do not invent one to fill the response, and do not force a domain's framing (financial, fitness, etc.) onto content that isn't actually about that.
 
 Output ONLY valid JSON matching this shape, no markdown, no prose:
 {
   "chapters": [{"at_seconds": 0, "label": "...", "label_en": "...", "takeover": false, "icon": null, "dark": false, "warn": false}],
   "intro": {"eyebrow": "...", "title": "...", "subtitle": "..."},
   "outro": {"kicker": "...", "headline": "...", "headline_accent": "...", "subtext": "...", "cta_label": "..."},
-  "data_points": [ /* each item is exactly one of the 4 shapes above, tagged by "visual" */ ]
+  "data_points": [ /* each item is exactly one of the 5 shapes above, tagged by "visual" */ ],
+  "atmosphere_keywords": ["...", "..."]
 }"""
 
 
@@ -134,7 +138,7 @@ def plan_content(segments: list[dict], duration: float) -> dict[str, Any]:
     empty = {
         "chapters": [], "data_cards": [], "gauges": [], "countdowns": [], "calendar_events": [],
         "mode_schedule": [{"frame": 0, "mode": "dominant"}],
-        "intro": None, "outro": None, "sections": [],
+        "intro": None, "outro": None, "sections": [], "quotes": [], "atmosphere_keywords": [],
     }
 
     transcript_text = _build_transcript_text(segments)
@@ -172,6 +176,7 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
     chapters.sort(key=lambda c: c["atFrame"])
 
     data_cards: list[dict] = []
+    quotes: list[dict] = []
     gauges: list[dict] = []
     countdowns: list[dict] = []
     calendar_events: list[dict] = []
@@ -199,7 +204,9 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
             continue
         visual = dp.get("visual") or "count_up"  # backward-compatible default
         try:
-            if visual == "gauge":
+            if visual == "quote":
+                entry, target = _plan_quote(dp, next_available_frame), quotes
+            elif visual == "gauge":
                 entry, target = _plan_gauge(dp, next_available_frame), gauges
             elif visual == "countdown":
                 entry, target = _plan_countdown(dp, next_available_frame), countdowns
@@ -252,7 +259,7 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
     # 做 15 帧淡出），不会同位置永久叠上（P3 修的 "cards never disappear" bug
     # 的另一半）。
     slotted = sorted(
-        (g for g in (data_cards + gauges + countdowns + calendar_events)),
+        (g for g in (data_cards + gauges + countdowns + calendar_events + quotes)),
         key=lambda g: g["mountFrame"],
     )
     for cur, nxt in zip(slotted, slotted[1:]):
@@ -290,10 +297,13 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
         if ro.get("headline_accent"):
             outro["headlineAccent"] = str(ro["headline_accent"])[:30]
 
+    atmosphere = [str(k)[:16] for k in (raw.get("atmosphere_keywords") or []) if str(k).strip()][:10]
+
     return {
         "chapters": chapters, "data_cards": data_cards, "gauges": gauges,
         "countdowns": countdowns, "calendar_events": calendar_events, "mode_schedule": dedup,
         "intro": intro, "outro": outro, "sections": sections,
+        "quotes": quotes, "atmosphere_keywords": atmosphere,
     }
 
 
@@ -443,6 +453,25 @@ def _plan_calendar(dp: dict, min_mount_frame: int) -> Optional[dict]:
         "mountFrame": mount_frame,
         "endFrame": end_frame,
     }
+
+
+QUOTE_DISPLAY_FRAMES = 140  # 金句停留 ~4.7s（读两遍的时间）
+
+
+def _plan_quote(dp: dict, min_mount_frame: int) -> Optional[dict]:
+    sec = float(dp["seconds"])
+    text = str(dp.get("text", "")).strip()
+    if not text:
+        return None
+    mount_frame = max(min_mount_frame, round(sec * FPS) - MOUNT_LEAD_FRAMES)
+    entry: dict[str, Any] = {
+        "text": text[:80],
+        "mountFrame": mount_frame,
+        "endFrame": mount_frame + QUOTE_DISPLAY_FRAMES,
+    }
+    if dp.get("attribution"):
+        entry["attribution"] = str(dp["attribution"])[:40]
+    return entry
 
 
 def _num(v: Any) -> Optional[float]:
