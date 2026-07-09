@@ -415,19 +415,14 @@ Output ONLY valid JSON, no markdown, no prose:
 If nothing needs cutting, return {"cut_word_indices": []}."""
 
 
-def plan_filler_removal(words: list[dict], duration: float) -> list[dict]:
-    """转写词级时间戳 -> 保留片段列表（喂给 VideoTrimmer 的 concat 操作）。
-
-    跟 remove_silences（纯静音检测）是两码事：这里判断的是"这个词是不是口误/
-    语气词/重录的失败尝试"，静音检测测不到有声的"呃""嗯"，也测不到中间没停顿
-    的重录。没配 LLM 或调用失败时返回 None（调用方应该跳过这步，不要因为这个
-    可选的精修步骤失败就搞垮整条剪辑流程）。
-    """
-    if not words:
-        logger.info("content_planner: 没有词级时间戳，跳过口误检测")
-        return []
-
+def _plan_filler_removal_once(words: list[dict], duration: float, *, feedback: Optional[str] = None) -> list[dict]:
+    """单次口误/重录判断 -> 保留片段列表。不含事后复核——见 plan_filler_removal。"""
     numbered = "\n".join(f"{i}: {w['word']} [{w['start']:.2f}-{w['end']:.2f}]" for i, w in enumerate(words))
+    if feedback:
+        numbered = (
+            f"NOTE: a previous pass at this exact task missed the following issue — "
+            f"make sure it's addressed this time: {feedback}\n\n{numbered}"
+        )
 
     raw = _call_llm_json("口误检测", FILLER_SYSTEM_PROMPT, numbered, temperature=0.1)
     if raw is None:
@@ -460,4 +455,81 @@ def plan_filler_removal(words: list[dict], duration: float) -> list[dict]:
         keep_ranges.append({"start_seconds": cur_start, "end_seconds": cur_end})
 
     logger.info(f"content_planner: 口误检测 -> 剪掉 {len(cut_indices)} 个词，保留 {len(keep_ranges)} 段")
+    return keep_ranges
+
+
+def _words_in_keep_ranges(words: list[dict], keep_ranges: list[dict]) -> list[dict]:
+    """还原"剪完后实际会播放"的词序列——keep_ranges 是按保留词的起止时间合并出来
+    的连续区间，所以用时间戳做包含判断就能精确还原，不会有边界误差。
+    """
+    kept = []
+    for w in words:
+        for r in keep_ranges:
+            if w["start"] >= r["start_seconds"] - 1e-6 and w["end"] <= r["end_seconds"] + 1e-6:
+                kept.append(w)
+                break
+    return kept
+
+
+VERIFY_FILLER_SYSTEM_PROMPT = """You are reviewing another editor's filler/retake removal
+work on a talking-head video. You are given the transcript AS IT WILL PLAY AFTER their
+cuts (word list, in order, with timestamps) — the filler/retake words they identified
+have already been removed from this list. Check whether the remaining text still reads
+as a clean single take: no leftover stutter, no abandoned false start, no repeated
+phrase that should have been replaced by a later clean version, no dangling filler
+word ("um"/"uh"/"like" as padding).
+
+Output ONLY valid JSON, no markdown, no prose:
+{"clean": true} if it reads cleanly, or
+{"clean": false, "issue": "one sentence describing the specific remaining problem"} if not."""
+
+
+def verify_filler_removal(words: list[dict], keep_ranges: list[dict]) -> Optional[dict]:
+    """复核 _plan_filler_removal_once 的输出：喂"剪完后实际会播放的词序列"给 LLM，
+    确认真的没有遗留口误/重录。这是抓"漏剪重录"这类 bug 的关键补丁——单次判断
+    之前没有任何事后检查。返回 None 表示复核本身不可用（无 LLM/调用失败/解析
+    失败）——调用方应把 None 当作"假定通过"处理，跟本文件其余精修步骤一致。
+    """
+    if not words:
+        return None
+    kept_words = _words_in_keep_ranges(words, keep_ranges) if keep_ranges else words
+    if not kept_words:
+        return None
+    numbered = "\n".join(f"{w['word']} [{w['start']:.2f}-{w['end']:.2f}]" for w in kept_words)
+    return _call_llm_json("口误复核", VERIFY_FILLER_SYSTEM_PROMPT, numbered, temperature=0.1)
+
+
+def plan_filler_removal(words: list[dict], duration: float) -> list[dict]:
+    """转写词级时间戳 -> 保留片段列表（喂给 VideoTrimmer 的 concat 操作）。
+
+    跟 remove_silences（纯静音检测）是两码事：这里判断的是"这个词是不是口误/
+    语气词/重录的失败尝试"，静音检测测不到有声的"呃""嗯"，也测不到中间没停顿
+    的重录。没配 LLM 或调用失败时返回空列表（调用方应该跳过这步，不要因为这个
+    可选的精修步骤失败就搞垮整条剪辑流程）。
+
+    加了一次事后复核（verify_filler_removal）：单次判断可能漏掉真实存在的重录
+    （确认过的真实 bug——判断没通过任何检查就直接交付）。复核发现问题就把问题
+    喂回去重新判断一次；重试后仍不通过就照常返回，只打日志——这仍然是可选精修
+    步骤，不该无限重试卡住整条剪辑流程。
+    """
+    if not words:
+        logger.info("content_planner: 没有词级时间戳，跳过口误检测")
+        return []
+
+    keep_ranges = _plan_filler_removal_once(words, duration)
+
+    review = verify_filler_removal(words, keep_ranges)
+    if review is None or review.get("clean", True):
+        return keep_ranges
+
+    issue = str(review.get("issue", ""))[:200]
+    logger.warning(f"content_planner: 口误复核发现遗留问题，重新判断一次: {issue}")
+    keep_ranges = _plan_filler_removal_once(words, duration, feedback=issue)
+
+    review2 = verify_filler_removal(words, keep_ranges)
+    if review2 is not None and not review2.get("clean", True):
+        logger.warning(
+            f"content_planner: 重试后口误复核仍不通过，按最新结果继续交付而不是无限重试: "
+            f"{str(review2.get('issue', ''))[:200]}"
+        )
     return keep_ranges
