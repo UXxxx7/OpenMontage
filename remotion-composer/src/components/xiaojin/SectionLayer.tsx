@@ -1,0 +1,117 @@
+/**
+ * SectionLayer — full-canvas chapter takeover, generalized from the
+ * hand-built sections in video-studio's vell-renewal-reminder
+ * (CoverageSection/LapseSection/...). This is the biggest visual-vocabulary
+ * gap between the hand-crafted reference and the JSON-driven template:
+ * the reference's signature move is that a chapter OWNS the whole canvas
+ * (its own background — often dark — plus an eyebrow/title header block and
+ * a section icon), with the speaker card docked as a small pip.
+ *
+ * JSON-driven equivalent: each `Section` describes one takeover span.
+ * Layout constants mirror the reference exactly (header at y=360,
+ * icon at y=500, terracotta eyebrow letterSpacing 7 / big 800-weight title).
+ *
+ * Layering contract: render this BEFORE ContentZone/graphics/SpeakerCard —
+ * background first, data graphics and the card sit on top (reference's
+ * index.tsx does the same: "Section content renders first (behind the
+ * card)"). Chrome (nav/captions/bars) stays above everything as always.
+ *
+ * [Prototyped by P2 to validate the contract-② `sections` extension;
+ * P3 owns the final form of this file.]
+ */
+import { interpolate, useCurrentFrame } from "remotion";
+import { SECTION_ICONS } from "./SectionIcons";
+import { APPLE, ColorMode, PALETTES } from "./theme";
+
+export interface Section {
+  /** Takeover span (frames). fromFrame should be >= introOutFrame. */
+  fromFrame: number;
+  toFrame: number;
+  /** Small terracotta letterspaced line above the title, e.g. "YOUR COVERAGE". */
+  eyebrow?: string;
+  /** Big header line in the video's primary language, e.g. "你的保障". */
+  title?: string;
+  /** Icon name from SECTION_ICONS ("shield_check" | "warning" | "clock"). */
+  icon?: string;
+  /** Overrides the base colorMode for this span (the reference alternates dark/warm). */
+  colorMode?: ColorMode;
+  /** Warning styling — accents go red instead of terracotta (reference's "why" section). */
+  warn?: boolean;
+}
+
+const ENTER_FRAMES = 18;
+const EXIT_FRAMES = 16;
+
+export const SectionLayer: React.FC<{
+  sections: Section[];
+  baseColorMode: ColorMode;
+  headingFont?: string;
+  labelFont?: string;
+}> = ({ sections, baseColorMode, headingFont = "inherit", labelFont = "inherit" }) => {
+  const frame = useCurrentFrame();
+
+  return (
+    <>
+      {sections.map((s, i) => {
+        if (frame < s.fromFrame || frame >= s.toFrame + EXIT_FRAMES) return null;
+        const local = frame - s.fromFrame;
+        const mode = s.colorMode || baseColorMode;
+        const palette = PALETTES[mode];
+        const accent = s.warn ? palette.bad : palette.accent;
+        const titleColor = mode === "dark" ? "#FFFFFF" : palette.ink;
+
+        const enter = interpolate(local, [0, ENTER_FRAMES], [0, 1], {
+          extrapolateLeft: "clamp", extrapolateRight: "clamp", easing: APPLE,
+        });
+        const exit = interpolate(frame, [s.toFrame, s.toFrame + EXIT_FRAMES], [1, 0], {
+          extrapolateLeft: "clamp", extrapolateRight: "clamp", easing: APPLE,
+        });
+        const opacity = Math.min(enter, exit);
+        const Icon = s.icon ? SECTION_ICONS[s.icon] : undefined;
+
+        return (
+          <div key={i} style={{ position: "absolute", inset: 0, opacity }}>
+            {/* Background takeover — only when this section overrides the base mode;
+                otherwise the base canvas already is the right color. */}
+            {s.colorMode && s.colorMode !== baseColorMode ? (
+              <div style={{ position: "absolute", inset: 0, background: palette.bg }} />
+            ) : null}
+
+            {(s.eyebrow || s.title) && (
+              <div
+                style={{
+                  position: "absolute", left: 0, top: 360, width: "100%",
+                  display: "flex", flexDirection: "column", alignItems: "center", gap: 8,
+                  transform: `translateY(${(1 - enter) * 18}px)`,
+                }}
+              >
+                {s.eyebrow ? (
+                  <span style={{
+                    fontFamily: labelFont, fontSize: 14, letterSpacing: 7,
+                    fontWeight: 700, color: accent, textTransform: "uppercase",
+                  }}>
+                    {s.eyebrow}
+                  </span>
+                ) : null}
+                {s.title ? (
+                  <span style={{
+                    fontFamily: headingFont, fontSize: 50, fontWeight: 800,
+                    color: titleColor, lineHeight: 1,
+                  }}>
+                    {s.title}
+                  </span>
+                ) : null}
+              </div>
+            )}
+
+            {Icon ? (
+              <div style={{ position: "absolute", left: 0, top: 500, width: "100%", display: "flex", justifyContent: "center" }}>
+                <Icon localFrame={local} color={accent} />
+              </div>
+            ) : null}
+          </div>
+        );
+      })}
+    </>
+  );
+};

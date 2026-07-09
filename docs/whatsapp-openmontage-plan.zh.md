@@ -216,6 +216,29 @@ CLAUDE-v2 的 §4b/§8/§9)在 WhatsApp 路径里没有任何代码在用——�
 L2 agent 读法典做规划 + 看 stills 复审(P1);"两条人脸位置不同的视频"的第二条
 实测(校准逻辑已在 MrBeast 片上验证,另一条待测)。
 
+### 第五轮(对标 video-studio 手工参考成片 VeLL)
+
+**背景**:验收标杆是 `video-studio/motion/vell-renewal-reminder/out/test.mp4`
+(手工打磨工程用真实源片重渲)。逐帧对比自动管线产出,差距分两类:
+
+**A. 模板已支持、管线没用上的(P2 本轮已补)**:
+- content_planner 新增从转写生成:**开场标题卡**(eyebrow/title/subtitle,
+  IntroTitle 组件)、**片尾 CTA**(kicker/headline/cta,OutroSection 组件)、
+  **双语章节标签**(labelEn,ChapterNav 第二行)。
+- `_op_apply_style` 发射 intro/outro props;intro 存在时 introOutFrame=80,
+  并把 intro 期间的 workflow 段推迟(标题必须压在近全屏大卡上,VeLL 同款);
+  outro 自动取片尾最后 5s(<12s 的视频不上 outro)。
+- 真实 compliance 数据经 op 传入已验证(陳大衛 David Chan 演示数据渲染正确)。
+
+**B. 模板尚不支持的(需 P3 + 契约②扩展,三方对齐)**:
+1. **明暗分段**:VeLL 按章节切换 dark/warm 底色,契约②的 colorMode 是全片
+   一个值 → 需要 colorMode schedule(如 [{fromFrame, mode}])。
+2. **章节标题版式块**:每段开头的 "YOUR COVERAGE / 你的保障" 大字眉题——
+   ContentZone 的 contentBeats 不可 JSON 序列化,需要一个可序列化的
+   sectionHeaders 数组。
+3. **定制段落图形**:盾牌打勾、超大日期版式("28 JUL 2025")这类 VeLL 手工
+   组件,是"图形词汇扩展"的下一批(可归入 quote/hero-date/icon-stat 类型)。
+
 ### 第四轮(车道修正:规划归 L2,L1.5 恢复冻结)
 
 **背景**:按《规划器车道:L1.5 vs L2》文档自查,第三轮为了让 WhatsApp 端到端

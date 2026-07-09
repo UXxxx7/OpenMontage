@@ -209,18 +209,32 @@ class VideoTrimmer(BaseTool):
                     temp_path = temp_dir / f"seg_{i:04d}{seg_input.suffix}"
                     # Segment boundaries here are arbitrary word-timestamp cut
                     # points (e.g. filler-word removal), not keyframe-aligned —
-                    # -c copy can only cut at keyframes, so it silently snaps
-                    # each boundary to the nearest one instead of the exact
-                    # requested point. Re-encode instead for frame-accurate
-                    # cuts. -ss before -i + -t (not -to) after, per the same
-                    # bug class as _cut above.
+                    # -c copy can only cut at keyframes, so the concat result
+                    # plays continuing audio over a FROZEN first frame until
+                    # the next keyframe (reproduced on real WhatsApp jobs).
+                    # Re-encode instead for frame-accurate cuts: -ss before -i
+                    # + -t (not -to) after, per the same bug class as _cut
+                    # above; crf 18 pins quality (the final concat re-encodes
+                    # once more, so segments must not degrade on this pass);
+                    # 30ms audio fades avoid clicks at joins (same treatment
+                    # video-use applies at its cut points).
                     cmd = ["ffmpeg", "-y"]
                     if seg_start is not None:
                         cmd.extend(["-ss", str(seg_start)])
                     cmd.extend(["-i", str(seg_input)])
                     if seg_end is not None:
-                        cmd.extend(["-t", str(seg_end - (seg_start or 0))])
-                    cmd.extend(["-c:v", "libx264", "-preset", "fast", "-c:a", "aac", str(temp_path)])
+                        cmd.extend(["-t", f"{max(0.0, float(seg_end) - float(seg_start or 0)):.3f}"])
+                    if seg_start is not None and seg_end is not None:
+                        fade_out_st = max(0.0, float(seg_end) - float(seg_start) - 0.03)
+                        cmd.extend(["-af", f"afade=t=in:d=0.03,afade=t=out:st={fade_out_st:.3f}:d=0.03"])
+                    else:
+                        cmd.extend(["-af", "afade=t=in:d=0.03"])
+                    cmd.extend([
+                        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                        "-pix_fmt", "yuv420p",
+                        "-c:a", "aac", "-b:a", "192k",
+                        str(temp_path),
+                    ])
                     self.run_command(cmd)
                     temp_files.append(temp_path)
                 else:

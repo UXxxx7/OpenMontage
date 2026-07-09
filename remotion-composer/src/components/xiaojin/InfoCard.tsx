@@ -28,6 +28,9 @@ export type Tone = "accent" | "good" | "bad" | "normal";
 
 export interface InfoRow {
   label: string;
+  /** Optional secondary line under the label — the reference build renders
+      bilingual rows (native language big, English small). */
+  labelEn?: string;
   /** Numeric target for count-up. Omit for a purely textual row. */
   value?: number;
   /** Formats the (possibly still-animating) numeric value for display. Not JSON-serializable — use prefix/divideBy/decimals from a JSON props file instead. */
@@ -54,6 +57,8 @@ export interface InfoRow {
 export interface InfoCardProps {
   title: string;
   subtitle?: string;
+  /** Warning card — title/accents render red (reference's lapse-warning section). */
+  warn?: boolean;
   rows: InfoRow[];
   /** Defaults per contract② when omitted. */
   x?: number;
@@ -88,6 +93,7 @@ export const InfoCard: React.FC<InfoCardProps> = ({
   width = 920,
   mountFrame,
   endFrame,
+  warn,
   colorMode,
   headingFont = "inherit",
   labelFont = "inherit",
@@ -121,6 +127,7 @@ export const InfoCard: React.FC<InfoCardProps> = ({
         top: y,
         width,
         background: "rgba(13,17,23,0.86)",
+        borderLeft: warn ? `4px solid ${palette.bad}` : undefined,
         borderRadius: 16,
         padding: "20px 24px",
         boxShadow: "0 8px 32px rgba(0,0,0,0.32)",
@@ -128,7 +135,7 @@ export const InfoCard: React.FC<InfoCardProps> = ({
         transform: `translateY(${(1 - cardEntry) * 16}px)`,
       }}
     >
-      <div style={{ fontFamily: headingFont, fontSize: 11, fontWeight: 600, letterSpacing: 3, color: "rgba(255,255,255,0.55)", marginBottom: 4 }}>
+      <div style={{ fontFamily: headingFont, fontSize: 11, fontWeight: 600, letterSpacing: 3, color: warn ? palette.bad : "rgba(255,255,255,0.55)", marginBottom: 4 }}>
         {title.toUpperCase()}
       </div>
       {subtitle ? (
@@ -170,7 +177,14 @@ export const InfoCard: React.FC<InfoCardProps> = ({
               transform: `translateX(${(1 - rowEntry) * -40}px)`,
             }}
           >
-            <span style={{ fontFamily: labelFont, fontSize: 18, fontWeight: 700, color: "#FFFFFF" }}>{row.label}</span>
+            <span style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+              <span style={{ fontFamily: labelFont, fontSize: 18, fontWeight: 700, color: "#FFFFFF" }}>{row.label}</span>
+              {row.labelEn ? (
+                <span style={{ fontFamily: labelFont, fontSize: 11, fontWeight: 600, letterSpacing: 2, color: "#FFFFFF", opacity: 0.5, textTransform: "uppercase" }}>
+                  {row.labelEn}
+                </span>
+              ) : null}
+            </span>
             <span>
               <span style={{ fontFamily: headingFont, fontSize: 26, fontWeight: 800, color: tone }}>{displayValue}</span>
               {row.unit ? (

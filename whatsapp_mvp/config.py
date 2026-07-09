@@ -72,6 +72,24 @@ class Config:
     llm_model: str = field(
         default_factory=lambda: os.getenv("LLM_MODEL", "deepseek-chat")
     )
+    # 长输出调用的模型（内容规划等整段 JSON 生成）：DeepSeek 网关对非流式
+    # 响应有 ~60s 硬时限，v4-pro 完不成长 JSON（实测），v4-flash 37s 完成。
+    # 短输出的 L2 决策继续用主模型（llm_model）。
+    llm_model_long_output: str = field(
+        default_factory=lambda: os.getenv("LLM_MODEL_LONG_OUTPUT", "deepseek-v4-flash")
+    )
+    # 视觉子能力（独立于主 LLM 通道）：主规划继续走 LLM_*（DeepSeek，文本），
+    # 需要"看图"的环节（QA stills 复审等）走 VISION_LLM_*（如智谱 GLM-4V）。
+    # 未配置时视觉环节整体跳过，不影响主流程。
+    vision_llm_base_url: str = field(
+        default_factory=lambda: os.getenv("VISION_LLM_BASE_URL", "")
+    )
+    vision_llm_api_key: str = field(
+        default_factory=lambda: os.getenv("VISION_LLM_API_KEY", "")
+    )
+    vision_llm_model: str = field(
+        default_factory=lambda: os.getenv("VISION_LLM_MODEL", "glm-4v-flash")
+    )
     # 保留兼容旧配置
     deepseek_api_key: str = field(
         default_factory=lambda: os.getenv("DEEPSEEK_API_KEY", "")

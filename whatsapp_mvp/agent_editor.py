@@ -234,9 +234,23 @@ def _chat(config, messages, tools=None, json_mode=False):
         payload["tools"] = tools
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
-    resp = requests.post(endpoint, headers={
-        "Authorization": f"Bearer {config.llm_api_key}", "Content-Type": "application/json"},
-        json=payload, timeout=90)
+    # [P1 复核] 429 退避重试（传输层容错，非规划逻辑）：agent 的 tool-calling
+    # 循环一次规划要打多发请求，免费档 LLM（Gemini free tier 5 RPM）必然间歇
+    # 429——等窗口重置继续，比整条规划失败回退 L1.5 兜底强得多。
+    import time as _time
+
+    for attempt in range(4):
+        resp = requests.post(endpoint, headers={
+            "Authorization": f"Bearer {config.llm_api_key}", "Content-Type": "application/json"},
+            json=payload, timeout=90)
+        if resp.status_code == 429 and attempt < 3:
+            wait = 25 * (attempt + 1)
+            import logging as _logging
+            _logging.getLogger(__name__).warning(f"L2 LLM 429，{wait}s 后重试")
+            _time.sleep(wait)
+            continue
+        resp.raise_for_status()
+        return resp.json()
     resp.raise_for_status()
     return resp.json()
 

@@ -145,9 +145,53 @@ def run_props_qa(props: dict, props_path: Path, remotion_dir: Path, out_dir: Pat
         if finding:
             result["findings"].append(finding)
 
+    # 视觉复审（video-studio CLAUDE-v2 §9 清单里"机器查不了、需要眼睛"的部分）：
+    # 把 stills 交给视觉子模型（VISION_LLM_*，如 GLM-4V）对照清单挑毛病。
+    # DeepSeek 主通道是纯文本模型看不了图，所以这一步走独立的视觉通道；
+    # 未配置或调用失败都只是"没有眼睛"，绝不影响渲染。
+    vision = _vision_review([s["path"] for s in result["stills"]])
+    if vision:
+        result["vision_review"] = vision
+        for f in vision.get("findings", []):
+            logger.warning(f"  qa_stills 视觉复审发现: {f}")
+
     (out_dir / "qa_report.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     for f in result["findings"]:
         logger.warning(f"  qa_stills 发现问题: {f}")
     return result
+
+
+_VISION_CHECKLIST = """这些是同一条竖屏(1080x1920)成片视频在不同时间点的抽帧。请对照以下清单逐帧检查，只报告确实存在的问题：
+1. 说话人取景：脸是否被裁切/贴边？脸应在其卡片顶部 20-40% 位置，胸肩可见。
+2. 元素重叠：字幕、数据卡、图标、章节导航之间是否互相遮挡？
+3. 空画布：说话人卡片缩小时，腾出的画面是否大面积空白（没有任何内容填充）？
+4. 文字问题：是否有文字被截断、溢出容器、或小到不可读？
+5. 对比度：文字/图形与背景颜色是否难以分辨？
+
+输出 JSON（只输出 JSON）：{"findings": [{"frame_index": 第几张图(从0起), "issue": "一句话描述", "severity": "high|low"}], "overall": "一句话总评"}
+没有问题就输出 {"findings": [], "overall": "..."}。不要为了凑数报告不存在的问题。"""
+
+
+def _vision_review(still_paths: list) -> Optional[dict]:
+    """视觉子模型复审 stills。返回 {"findings": [...], "overall": str} 或 None。"""
+    if not still_paths:
+        return None
+    try:
+        from .llm_client import call_vision_chat
+
+        raw = call_vision_chat(_VISION_CHECKLIST, still_paths[:5])
+        if not raw:
+            return None
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.strip("`")
+            cleaned = cleaned[cleaned.find("{"):cleaned.rfind("}") + 1]
+        data = json.loads(cleaned)
+        if isinstance(data, dict) and isinstance(data.get("findings"), list):
+            return data
+        return None
+    except Exception as e:
+        logger.warning(f"  qa_stills: 视觉复审异常（跳过）: {e}")
+        return None

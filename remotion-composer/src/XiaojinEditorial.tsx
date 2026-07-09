@@ -32,6 +32,7 @@ import { Captions, CaptionPhrase } from "./components/xiaojin/Captions";
 import { ChapterNav, Chapter } from "./components/xiaojin/ChapterNav";
 import { ComplianceBar } from "./components/xiaojin/ComplianceBar";
 import { ContentBeat, ContentZone } from "./components/xiaojin/ContentZone";
+import { Section, SectionLayer } from "./components/xiaojin/SectionLayer";
 import { CountdownRing, CountdownRingProps } from "./components/xiaojin/CountdownRing";
 import { InfoCard, InfoCardProps } from "./components/xiaojin/InfoCard";
 import { IntroTitle } from "./components/xiaojin/IntroTitle";
@@ -93,6 +94,8 @@ export interface XiaojinEditorialProps extends Record<string, unknown> {
   captions: CaptionPhrase[];
   /** The graphic content side opposite the speaker card. Omit for a chrome-only build. */
   contentBeats?: ContentBeat[];
+  /** Full-canvas chapter takeovers (background + header + icon) — see SectionLayer. */
+  sections?: Section[];
   /** Count-up stat cards (contract② "[P3 NEW capability]"). Renders alongside contentBeats, not in place of it. */
   dataCards?: DataCard[];
   /** Semicircle risk/status gauges — Data Display Analysis "risk consequence" rows. */
@@ -165,6 +168,7 @@ export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = ({
   introOutFrame,
   captions,
   contentBeats,
+  sections,
   dataCards,
   gauges,
   countdowns,
@@ -181,6 +185,16 @@ export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = ({
 
   return (
     <AbsoluteFill style={{ background: bg }}>
+      {/* Full-canvas section takeovers render FIRST — they are backgrounds;
+          the card, graphics and chrome all sit above them. */}
+      {sections?.length ? (
+        <SectionLayer
+          sections={sections}
+          baseColorMode={colorMode}
+          headingFont={headingFont}
+          labelFont={labelFont}
+        />
+      ) : null}
       <SpeakerCard
         videoSrc={videoSrc}
         scenes={scenes}
