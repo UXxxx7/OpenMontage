@@ -155,7 +155,11 @@ def plan_content(segments: list[dict], duration: float) -> dict[str, Any]:
     if raw is None:
         return empty
 
-    return _to_frame_plan(raw, duration)
+    plan = _to_frame_plan(raw, duration)
+    # 视觉密度下限（richness floor）：video-studio CLAUDE-v2 §9 "score before
+    # you ship" 的可自动化部分。规划质量不再依赖单次 LLM 判断的心情——不达标
+    # 就带反馈重规划一轮，仍不达标就用确定性兜底从转写里挑句子做金句卡。
+    return _apply_richness_floor(raw, plan, segments, duration)
 
 
 def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
@@ -479,6 +483,125 @@ def _num(v: Any) -> Optional[float]:
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+# ---------------------------------------------------------------------------
+# 视觉密度下限（richness floor）
+#
+# "每条视频保证有画面节奏"必须是机制而不是运气：任意连续 RICHNESS_WINDOW
+# 秒内至少要有一个画布事件（图形/金句/段落接管），否则观感就是"卡片+字幕
+# 干坐着"。检查是确定性的；修复分两级——先带着具体空档反馈让 LLM 补一轮
+# （最多一轮，对齐 reviewer 协议的轮数上限），还不行就机械地从空档里挑最长
+# 的完整转写句做金句卡（原话，不需要任何判断力，保证下限）。
+# ---------------------------------------------------------------------------
+
+RICHNESS_WINDOW_FRAMES = 12 * FPS   # 超过 12s 无画布事件 = 稀疏
+_FLOOR_HEAD_SKIP_FRAMES = 90        # 开场有 intro 标题卡罩着
+_FLOOR_TAIL_SKIP_FRAMES = 150       # 片尾有 outro CTA 罩着
+_FLOOR_MAX_FALLBACK_QUOTES = 3
+
+REPLAN_SYSTEM_PROMPT = """You previously produced a content plan for this talking-head video, but the listed time spans have NO visual event at all (no data graphic, no quote, no section takeover) — on screen it's just the speaker and captions for too long.
+
+From the transcript lines spoken WITHIN those spans only, add visual moments using the same shapes as before (count_up / gauge / countdown / calendar / quote). Prefer "quote" with the exact spoken line, verbatim — never invent or paraphrase. 1 moment per span is enough; skip a span if its lines are genuinely too weak to show (that is acceptable).
+
+Output ONLY valid JSON: {"data_points": [ ... ]}"""
+
+
+def _coverage_spans(plan: dict) -> list[tuple[int, int]]:
+    spans = []
+    for g in (plan["data_cards"] + plan["gauges"] + plan["countdowns"]
+              + plan["calendar_events"] + plan["quotes"]):
+        spans.append((g["mountFrame"], g.get("endFrame", g["mountFrame"] + 90)))
+    for sec in plan["sections"]:
+        spans.append((sec["fromFrame"], sec["toFrame"]))
+    return sorted(spans)
+
+
+def _sparse_gaps(plan: dict, duration: float) -> list[tuple[int, int]]:
+    """无画布事件且长于阈值的帧区间。短视频（intro+outro 已covering）返回空。"""
+    dur_frames = round(duration * FPS)
+    end_limit = dur_frames - _FLOOR_TAIL_SKIP_FRAMES
+    if end_limit - _FLOOR_HEAD_SKIP_FRAMES < RICHNESS_WINDOW_FRAMES:
+        return []
+    gaps = []
+    cursor = _FLOOR_HEAD_SKIP_FRAMES
+    for a, b in _coverage_spans(plan):
+        if a - cursor > RICHNESS_WINDOW_FRAMES:
+            gaps.append((cursor, a))
+        cursor = max(cursor, b)
+    if end_limit - cursor > RICHNESS_WINDOW_FRAMES:
+        gaps.append((cursor, end_limit))
+    return gaps
+
+
+def _fallback_quotes_for_gaps(gaps: list[tuple[int, int]], segments: list[dict],
+                              existing_texts: set) -> list[dict]:
+    """确定性兜底：空档按 12s 窗口切开，每个窗口挑档内最长的转写句 -> quote。
+
+    一个空档只放一条是不够的（55s 的空档放一条金句，剩下 40s 还是稀疏）——
+    保证的对象是"任意连续窗口都有事件"，所以按窗口逐段放置，直到配额用完
+    或该窗口没有可用转写句（没句子的时段机制上无解，接受）。
+    """
+    out: list[dict] = []
+    for a, b in gaps:
+        cursor = a
+        while cursor < b and len(out) < _FLOOR_MAX_FALLBACK_QUOTES:
+            win_end = min(cursor + RICHNESS_WINDOW_FRAMES, b)
+            a_s, b_s = cursor / FPS, win_end / FPS
+            candidates = [
+                seg for seg in segments
+                if seg.get("text", "").strip()
+                and a_s <= float(seg.get("start", 0))
+                and float(seg.get("end", seg.get("start", 0))) <= b_s
+            ]
+            candidates.sort(key=lambda seg: len(seg["text"].strip()), reverse=True)
+            for c in candidates:
+                t = c["text"].strip()[:80]
+                if len(t) >= 6 and t not in existing_texts:
+                    out.append({"visual": "quote", "seconds": float(c["start"]), "text": t})
+                    existing_texts.add(t)
+                    break
+            cursor = win_end
+        if len(out) >= _FLOOR_MAX_FALLBACK_QUOTES:
+            break
+    return out
+
+
+def _apply_richness_floor(raw: dict, plan: dict, segments: list[dict],
+                          duration: float, allow_replan: bool = True) -> dict:
+    gaps = _sparse_gaps(plan, duration)
+    if not gaps:
+        return plan
+
+    gap_desc = ", ".join(f"{a / FPS:.0f}s-{b / FPS:.0f}s" for a, b in gaps)
+    logger.info(f"content_planner: 密度下限触发，空档: {gap_desc}")
+
+    data_points = list(raw.get("data_points") or [])
+
+    if allow_replan and segments:
+        user_message = (
+            f"Uncovered spans: {gap_desc}\n\nTranscript:\n"
+            + _build_transcript_text(segments)
+        )
+        extra = _call_llm_json("密度补规划", REPLAN_SYSTEM_PROMPT, user_message,
+                               temperature=0.2, model=get_config().llm_model_long_output)
+        if extra and isinstance(extra.get("data_points"), list):
+            data_points += [dp for dp in extra["data_points"] if isinstance(dp, dict)]
+            plan = _to_frame_plan({**raw, "data_points": data_points}, duration)
+            gaps = _sparse_gaps(plan, duration)
+            if not gaps:
+                logger.info("content_planner: 补规划一轮后密度达标")
+                return plan
+
+    # 仍有空档 -> 机械兜底（原话金句，不依赖判断力）
+    existing = {str(dp.get("text", "")) for dp in data_points if isinstance(dp, dict)}
+    fallback = _fallback_quotes_for_gaps(gaps, segments, existing)
+    if fallback:
+        logger.info(f"content_planner: 兜底金句 x{len(fallback)}（空档内最长转写句）")
+        plan = _to_frame_plan({**raw, "data_points": data_points + fallback}, duration)
+    else:
+        logger.info("content_planner: 空档内无可用转写句，保持现计划（已尽机制所能）")
+    return plan
 
 
 # ---------------------------------------------------------------------------

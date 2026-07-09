@@ -127,6 +127,38 @@ def main():
           {"quotes": plan["quotes"], "modes": plan["mode_schedule"]})
     check("atmosphere 关键词透传", plan["atmosphere_keywords"] == ["renewal", "保障", "coverage"])
 
+    # 8. 密度下限：空档检测 / 确定性兜底 / 短片豁免
+    from whatsapp_mvp.content_planner import (
+        _apply_richness_floor, _sparse_gaps, RICHNESS_WINDOW_FRAMES,
+    )
+    # 60s 视频、无任何画布事件 -> 中段应报告空档
+    bare = _to_frame_plan({"chapters": []}, duration=60.0)
+    gaps = _sparse_gaps(bare, 60.0)
+    check("裸计划在长视频上检出空档", len(gaps) >= 1, gaps)
+
+    # 短片(12s)豁免：intro+outro 已覆盖，不该报空档
+    check("短视频豁免密度检查", _sparse_gaps(_to_frame_plan({"chapters": []}, 12.0), 12.0) == [])
+
+    # 确定性兜底(禁用重规划)：从空档内最长转写句合成金句
+    segs = [
+        {"start": 10.0, "end": 13.0, "text": "this is the single most important thing to remember"},
+        {"start": 24.0, "end": 27.0, "text": "another decently long spoken line right here"},
+        {"start": 40.0, "end": 43.0, "text": "and one more full sentence near the end of it"},
+    ]
+    fixed = _apply_richness_floor({"chapters": []}, bare, segs, 60.0, allow_replan=False)
+    check("兜底金句用了空档内的原话", len(fixed["quotes"]) >= 2
+          and fixed["quotes"][0]["text"].startswith("this is the single"), fixed["quotes"])
+    check("兜底后无残余空档（有转写句可用的时段）", _sparse_gaps(fixed, 60.0) == [],
+          {"before": gaps, "after": _sparse_gaps(fixed, 60.0)})
+
+    # 已有覆盖的计划不触发下限（原计划原样返回）
+    covered_raw = {"chapters": [], "data_points": [
+        {"visual": "quote", "seconds": t, "text": f"line at {t} seconds long enough"} for t in (8.0, 20.0, 32.0, 44.0)
+    ]}
+    covered = _to_frame_plan(covered_raw, 60.0)
+    same = _apply_richness_floor(covered_raw, covered, segs, 60.0, allow_replan=False)
+    check("密度达标的计划不被改动", same is covered)
+
     # 5. 畸形条目容错：非 dict / 缺字段不炸、不产出
     plan = _to_frame_plan({"chapters": [{"label": "no at_seconds"}],
                            "data_points": ["not a dict", {"visual": "gauge"}]}, duration=30.0)
