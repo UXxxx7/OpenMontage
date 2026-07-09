@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 from typing import Optional
 
@@ -115,6 +116,83 @@ def update_job_fields(job_id: str, **kwargs) -> Optional[Job]:
         session.close()
 
 
+# ---------------------------------------------------------------------------
+# Asset helpers (b-roll / multi-asset intake) — thin JSON on Job.assets
+# ---------------------------------------------------------------------------
+
+def get_assets(job: Job) -> list[dict]:
+    """解析 job.assets（JSON）为列表；为空/损坏时返回 []。"""
+    raw = getattr(job, "assets", None)
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, list) else []
+    except (ValueError, TypeError):
+        return []
+
+
+def append_asset(job_id: str, media_id: str, kind: str, label: str = "") -> Optional[Job]:
+    """往 job.assets 追加一条资产（kind = "video"|"image"）。
+    角色在 collecting 期一律 provisional="broll"，"go" 时由 finalize_target 定 target。
+    order 自动取当前长度。"""
+    session = get_session()
+    try:
+        job = session.query(Job).filter(Job.id == job_id).first()
+        if not job:
+            return None
+        assets = get_assets(job)
+        assets.append({
+            "role": "broll",          # provisional; finalized at "go"
+            "kind": kind,
+            "media_id": media_id,
+            "local_path": None,
+            "label": label or "",
+            "order": len(assets),
+        })
+        job.assets = json.dumps(assets, ensure_ascii=False)
+        session.commit()
+        session.refresh(job)
+        return job
+    finally:
+        session.close()
+
+
+def finalize_target(job_id: str, target_media_id: str) -> Optional[Job]:
+    """'go' 时定角色：target_media_id 那条设 role=target，其余都 broll。"""
+    session = get_session()
+    try:
+        job = session.query(Job).filter(Job.id == job_id).first()
+        if not job:
+            return None
+        assets = get_assets(job)
+        for a in assets:
+            a["role"] = "target" if a.get("media_id") == target_media_id else "broll"
+        job.assets = json.dumps(assets, ensure_ascii=False)
+        session.commit()
+        session.refresh(job)
+        return job
+    finally:
+        session.close()
+
+
+def set_asset_local_path(job_id: str, media_id: str, local_path: str) -> None:
+    """下载后回填某个资产的本地路径。"""
+    session = get_session()
+    try:
+        job = session.query(Job).filter(Job.id == job_id).first()
+        if not job:
+            return
+        assets = get_assets(job)
+        for a in assets:
+            if a.get("media_id") == media_id:
+                a["local_path"] = local_path
+        job.assets = json.dumps(assets, ensure_ascii=False)
+        session.commit()
+    finally:
+        session.close()
+
+
 def get_active_job_for_user(user_id: int) -> Optional[Job]:
     from sqlalchemy.orm import joinedload
 
@@ -178,5 +256,3 @@ def message_exists(whatsapp_message_id: str) -> bool:
         )
     finally:
         session.close()
-
-

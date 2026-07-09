@@ -32,6 +32,8 @@ class Base(DeclarativeBase):
 
 class JobStatus(str, Enum):
     RECEIVED = "RECEIVED"
+    COLLECTING_ASSETS = "COLLECTING_ASSETS"
+    NEEDS_TARGET_CHOICE = "NEEDS_TARGET_CHOICE"
     DOWNLOADING_MEDIA = "DOWNLOADING_MEDIA"
     PLANNING = "PLANNING"
     NEEDS_CLARIFICATION = "NEEDS_CLARIFICATION"
@@ -52,6 +54,7 @@ class MessageDirection(str, Enum):
 class MessageType(str, Enum):
     TEXT = "text"
     VIDEO = "video"
+    IMAGE = "image"
     BUTTON_REPLY = "button_reply"
     INTERACTIVE = "interactive"
     UNKNOWN = "unknown"
@@ -91,6 +94,10 @@ class Job(Base):
     input_caption: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     whatsapp_media_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     edit_request: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # b-roll / multi-asset intake: JSON list of
+    # {role: "target"|"broll", media_id, local_path, label, order}.
+    # whatsapp_media_id/input_video_path above still point at the target (back-compat).
+    assets: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     # LLM planner output (JSON)
     planned_edit: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -163,6 +170,19 @@ _engine = None
 _SessionLocal = None
 
 
+def _migrate_schema(engine) -> None:
+    """轻量幂等迁移：create_all 不会给已存在的表加列，后加的可空列在这里补。
+    对 sqlite / postgres 都适用（ALTER TABLE ADD COLUMN）。列已存在则 no-op。"""
+    from sqlalchemy import inspect as _inspect, text as _text
+    try:
+        cols = {c["name"] for c in _inspect(engine).get_columns("jobs")}
+    except Exception:
+        return
+    if "assets" not in cols:
+        with engine.begin() as conn:
+            conn.execute(_text("ALTER TABLE jobs ADD COLUMN assets TEXT"))
+
+
 def _init_engine() -> None:
     global _engine, _SessionLocal
     config = get_config()
@@ -174,6 +194,7 @@ def _init_engine() -> None:
 
     _engine = create_engine(db_url, connect_args=connect_args, echo=False)
     Base.metadata.create_all(bind=_engine)
+    _migrate_schema(_engine)
 
     from sqlalchemy.orm import sessionmaker
 
@@ -185,4 +206,3 @@ def get_session() -> Session:
     if _SessionLocal is None:
         _init_engine()
     return _SessionLocal()
-

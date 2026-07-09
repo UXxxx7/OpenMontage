@@ -12,8 +12,11 @@ from fastapi.responses import PlainTextResponse, FileResponse
 from .config import get_config
 from .database import JobStatus, MessageDirection, MessageType
 from .job_manager import (
+    append_asset,
     create_job,
+    finalize_target,
     get_active_job_for_user,
+    get_assets,
     get_job,
     get_or_create_user,
     message_exists,
@@ -159,6 +162,37 @@ async def _handle_message(msg: dict, contacts: list[dict], wa: WhatsAppClient) -
                 save_message(active_job.id, MessageDirection.INBOUND, MessageType.TEXT, text_body, message_id)
                 return
 
+            # b-roll 收集期：'go' 收尾开始，其余提示继续发素材
+            if active_job.status == JobStatus.COLLECTING_ASSETS:
+                if text_body in ("go", "start", "done", "开始", "完成", "好了"):
+                    _finalize_collection(active_job, from_number, wa)
+                else:
+                    _safe_send(wa, from_number, "Send your clips, then reply 'go' to start.")
+                save_message(active_job.id, MessageDirection.INBOUND, MessageType.TEXT, text_body, message_id)
+                return
+
+            # 2+ 视频时问哪个是主视频：解析用户回的编号
+            if active_job.status == JobStatus.NEEDS_TARGET_CHOICE:
+                videos = [a for a in get_assets(active_job) if a.get("kind") == "video"]
+                try:
+                    choice = int("".join(ch for ch in text_body if ch.isdigit()))
+                except ValueError:
+                    choice = 0
+                if 1 <= choice <= len(videos):
+                    target = videos[choice - 1]
+                    finalize_target(active_job.id, target["media_id"])
+                    update_job_fields(
+                        active_job.id,
+                        whatsapp_media_id=target["media_id"],
+                        edit_request=active_job.edit_request or target.get("label", ""),
+                    )
+                    _safe_send(wa, from_number, "Got it. Starting the edit...")
+                    _enqueue_process(active_job.id)
+                else:
+                    _safe_send(wa, from_number, f"Please reply with a number 1-{len(videos)}.")
+                save_message(active_job.id, MessageDirection.INBOUND, MessageType.TEXT, text_body, message_id)
+                return
+
         _safe_send(
             wa,
             from_number,
@@ -167,27 +201,114 @@ async def _handle_message(msg: dict, contacts: list[dict], wa: WhatsAppClient) -
         )
         return
 
-    # --- Video messages ---
-    if msg_type == "video":
-        video_data = msg.get("video", {})
-        media_id = video_data.get("id", "")
-        caption = video_data.get("caption", "")
-
+    # --- Media messages (video / image) — collect into one job, start on 'go' ---
+    if msg_type in ("video", "image"):
+        media = msg.get(msg_type, {})
+        media_id = media.get("id", "")
+        caption = media.get("caption", "")
         if not media_id:
             return
-
-        job = create_job(user_id=user.id, pipeline="talking-head", input_caption=caption)
-        # 保存 edit_request 和 media_id 供 worker 使用
-        update_job_fields(job.id, edit_request=caption, whatsapp_media_id=media_id)
-        update_job_status(job.id, JobStatus.RECEIVED)
-
-        save_message(job.id, MessageDirection.INBOUND, MessageType.VIDEO, caption, message_id)
-
-        _enqueue_process(job.id)
-        _safe_send(wa, from_number, "Video received! I'll analyze it and let you know my edit plan.")
+        _collect_media(user, from_number, msg_type, media_id, caption, message_id, wa)
         return
 
     _safe_send(wa, from_number, "Please send a video for editing.")
+
+
+# ---------------------------------------------------------------------------
+# b-roll / multi-asset collection
+# ---------------------------------------------------------------------------
+
+def _collect_media(user, from_number, kind, media_id, caption, message_id, wa) -> None:
+    """把一条媒体收进 collecting 中的 job；没有就新建一个 COLLECTING_ASSETS job。"""
+    mtype = MessageType.VIDEO if kind == "video" else MessageType.IMAGE
+    active = get_active_job_for_user(user.id)
+    # 收集态、或"问哪个是主视频"态都接着收：问角色期又来素材→视频集变了，
+    # 退回收集态、重新等 'go'（旧的编号问题作废，防孤立 job）。
+    if active and active.status in (JobStatus.COLLECTING_ASSETS, JobStatus.NEEDS_TARGET_CHOICE):
+        job = append_asset(active.id, media_id, kind, caption)
+        if active.status == JobStatus.NEEDS_TARGET_CHOICE:
+            update_job_status(active.id, JobStatus.COLLECTING_ASSETS)
+        save_message(active.id, MessageDirection.INBOUND, mtype, caption, message_id)
+        _schedule_collect_timeout(active.id, len(get_assets(job)) if job else 0)
+        return
+    # 新起一个收集 job，这条作为第一个资产
+    job = create_job(user_id=user.id, pipeline="talking-head", input_caption=caption)
+    update_job_status(job.id, JobStatus.COLLECTING_ASSETS)
+    job = append_asset(job.id, media_id, kind, caption)
+    if kind == "video":
+        # 暂定为 target（向后兼容：worker/pipeline 读 whatsapp_media_id）
+        update_job_fields(job.id, edit_request=caption, whatsapp_media_id=media_id)
+    save_message(job.id, MessageDirection.INBOUND, mtype, caption, message_id)
+    _schedule_collect_timeout(job.id, len(get_assets(job)) if job else 0)
+    _safe_send(
+        wa, from_number,
+        "Got it. Send your main video plus any b-roll clips/photos "
+        "(add a short note on each saying where it goes). "
+        "Reply 'go' when done — or 'go' now to edit without b-roll.",
+    )
+
+
+def _schedule_collect_timeout(job_id: str, seen_count: int) -> None:
+    """收集态超时兜底：RQ 可用时延时入队一个 finalize 检查；此后无新素材则自动 'go'，
+    防止用户发了视频却不打 'go' 而永久卡住。sync 模式（无后台调度）下 no-op——那时靠显式 'go'。"""
+    import os
+    if os.getenv("USE_RQ_WORKER", "").lower() != "true":
+        return
+    try:
+        import datetime as _dt
+        from redis import Redis
+        import rq
+        config = get_config()
+        delay = int(os.getenv("WA_COLLECT_TIMEOUT_S", "45"))
+        redis_conn = Redis.from_url(config.redis_url, socket_connect_timeout=2, socket_timeout=2)
+        q = rq.Queue("whatsapp_mvp", connection=redis_conn)
+        q.enqueue_in(_dt.timedelta(seconds=delay), finalize_collection_timeout, job_id, seen_count)
+    except Exception as e:
+        logger.warning(f"schedule collect timeout failed: {e}")
+
+
+def finalize_collection_timeout(job_id: str, seen_count: int) -> None:
+    """RQ 延时回调：仍是收集态、且此后无新素材（资产数没变）→ 自动 finalize（等价用户 'go'）。
+    资产数变了说明期间又来了素材，交给更晚那次调度的超时处理，本次直接放行。"""
+    job = get_job(job_id)
+    if not job or job.status != JobStatus.COLLECTING_ASSETS:
+        return
+    if len(get_assets(job)) != seen_count:
+        return
+    config = get_config()
+    wa = WhatsAppClient(config)
+    from_number = job.user.whatsapp_id if job.user else None
+    if from_number:
+        _finalize_collection(job, from_number, wa)
+
+
+def _finalize_collection(job, from_number, wa) -> None:
+    """'go' 时定角色并开始：0 视频→提示；1 视频→直接开始；2+ 视频→问哪个是主视频。"""
+    assets = get_assets(job)
+    videos = [a for a in assets if a.get("kind") == "video"]
+    if not videos:
+        _safe_send(wa, from_number, "I need a main video to edit. Send one, then reply 'go'.")
+        return
+    if len(videos) == 1:
+        target = videos[0]
+        finalize_target(job.id, target["media_id"])
+        update_job_fields(
+            job.id,
+            whatsapp_media_id=target["media_id"],
+            edit_request=job.edit_request or target.get("label", ""),
+        )
+        n_broll = len(assets) - 1
+        extra = f" and {n_broll} b-roll item(s)" if n_broll else ""
+        _safe_send(wa, from_number, f"Got your video{extra}. Starting the edit...")
+        _enqueue_process(job.id)
+        return
+    # 2+ 视频 → 问哪个是主视频
+    update_job_status(job.id, JobStatus.NEEDS_TARGET_CHOICE)
+    lines = ["Which one is your main talking-head video? Reply with the number:"]
+    for i, v in enumerate(videos, 1):
+        lbl = v.get("label") or f"clip {v.get('order', '?')}"
+        lines.append(f"{i}. {lbl}")
+    _safe_send(wa, from_number, "\n".join(lines))
 
 
 # ---------------------------------------------------------------------------
@@ -397,7 +518,3 @@ async def serve_file(job_id: str, filename: str):
 
     media_type = "video/mp4" if filename.endswith(".mp4") else "application/octet-stream"
     return FileResponse(str(file_path), media_type=media_type)
-
-
-
-
