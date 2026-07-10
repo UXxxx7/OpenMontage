@@ -50,6 +50,28 @@ TIMELINE_NODE_MIN_GAP_FRAMES = 30
 # 全画布接管至少要有这么多帧才值得放一个多阶段 timeline 图形（给动画+停留留出空间）。
 TIMELINE_MIN_SECTION_FRAMES = 90
 
+# P3: InfoCard 宽度按行数递增，而不是不管几行都占满 920px——1 行卡跟 5 行卡
+# 视觉上占用的空间该不一样，SpeakerCard 在 Workflow 模式下的收缩量
+# (pipeline_runner._workflow_box) 直接读这个宽度决定收多窄：内容越窄，
+# SpeakerCard 就不用收得那么小。
+INFO_CARD_MIN_WIDTH = 480
+INFO_CARD_MAX_WIDTH = 920
+INFO_CARD_WIDTH_PER_ROW = 90
+
+# 仪表盘/倒计时/日历是固定尺寸的单值卡片（不像 InfoCard 按行数变化）——数值
+# 取自各组件自身的固有宽度（RiskGauge 的 SVG 半径+padding、CountdownRing 同理、
+# Calendar 组件硬编码 width:460），供 pipeline_runner 算 SpeakerCard 该收多窄。
+# before_after 维持 920（BudgetRevealSection 的默认 width，不做行数式变化——
+# 左右两个值的展示形状本来就不随内容量变化）。
+CONTENT_WIDTH_BY_VISUAL = {"gauge": 310, "countdown": 260, "calendar": 460, "before_after": 920}
+# 全画布章节接管（sections）：内容占满整个画布，SpeakerCard 应该收到 P2 验证过
+# 的最小 pip 尺寸——用同一个"宽内容"哨兵值，不需要单独一套逻辑。
+SECTION_CONTENT_WIDTH = 920
+
+
+def _info_card_width(row_count: int) -> int:
+    return min(INFO_CARD_MAX_WIDTH, INFO_CARD_MIN_WIDTH + max(0, row_count - 1) * INFO_CARD_WIDTH_PER_ROW)
+
 SYSTEM_PROMPT = """You analyze a talking-head video's transcript and produce a content plan for the video's chapter markers and any data-worthy moments, following these rules (from the project's compose-director.md style codex, "Data Display Analysis" section).
 
 **This video could be about absolutely anything** — cooking, fitness, finance, a product review, a story, a tutorial, a rant. Do not default to any one domain or topic. Every chapter label, and whether there are any data points at all, must come ONLY from what THIS specific transcript actually says — never reuse a pattern, label, or topic from any other video you've seen. A video with no notable moments should get an empty data_points array; that is a completely normal, common outcome, not a failure.
@@ -187,10 +209,15 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
     countdowns: list[dict] = []
     calendar_events: list[dict] = []
     before_afters: list[dict] = []
-    # (start_frame, end_frame) windows where the content zone needs room —
-    # shared across all 4 visual types, since all of them need the
-    # SpeakerCard to be in Workflow (shrunk) mode while they're on screen.
-    workflow_ranges: list[tuple[int, int]] = []
+    # (start_frame, end_frame, content_width) windows where the content zone
+    # needs room — shared across all 4 visual types, since all of them need
+    # the SpeakerCard to be in Workflow (shrunk) mode while they're on
+    # screen. content_width (P3) is how wide that particular visual actually
+    # renders (InfoCard's row-count-aware width, or a fixed per-type width
+    # for gauge/countdown/calendar/before_after) — pipeline_runner uses it to
+    # size the SpeakerCard's Workflow-mode box, so a narrow gauge doesn't
+    # force the same aggressive shrink as a wide 5-row InfoCard.
+    workflow_ranges: list[tuple[int, int, int]] = []
 
     # All 4 visual types share ONE content-zone lane (they all drive the same
     # dominant/workflow mode_schedule below), so process data points in
@@ -228,7 +255,10 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
         if entry is None:
             continue
         target.append(entry)
-        workflow_ranges.append((entry["mountFrame"], entry["endFrame"]))
+        # count_up's width is already row-count-aware (set in _plan_count_up);
+        # every other visual type has a fixed footprint per CONTENT_WIDTH_BY_VISUAL.
+        content_width = entry["width"] if visual == "count_up" else CONTENT_WIDTH_BY_VISUAL.get(visual, INFO_CARD_MAX_WIDTH)
+        workflow_ranges.append((entry["mountFrame"], entry["endFrame"], content_width))
         next_available_frame = entry["endFrame"] + MIN_GAP_AFTER_PREVIOUS_FRAMES
 
     # 全画布章节接管（sections）：takeover 章节的跨度 = 本章 atFrame 到下一章
@@ -257,7 +287,7 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
         if timeline_plan and timeline_plan["chapter_index"] == idx:
             sec["timeline"] = {"heading": timeline_plan["heading"], "nodes": timeline_plan["nodes"]}
         sections.append(sec)
-        workflow_ranges.append((start, end))
+        workflow_ranges.append((start, end, SECTION_CONTENT_WIDTH))
     for ch in chapters:
         for k in ("_takeover", "_icon", "_dark", "_warn"):
             ch.pop(k, None)
@@ -277,8 +307,10 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
             cur["endFrame"] = min(cur.get("endFrame", nxt["mountFrame"]), nxt["mountFrame"])
 
     mode_schedule = [{"frame": 0, "mode": "dominant"}]
-    for start, end in _merge_workflow_ranges(workflow_ranges):
-        mode_schedule.append({"frame": max(1, start - WORKFLOW_SHRINK_LEAD_FRAMES), "mode": "workflow"})
+    for start, end, width in _merge_workflow_ranges(workflow_ranges):
+        mode_schedule.append({
+            "frame": max(1, start - WORKFLOW_SHRINK_LEAD_FRAMES), "mode": "workflow", "contentWidth": width,
+        })
         if round(end) < round(duration * FPS):
             mode_schedule.append({"frame": end, "mode": "dominant"})
     # interpolate() requires strictly increasing frame numbers. Ranges are
@@ -315,7 +347,7 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
     }
 
 
-def _merge_workflow_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+def _merge_workflow_ranges(ranges: list[tuple[int, int, int]]) -> list[tuple[int, int, int]]:
     """Merge workflow ranges close enough together that building the schedule
     from them separately would collide.
 
@@ -332,16 +364,22 @@ def _merge_workflow_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int
     back-to-back graphics keep the card continuously in Workflow mode
     instead of a needless grow-then-immediately-shrink flicker, or worse,
     no shrink happening at all.
+
+    The merged content_width (3rd element, P3) takes the max of the two
+    ranges being merged — if the continuous docked span covers both a
+    narrow gauge and a wide InfoCard, the SpeakerCard must stay narrow
+    enough for the wider one the whole time, not flicker size mid-dock.
     """
     if not ranges:
         return []
     merged = [list(sorted(ranges)[0])]
-    for start, end in sorted(ranges)[1:]:
+    for start, end, width in sorted(ranges)[1:]:
         if start - WORKFLOW_SHRINK_LEAD_FRAMES <= merged[-1][1]:
             merged[-1][1] = max(merged[-1][1], end)
+            merged[-1][2] = max(merged[-1][2], width)
         else:
-            merged.append([start, end])
-    return [(s, e) for s, e in merged]
+            merged.append([start, end, width])
+    return [(s, e, w) for s, e, w in merged]
 
 
 def _dp_seconds(dp: dict) -> float:
@@ -407,7 +445,7 @@ def _plan_count_up(dp: dict, min_mount_frame: int) -> Optional[dict]:
     end_frame = max(last_row_frame, card_mount_frame) + HOLD_AFTER_LAST_ROW_FRAMES
     return {
         "title": str(dp.get("title", ""))[:40],
-        "x": 80, "y": 900, "width": 920,
+        "x": 80, "y": 900, "width": _info_card_width(len(rows)),
         "mountFrame": card_mount_frame,
         "endFrame": end_frame,
         "rows": rows,
