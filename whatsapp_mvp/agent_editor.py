@@ -233,13 +233,34 @@ def _simulate(name, args, duration):
     return {"ok": True, "estimated_duration_seconds": round(d, 1)}, d
 
 
-def _chat(config, messages, tools=None, json_mode=False):
-    endpoint = (config.llm_base_url or "").rstrip("/")
+# 原生 provider 端点（无 LLM_BASE_URL / 中转站时兜底直连，和 llm_planner.py 的
+# provider 路由保持一致）。两者都是 OpenAI 兼容的 chat/completions + function-calling，
+# 跟这里的 tool-calling 循环直接兼容；claude 的原生 Messages API 工具格式不同，
+# 暂不在此路径支持——要用就配 LLM_BASE_URL 走中转站。
+_NATIVE_PROVIDER_ENDPOINTS = {
+    "deepseek": "https://api.deepseek.com/chat/completions",
+    "openai": "https://api.openai.com/v1/chat/completions",
+}
+
+
+def _resolve_endpoint_and_key(config) -> tuple[str | None, str | None]:
+    base_url = (config.llm_base_url or "").rstrip("/")
+    if base_url:
+        endpoint = base_url if base_url.endswith("/v1") else base_url + "/v1"
+        return endpoint + "/chat/completions", config.llm_api_key
+    provider = (config.llm_provider or "").lower()
+    endpoint = _NATIVE_PROVIDER_ENDPOINTS.get(provider)
     if not endpoint:
-        raise RuntimeError("需要配置 LLM_BASE_URL（中转站）")
-    if not endpoint.endswith("/v1"):
-        endpoint += "/v1"
-    endpoint += "/chat/completions"
+        return None, None
+    api_key = config.llm_api_key or config.deepseek_api_key or config.openai_api_key
+    return endpoint, api_key
+
+
+def _chat(config, messages, tools=None, json_mode=False):
+    endpoint, api_key = _resolve_endpoint_and_key(config)
+    if not endpoint or not api_key:
+        raise RuntimeError(
+            "需要配置 LLM_BASE_URL（中转站）或原生 provider（LLM_PROVIDER=deepseek/openai + 对应 API key）")
     payload = {"model": config.llm_model, "messages": messages, "temperature": 0.2}
     if tools:
         payload["tools"] = tools
@@ -252,7 +273,7 @@ def _chat(config, messages, tools=None, json_mode=False):
 
     for attempt in range(4):
         resp = requests.post(endpoint, headers={
-            "Authorization": f"Bearer {config.llm_api_key}", "Content-Type": "application/json"},
+            "Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json=payload, timeout=90)
         if resp.status_code == 429 and attempt < 3:
             wait = 25 * (attempt + 1)

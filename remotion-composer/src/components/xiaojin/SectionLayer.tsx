@@ -22,6 +22,7 @@
 import { interpolate, useCurrentFrame } from "remotion";
 import { SECTION_ICONS } from "./SectionIcons";
 import { APPLE, ColorMode, PALETTES } from "./theme";
+import { TimelineNode, TimelineSection as TimelineSectionGraphic } from "./TimelineSection";
 
 export interface Section {
   /** Takeover span (frames). fromFrame should be >= introOutFrame. */
@@ -31,12 +32,23 @@ export interface Section {
   eyebrow?: string;
   /** Big header line in the video's primary language, e.g. "你的保障". */
   title?: string;
-  /** Icon name from SECTION_ICONS ("shield_check" | "warning" | "clock"). */
+  /** Icon name from SECTION_ICONS ("shield_check" | "warning" | "clock"). Omit when `timeline` is set — they occupy the same vertical space. */
   icon?: string;
   /** Overrides the base colorMode for this span (the reference alternates dark/warm). */
   colorMode?: ColorMode;
   /** Warning styling — accents go red instead of terracotta (reference's "why" section). */
   warn?: boolean;
+  /**
+   * Full-canvas multi-stage process timeline filling the rest of this
+   * section's takeover (see TimelineSection). Only renders when this
+   * section's resolved colorMode is "dark" — the graphic is hardcoded for a
+   * dark canvas (see TimelineSection's doc comment) and would not read
+   * against a warm/cream section.
+   */
+  timeline?: {
+    heading: string;
+    nodes: TimelineNode[];
+  };
 }
 
 const ENTER_FRAMES = 18;
@@ -124,6 +136,17 @@ export const SectionLayer: React.FC<{
               <div style={{ position: "absolute", left: 0, top: 500, width: "100%", display: "flex", justifyContent: "center" }}>
                 <Icon localFrame={local} color={accent} />
               </div>
+            ) : null}
+
+            {s.timeline && mode === "dark" ? (
+              <TimelineSectionGraphic
+                heading={s.timeline.heading}
+                mountFrame={s.fromFrame}
+                endFrame={s.toFrame}
+                nodes={s.timeline.nodes}
+                headingFont={headingFont}
+                labelFont={labelFont}
+              />
             ) : null}
           </div>
         );

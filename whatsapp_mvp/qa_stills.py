@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -31,11 +32,22 @@ _STILL_TIMEOUT_S = 120
 
 # Must match pipeline_runner's geometry (single source of truth would be a
 # circular import; these mirror _DOMINANT_BOX/_WORKFLOW_BOX, change together).
-# Workflow mode: card docks small at bottom-right (740,1200 300x531); the
-# graphics (dataCards/gauges/countdowns/calendars, default y=900) occupy the
-# freed canvas — the fill check samples that region.
-_WORKFLOW_BOX_H = 531
-_CONTENT_ZONE = {"x0": 60, "y0": 860, "x1": 1020, "y1": 1190}
+# Workflow mode: card docks small at top-right (740,104 300x900); the
+# graphics (dataCards/gauges/countdowns/calendars/beforeAfter, default y=900,
+# and section takeovers spanning most of the canvas) occupy the freed canvas
+# — the fill check samples that region.
+_WORKFLOW_BOX_H = 900
+# Previously only a 330px/17%-of-frame-height band (y=860-1190) — a frame
+# could be entirely empty everywhere else in the canvas and still pass.
+# Widened to span from where content-zone graphics conventionally start
+# (y=900) down to the pinned BrandBar/ComplianceBar zone (y=1824, see
+# theme.ts's BRAND/COMPLIANCE constants), and nearly the full canvas width —
+# now ~47% of frame height instead of ~17%. This overlaps the Workflow pip's
+# own bottom-right footprint for a small sliver (y=900-1004) — the pip
+# itself isn't background color, so that sliver alone can't make a truly
+# empty frame register as "filled"; the remaining ~800px of the zone is
+# unaffected and carries the real signal.
+_CONTENT_ZONE = {"x0": 40, "y0": 900, "x1": 1040, "y1": 1800}
 _BG = {"warm": (0xF2, 0xEB, 0xE0), "dark": (0x0D, 0x11, 0x17)}
 _MIN_CONTENT_FILL = 0.06  # below this, a docked frame's content zone is "empty canvas"
 
@@ -61,12 +73,24 @@ def is_docked(scenes: list[dict], frame: int) -> bool:
 
 
 def pick_qa_frames(props: dict) -> list[int]:
-    """codex 的抽查点：intro 落位、每张数据卡全展开、全屏区间中点、片尾。"""
+    """codex 的抽查点：intro 落位、每张数据卡全展开、每个前后对比卡全展开、
+    每个全画布接管的中点、全屏区间中点、片尾。"""
     duration_frames = max(1, round(props["durationSeconds"] * _FPS))
     frames = {min(props.get("introOutFrame", 20) + 15, duration_frames - 1)}
     for card in props.get("dataCards", []):
         last_row = max((r.get("mountOffset", 0) for r in card.get("rows", [])), default=0)
         frames.add(min(card["mountFrame"] + last_row + 30, duration_frames - 1))
+    # beforeAfter cards weren't sampled at all before this — both values need
+    # to have actually landed, not just the card's own mount, for the still
+    # to show the finished reveal.
+    for card in props.get("beforeAfter", []):
+        frames.add(min(card["secondRevealFrame"] + 40, duration_frames - 1))
+    # Section takeovers (incl. any process timeline they carry) are commonly
+    # docked the whole time they're on screen, so the "full-screen interval
+    # midpoint" sampling below never catches them — sample each one directly.
+    for sec in props.get("sections", []):
+        mid = (sec["fromFrame"] + sec["toFrame"]) // 2
+        frames.add(min(max(mid, 0), duration_frames - 1))
     frames.add(max(duration_frames - 30, 0))
     scenes = props.get("scenes", [])
     full_frames = [f for f in range(0, duration_frames, 30) if not is_docked(scenes, f)]
@@ -76,8 +100,11 @@ def pick_qa_frames(props: dict) -> list[int]:
 
 
 def render_still(remotion_dir: Path, props_path: Path, frame: int, out_png: Path) -> bool:
+    # Windows: subprocess needs the resolved npx.cmd, plain "npx" raises
+    # WinError 2 (same fix already applied in pipeline_runner.py's render call).
+    npx_bin = shutil.which("npx") or "npx"
     cmd = [
-        "npx", "remotion", "still", "XiaojinEditorial", str(out_png),
+        npx_bin, "remotion", "still", "XiaojinEditorial", str(out_png),
         f"--frame={frame}", f"--props={props_path}", f"--scale={_SCALE}",
     ]
     try:
