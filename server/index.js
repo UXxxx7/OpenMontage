@@ -131,9 +131,20 @@ async function handleMessage(message) {
     const mediaId = message.video?.id;
     const caption = message.video?.caption || "";
     if (!mediaId) return;
+    // 入队前先看拥堵度，给用户即时回执——排队期间零反馈是实测过的体验硬伤
+    // （2026-07-09：队列 6 单积压，用户以为系统挂了）。回执由网关直发，
+    // 不等 worker 领到任务才吭声。
+    let ahead = 0;
+    try {
+      ahead = (await videoQueue.getWaitingCount()) + (await videoQueue.getActiveCount());
+    } catch {}
     await videoQueue.add("edit-video", {
       waNumber, mediaId, editRequest: caption, msgId,
     }, queueOptions(msgId));
+    if (ahead > 0) {
+      await gatewaySendText(waNumber,
+        `Video received — ${ahead} job${ahead > 1 ? "s" : ""} ahead of you in the queue. I'll start on yours as soon as it's your turn.`);
+    }
     return;
   }
 
@@ -219,6 +230,21 @@ async function withTimeout(promise, ms, fallback) {
 
 function env(name, fallback = "") {
   return process.env[name] || fallback;
+}
+
+async function gatewaySendText(waNumber, text) {
+  const token = env("WA_TOKEN", env("WHATSAPP_ACCESS_TOKEN"));
+  const phoneId = env("WA_PHONE_ID", env("WHATSAPP_PHONE_NUMBER_ID"));
+  if (!token || !phoneId) return;
+  try {
+    await axios.post(
+      `https://graph.facebook.com/${env("WA_GRAPH_VERSION", "v21.0")}/${phoneId}/messages`,
+      { messaging_product: "whatsapp", to: waNumber, type: "text", text: { body: text } },
+      { headers: { Authorization: `Bearer ${token}` }, timeout: 10000 }
+    );
+  } catch (err) {
+    console.warn("[gateway] ack send failed:", err.message);
+  }
 }
 
 function whatsappVerifyToken() {

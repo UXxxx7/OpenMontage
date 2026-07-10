@@ -17,6 +17,22 @@ from .database import Job
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# 重型阶段并发闸门。node 侧 WA_WORKER_CONCURRENCY>1 后，多任务的"规划"可以
+# 重叠（主要在等 LLM 响应，占不了多少 CPU），但转写(Whisper)/Remotion 渲染/
+# 画质增强是 CPU/内存大户——单机上两个同时跑会互相拖慢到集体超时（实测事故，
+# 2026-07-08）。给每类重活一个信号量各自排队：多用户的感受是"并行推进"，
+# 机器的现实是"重活永远只有 N 个在跑"。槽位数可用环境变量按机器调。
+import os as _os_mod
+import threading as _threading
+
+_TRANSCRIBE_SLOTS = _threading.Semaphore(int(_os_mod.getenv("OM_TRANSCRIBE_SLOTS", "1")))
+_RENDER_SLOTS = _threading.Semaphore(int(_os_mod.getenv("OM_RENDER_SLOTS", "1")))
+_ENHANCE_SLOTS = _threading.Semaphore(int(_os_mod.getenv("OM_ENHANCE_SLOTS", "1")))
+# 渲染子进程硬超时：卡死的渲染不许永久占坑（2026-07-09 实测：一个挂起任务
+# 瘫痪整条队列）。30 分钟对 60s 视频富余 4-5 倍。
+_RENDER_TIMEOUT_S = int(_os_mod.getenv("OM_RENDER_TIMEOUT_S", "1800"))
+
 
 # ============================================================================
 # 主入口
@@ -279,11 +295,12 @@ def _safe_transcribe(src: str, workdir: Path, model_size: str):
 
     _hf = _os.environ.pop("HF_TOKEN", None)
     try:
-        t = Transcriber().execute({
-            "input_path": src,
-            "output_dir": str(workdir),
-            "model_size": model_size,
-        })
+        with _TRANSCRIBE_SLOTS:  # Whisper 是 CPU 大户，跨任务串行
+            t = Transcriber().execute({
+                "input_path": src,
+                "output_dir": str(workdir),
+                "model_size": model_size,
+            })
     except Exception as e:
         logger.warning(f"  转写调用异常: {e}")
         return None
@@ -628,6 +645,11 @@ def _mode_schedule_to_scenes(mode_schedule: list[dict]) -> list[dict]:
 
 
 def _run_enhancement_chain(src: str, workdir: Path) -> str:
+    with _ENHANCE_SLOTS:  # face/color/audio 增强都是 ffmpeg/模型重活，跨任务串行
+        return _run_enhancement_chain_inner(src, workdir)
+
+
+def _run_enhancement_chain_inner(src: str, workdir: Path) -> str:
     """face_enhance -> color_grade -> audio_enhance，best-effort（单步失败不影响其它步骤）。
 
     对应 compose-director.md Step 1（"Attempt every step if the tool is
@@ -867,7 +889,9 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         "--crf=18",
     ]
     logger.info(f"  apply_style: rendering via {' '.join(cmd)} (cwd={remotion_dir})")
-    result = subprocess.run(cmd, cwd=str(remotion_dir), capture_output=True, text=True)
+    with _RENDER_SLOTS:  # Remotion 渲染跨任务串行 + 硬超时防卡死占坑
+        result = subprocess.run(cmd, cwd=str(remotion_dir), capture_output=True, text=True,
+                                timeout=_RENDER_TIMEOUT_S)
     if result.returncode != 0:
         logger.error(f"apply_style render stderr: {result.stderr[-4000:]}")
         raise RuntimeError(f"apply_style 渲染失败 (exit {result.returncode})")
