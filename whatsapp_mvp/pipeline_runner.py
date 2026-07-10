@@ -711,13 +711,11 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
     构建 props 并调用 P3 的稳定渲染入口：
     `npx remotion render XiaojinEditorial --props=<json>`。
 
-    章节/数据卡/仪表盘/倒计时/日历/前后对比默认都走 content_planner 的完整 Data
-    Display Analysis（按 compose-director.md 的表格把每个数据点分到该用的图形，
-    不再只有 count-up 一种；前后对比用 BudgetRevealSection，多阶段流程时间线
-    挂在对应 takeover 章节的 sections[].timeline 上，见 SectionLayer）；调用方
-    也可以显式传 op["chapters"] / op["data_cards"] / op["gauges"] /
-    op["countdowns"] / op["calendar_events"] / op["before_after"] /
-    op["mode_schedule"] 覆盖（例如手工编排的演示）。
+    章节/数据卡/仪表盘/倒计时/日历默认都走 content_planner 的完整 Data Display
+    Analysis（按 compose-director.md 的表格把每个数据点分到该用的图形，不再只有
+    count-up 一种）；调用方也可以显式传 op["chapters"] / op["data_cards"] /
+    op["gauges"] / op["countdowns"] / op["calendar_events"] / op["mode_schedule"]
+    覆盖（例如手工编排的演示）。
 
     QR + 联系方式（props["qrContact"]）不经过 content_planner 的语义判断——
     是否显示 QR 完全取决于调用方是否在 op["qr_contact"] 里给了真实联系方式，
@@ -756,42 +754,6 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         # 短语级字幕（词级时间戳重组），不是 5-6 行的 segment 大段
         captions = build_caption_phrases(t.data.get("word_timestamps") or [], segments)
 
-    if op.get("chapters") or op.get("data_cards"):
-        chapters = op.get("chapters") or []
-        data_cards = op.get("data_cards") or []
-        gauges = op.get("gauges") or []
-        countdowns = op.get("countdowns") or []
-        calendar_events = op.get("calendar_events") or []
-        before_after = op.get("before_after") or []
-        mode_schedule = op.get("mode_schedule") or [{"frame": 0, "mode": "dominant"}]
-        plan_intro = None
-        plan_outro = None
-        plan_sections = op.get("sections") or []
-        plan_quotes = op.get("quotes") or []
-        plan_atmosphere = op.get("atmosphere_keywords") or []
-    else:
-        logger.info("  apply_style: 内容规划中（章节 + 数据展示分析）...")
-        content_plan = plan_content(segments, duration)
-        chapters = content_plan["chapters"]
-        data_cards = content_plan["data_cards"]
-        gauges = content_plan["gauges"]
-        countdowns = content_plan["countdowns"]
-        calendar_events = content_plan["calendar_events"]
-        before_after = content_plan.get("before_after") or []
-        mode_schedule = content_plan["mode_schedule"]
-        plan_intro = content_plan.get("intro")
-        plan_outro = content_plan.get("outro")
-        plan_sections = content_plan.get("sections") or []
-        plan_quotes = content_plan.get("quotes") or []
-        plan_atmosphere = content_plan.get("atmosphere_keywords") or []
-        logger.info(
-            f"  apply_style: 规划出 {len(chapters)} 个章节、{len(data_cards)} 个数据卡、"
-            f"{len(gauges)} 个仪表盘、{len(countdowns)} 个倒计时、{len(calendar_events)} 个日历、"
-            f"{len(before_after)} 个前后对比"
-        )
-
-    scenes = _mode_schedule_to_scenes(mode_schedule)
-
     remotion_dir = Path(config.openmontage_root) / "remotion-composer"
     job_slug = workdir.name
     public_video_rel = f"jobs/{job_slug}/source.mp4"
@@ -799,107 +761,173 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
     public_video_abs.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(src, public_video_abs)
 
-    props: dict[str, Any] = {
-        "videoSrc": public_video_rel,
-        "durationSeconds": duration,
-        "colorMode": op.get("colorMode", "warm"),
-        "speakerObjectPosition": op.get("speaker_object_position")
-            or calibrate_speaker_object_position(src, workdir),
-        "scenes": scenes,
-        "introOutFrame": 20,
-        "chapters": chapters,
-        "captions": captions,
-    }
-    if plan_sections:
-        props["sections"] = plan_sections
-    if plan_quotes:
-        props["quotes"] = plan_quotes
-    if plan_atmosphere:
-        props["atmosphereKeywords"] = plan_atmosphere
-
-    # 开场标题卡/片尾 CTA：模板一直支持（IntroTitle/OutroSection），此前管线从不
-    # 生成——这是与 video-studio 手工参考成片(VeLL)最大的一块可自动化差距。
-    # op 显式传入优先；否则用 content_planner 从转写里写的文案。
-    intro = op.get("intro") or plan_intro
-    if intro:
-        props["intro"] = intro
-        # codex：intro 约占开场 ~3s，期间隐藏 chrome/字幕
-        intro_out = int(op.get("introOutFrame", 80))
-        props["introOutFrame"] = intro_out
-        # intro 期间卡片必须保持 Dominant(近全屏)——标题是压在大卡上的
-        # (VeLL 参考)。把 introOutFrame 之前开始的 workflow 段推迟到 intro
-        # 结束后 20 帧，避免标题叠在停靠小卡+背景上。
-        clamped = []
-        for m in mode_schedule:
-            m = dict(m)
-            if m.get("mode") == "workflow" and m["frame"] < intro_out + 20:
-                m["frame"] = intro_out + 20
-            clamped.append(m)
-        # 保持严格递增（推迟后可能与后续项撞帧）
-        mode_schedule = []
-        for m in sorted(clamped, key=lambda x: x["frame"]):
-            if mode_schedule and m["frame"] <= mode_schedule[-1]["frame"]:
-                continue
-            mode_schedule.append(m)
-        props["scenes"] = _mode_schedule_to_scenes(mode_schedule)
-        # 段落接管同样不得在 intro 期间开始
-        if props.get("sections"):
-            adjusted = []
-            for sec in props["sections"]:
-                sec = dict(sec)
-                if sec["fromFrame"] < intro_out + 20:
-                    sec["fromFrame"] = intro_out + 20
-                if sec["toFrame"] - sec["fromFrame"] >= 40:
-                    adjusted.append(sec)
-            props["sections"] = adjusted
-    outro = op.get("outro") or plan_outro
-    if outro:
-        duration_frames = max(1, round(duration * 30))
-        # 片尾最后 ~5s 交给 outro（不足 12s 的视频不上 outro，避免喧宾夺主）
-        if duration_frames >= 360:
-            outro = dict(outro)
-            outro.setdefault("fromFrame", duration_frames - 150)
-            props["outro"] = outro
-    if data_cards:
-        props["dataCards"] = data_cards
-    if before_after:
-        props["beforeAfter"] = before_after
-    if gauges:
-        props["gauges"] = gauges
-    if countdowns:
-        props["countdowns"] = countdowns
-    if calendar_events:
-        props["calendarEvents"] = calendar_events
-    qr_input = op.get("qr_contact") or {}
-    if qr_input.get("contact_url"):
-        from .qr_gen import generate_qr
-        qr_rel = f"jobs/{job_slug}/qr.png"
-        qr_abs = remotion_dir / "public" / qr_rel
-        if generate_qr(qr_input["contact_url"], qr_abs):
-            qr_contact: dict[str, Any] = {
-                "qrSrc": qr_rel,
-                "contactName": qr_input.get("contact_name", ""),
-                "ctaLabel": qr_input.get("cta_label", "WhatsApp Now"),
-                "mountFrame": qr_input.get("mount_frame", max(0, round(duration * 30) - 200)),
-            }
-            if qr_input.get("contact_company"):
-                qr_contact["contactCompany"] = qr_input["contact_company"]
-            props["qrContact"] = qr_contact
-    if op.get("brand"):
-        props["brand"] = op["brand"]
-    elif op.get("compliance"):
-        props["compliance"] = op["compliance"]
-
+    # 人脸裁剪校准是确定性的（同一段视频每次算出来的结果一样），跟内容规划反馈
+    # 无关，只需要在下面的重试闭包外面算一次——重试它只会得到一模一样的值。
+    speaker_object_position = op.get("speaker_object_position") or calibrate_speaker_object_position(src, workdir)
     props_path = workdir / "_op_apply_style_props.json"
-    props_path.write_text(json.dumps(props, ensure_ascii=False), encoding="utf-8")
 
-    # 渲染整片前抽 QA stills 做机器检查（video-studio CLAUDE-v2 §8 的可自动化
-    # 部分）。findings 只记录不阻断；stills + qa_report.json 留在 workdir 供
-    # 有视觉的 agent 复审。
+    def _build(feedback: Optional[str] = None) -> dict[str, Any]:
+        """内容规划 + 组 contract② props。包成闭包是为了让视觉复核重试只重新
+        走这一步（一次 LLM 调用 + 一轮 QA stills），不用重新跑 enhancement
+        chain / 转写 / 完整 Remotion 渲染——那些跟"这次数据点怎么摆"无关，
+        重来一遍纯浪费（渲染整片是整条管线里最贵、也没有 subprocess 超时
+        保护的一步）。
+        """
+        if op.get("chapters") or op.get("data_cards"):
+            chapters = op.get("chapters") or []
+            data_cards = op.get("data_cards") or []
+            gauges = op.get("gauges") or []
+            countdowns = op.get("countdowns") or []
+            calendar_events = op.get("calendar_events") or []
+            before_after = op.get("before_after") or []
+            mode_schedule = op.get("mode_schedule") or [{"frame": 0, "mode": "dominant"}]
+            plan_intro = None
+            plan_outro = None
+            plan_sections = op.get("sections") or []
+            plan_quotes = op.get("quotes") or []
+            plan_atmosphere = op.get("atmosphere_keywords") or []
+        else:
+            logger.info("  apply_style: 内容规划中（章节 + 数据展示分析）...")
+            content_plan = plan_content(segments, duration, feedback=feedback)
+            chapters = content_plan["chapters"]
+            data_cards = content_plan["data_cards"]
+            gauges = content_plan["gauges"]
+            countdowns = content_plan["countdowns"]
+            calendar_events = content_plan["calendar_events"]
+            before_after = content_plan.get("before_after") or []
+            mode_schedule = content_plan["mode_schedule"]
+            plan_intro = content_plan.get("intro")
+            plan_outro = content_plan.get("outro")
+            plan_sections = content_plan.get("sections") or []
+            plan_quotes = content_plan.get("quotes") or []
+            plan_atmosphere = content_plan.get("atmosphere_keywords") or []
+            logger.info(
+                f"  apply_style: 规划出 {len(chapters)} 个章节、{len(data_cards)} 个数据卡、"
+                f"{len(gauges)} 个仪表盘、{len(countdowns)} 个倒计时、{len(calendar_events)} 个日历、"
+                f"{len(before_after)} 个前后对比、{len(plan_quotes)} 条金句"
+            )
+
+        scenes = _mode_schedule_to_scenes(mode_schedule)
+
+        props: dict[str, Any] = {
+            "videoSrc": public_video_rel,
+            "durationSeconds": duration,
+            "colorMode": op.get("colorMode", "warm"),
+            "speakerObjectPosition": speaker_object_position,
+            "scenes": scenes,
+            "introOutFrame": 20,
+            "chapters": chapters,
+            "captions": captions,
+        }
+        if plan_sections:
+            props["sections"] = plan_sections
+        if plan_quotes:
+            props["quotes"] = plan_quotes
+        if plan_atmosphere:
+            props["atmosphereKeywords"] = plan_atmosphere
+
+        # 开场标题卡/片尾 CTA：模板一直支持（IntroTitle/OutroSection），此前管线从不
+        # 生成——这是与 video-studio 手工参考成片(VeLL)最大的一块可自动化差距。
+        # op 显式传入优先；否则用 content_planner 从转写里写的文案。
+        intro = op.get("intro") or plan_intro
+        if intro:
+            props["intro"] = intro
+            # codex：intro 约占开场 ~3s，期间隐藏 chrome/字幕
+            intro_out = int(op.get("introOutFrame", 80))
+            props["introOutFrame"] = intro_out
+            # intro 期间卡片必须保持 Dominant(近全屏)——标题是压在大卡上的
+            # (VeLL 参考)。把 introOutFrame 之前开始的 workflow 段推迟到 intro
+            # 结束后 20 帧，避免标题叠在停靠小卡+背景上。
+            clamped = []
+            for m in mode_schedule:
+                m = dict(m)
+                if m.get("mode") == "workflow" and m["frame"] < intro_out + 20:
+                    m["frame"] = intro_out + 20
+                clamped.append(m)
+            # 保持严格递增（推迟后可能与后续项撞帧）
+            mode_schedule = []
+            for m in sorted(clamped, key=lambda x: x["frame"]):
+                if mode_schedule and m["frame"] <= mode_schedule[-1]["frame"]:
+                    continue
+                mode_schedule.append(m)
+            props["scenes"] = _mode_schedule_to_scenes(mode_schedule)
+            # 段落接管同样不得在 intro 期间开始
+            if props.get("sections"):
+                adjusted = []
+                for sec in props["sections"]:
+                    sec = dict(sec)
+                    if sec["fromFrame"] < intro_out + 20:
+                        sec["fromFrame"] = intro_out + 20
+                    if sec["toFrame"] - sec["fromFrame"] >= 40:
+                        adjusted.append(sec)
+                props["sections"] = adjusted
+        outro = op.get("outro") or plan_outro
+        if outro:
+            duration_frames = max(1, round(duration * 30))
+            # 片尾最后 ~5s 交给 outro（不足 12s 的视频不上 outro，避免喧宾夺主）
+            if duration_frames >= 360:
+                outro = dict(outro)
+                outro.setdefault("fromFrame", duration_frames - 150)
+                props["outro"] = outro
+        if data_cards:
+            props["dataCards"] = data_cards
+        if gauges:
+            props["gauges"] = gauges
+        if countdowns:
+            props["countdowns"] = countdowns
+        if calendar_events:
+            props["calendarEvents"] = calendar_events
+        if before_after:
+            props["beforeAfter"] = before_after
+        qr_input = op.get("qr_contact") or {}
+        if qr_input.get("contact_url"):
+            from .qr_gen import generate_qr
+            qr_rel = f"jobs/{job_slug}/qr.png"
+            qr_abs = remotion_dir / "public" / qr_rel
+            if generate_qr(qr_input["contact_url"], qr_abs):
+                qr_contact: dict[str, Any] = {
+                    "qrSrc": qr_rel,
+                    "contactName": qr_input.get("contact_name", ""),
+                    "ctaLabel": qr_input.get("cta_label", "WhatsApp Now"),
+                    "mountFrame": qr_input.get("mount_frame", max(0, round(duration * 30) - 200)),
+                }
+                if qr_input.get("contact_company"):
+                    qr_contact["contactCompany"] = qr_input["contact_company"]
+                props["qrContact"] = qr_contact
+        if op.get("brand"):
+            props["brand"] = op["brand"]
+        elif op.get("compliance"):
+            props["compliance"] = op["compliance"]
+
+        props_path.write_text(json.dumps(props, ensure_ascii=False), encoding="utf-8")
+        return props
+
+    props = _build()
+
+    # 渲染整片前抽 QA stills 做机器检查 + 视觉复审（video-studio CLAUDE-v2 §9
+    # "score before you ship" 自我修正循环的自动化版本）。视觉复审本身
+    # （qa_stills._vision_review/call_vision_chat）已经存在；这里补上原本
+    # 缺失的一环——真的按它的发现做点什么，而不是只记录进 qa_report.json
+    # 就撒手不管。发现 "high" 级问题就把问题喂回内容规划重试一次——只重新走
+    # 这一步（一次 LLM 调用 + 一轮 QA stills），不用重新渲染整片。重试后仍有
+    # 问题就 raise，交给下面已有的 _DEGRADABLE_OPS 降级交付逻辑处理——不是
+    # 发明新的失败处理方式，是复用已经存在、已经验证过的那一套（render 失败
+    # 时走的就是同一条路）。
     if not op.get("skipQaStills"):
         from .qa_stills import run_props_qa
 
-        run_props_qa(props, props_path, remotion_dir, workdir / "qa_stills")
+        qa_result = run_props_qa(props, props_path, remotion_dir, workdir / "qa_stills")
+        vision_findings = (qa_result.get("vision_review") or {}).get("findings") or []
+        major = [f for f in vision_findings if f.get("severity") == "high"]
+        if major:
+            feedback = "; ".join(f"still #{f.get('frame_index')}: {f.get('issue', '')}" for f in major)[:500]
+            logger.warning(f"  apply_style: 视觉复审发现问题，重新规划一次: {feedback}")
+            props = _build(feedback=feedback)
+            qa_result = run_props_qa(props, props_path, remotion_dir, workdir / "qa_stills")
+            vision_findings = (qa_result.get("vision_review") or {}).get("findings") or []
+            major = [f for f in vision_findings if f.get("severity") == "high"]
+            if major:
+                raise RuntimeError(f"apply_style: 视觉复审重试后仍发现问题，触发降级交付: {major}")
 
     out = workdir / "_op_styled.mp4"
     npx_bin = shutil.which("npx") or "npx"  # Windows: subprocess needs the resolved npx.cmd, plain "npx" raises WinError 2
@@ -917,6 +945,7 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         raise RuntimeError(f"apply_style 渲染失败 (exit {result.returncode})")
 
     return str(out) if out.exists() else None
+
 
 
 _OP_HANDLERS: dict[str, Callable[[str, dict, Path], Optional[str]]] = {
