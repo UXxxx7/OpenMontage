@@ -43,6 +43,12 @@ WORKFLOW_SHRINK_LEAD_FRAMES = 10
 GAUGE_ANIMATION_FRAMES = 20 + 50  # fillDelayFrames + fillDurationFrames 默认值
 COUNTDOWN_ANIMATION_FRAMES = 40  # revealFrames 默认值
 CALENDAR_DISPLAY_FRAMES = 150  # 日历没有"动画完成"节点，给一个固定停留时长
+BEFORE_AFTER_ANIMATION_FRAMES = 40  # BudgetRevealSection 数值动画时长（组件默认值）
+# TimelineSection 每个节点之间至少留这么多帧，避免相邻阶段的点动画/文字入场叠在一起
+# （组件自身的 GROW_WINDOW 是 25 帧）。
+TIMELINE_NODE_MIN_GAP_FRAMES = 30
+# 全画布接管至少要有这么多帧才值得放一个多阶段 timeline 图形（给动画+停留留出空间）。
+TIMELINE_MIN_SECTION_FRAMES = 90
 
 SYSTEM_PROMPT = """You analyze a talking-head video's transcript and produce a content plan for the video's chapter markers and any data-worthy moments, following these rules (from the project's compose-director.md style codex, "Data Display Analysis" section).
 
@@ -57,20 +63,29 @@ SYSTEM_PROMPT = """You analyze a talking-head video's transcript and produce a c
    - A countdown / time-remaining figure ("30 days left", "2 weeks to go", "one month until...") -> "countdown"
    - A specific calendar date ("July 28th", "by March 3rd", "expires on the 15th") -> "calendar"
    - A risk / negative-consequence framing (something that could go wrong, a warning, a "before it's too late", an "at risk" outcome) -> "gauge"
+   - A single dramatic BEFORE/AFTER comparison of the SAME metric across two points in time (a cost/price/metric/quantity that jumped or dropped, e.g. "we used to spend $X, now we spend $Y", "went from 10 to 100") — genuinely the single richest moment in the video, not a routine number — -> "before_after". Only use this for a moment that really is a dramatic two-point comparison; most videos have zero of these.
    - Any other number worth calling out (money, reps, distances, times, scores, percentages, quantities, counts) -> "count_up"
+   - A punchy spoken line worth showing as typography — the thesis, a strong claim, a memorable one-liner ("this changed everything", "never skip this step") -> "quote". This is the PRIMARY visual for videos with no numeric moments at all: a data-less video should still get 1-3 quote moments (its actual best lines, verbatim — never paraphrase or invent). Videos WITH plenty of numeric visuals need 0-1 quotes at most.
+3b. Multi-stage process timeline: if (and only if) the transcript describes a genuine multi-step SEQUENTIAL process with 3-5 distinct stages, each with its own duration/quantity ("first we do X for N weeks, then Y for M months, then Z..." — a workflow, a production pipeline, a plan with ordered phases), this deserves a full-canvas timeline graphic instead of a data card. It must correspond to exactly one chapter that you also mark "takeover": true and "dark": true (and "icon": null — the timeline fills that space instead) — set "process_timeline" to describe it, referencing that chapter's exact "label" text. Most videos have none of this; only use it for a real ordered multi-stage process, not a simple list.
 4. Output shape per visual type (all times in seconds, matching when that number/date is actually spoken):
-   - count_up: {"visual":"count_up","title":"...","rows":[{"label":"short label in the video's primary language","label_en":"1-3 word UPPERCASE ENGLISH","seconds":12.3,"value":42,"prefix":"","divideBy":1,"decimals":0,"unit":"","tone":"accent|good|bad|normal"}]} — group values that belong together (e.g. before/after of the same metric) into ONE card as multiple rows, not separate cards. prefix/divideBy/decimals/unit format the number so it's compact and readable (e.g. divideBy 1000000 + decimals 1 -> "1.5" for 1,500,000) — never a raw unformatted number.
+   - count_up: {"visual":"count_up","title":"...","rows":[{"label":"short label in the video's primary language","label_en":"1-3 word UPPERCASE ENGLISH","seconds":12.3,"value":42,"prefix":"","divideBy":1,"decimals":0,"unit":"","tone":"accent|good|bad|normal"}]} — group values that belong together into ONE card as multiple rows, not separate cards (but see "before_after" above for a two-point comparison of the SAME metric — that's richer as its own visual, not a two-row count_up card). prefix/divideBy/decimals/unit format the number so it's compact and readable (e.g. divideBy 1000000 + decimals 1 -> "1.5" for 1,500,000) — never a raw unformatted number.
    - gauge: {"visual":"gauge","seconds":12.3,"title":"...","leftLabel":"UPPERCASE","rightLabel":"UPPERCASE","value":0-1} — leftLabel is the safe/good end, rightLabel is the risk/bad end, value is how far toward the risk end this moment lands (1.0 = fully at risk).
    - countdown: {"visual":"countdown","seconds":12.3,"value":30,"unitLabel":"DAYS","label":"UPPERCASE short label","headline":"a short sentence","headlineAccent":"optional second line, e.g. the consequence"}
+   - quote: {"visual":"quote","seconds":12.3,"text":"the exact spoken line, verbatim, <=80 chars","attribution":"optional speaker name if they introduce themselves"}
    - calendar: {"visual":"calendar","seconds":12.3,"year":2026,"month":7,"targetDay":28,"eventLabel":"short label"} — if the transcript doesn't state a year explicitly, infer the correct one using the reference date given in the user message (e.g. a date mentioned as still upcoming should resolve to this year or next, not a past year).
+   - before_after: {"visual":"before_after","kicker":"short UPPERCASE English label for what's being compared, e.g. \"THE BUDGET\"","leftLabel":"UPPERCASE, e.g. \"2 YEARS AGO\"","leftSeconds":10.2,"leftValue":100,"leftPrefix":"$","leftSuffix":"K","rightLabel":"UPPERCASE, e.g. \"TODAY\"","rightSeconds":14.8,"rightValue":1.5,"rightPrefix":"$","rightSuffix":"M","rightDecimals":1} — leftSeconds/rightSeconds are when EACH value is actually spoken (often several seconds apart); prefix/suffix/rightDecimals format each number for display (e.g. rightDecimals 1 -> "1.5").
 5. If the transcript has no genuinely dramatic/comparison-worthy moments, return an empty data_points array. Do not invent one to fill the response, and do not force a domain's framing (financial, fitness, etc.) onto content that isn't actually about that.
+4b. Atmosphere keywords: pick 6-10 short words/terms from THIS transcript's own vocabulary (the topic's nouns/verbs, both languages if bilingual) for a faint background texture — output as "atmosphere_keywords": ["...", ...].
+5. If the transcript has no genuinely dramatic/comparison-worthy moments AND no quote-worthy lines, return an empty data_points array. Do not invent one to fill the response, and do not force a domain's framing (financial, fitness, etc.) onto content that isn't actually about that.
 
 Output ONLY valid JSON matching this shape, no markdown, no prose:
 {
   "chapters": [{"at_seconds": 0, "label": "...", "label_en": "...", "takeover": false, "icon": null, "dark": false, "warn": false}],
   "intro": {"eyebrow": "...", "title": "...", "subtitle": "..."},
   "outro": {"kicker": "...", "headline": "...", "headline_accent": "...", "subtext": "...", "cta_label": "..."},
-  "data_points": [ /* each item is exactly one of the 4 shapes above, tagged by "visual" */ ]
+  "data_points": [ /* each item is exactly one of the 5 shapes above, tagged by "visual" */ ],
+  "atmosphere_keywords": ["...", "..."],
+  "process_timeline": null /* or {"chapter_label": "must exactly match one chapter's \"label\" above", "heading": "short UPPERCASE English, e.g. \"FROM IDEA TO UPLOAD\"", "stages": [{"label":"UPPERCASE short stage name","seconds":12.3,"prefix":"","target":3,"unit":"MONTHS","is_total":false}, ...]} */
 }"""
 
 
@@ -125,16 +140,22 @@ def _call_llm_json(label: str, system_prompt: str, user_message: str, *, tempera
         return None
 
 
-def plan_content(segments: list[dict], duration: float) -> dict[str, Any]:
+def plan_content(segments: list[dict], duration: float, *, feedback: Optional[str] = None) -> dict[str, Any]:
     """转写分段 -> 章节 + 四种图形的计划（已经是 frame 单位，可以直接喂给 XiaojinEditorial）。
 
     LLM 调用失败或没配 key 时，返回空计划——内容判断本来就是锦上添花，不应该
     因为它失败就搞垮整条剪辑流程。
+
+    feedback: 视觉复审（qa_stills._vision_review）发现问题后，_op_apply_style
+    重新规划一次时传入的具体问题描述——喂给同一个 LLM 调用，让它避开已知的
+    错误（例如某张数据卡跟另一个元素挤在一起），而不是盲目重跑一次一模一样
+    的判断。
     """
     empty = {
         "chapters": [], "data_cards": [], "gauges": [], "countdowns": [], "calendar_events": [],
+        "before_after": [],
         "mode_schedule": [{"frame": 0, "mode": "dominant"}],
-        "intro": None, "outro": None, "sections": [],
+        "intro": None, "outro": None, "sections": [], "quotes": [], "atmosphere_keywords": [],
     }
 
     transcript_text = _build_transcript_text(segments)
@@ -143,6 +164,11 @@ def plan_content(segments: list[dict], duration: float) -> dict[str, Any]:
         f"Reference date (for resolving relative/year-less dates): {today}\n"
         f"Video duration: {duration:.1f}s\n\nTranscript:\n{transcript_text}"
     )
+    if feedback:
+        user_message = (
+            f"NOTE: a previous rendering of this exact plan had the following visual "
+            f"problem — adjust the plan so it doesn't recur: {feedback}\n\n{user_message}"
+        )
 
     # 走 _call_llm_json（JSON 解析失败整体重试一次）+ 长输出模型路由（DeepSeek
     # 网关 ~60s 硬时限，v4-pro 写不完整段规划 JSON，v4-flash 37s 完成）。
@@ -151,7 +177,11 @@ def plan_content(segments: list[dict], duration: float) -> dict[str, Any]:
     if raw is None:
         return empty
 
-    return _to_frame_plan(raw, duration)
+    plan = _to_frame_plan(raw, duration)
+    # 视觉密度下限（richness floor）：video-studio CLAUDE-v2 §9 "score before
+    # you ship" 的可自动化部分。规划质量不再依赖单次 LLM 判断的心情——不达标
+    # 就带反馈重规划一轮，仍不达标就用确定性兜底从转写里挑句子做金句卡。
+    return _apply_richness_floor(raw, plan, segments, duration)
 
 
 def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
@@ -172,9 +202,11 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
     chapters.sort(key=lambda c: c["atFrame"])
 
     data_cards: list[dict] = []
+    quotes: list[dict] = []
     gauges: list[dict] = []
     countdowns: list[dict] = []
     calendar_events: list[dict] = []
+    before_afters: list[dict] = []
     # (start_frame, end_frame) windows where the content zone needs room —
     # shared across all 4 visual types, since all of them need the
     # SpeakerCard to be in Workflow (shrunk) mode while they're on screen.
@@ -199,12 +231,16 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
             continue
         visual = dp.get("visual") or "count_up"  # backward-compatible default
         try:
-            if visual == "gauge":
+            if visual == "quote":
+                entry, target = _plan_quote(dp, next_available_frame), quotes
+            elif visual == "gauge":
                 entry, target = _plan_gauge(dp, next_available_frame), gauges
             elif visual == "countdown":
                 entry, target = _plan_countdown(dp, next_available_frame), countdowns
             elif visual == "calendar":
                 entry, target = _plan_calendar(dp, next_available_frame), calendar_events
+            elif visual == "before_after":
+                entry, target = _plan_before_after(dp, next_available_frame), before_afters
             else:
                 entry, target = _plan_count_up(dp, next_available_frame), data_cards
         except (KeyError, TypeError, ValueError) as e:
@@ -220,6 +256,7 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
     # 全画布章节接管（sections）：takeover 章节的跨度 = 本章 atFrame 到下一章
     # atFrame（或片尾）。接管期卡片应停靠（并入 workflow_ranges）。
     duration_frames = round(duration * FPS)
+    timeline_plan = _plan_process_timeline(raw.get("process_timeline"), chapters, duration_frames)
     sections: list[dict] = []
     for idx, ch in enumerate(chapters):
         if not ch.get("_takeover"):
@@ -239,6 +276,8 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
             sec["colorMode"] = "dark"
         if ch.get("_warn"):
             sec["warn"] = True
+        if timeline_plan and timeline_plan["chapter_index"] == idx:
+            sec["timeline"] = {"heading": timeline_plan["heading"], "nodes": timeline_plan["nodes"]}
         sections.append(sec)
         workflow_ranges.append((start, end))
     for ch in chapters:
@@ -252,7 +291,7 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
     # 做 15 帧淡出），不会同位置永久叠上（P3 修的 "cards never disappear" bug
     # 的另一半）。
     slotted = sorted(
-        (g for g in (data_cards + gauges + countdowns + calendar_events)),
+        (g for g in (data_cards + gauges + countdowns + calendar_events + quotes + before_afters)),
         key=lambda g: g["mountFrame"],
     )
     for cur, nxt in zip(slotted, slotted[1:]):
@@ -290,10 +329,14 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
         if ro.get("headline_accent"):
             outro["headlineAccent"] = str(ro["headline_accent"])[:30]
 
+    atmosphere = [str(k)[:16] for k in (raw.get("atmosphere_keywords") or []) if str(k).strip()][:10]
+
     return {
         "chapters": chapters, "data_cards": data_cards, "gauges": gauges,
-        "countdowns": countdowns, "calendar_events": calendar_events, "mode_schedule": dedup,
+        "countdowns": countdowns, "calendar_events": calendar_events, "before_after": before_afters,
+        "mode_schedule": dedup,
         "intro": intro, "outro": outro, "sections": sections,
+        "quotes": quotes, "atmosphere_keywords": atmosphere,
     }
 
 
@@ -342,6 +385,11 @@ def _dp_seconds(dp: dict) -> float:
             except (KeyError, TypeError, ValueError):
                 continue
         return min(secs) if secs else float("inf")
+    if visual == "before_after":
+        try:
+            return float(dp.get("leftSeconds", dp.get("seconds")))
+        except (TypeError, ValueError):
+            return float("inf")
     try:
         return float(dp["seconds"])
     except (KeyError, TypeError, ValueError):
@@ -445,11 +493,264 @@ def _plan_calendar(dp: dict, min_mount_frame: int) -> Optional[dict]:
     }
 
 
+QUOTE_DISPLAY_FRAMES = 140  # 金句停留 ~4.7s（读两遍的时间）
+
+
+def _plan_quote(dp: dict, min_mount_frame: int) -> Optional[dict]:
+    sec = float(dp["seconds"])
+    text = str(dp.get("text", "")).strip()
+    if not text:
+        return None
+    mount_frame = max(min_mount_frame, round(sec * FPS) - MOUNT_LEAD_FRAMES)
+    entry: dict[str, Any] = {
+        "text": text[:80],
+        "mountFrame": mount_frame,
+        "endFrame": mount_frame + QUOTE_DISPLAY_FRAMES,
+    }
+    if dp.get("attribution"):
+        entry["attribution"] = str(dp["attribution"])[:40]
+    return entry
+
+
+
+def _plan_before_after(dp: dict, min_mount_frame: int) -> Optional[dict]:
+    left_value = _num(dp.get("leftValue"))
+    right_value = _num(dp.get("rightValue"))
+    if left_value is None or right_value is None:
+        return None
+    try:
+        left_sec = float(dp.get("leftSeconds", dp.get("seconds", 0)) or 0)
+    except (TypeError, ValueError):
+        left_sec = 0.0
+    try:
+        right_sec = float(dp.get("rightSeconds", left_sec) or left_sec)
+    except (TypeError, ValueError):
+        right_sec = left_sec
+
+    mount_frame = max(min_mount_frame, round(left_sec * FPS) - MOUNT_LEAD_FRAMES)
+    # secondRevealFrame must land on or after the right value's own beat, but
+    # never before the card itself has visibly entered (same "floor against
+    # the previous/own animation" principle as every other visual type here).
+    second_reveal_frame = max(mount_frame + 20, round(right_sec * FPS) - MOUNT_LEAD_FRAMES)
+    end_frame = max(mount_frame, second_reveal_frame) + BEFORE_AFTER_ANIMATION_FRAMES + HOLD_AFTER_LAST_ROW_FRAMES
+
+    entry: dict[str, Any] = {
+        "kicker": str(dp.get("kicker", ""))[:40],
+        "leftLabel": str(dp.get("leftLabel", ""))[:24],
+        "leftValue": left_value,
+        "rightLabel": str(dp.get("rightLabel", ""))[:24],
+        "rightValue": right_value,
+        "x": 80, "y": 900, "width": 920,
+        "mountFrame": mount_frame,
+        "secondRevealFrame": second_reveal_frame,
+        "endFrame": end_frame,
+    }
+    if dp.get("leftPrefix"):
+        entry["leftPrefix"] = str(dp["leftPrefix"])
+    if dp.get("leftSuffix"):
+        entry["leftSuffix"] = str(dp["leftSuffix"])
+    if dp.get("leftDecimals") is not None:
+        entry["leftDecimals"] = dp["leftDecimals"]
+    if dp.get("rightPrefix"):
+        entry["rightPrefix"] = str(dp["rightPrefix"])
+    if dp.get("rightSuffix"):
+        entry["rightSuffix"] = str(dp["rightSuffix"])
+    if dp.get("rightDecimals") is not None:
+        entry["rightDecimals"] = dp["rightDecimals"]
+    return entry
+
+
+def _plan_process_timeline(raw_pt: Any, chapters: list[dict], duration_frames: int) -> Optional[dict]:
+    """Chapter-attached multi-stage timeline (TimelineSection), matched by the
+    chapter's exact "label" text since the LLM emits chapters and
+    process_timeline in the same response. Also force-marks the matched
+    chapter as a dark takeover with no icon (the timeline fills that space
+    instead) — overriding whatever takeover/dark/icon booleans the LLM
+    itself gave that chapter, since a process_timeline only makes sense atop
+    a full dark takeover.
+    """
+    if not isinstance(raw_pt, dict):
+        return None
+    chapter_label = str(raw_pt.get("chapter_label", "")).strip()
+    stages_in = raw_pt.get("stages") or []
+    if not chapter_label or not isinstance(stages_in, list) or len(stages_in) < 2:
+        return None
+
+    match_idx = next(
+        (i for i, c in enumerate(chapters) if str(c.get("label", "")).strip().lower() == chapter_label.lower()),
+        None,
+    )
+    if match_idx is None:
+        return None
+
+    ch = chapters[match_idx]
+    start = ch["atFrame"]
+    end = chapters[match_idx + 1]["atFrame"] if match_idx + 1 < len(chapters) else duration_frames
+    if end - start < TIMELINE_MIN_SECTION_FRAMES:
+        return None
+
+    nodes: list[dict] = []
+    prev_floor = start
+    for s in stages_in:
+        if not isinstance(s, dict):
+            continue
+        target = _num(s.get("target"))
+        sec = _num(s.get("seconds"))
+        if target is None or sec is None:
+            continue
+        raw_frame = round(sec * FPS) - MOUNT_LEAD_FRAMES
+        reveal_frame = max(raw_frame, prev_floor)
+        nodes.append({
+            "label": str(s.get("label", ""))[:24],
+            "revealFrame": reveal_frame,
+            "prefix": str(s.get("prefix", "")),
+            "target": target,
+            "unit": str(s.get("unit", ""))[:16],
+            "isTotal": bool(s.get("is_total")),
+        })
+        prev_floor = reveal_frame + TIMELINE_NODE_MIN_GAP_FRAMES
+    if len(nodes) < 2:
+        return None
+
+    # Overrides whatever the LLM said for this specific chapter — a
+    # process_timeline requires the dark full-canvas takeover treatment
+    # (TimelineSection is hardcoded for a dark canvas, see its doc comment),
+    # and it occupies the same space an icon would.
+    ch["_takeover"] = True
+    ch["_dark"] = True
+    ch["_icon"] = None
+
+    return {
+        "chapter_index": match_idx,
+        "heading": str(raw_pt.get("heading", ""))[:40],
+        "nodes": nodes,
+    }
+
+
 def _num(v: Any) -> Optional[float]:
     try:
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+# ---------------------------------------------------------------------------
+# 视觉密度下限（richness floor）
+#
+# "每条视频保证有画面节奏"必须是机制而不是运气：任意连续 RICHNESS_WINDOW
+# 秒内至少要有一个画布事件（图形/金句/段落接管），否则观感就是"卡片+字幕
+# 干坐着"。检查是确定性的；修复分两级——先带着具体空档反馈让 LLM 补一轮
+# （最多一轮，对齐 reviewer 协议的轮数上限），还不行就机械地从空档里挑最长
+# 的完整转写句做金句卡（原话，不需要任何判断力，保证下限）。
+# ---------------------------------------------------------------------------
+
+RICHNESS_WINDOW_FRAMES = 12 * FPS   # 超过 12s 无画布事件 = 稀疏
+_FLOOR_HEAD_SKIP_FRAMES = 90        # 开场有 intro 标题卡罩着
+_FLOOR_TAIL_SKIP_FRAMES = 150       # 片尾有 outro CTA 罩着
+_FLOOR_MAX_FALLBACK_QUOTES = 3
+
+REPLAN_SYSTEM_PROMPT = """You previously produced a content plan for this talking-head video, but the listed time spans have NO visual event at all (no data graphic, no quote, no section takeover) — on screen it's just the speaker and captions for too long.
+
+From the transcript lines spoken WITHIN those spans only, add visual moments using the same shapes as before (count_up / gauge / countdown / calendar / quote). Prefer "quote" with the exact spoken line, verbatim — never invent or paraphrase. 1 moment per span is enough; skip a span if its lines are genuinely too weak to show (that is acceptable).
+
+Output ONLY valid JSON: {"data_points": [ ... ]}"""
+
+
+def _coverage_spans(plan: dict) -> list[tuple[int, int]]:
+    spans = []
+    for g in (plan["data_cards"] + plan["gauges"] + plan["countdowns"]
+              + plan["calendar_events"] + plan["quotes"]):
+        spans.append((g["mountFrame"], g.get("endFrame", g["mountFrame"] + 90)))
+    for sec in plan["sections"]:
+        spans.append((sec["fromFrame"], sec["toFrame"]))
+    return sorted(spans)
+
+
+def _sparse_gaps(plan: dict, duration: float) -> list[tuple[int, int]]:
+    """无画布事件且长于阈值的帧区间。短视频（intro+outro 已covering）返回空。"""
+    dur_frames = round(duration * FPS)
+    end_limit = dur_frames - _FLOOR_TAIL_SKIP_FRAMES
+    if end_limit - _FLOOR_HEAD_SKIP_FRAMES < RICHNESS_WINDOW_FRAMES:
+        return []
+    gaps = []
+    cursor = _FLOOR_HEAD_SKIP_FRAMES
+    for a, b in _coverage_spans(plan):
+        if a - cursor > RICHNESS_WINDOW_FRAMES:
+            gaps.append((cursor, a))
+        cursor = max(cursor, b)
+    if end_limit - cursor > RICHNESS_WINDOW_FRAMES:
+        gaps.append((cursor, end_limit))
+    return gaps
+
+
+def _fallback_quotes_for_gaps(gaps: list[tuple[int, int]], segments: list[dict],
+                              existing_texts: set) -> list[dict]:
+    """确定性兜底：空档按 12s 窗口切开，每个窗口挑档内最长的转写句 -> quote。
+
+    一个空档只放一条是不够的（55s 的空档放一条金句，剩下 40s 还是稀疏）——
+    保证的对象是"任意连续窗口都有事件"，所以按窗口逐段放置，直到配额用完
+    或该窗口没有可用转写句（没句子的时段机制上无解，接受）。
+    """
+    out: list[dict] = []
+    for a, b in gaps:
+        cursor = a
+        while cursor < b and len(out) < _FLOOR_MAX_FALLBACK_QUOTES:
+            win_end = min(cursor + RICHNESS_WINDOW_FRAMES, b)
+            a_s, b_s = cursor / FPS, win_end / FPS
+            candidates = [
+                seg for seg in segments
+                if seg.get("text", "").strip()
+                and a_s <= float(seg.get("start", 0))
+                and float(seg.get("end", seg.get("start", 0))) <= b_s
+            ]
+            candidates.sort(key=lambda seg: len(seg["text"].strip()), reverse=True)
+            for c in candidates:
+                t = c["text"].strip()[:80]
+                if len(t) >= 6 and t not in existing_texts:
+                    out.append({"visual": "quote", "seconds": float(c["start"]), "text": t})
+                    existing_texts.add(t)
+                    break
+            cursor = win_end
+        if len(out) >= _FLOOR_MAX_FALLBACK_QUOTES:
+            break
+    return out
+
+
+def _apply_richness_floor(raw: dict, plan: dict, segments: list[dict],
+                          duration: float, allow_replan: bool = True) -> dict:
+    gaps = _sparse_gaps(plan, duration)
+    if not gaps:
+        return plan
+
+    gap_desc = ", ".join(f"{a / FPS:.0f}s-{b / FPS:.0f}s" for a, b in gaps)
+    logger.info(f"content_planner: 密度下限触发，空档: {gap_desc}")
+
+    data_points = list(raw.get("data_points") or [])
+
+    if allow_replan and segments:
+        user_message = (
+            f"Uncovered spans: {gap_desc}\n\nTranscript:\n"
+            + _build_transcript_text(segments)
+        )
+        extra = _call_llm_json("密度补规划", REPLAN_SYSTEM_PROMPT, user_message,
+                               temperature=0.2, model=get_config().llm_model_long_output)
+        if extra and isinstance(extra.get("data_points"), list):
+            data_points += [dp for dp in extra["data_points"] if isinstance(dp, dict)]
+            plan = _to_frame_plan({**raw, "data_points": data_points}, duration)
+            gaps = _sparse_gaps(plan, duration)
+            if not gaps:
+                logger.info("content_planner: 补规划一轮后密度达标")
+                return plan
+
+    # 仍有空档 -> 机械兜底（原话金句，不依赖判断力）
+    existing = {str(dp.get("text", "")) for dp in data_points if isinstance(dp, dict)}
+    fallback = _fallback_quotes_for_gaps(gaps, segments, existing)
+    if fallback:
+        logger.info(f"content_planner: 兜底金句 x{len(fallback)}（空档内最长转写句）")
+        plan = _to_frame_plan({**raw, "data_points": data_points + fallback}, duration)
+    else:
+        logger.info("content_planner: 空档内无可用转写句，保持现计划（已尽机制所能）")
+    return plan
 
 
 # ---------------------------------------------------------------------------

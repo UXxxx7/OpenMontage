@@ -14,7 +14,7 @@
  * component built against a real fact-sheet schema when a regulated/
  * lead-gen use case actually needs it.
  */
-import { interpolate, useCurrentFrame } from "remotion";
+import { interpolate, spring, useCurrentFrame, useVideoConfig } from "remotion";
 import { APPLE, ColorMode, H, PALETTES, W } from "./theme";
 
 export interface OutroSectionProps {
@@ -43,6 +43,7 @@ export const OutroSection: React.FC<OutroSectionProps> = ({
   font = "inherit",
 }) => {
   const frame = useCurrentFrame();
+  const { fps } = useVideoConfig();
   const palette = PALETTES[colorMode];
   if (frame < outroFromFrame) return null;
   const local = frame - outroFromFrame;
@@ -54,6 +55,15 @@ export const OutroSection: React.FC<OutroSectionProps> = ({
   const r2 = interpolate(local, [20, 40], [0, 1], opts);
   const r3 = interpolate(local, [32, 52], [0, 1], opts);
   const lineW = interpolate(local, [8, 28], [0, 220], opts);
+  // Headline is the single biggest, most prominent element here — a plain
+  // fade+slide isn't enough for a "main headline entrance" (see the
+  // animation vocabulary table in CLAUDE-v2.md); give it its own spring
+  // scale, same as IntroTitle's title treatment.
+  const headlineScale = 0.85 + spring({ frame: Math.max(0, local - 8), fps, config: { damping: 14, stiffness: 220 } }) * 0.15;
+  // CTA pill gets a springier "pop" (lower damping -> visible overshoot),
+  // matching the project's existing chip/badge convention elsewhere
+  // (spring back.out entrances, scale past 1 then settling).
+  const ctaScale = 0.7 + spring({ frame: Math.max(0, local - 32), fps, config: { damping: 9, stiffness: 200 } }) * 0.3;
 
   return (
     <div
@@ -89,7 +99,7 @@ export const OutroSection: React.FC<OutroSectionProps> = ({
           top: 420,
           width: W,
           opacity: r1,
-          transform: `translateY(${(1 - r1) * 20}px)`,
+          transform: `translateY(${(1 - r1) * 20}px) scale(${headlineScale})`,
           textAlign: "center",
           fontFamily: font,
           fontSize: 62,
@@ -147,7 +157,7 @@ export const OutroSection: React.FC<OutroSectionProps> = ({
           display: "flex",
           justifyContent: "center",
           opacity: r3,
-          transform: `translateY(${(1 - r3) * 14}px)`,
+          transform: `translateY(${(1 - r3) * 14}px) scale(${ctaScale})`,
         }}
       >
         <div

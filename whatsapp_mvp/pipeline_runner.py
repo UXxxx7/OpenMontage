@@ -17,6 +17,22 @@ from .database import Job
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# 重型阶段并发闸门。node 侧 WA_WORKER_CONCURRENCY>1 后，多任务的"规划"可以
+# 重叠（主要在等 LLM 响应，占不了多少 CPU），但转写(Whisper)/Remotion 渲染/
+# 画质增强是 CPU/内存大户——单机上两个同时跑会互相拖慢到集体超时（实测事故，
+# 2026-07-08）。给每类重活一个信号量各自排队：多用户的感受是"并行推进"，
+# 机器的现实是"重活永远只有 N 个在跑"。槽位数可用环境变量按机器调。
+import os as _os_mod
+import threading as _threading
+
+_TRANSCRIBE_SLOTS = _threading.Semaphore(int(_os_mod.getenv("OM_TRANSCRIBE_SLOTS", "1")))
+_RENDER_SLOTS = _threading.Semaphore(int(_os_mod.getenv("OM_RENDER_SLOTS", "1")))
+_ENHANCE_SLOTS = _threading.Semaphore(int(_os_mod.getenv("OM_ENHANCE_SLOTS", "1")))
+# 渲染子进程硬超时：卡死的渲染不许永久占坑（2026-07-09 实测：一个挂起任务
+# 瘫痪整条队列）。30 分钟对 60s 视频富余 4-5 倍。
+_RENDER_TIMEOUT_S = int(_os_mod.getenv("OM_RENDER_TIMEOUT_S", "1800"))
+
 
 # ============================================================================
 # 主入口
@@ -279,11 +295,12 @@ def _safe_transcribe(src: str, workdir: Path, model_size: str):
 
     _hf = _os.environ.pop("HF_TOKEN", None)
     try:
-        t = Transcriber().execute({
-            "input_path": src,
-            "output_dir": str(workdir),
-            "model_size": model_size,
-        })
+        with _TRANSCRIBE_SLOTS:  # Whisper 是 CPU 大户，跨任务串行
+            t = Transcriber().execute({
+                "input_path": src,
+                "output_dir": str(workdir),
+                "model_size": model_size,
+            })
     except Exception as e:
         logger.warning(f"  转写调用异常: {e}")
         return None
@@ -523,12 +540,21 @@ def _op_color_grade(src: str, op: dict, workdir: Path) -> Optional[str]:
     return r.data.get("output") or (r.artifacts[0] if r.artifacts else None)
 
 
+_BROLL_IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")
+
+
 def _op_insert_broll(src: str, op: dict, workdir: Path) -> Optional[str]:
-    """把用户上传的 b-roll 叠进成片（video_compose overlay，保留说话人原声，薄封装）。
+    """把用户上传的 b-roll 叠进成片（单次 ffmpeg 多层合成，保留说话人原声）。
     资产文件在 workdir/assets/broll_<asset_ref>.*（Phase 1 已下载）。
-    默认 PiP 右下角小窗；mode=cutaway 时全屏。整片收尾类，排在剪辑之后。
-    offset_seconds=start 让素材从插入点开始播；图片 loop 填满窗口。"""
-    from tools.video.video_compose import VideoCompose
+
+    输出方向自动跟随素材：主视频或任一 b-roll 为横屏 → 横屏画布，否则跟随主视频；
+    op.orientation ∈ {portrait,landscape} 可强制覆盖（用户说“横屏/竖屏”时规划器给）。
+    每段 mode：
+      - broll_main（默认）：b-roll 铺满画布，人物缩成右下小窗。
+      - cutaway：b-roll 铺满画布，不叠人物。
+      - pip：人物打底铺满，b-roll 缩成右下小窗（旧版式）。
+    讲话（无 b-roll）的时段：人物按画布方向居中，方向不符则两边/上下留黑。
+    整片收尾类，排在剪辑之后。"""
     items = op.get("items") or []
     if not items:
         return None
@@ -536,7 +562,9 @@ def _op_insert_broll(src: str, op: dict, workdir: Path) -> Optional[str]:
     base_w, base_h = _probe_dimensions(Path(src))
     if not base_w or not base_h:
         raise RuntimeError("insert_broll: 无法读取主视频画幅")
-    overlays: list[dict] = []
+
+    resolved: list[dict] = []
+    any_landscape = base_w > base_h
     for it in items:
         ref = it.get("asset_ref")
         start = _num(it.get("start_seconds"))
@@ -548,36 +576,92 @@ def _op_insert_broll(src: str, op: dict, workdir: Path) -> Optional[str]:
             logger.warning(f"  insert_broll: 找不到资产 broll_{ref}.*，跳过")
             continue
         asset = matches[0]
-        is_image = asset.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")
-        # 视频素材：窗口收到不超过素材本身时长，避免叠加末尾冻帧
+        is_image = asset.suffix.lower() in _BROLL_IMG_EXTS
         if not is_image:
+            # 视频素材：窗口收到不超过素材本身时长，避免叠加末尾冻帧
             clip_dur = _probe_duration(asset)
             if clip_dur and (end - start) > clip_dur:
                 end = start + clip_dur
-        mode = str(it.get("mode") or "pip").lower()
-        if mode == "cutaway":
-            w, h, x, y = base_w, base_h, 0, 0
-        else:  # 默认 PiP：右下角小窗，留脸
-            w = int(base_w * 0.38)
-            h = int(w * 9 / 16)
-            x = base_w - w - 40
-            y = base_h - h - 40
-        overlays.append({
-            "asset_path": str(asset), "x": x, "y": y, "width": w, "height": h,
-            "start_seconds": start, "end_seconds": end,
-            "offset_seconds": start,        # 从插入点开始播（配合 video_compose 新参数）
-            "loop": bool(is_image),         # 图片循环填满窗口
-        })
-    if not overlays:
+        bw, bh = _probe_dimensions(asset)
+        if bw and bh and bw > bh:
+            any_landscape = True
+        mode = str(it.get("mode") or "broll_main").lower()
+        if mode not in ("broll_main", "cutaway", "pip"):
+            mode = "broll_main"
+        resolved.append({"path": str(asset), "start": start, "end": end,
+                         "is_img": is_image, "mode": mode})
+    if not resolved:
         return None
+
+    orientation = str(op.get("orientation") or "auto").lower()
+    if orientation not in ("portrait", "landscape"):
+        orientation = "landscape" if any_landscape else "portrait"
+    out_w, out_h = (1920, 1080) if orientation == "landscape" else (1080, 1920)
+
     out = workdir / "_op_insert_broll.mp4"
-    r = VideoCompose().execute({
-        "operation": "overlay", "input_path": src,
-        "overlays": overlays, "output_path": str(out),
-    })
-    if not r.success:
-        raise RuntimeError(f"insert_broll 失败: {r.error}")
-    return r.data.get("output") or (r.artifacts[0] if r.artifacts else None)
+    _composite_broll(src, resolved, out, out_w, out_h,
+                     ins_h=round(out_h * 0.28), margin=round(out_w * 0.03))
+    return str(out)
+
+
+def _composite_broll(src: str, resolved: list, out: Path,
+                     out_w: int, out_h: int, ins_h: int, margin: int) -> None:
+    """单次 ffmpeg filter_complex：人物 pillarbox 打底 + 每段 b-roll 按 mode 叠加。
+    输入 0=人物（含原声/已烧字幕）；1..N=各 b-roll（图片用 -loop 输入）。"""
+    inputs: list[str] = ["-i", str(src)]
+    for r in resolved:
+        if r["is_img"]:
+            inputs += ["-loop", "1", "-t", f'{max(0.1, r["end"] - r["start"]):.3f}', "-i", r["path"]]
+        else:
+            inputs += ["-i", r["path"]]
+
+    main_idx = [i for i, r in enumerate(resolved) if r["mode"] == "broll_main"]
+    ins_map = {idx: k for k, idx in enumerate(main_idx)}
+    # 归一化：把每一路都统一成 yuv420p / SAR=1 / 30fps。真实手机/录屏素材的像素格式、
+    # 采样宽高比、帧率各不相同，overlay 混合异质流会在部分 ffmpeg 上报 "-22 Invalid
+    # argument / no packets"。统一后即可稳定合成。
+    _norm = ",format=yuv420p,setsar=1,fps=30"
+    fc: list[str] = []
+    # 人物拆流：1 路打底 + 每个 broll_main 一路小窗（未用的 split 输出会导致 ffmpeg 报错，故精确计数）
+    split_outs = "[spk_base]" + "".join(f"[ins{k}]" for k in range(len(main_idx)))
+    fc.append(f"[0:v]split={1 + len(main_idx)}{split_outs}")
+    fc.append(f"[spk_base]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease,"
+              f"pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:black{_norm}[base]")
+    for i, r in enumerate(resolved):
+        vin = f"{i + 1}:v"
+        offset = "" if r["is_img"] else f",setpts=PTS-STARTPTS+{r['start']}/TB"
+        if r["mode"] == "pip":
+            boxw = int(out_w * 0.38)
+            fc.append(f"[{vin}]scale={boxw}:-2{offset}{_norm}[bro{i}]")
+        else:  # broll_main / cutaway：铺满画布（等比放大后居中裁切）
+            fc.append(f"[{vin}]scale={out_w}:{out_h}:force_original_aspect_ratio=increase,"
+                      f"crop={out_w}:{out_h}{offset}{_norm}[bro{i}]")
+        if r["mode"] == "broll_main":
+            fc.append(f"[ins{ins_map[i]}]scale=-2:{ins_h}{_norm}[insv{i}]")
+    cur = "base"
+    for i, r in enumerate(resolved):
+        s, e = r["start"], r["end"]
+        if r["mode"] == "pip":
+            fc.append(f"[{cur}][bro{i}]overlay=W-w-{margin}:H-h-{margin}:enable='between(t,{s},{e})'[c{i}]")
+        elif r["mode"] == "cutaway":
+            fc.append(f"[{cur}][bro{i}]overlay=0:0:enable='between(t,{s},{e})'[c{i}]")
+        else:  # broll_main：先铺满，再叠人物小窗
+            fc.append(f"[{cur}][bro{i}]overlay=0:0:enable='between(t,{s},{e})'[m{i}]")
+            fc.append(f"[m{i}][insv{i}]overlay=W-w-{margin}:H-h-{margin}:enable='between(t,{s},{e})'[c{i}]")
+        cur = f"c{i}"
+    fc.append(f"[{cur}]null[outv]")
+    # 输出时长钉在主视频长度：b-roll 用 setpts 偏移后其流可能比主视频长（overlay 默认跟
+    # 最长流），不钉住会把成片拉长、末尾是无人物的残留 b-roll。
+    base_dur = _probe_duration(Path(src))
+    cmd = ["ffmpeg", "-y"] + inputs + ["-filter_complex", ";".join(fc),
+           "-map", "[outv]", "-map", "0:a?",
+           "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac"]
+    if base_dur and base_dur > 0:
+        cmd += ["-t", f"{base_dur:.3f}"]
+    cmd += [str(out), "-loglevel", "error"]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0 or not out.exists():
+        raise RuntimeError(f"insert_broll 合成失败: {proc.stderr[-500:]}")
 
 
 def _op_add_subtitles(src: str, op: dict, workdir: Path) -> Optional[str]:
@@ -615,7 +699,20 @@ def _op_add_subtitles(src: str, op: dict, workdir: Path) -> Optional[str]:
 # reasons about WHEN to be in which mode (dominant vs workflow); the actual
 # pixel box a mode maps to is a rendering-layer concern, not a planning one.
 _DOMINANT_BOX = {"x": 60, "y": 104, "w": 960, "h": 1100}
-_WORKFLOW_BOX = {"x": 740, "y": 1200, "w": 300, "h": 531}
+# h was previously 531 -- below video-studio's documented floor of >=900px
+# for a Workflow-mode card (CLAUDE-v2.md §6a: a shorter card reveals only a
+# thin horizontal slice of the source video via objectFit:"cover", cropping
+# to head-only instead of showing chest/shoulders). Kept narrow (w=300, same
+# as before) rather than scaled up proportionally: a box narrower than the
+# source's own aspect ratio is HEIGHT-driven under objectFit:"cover" (crops
+# left/right, not top/bottom), which guarantees the full vertical extent of
+# the speaker is visible regardless of the exact source aspect ratio.
+# Top-anchored at the same y as _DOMINANT_BOX (104, not bottom-anchored at
+# 1200 like before) so the card's top edge stays fixed across the
+# Dominant<->Workflow transition, and so its bottom (1004) stays clear of
+# where content-zone graphics conventionally start (y=900 default) instead
+# of overlapping them for ~600px like the old bottom-anchored box did.
+_WORKFLOW_BOX = {"x": 740, "y": 104, "w": 300, "h": 900}
 
 
 def _mode_schedule_to_scenes(mode_schedule: list[dict]) -> list[dict]:
@@ -628,6 +725,11 @@ def _mode_schedule_to_scenes(mode_schedule: list[dict]) -> list[dict]:
 
 
 def _run_enhancement_chain(src: str, workdir: Path) -> str:
+    with _ENHANCE_SLOTS:  # face/color/audio 增强都是 ffmpeg/模型重活，跨任务串行
+        return _run_enhancement_chain_inner(src, workdir)
+
+
+def _run_enhancement_chain_inner(src: str, workdir: Path) -> str:
     """face_enhance -> color_grade -> audio_enhance，best-effort（单步失败不影响其它步骤）。
 
     对应 compose-director.md Step 1（"Attempt every step if the tool is
@@ -719,35 +821,6 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         # 短语级字幕（词级时间戳重组），不是 5-6 行的 segment 大段
         captions = build_caption_phrases(t.data.get("word_timestamps") or [], segments)
 
-    if op.get("chapters") or op.get("data_cards"):
-        chapters = op.get("chapters") or []
-        data_cards = op.get("data_cards") or []
-        gauges = op.get("gauges") or []
-        countdowns = op.get("countdowns") or []
-        calendar_events = op.get("calendar_events") or []
-        mode_schedule = op.get("mode_schedule") or [{"frame": 0, "mode": "dominant"}]
-        plan_intro = None
-        plan_outro = None
-        plan_sections = op.get("sections") or []
-    else:
-        logger.info("  apply_style: 内容规划中（章节 + 数据展示分析）...")
-        content_plan = plan_content(segments, duration)
-        chapters = content_plan["chapters"]
-        data_cards = content_plan["data_cards"]
-        gauges = content_plan["gauges"]
-        countdowns = content_plan["countdowns"]
-        calendar_events = content_plan["calendar_events"]
-        mode_schedule = content_plan["mode_schedule"]
-        plan_intro = content_plan.get("intro")
-        plan_outro = content_plan.get("outro")
-        plan_sections = content_plan.get("sections") or []
-        logger.info(
-            f"  apply_style: 规划出 {len(chapters)} 个章节、{len(data_cards)} 个数据卡、"
-            f"{len(gauges)} 个仪表盘、{len(countdowns)} 个倒计时、{len(calendar_events)} 个日历"
-        )
-
-    scenes = _mode_schedule_to_scenes(mode_schedule)
-
     remotion_dir = Path(config.openmontage_root) / "remotion-composer"
     job_slug = workdir.name
     public_video_rel = f"jobs/{job_slug}/source.mp4"
@@ -755,101 +828,173 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
     public_video_abs.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(src, public_video_abs)
 
-    props: dict[str, Any] = {
-        "videoSrc": public_video_rel,
-        "durationSeconds": duration,
-        "colorMode": op.get("colorMode", "warm"),
-        "speakerObjectPosition": op.get("speaker_object_position")
-            or calibrate_speaker_object_position(src, workdir),
-        "scenes": scenes,
-        "introOutFrame": 20,
-        "chapters": chapters,
-        "captions": captions,
-    }
-    if plan_sections:
-        props["sections"] = plan_sections
-
-    # 开场标题卡/片尾 CTA：模板一直支持（IntroTitle/OutroSection），此前管线从不
-    # 生成——这是与 video-studio 手工参考成片(VeLL)最大的一块可自动化差距。
-    # op 显式传入优先；否则用 content_planner 从转写里写的文案。
-    intro = op.get("intro") or plan_intro
-    if intro:
-        props["intro"] = intro
-        # codex：intro 约占开场 ~3s，期间隐藏 chrome/字幕
-        intro_out = int(op.get("introOutFrame", 80))
-        props["introOutFrame"] = intro_out
-        # intro 期间卡片必须保持 Dominant(近全屏)——标题是压在大卡上的
-        # (VeLL 参考)。把 introOutFrame 之前开始的 workflow 段推迟到 intro
-        # 结束后 20 帧，避免标题叠在停靠小卡+背景上。
-        clamped = []
-        for m in mode_schedule:
-            m = dict(m)
-            if m.get("mode") == "workflow" and m["frame"] < intro_out + 20:
-                m["frame"] = intro_out + 20
-            clamped.append(m)
-        # 保持严格递增（推迟后可能与后续项撞帧）
-        mode_schedule = []
-        for m in sorted(clamped, key=lambda x: x["frame"]):
-            if mode_schedule and m["frame"] <= mode_schedule[-1]["frame"]:
-                continue
-            mode_schedule.append(m)
-        props["scenes"] = _mode_schedule_to_scenes(mode_schedule)
-        # 段落接管同样不得在 intro 期间开始
-        if props.get("sections"):
-            adjusted = []
-            for sec in props["sections"]:
-                sec = dict(sec)
-                if sec["fromFrame"] < intro_out + 20:
-                    sec["fromFrame"] = intro_out + 20
-                if sec["toFrame"] - sec["fromFrame"] >= 40:
-                    adjusted.append(sec)
-            props["sections"] = adjusted
-    outro = op.get("outro") or plan_outro
-    if outro:
-        duration_frames = max(1, round(duration * 30))
-        # 片尾最后 ~5s 交给 outro（不足 12s 的视频不上 outro，避免喧宾夺主）
-        if duration_frames >= 360:
-            outro = dict(outro)
-            outro.setdefault("fromFrame", duration_frames - 150)
-            props["outro"] = outro
-    if data_cards:
-        props["dataCards"] = data_cards
-    if gauges:
-        props["gauges"] = gauges
-    if countdowns:
-        props["countdowns"] = countdowns
-    if calendar_events:
-        props["calendarEvents"] = calendar_events
-    qr_input = op.get("qr_contact") or {}
-    if qr_input.get("contact_url"):
-        from .qr_gen import generate_qr
-        qr_rel = f"jobs/{job_slug}/qr.png"
-        qr_abs = remotion_dir / "public" / qr_rel
-        if generate_qr(qr_input["contact_url"], qr_abs):
-            qr_contact: dict[str, Any] = {
-                "qrSrc": qr_rel,
-                "contactName": qr_input.get("contact_name", ""),
-                "ctaLabel": qr_input.get("cta_label", "WhatsApp Now"),
-                "mountFrame": qr_input.get("mount_frame", max(0, round(duration * 30) - 200)),
-            }
-            if qr_input.get("contact_company"):
-                qr_contact["contactCompany"] = qr_input["contact_company"]
-            props["qrContact"] = qr_contact
-    if op.get("brand"):
-        props["brand"] = op["brand"]
-    elif op.get("compliance"):
-        props["compliance"] = op["compliance"]
-
+    # 人脸裁剪校准是确定性的（同一段视频每次算出来的结果一样），跟内容规划反馈
+    # 无关，只需要在下面的重试闭包外面算一次——重试它只会得到一模一样的值。
+    speaker_object_position = op.get("speaker_object_position") or calibrate_speaker_object_position(src, workdir)
     props_path = workdir / "_op_apply_style_props.json"
-    props_path.write_text(json.dumps(props, ensure_ascii=False), encoding="utf-8")
 
-    # 渲染整片前抽 QA stills 做机器检查（video-studio CLAUDE-v2 §8 的可自动化
-    # 部分）。findings 只记录不阻断；stills + qa_report.json 留在 workdir 供
-    # 有视觉的 agent 复审。
+    def _build(feedback: Optional[str] = None) -> dict[str, Any]:
+        """内容规划 + 组 contract② props。包成闭包是为了让视觉复核重试只重新
+        走这一步（一次 LLM 调用 + 一轮 QA stills），不用重新跑 enhancement
+        chain / 转写 / 完整 Remotion 渲染——那些跟"这次数据点怎么摆"无关，
+        重来一遍纯浪费（渲染整片是整条管线里最贵、也没有 subprocess 超时
+        保护的一步）。
+        """
+        if op.get("chapters") or op.get("data_cards"):
+            chapters = op.get("chapters") or []
+            data_cards = op.get("data_cards") or []
+            gauges = op.get("gauges") or []
+            countdowns = op.get("countdowns") or []
+            calendar_events = op.get("calendar_events") or []
+            before_after = op.get("before_after") or []
+            mode_schedule = op.get("mode_schedule") or [{"frame": 0, "mode": "dominant"}]
+            plan_intro = None
+            plan_outro = None
+            plan_sections = op.get("sections") or []
+            plan_quotes = op.get("quotes") or []
+            plan_atmosphere = op.get("atmosphere_keywords") or []
+        else:
+            logger.info("  apply_style: 内容规划中（章节 + 数据展示分析）...")
+            content_plan = plan_content(segments, duration, feedback=feedback)
+            chapters = content_plan["chapters"]
+            data_cards = content_plan["data_cards"]
+            gauges = content_plan["gauges"]
+            countdowns = content_plan["countdowns"]
+            calendar_events = content_plan["calendar_events"]
+            before_after = content_plan.get("before_after") or []
+            mode_schedule = content_plan["mode_schedule"]
+            plan_intro = content_plan.get("intro")
+            plan_outro = content_plan.get("outro")
+            plan_sections = content_plan.get("sections") or []
+            plan_quotes = content_plan.get("quotes") or []
+            plan_atmosphere = content_plan.get("atmosphere_keywords") or []
+            logger.info(
+                f"  apply_style: 规划出 {len(chapters)} 个章节、{len(data_cards)} 个数据卡、"
+                f"{len(gauges)} 个仪表盘、{len(countdowns)} 个倒计时、{len(calendar_events)} 个日历、"
+                f"{len(before_after)} 个前后对比、{len(plan_quotes)} 条金句"
+            )
+
+        scenes = _mode_schedule_to_scenes(mode_schedule)
+
+        props: dict[str, Any] = {
+            "videoSrc": public_video_rel,
+            "durationSeconds": duration,
+            "colorMode": op.get("colorMode", "warm"),
+            "speakerObjectPosition": speaker_object_position,
+            "scenes": scenes,
+            "introOutFrame": 20,
+            "chapters": chapters,
+            "captions": captions,
+        }
+        if plan_sections:
+            props["sections"] = plan_sections
+        if plan_quotes:
+            props["quotes"] = plan_quotes
+        if plan_atmosphere:
+            props["atmosphereKeywords"] = plan_atmosphere
+
+        # 开场标题卡/片尾 CTA：模板一直支持（IntroTitle/OutroSection），此前管线从不
+        # 生成——这是与 video-studio 手工参考成片(VeLL)最大的一块可自动化差距。
+        # op 显式传入优先；否则用 content_planner 从转写里写的文案。
+        intro = op.get("intro") or plan_intro
+        if intro:
+            props["intro"] = intro
+            # codex：intro 约占开场 ~3s，期间隐藏 chrome/字幕
+            intro_out = int(op.get("introOutFrame", 80))
+            props["introOutFrame"] = intro_out
+            # intro 期间卡片必须保持 Dominant(近全屏)——标题是压在大卡上的
+            # (VeLL 参考)。把 introOutFrame 之前开始的 workflow 段推迟到 intro
+            # 结束后 20 帧，避免标题叠在停靠小卡+背景上。
+            clamped = []
+            for m in mode_schedule:
+                m = dict(m)
+                if m.get("mode") == "workflow" and m["frame"] < intro_out + 20:
+                    m["frame"] = intro_out + 20
+                clamped.append(m)
+            # 保持严格递增（推迟后可能与后续项撞帧）
+            mode_schedule = []
+            for m in sorted(clamped, key=lambda x: x["frame"]):
+                if mode_schedule and m["frame"] <= mode_schedule[-1]["frame"]:
+                    continue
+                mode_schedule.append(m)
+            props["scenes"] = _mode_schedule_to_scenes(mode_schedule)
+            # 段落接管同样不得在 intro 期间开始
+            if props.get("sections"):
+                adjusted = []
+                for sec in props["sections"]:
+                    sec = dict(sec)
+                    if sec["fromFrame"] < intro_out + 20:
+                        sec["fromFrame"] = intro_out + 20
+                    if sec["toFrame"] - sec["fromFrame"] >= 40:
+                        adjusted.append(sec)
+                props["sections"] = adjusted
+        outro = op.get("outro") or plan_outro
+        if outro:
+            duration_frames = max(1, round(duration * 30))
+            # 片尾最后 ~5s 交给 outro（不足 12s 的视频不上 outro，避免喧宾夺主）
+            if duration_frames >= 360:
+                outro = dict(outro)
+                outro.setdefault("fromFrame", duration_frames - 150)
+                props["outro"] = outro
+        if data_cards:
+            props["dataCards"] = data_cards
+        if gauges:
+            props["gauges"] = gauges
+        if countdowns:
+            props["countdowns"] = countdowns
+        if calendar_events:
+            props["calendarEvents"] = calendar_events
+        if before_after:
+            props["beforeAfter"] = before_after
+        qr_input = op.get("qr_contact") or {}
+        if qr_input.get("contact_url"):
+            from .qr_gen import generate_qr
+            qr_rel = f"jobs/{job_slug}/qr.png"
+            qr_abs = remotion_dir / "public" / qr_rel
+            if generate_qr(qr_input["contact_url"], qr_abs):
+                qr_contact: dict[str, Any] = {
+                    "qrSrc": qr_rel,
+                    "contactName": qr_input.get("contact_name", ""),
+                    "ctaLabel": qr_input.get("cta_label", "WhatsApp Now"),
+                    "mountFrame": qr_input.get("mount_frame", max(0, round(duration * 30) - 200)),
+                }
+                if qr_input.get("contact_company"):
+                    qr_contact["contactCompany"] = qr_input["contact_company"]
+                props["qrContact"] = qr_contact
+        if op.get("brand"):
+            props["brand"] = op["brand"]
+        elif op.get("compliance"):
+            props["compliance"] = op["compliance"]
+
+        props_path.write_text(json.dumps(props, ensure_ascii=False), encoding="utf-8")
+        return props
+
+    props = _build()
+
+    # 渲染整片前抽 QA stills 做机器检查 + 视觉复审（video-studio CLAUDE-v2 §9
+    # "score before you ship" 自我修正循环的自动化版本）。视觉复审本身
+    # （qa_stills._vision_review/call_vision_chat）已经存在；这里补上原本
+    # 缺失的一环——真的按它的发现做点什么，而不是只记录进 qa_report.json
+    # 就撒手不管。发现 "high" 级问题就把问题喂回内容规划重试一次——只重新走
+    # 这一步（一次 LLM 调用 + 一轮 QA stills），不用重新渲染整片。重试后仍有
+    # 问题就 raise，交给下面已有的 _DEGRADABLE_OPS 降级交付逻辑处理——不是
+    # 发明新的失败处理方式，是复用已经存在、已经验证过的那一套（render 失败
+    # 时走的就是同一条路）。
     if not op.get("skipQaStills"):
         from .qa_stills import run_props_qa
 
-        run_props_qa(props, props_path, remotion_dir, workdir / "qa_stills")
+        qa_result = run_props_qa(props, props_path, remotion_dir, workdir / "qa_stills")
+        vision_findings = (qa_result.get("vision_review") or {}).get("findings") or []
+        major = [f for f in vision_findings if f.get("severity") == "high"]
+        if major:
+            feedback = "; ".join(f"still #{f.get('frame_index')}: {f.get('issue', '')}" for f in major)[:500]
+            logger.warning(f"  apply_style: 视觉复审发现问题，重新规划一次: {feedback}")
+            props = _build(feedback=feedback)
+            qa_result = run_props_qa(props, props_path, remotion_dir, workdir / "qa_stills")
+            vision_findings = (qa_result.get("vision_review") or {}).get("findings") or []
+            major = [f for f in vision_findings if f.get("severity") == "high"]
+            if major:
+                raise RuntimeError(f"apply_style: 视觉复审重试后仍发现问题，触发降级交付: {major}")
 
     out = workdir / "_op_styled.mp4"
     npx_bin = shutil.which("npx") or "npx"  # Windows: subprocess needs the resolved npx.cmd, plain "npx" raises WinError 2
@@ -859,12 +1004,15 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         "--crf=18",
     ]
     logger.info(f"  apply_style: rendering via {' '.join(cmd)} (cwd={remotion_dir})")
-    result = subprocess.run(cmd, cwd=str(remotion_dir), capture_output=True, text=True)
+    with _RENDER_SLOTS:  # Remotion 渲染跨任务串行 + 硬超时防卡死占坑
+        result = subprocess.run(cmd, cwd=str(remotion_dir), capture_output=True, text=True,
+                                timeout=_RENDER_TIMEOUT_S)
     if result.returncode != 0:
         logger.error(f"apply_style render stderr: {result.stderr[-4000:]}")
         raise RuntimeError(f"apply_style 渲染失败 (exit {result.returncode})")
 
     return str(out) if out.exists() else None
+
 
 
 _OP_HANDLERS: dict[str, Callable[[str, dict, Path], Optional[str]]] = {

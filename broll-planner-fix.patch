@@ -1,0 +1,26 @@
+diff --git a/whatsapp_mvp/agent_editor.py b/whatsapp_mvp/agent_editor.py
+index 4430e31..747769e 100644
+--- a/whatsapp_mvp/agent_editor.py
++++ b/whatsapp_mvp/agent_editor.py
+@@ -198,7 +198,7 @@ SYSTEM_BASE = """你是 OpenMontage 的剪辑 agent，编辑用户上传的 talk
+ - 剪口误/语气词/重录：优先用 remove_filler（它读转写逐词判断，能剪有声的"呃/嗯"和无停顿的重录），不要用 remove_segment 去手动框口误。remove_silences 只删静音停顿，和 remove_filler 可叠加。
+ - 基于内容的"选择性剪辑"：若提供了逐句转录（带时间戳），当用户要"只保留讲 X 的部分""删掉聊 Y 那段"这类**按内容选择**的诉求，用 remove_segment(start_seconds, end_seconds) 按转录里的真实时间戳精确剪除，可多次调用。没有明确要求就不要擅自删改说话内容。
+ - 调色/画面质感：用户说"调暖/暖色/电影感"→ color_grade profile=cinematic_warm；"冷调/青橙"→ cinematic_cool；"暗黑/氛围感/压暗"→ moody_dark；"明亮干净/清新"→ bright_clean；"复古/胶片/怀旧"→ vintage_film；"高对比/浓郁/有冲击力"→ high_contrast；"轻微校色/自然"→ neutral。color_grade 是整片调色，可与剪辑类叠加；但**不要和 apply_style 叠加**（模板自带风格观感，套模板时就别再单独调色）。
+-- b-roll 插入：**仅当 source_facts 里列出了"可用 b-roll 素材"时**才用 insert_broll，没列就绝不 emit。对每段素材，用它的说明（label）去转录里找**内容匹配**的那句话，取那句的时间窗，emit 一条 items 项 {asset_ref: 该素材编号, start_seconds, end_seconds, mode: "pip"}。默认 pip（小窗留脸），用户明说"全屏/切过去"才 cutaway。说明匹配不上任何一句就跳过该素材、不硬塞；两段 b-roll 不要时间重叠。用户没给具体位置说明时，可按素材说明与转录话题就近放置。
++- b-roll 插入：**只要 source_facts 里列出了 b-roll 素材，就必须为每段 emit 一条 insert_broll**（没列则绝不 emit）。用户上传带说明的素材、这个动作本身就是明确指令——**即使主编辑要求里没提到 b-roll，也要插入；绝不能因为"用户只说了加字幕/剪空白"就把插 b-roll 当作"用户没要求的多余操作"而跳过或省略**。对每段素材，用它的说明（label）去转录里找**内容匹配**的那句话，取那句的时间窗，emit 一条 items 项 {asset_ref: 该素材编号, start_seconds, end_seconds, mode: "pip"}。默认 pip（小窗留脸），用户明说"全屏/切过去"才 cutaway。说明实在匹配不上任何一句才跳过该段、不硬塞；两段 b-roll 不要时间重叠。用户没给具体位置说明时，按素材说明与转录话题就近放置。
+ - 出片风格：用户说"剪好看点/精致/小红书风格/我们的品牌风格/做正式些"这类诉求，用 apply_style 套品牌模板出片。它**自带字幕**，选了它就不要再加 add_subtitles。
+ - 零指令默认：用户只说"帮我剪一下/剪一下/edit this"这类**没有任何具体指令**的请求，不要问澄清，直接默认先 remove_filler 再 apply_style，并在 finish 的 rationale 里说明这是默认处理、下次可给更具体要求。
+ 
+diff --git a/whatsapp_mvp/worker.py b/whatsapp_mvp/worker.py
+index a7c3e07..1506661 100644
+--- a/whatsapp_mvp/worker.py
++++ b/whatsapp_mvp/worker.py
+@@ -358,7 +358,7 @@ def _run_llm_planner(job: Any) -> None:
+     from .job_manager import get_assets
+     broll = [a for a in get_assets(job) if a.get("role") == "broll"]
+     if broll:
+-        lines = ["可用 b-roll 素材（用户上传，用 insert_broll 按需插入；asset_ref 用下面的编号）："]
++        lines = ["用户上传的 b-roll 素材（上传并附说明＝明确要求你按说明把它们插进成片，必须处理，不是可选项）。逐段 emit insert_broll，asset_ref 用下面的编号："]
+         for a in broll:
+             lines.append(f"[b{a.get('order')}] 类型={a.get('kind')} 说明=\"{a.get('label') or '(无说明)'}\"")
+         block = "\n".join(lines)

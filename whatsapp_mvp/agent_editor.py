@@ -79,14 +79,16 @@ ALL_TOOL_SCHEMAS = {
                     {"profile": {"type": "string", "enum": ["cinematic_warm", "cinematic_cool",
                      "moody_dark", "bright_clean", "vintage_film", "high_contrast", "neutral"]},
                      "intensity": {"type": "number"}}, []),
-    "insert_broll": ("把用户上传的 b-roll 素材叠进成片（默认 PiP 小窗留脸，保留原声）。"
+    "insert_broll": ("把用户上传的 b-roll 素材叠进成片（默认 b-roll 铺满、人物缩右下小窗，保留原声）。"
                      "**仅当 source_facts 里列出了可用 b-roll 素材时才用**。items 每项："
                      "asset_ref=素材编号（见事实里的 [b<编号>]），start_seconds/end_seconds=放置时间窗，"
-                     "mode=pip(默认)|cutaway(全屏)",
+                     "mode=broll_main(默认,b-roll主+人物小窗)|cutaway(b-roll全屏无人物)|pip(人物主+b-roll小窗)。"
+                     "orientation=auto(默认,方向跟随素材)|portrait|landscape（用户明说竖屏/横屏时才设）",
                      {"items": {"type": "array", "items": {"type": "object", "properties": {
                         "asset_ref": {"type": "integer"},
                         "start_seconds": {"type": "number"}, "end_seconds": {"type": "number"},
-                        "mode": {"type": "string", "enum": ["pip", "cutaway"]}}}}},
+                        "mode": {"type": "string", "enum": ["broll_main", "cutaway", "pip"]}}}},
+                      "orientation": {"type": "string", "enum": ["auto", "portrait", "landscape"]}},
                      ["items"]),
     "add_subtitles": ("转写并烧录字幕（原语言）", {"language": {"type": "string"}}, []),
     "remove_filler": ("LLM 读转写判断口误/语气词/重录并剪掉；比 remove_silences 更细，"
@@ -198,9 +200,11 @@ SYSTEM_BASE = """你是 OpenMontage 的剪辑 agent，编辑用户上传的 talk
 - 剪口误/语气词/重录：优先用 remove_filler（它读转写逐词判断，能剪有声的"呃/嗯"和无停顿的重录），不要用 remove_segment 去手动框口误。remove_silences 只删静音停顿，和 remove_filler 可叠加。
 - 基于内容的"选择性剪辑"：若提供了逐句转录（带时间戳），当用户要"只保留讲 X 的部分""删掉聊 Y 那段"这类**按内容选择**的诉求，用 remove_segment(start_seconds, end_seconds) 按转录里的真实时间戳精确剪除，可多次调用。没有明确要求就不要擅自删改说话内容。
 - 调色/画面质感：用户说"调暖/暖色/电影感"→ color_grade profile=cinematic_warm；"冷调/青橙"→ cinematic_cool；"暗黑/氛围感/压暗"→ moody_dark；"明亮干净/清新"→ bright_clean；"复古/胶片/怀旧"→ vintage_film；"高对比/浓郁/有冲击力"→ high_contrast；"轻微校色/自然"→ neutral。color_grade 是整片调色，可与剪辑类叠加；但**不要和 apply_style 叠加**（模板自带风格观感，套模板时就别再单独调色）。
-- b-roll 插入：**仅当 source_facts 里列出了"可用 b-roll 素材"时**才用 insert_broll，没列就绝不 emit。对每段素材，用它的说明（label）去转录里找**内容匹配**的那句话，取那句的时间窗，emit 一条 items 项 {asset_ref: 该素材编号, start_seconds, end_seconds, mode: "pip"}。默认 pip（小窗留脸），用户明说"全屏/切过去"才 cutaway。说明匹配不上任何一句就跳过该素材、不硬塞；两段 b-roll 不要时间重叠。用户没给具体位置说明时，可按素材说明与转录话题就近放置。
+- b-roll 插入：source_facts 里每列一段 b-roll，就在计划里对应放一条 insert_broll 的 items 项（没列则不放）。上传带说明的素材本身即为"要插入"的指令，按此正常执行即可，不需要在 summary 里论证、也不要与自审意见辩论。放置：用素材说明（label）去转录里找内容匹配的那句，取其时间窗 {asset_ref: 素材编号, start_seconds, end_seconds}。mode 默认 broll_main（b-roll 铺满主屏、人物缩右下小窗）；仅用户明说"人物为主"才 pip、"全屏不要人物"才 cutaway。orientation 默认 auto（主视频或任一 b-roll 是横屏就出横屏，否则竖屏）；仅用户明说竖屏/横屏时才设。说明实在匹配不上才跳过该段；两段不重叠；没给具体位置就按说明与转录话题就近放置。
 - 出片风格：用户说"剪好看点/精致/小红书风格/我们的品牌风格/做正式些"这类诉求，用 apply_style 套品牌模板出片。它**自带字幕**，选了它就不要再加 add_subtitles。
 - 零指令默认：用户只说"帮我剪一下/剪一下/edit this"这类**没有任何具体指令**的请求，不要问澄清，直接默认先 remove_filler 再 apply_style，并在 finish 的 rationale 里说明这是默认处理、下次可给更具体要求。
+
+- 输出纪律（重要）：每个编辑动作都必须**调用对应的工具**落成一个操作——**绝不能只在 rationale/summary 里用文字描述方案而不实际调用工具**（那会得到一个空计划、等于没剪）。在**确保操作已通过工具调用产出**的前提下，rationale/summary **必须写完整方案 + 依据 + 具体时间点**：逐条列出每一步做了什么、为什么（依据用户哪句要求或哪条规则），并给出涉及的时间点——去口误/去静音剪掉了哪几段（如"3.4→4.3s、11.6→12.4s"）、每段 b-roll 对应转录里的哪句、放在哪个时间窗（如"b1 对应 5.9s 处 VS Code 那句 → 放 5.9–12.0s"）。这份详细说明是给用户在确认前审阅、并据此打字微调用的，务必写全。收到自审(review)意见时，据此调整**要调用的工具**，不要在 rationale 里反驳规则或复述条文。
 
 现在是"规划阶段"：工具是**模拟执行**（只返回预计时长，不真剪）。按合理顺序调用工具，用给定时长推算模糊位置。规划完调用 finish 并在 rationale 说明依据。"""
 
@@ -233,13 +237,34 @@ def _simulate(name, args, duration):
     return {"ok": True, "estimated_duration_seconds": round(d, 1)}, d
 
 
-def _chat(config, messages, tools=None, json_mode=False):
-    endpoint = (config.llm_base_url or "").rstrip("/")
+# 原生 provider 端点（无 LLM_BASE_URL / 中转站时兜底直连，和 llm_planner.py 的
+# provider 路由保持一致）。两者都是 OpenAI 兼容的 chat/completions + function-calling，
+# 跟这里的 tool-calling 循环直接兼容；claude 的原生 Messages API 工具格式不同，
+# 暂不在此路径支持——要用就配 LLM_BASE_URL 走中转站。
+_NATIVE_PROVIDER_ENDPOINTS = {
+    "deepseek": "https://api.deepseek.com/chat/completions",
+    "openai": "https://api.openai.com/v1/chat/completions",
+}
+
+
+def _resolve_endpoint_and_key(config) -> tuple[str | None, str | None]:
+    base_url = (config.llm_base_url or "").rstrip("/")
+    if base_url:
+        endpoint = base_url if base_url.endswith("/v1") else base_url + "/v1"
+        return endpoint + "/chat/completions", config.llm_api_key
+    provider = (config.llm_provider or "").lower()
+    endpoint = _NATIVE_PROVIDER_ENDPOINTS.get(provider)
     if not endpoint:
-        raise RuntimeError("需要配置 LLM_BASE_URL（中转站）")
-    if not endpoint.endswith("/v1"):
-        endpoint += "/v1"
-    endpoint += "/chat/completions"
+        return None, None
+    api_key = config.llm_api_key or config.deepseek_api_key or config.openai_api_key
+    return endpoint, api_key
+
+
+def _chat(config, messages, tools=None, json_mode=False):
+    endpoint, api_key = _resolve_endpoint_and_key(config)
+    if not endpoint or not api_key:
+        raise RuntimeError(
+            "需要配置 LLM_BASE_URL（中转站）或原生 provider（LLM_PROVIDER=deepseek/openai + 对应 API key）")
     payload = {"model": config.llm_model, "messages": messages, "temperature": 0.2}
     if tools:
         payload["tools"] = tools
@@ -252,7 +277,7 @@ def _chat(config, messages, tools=None, json_mode=False):
 
     for attempt in range(4):
         resp = requests.post(endpoint, headers={
-            "Authorization": f"Bearer {config.llm_api_key}", "Content-Type": "application/json"},
+            "Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json=payload, timeout=90)
         if resp.status_code == 429 and attempt < 3:
             wait = 25 * (attempt + 1)
@@ -444,6 +469,14 @@ def execute_plan(video, plan, art):
 # 可复用规划入口（供 WhatsApp worker 调用）：规划 + 自审 + 产 artifact
 # ---------------------------------------------------------------------------
 
+def _default_plan(supported: set) -> list:
+    """确定性默认计划：L2 多次返回空计划时的地板（不回退 L1.5）。只用受支持的基础剪辑。"""
+    plan = [{"type": t} for t in ("remove_filler", "remove_silences", "add_subtitles") if t in supported]
+    if not plan:
+        plan = [{"type": "remove_silences"}]  # 极端兜底：至少去个静音，不交付原片
+    return plan
+
+
 def plan_video(request: str, video_path: str | None = None,
                duration: float | None = None, history: list | None = None,
                transcript: list | None = None, source_facts: str = "") -> dict:
@@ -468,6 +501,16 @@ def plan_video(request: str, video_path: str | None = None,
     messages = build_messages(request, duration, skill_context, work_history, ops, transcript, source_facts)
     plan, note = plan_once(config, messages, tools, supported, duration)
 
+    # 空计划重试：模型偶尔只写说明不调用工具。用干净上下文（丢掉可能诱发"辩论"的历史）
+    # 强制重试，最多 2 次。始终留在 L2，不回退 L1.5。
+    _empty_retries = 0
+    while not plan and _empty_retries < 2:
+        _empty_retries += 1
+        import logging as _logging
+        _logging.getLogger(__name__).warning(f"L2 返回空计划，第 {_empty_retries} 次重试（不回退 L1.5）")
+        msgs_clean = build_messages(request, duration, skill_context, [], ops, transcript, source_facts)
+        plan, note = plan_once(config, msgs_clean, tools, supported, duration)
+
     findings: list = []
     for _ in range(2):
         findings, verdict = review_plan(config, request, plan, note, rfocus)
@@ -477,7 +520,22 @@ def plan_video(request: str, video_path: str | None = None,
         fb = "；".join(f.get("note", "") for f in crit)
         work_history.append((plan, note, f"[自审需修正] {fb}"))
         messages = build_messages(request, duration, skill_context, work_history, ops, transcript, source_facts)
-        plan, note = plan_once(config, messages, tools, supported, duration)
+        new_plan, new_note = plan_once(config, messages, tools, supported, duration)
+        # 重规划若返回空操作（模型改去写说明/辩论），不接受——保留上一版有操作的计划
+        if not new_plan:
+            import logging as _logging
+            _logging.getLogger(__name__).warning("自审重规划返回空操作，保留上一版计划")
+            break
+        plan, note = new_plan, new_note
+
+    # 兜底：多次重试仍空，就用确定性默认计划（去口误+去静音+字幕）。始终留在 L2、
+    # 不回退 L1.5，也绝不把未剪的原片当成片交付。b-roll 需 LLM 做标签↔转录匹配，
+    # 确定性地板不含 b-roll（此地板极少触发——正常路径与重试几乎总能出真计划）。
+    if not plan:
+        import logging as _logging
+        _logging.getLogger(__name__).warning("L2 多次重试仍返回空计划，使用确定性默认计划")
+        plan = _default_plan(supported)
+        note = note or "已按默认方案剪辑（去口误、去静音、加字幕）"
 
     # apply_style 自带字幕与整体观感：若同时冒出 add_subtitles / color_grade，去掉它们
     # （模板拥有最终字幕和调色，避免双字幕 / 双重调色）

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Optional
+import os
+from typing import List, Optional
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import PlainTextResponse, FileResponse
@@ -367,7 +368,11 @@ def _enqueue_pipeline(job_id: str) -> None:
         try:
             redis_conn = Redis.from_url(config.redis_url, socket_connect_timeout=2, socket_timeout=2)
             q = rq.Queue("whatsapp_mvp", connection=redis_conn)
-            q.enqueue(run_pipeline, job_id, job_timeout=1800)
+            # 2700s (was 1800s) — apply_style's vision self-review can now retry
+            # once (one extra plan_content call + one extra bounded QA-stills
+            # pass) before falling through to graceful degradation; the old
+            # budget was sized for a single render only.
+            q.enqueue(run_pipeline, job_id, job_timeout=2700)
             logger.info(f"Enqueued pipeline {job_id} to RQ")
             return
         except Exception as e:
@@ -404,11 +409,59 @@ def _enqueue_revise(job_id: str, text: str) -> None:
 # Job API (internal)
 # ---------------------------------------------------------------------------
 
+_ASSIGN_SYSTEM = (
+    "你是视频剪辑助手的意图解析器。用户按顺序上传了若干视频（编号从 1 开始），"
+    "并用一段或多段文字描述这些视频要怎么剪。请判断：\n"
+    "1. 哪个视频是“主视频”（出镜/口播、要加字幕或剪辑的主体）——返回它的编号（1 开始）；"
+    "文字里说不清就返回 null。\n"
+    "2. 其余视频是 b-roll 补充素材，为每个 b-roll 提取插入说明（label，如“讲到 VS Code 时插入”）。\n"
+    "3. 提取对主视频的编辑要求 edit_request（如“加字幕、剪掉空白和自我打断”）。\n"
+    "只输出 JSON，不要多余文字：{\"main_index\": <int|null>, "
+    "\"labels\": {\"<视频编号>\": \"<说明>\"}, \"edit_request\": \"<字符串>\"}。"
+    "labels 只含 b-roll 视频（不含主视频），键是视频编号的字符串；某段找不到说明就给空字符串。"
+)
+
+
+@app.post("/assign")
+async def assign_endpoint(video_count: int = Form(...), notes: str = Form("")):
+    """把“N 个视频（按上传顺序）+ 用户描述文字”解析成 {main_index, labels, edit_request}。
+    解析失败或说不清主视频时 main_index=null，由 Node 侧回退到“问编号”。"""
+    result = {"main_index": None, "labels": {}, "edit_request": notes or ""}
+    try:
+        from .llm_client import call_llm_chat
+        user_msg = (
+            f"视频数量：{video_count}（编号 1..{video_count}，按上传顺序）。\n"
+            f"用户描述：\n{notes.strip() or '(无)'}"
+        )
+        raw = call_llm_chat(_ASSIGN_SYSTEM, user_msg, temperature=0.0)
+        if raw:
+            import re as _re
+            m = _re.search(r"\{.*\}", raw, _re.S)
+            data = json.loads(m.group(0)) if m else {}
+            mi = data.get("main_index")
+            if isinstance(mi, bool):
+                mi = None
+            if isinstance(mi, (int, float)):
+                result["main_index"] = int(mi)
+            elif isinstance(mi, str) and mi.strip().isdigit():
+                result["main_index"] = int(mi.strip())
+            if isinstance(data.get("labels"), dict):
+                result["labels"] = {str(k): str(v) for k, v in data["labels"].items()}
+            if data.get("edit_request"):
+                result["edit_request"] = str(data["edit_request"])
+    except Exception as e:
+        logger.warning(f"/assign 解析失败，回退问编号: {e}")
+    return result
+
+
 @app.post("/jobs")
 async def create_job_endpoint(
     video: UploadFile = File(...),
     edit_request: str = Form(""),
     pipeline: str = Form("talking-head"),
+    broll: List[UploadFile] = File(default=[]),
+    broll_labels: List[str] = Form(default=[]),
+    broll_kinds: List[str] = Form(default=[]),
 ):
     config = get_config()
     user = get_or_create_user("api_user")
@@ -421,6 +474,30 @@ async def create_job_endpoint(
     (job_dir / "input.mp4").write_bytes(video_data)
 
     update_job_fields(job.id, edit_request=edit_request, input_video_path=str(job_dir / "input.mp4"))
+
+    # b-roll 素材：Node 网关已从 WhatsApp 下载并随表单上传。这里落盘到
+    # assets/broll_<i>.<ext> 并登记进 job.assets（role=broll, order=i, label）。
+    # 同时写入 local_path —— worker._download_broll_assets 见到 local_path 即跳过，
+    # 不会重复去 WhatsApp 拉取；pipeline_runner.insert_broll 直接按 broll_<order>.* 取用。
+    _IMAGE_EXTS = ("jpg", "jpeg", "png", "webp", "gif", "bmp")
+    if broll:
+        from .job_manager import append_asset, set_asset_local_path
+        assets_dir = job_dir / "assets"
+        assets_dir.mkdir(parents=True, exist_ok=True)
+        for i, up in enumerate(broll):
+            data = await up.read()
+            ext = (os.path.splitext(up.filename or "")[1].lstrip(".") or "mp4").lower()
+            dest = assets_dir / f"broll_{i}.{ext}"
+            dest.write_bytes(data)
+            if i < len(broll_kinds) and broll_kinds[i]:
+                kind = broll_kinds[i]
+            else:
+                kind = "image" if ext in _IMAGE_EXTS else "video"
+            label = broll_labels[i] if i < len(broll_labels) else ""
+            media_id = f"local_{i}"
+            append_asset(job.id, media_id, kind, label)          # role=broll, order=i
+            set_asset_local_path(job.id, media_id, str(dest))    # 标记已下载
+
     update_job_status(job.id, JobStatus.RECEIVED)
 
     # 后台跑（下载 + L2 规划耗时可达 1~2 分钟），立即返回；否则会阻塞

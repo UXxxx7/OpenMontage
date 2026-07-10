@@ -127,13 +127,29 @@ async function handleMessage(message) {
 
   console.log(`[webhook] from=${waNumber} type=${msgType}`);
 
-  if (msgType === "video") {
-    const mediaId = message.video?.id;
-    const caption = message.video?.caption || "";
+  // 视频/图片 → 收集态：每条素材攒进 Redis，等用户回 'go' 再统一建任务
+  // （支持“主视频 + 多段 b-roll”）。每收一条回一句引导，告诉用户何时结束。
+  if (msgType === "video" || msgType === "image") {
+    const media = message[msgType] || {};
+    const mediaId = media.id;
     if (!mediaId) return;
-    await videoQueue.add("edit-video", {
-      waNumber, mediaId, editRequest: caption, msgId,
-    }, queueOptions(msgId));
+    const caption = media.caption || "";
+    const count = await redis.rpush(collectKey(waNumber),
+      JSON.stringify({ mediaId, caption, kind: msgType }));
+    await redis.expire(collectKey(waNumber), Number(env("WA_COLLECT_TTL", "3600")));
+    await redis.del(awaitChoiceKey(waNumber)); // 又来新素材 → 作废旧的“选主视频”问题
+    // 收集回执由网关直发而不是入队（collect-ack 作为队列任务会排在重活后面，
+    // 队列拥堵时回执又变回沉默——2026-07-09 实测过的坑），顺带告知拥堵度。
+    let ahead = 0;
+    try {
+      ahead = (await videoQueue.getWaitingCount()) + (await videoQueue.getActiveCount());
+    } catch {}
+    const noun = msgType === "image" ? "图片" : "视频";
+    const note = caption ? `（说明：${caption}）` : "";
+    await gatewaySendText(waNumber,
+      `已收到第 ${count} 个${noun}${note}。\n` +
+      `可以继续发素材，也可以用文字补充说明。全部发完回复 *go* 开始，回复 *cancel* 取消。` +
+      (ahead > 0 ? `\n（当前有 ${ahead} 个任务在处理/排队，开始后需要多等一会）` : ""));
     return;
   }
 
@@ -144,6 +160,49 @@ async function handleMessage(message) {
       Number(env("WA_REDIS_OP_TIMEOUT_MS", "2000")),
       null
     );
+
+    // ── 收集流程优先 ──
+    // 用户刚发过素材（缓冲非空）或正处在“选主视频”阶段时，意图是开一个新任务，
+    // 这些分支要压过下面对旧活跃任务的处理，且不受 activeJob 影响（否则残留的
+    // 活跃任务会让新素材永远无法用 go 收尾 —— 见对抗性审查 #3/#5）。
+    const awaitingChoice = await withTimeout(
+      redis.get(awaitChoiceKey(waNumber)),
+      Number(env("WA_REDIS_OP_TIMEOUT_MS", "2000")),
+      null
+    );
+    const pendingCount = await withTimeout(
+      redis.llen(collectKey(waNumber)),
+      Number(env("WA_REDIS_OP_TIMEOUT_MS", "2000")),
+      0
+    );
+    const cancelWords = ["cancel", "no", "stop", "取消"];
+    const goWords = ["go", "start", "done", "开始", "完成", "好了"];
+
+    if (awaitingChoice || pendingCount > 0) {
+      // 任何阶段都允许取消（含“选主视频”阶段 —— 修 #5）
+      if (cancelWords.includes(normalized)) {
+        await redis.del(collectKey(waNumber));
+        await redis.del(awaitChoiceKey(waNumber));
+        await videoQueue.add("collect-cancel", { waNumber, msgId }, queueOptions(msgId));
+        return;
+      }
+      // 选主视频阶段：期待一个编号，交给 worker 校验并建任务
+      if (awaitingChoice) {
+        await videoQueue.add("collection-choice",
+          { waNumber, choice: text, msgId }, queueOptions(msgId));
+        return;
+      }
+      // 'go' 收尾：把缓冲里的素材定角色并开始
+      if (goWords.includes(normalized)) {
+        await videoQueue.add("finalize-collection", { waNumber, msgId }, queueOptions(msgId));
+        return;
+      }
+      // 收集态里发了其它文字 → 当作对素材的描述，存进 notes 缓冲（go 时交给 LLM 解析）
+      await redis.rpush(notesKey(waNumber), text);
+      await redis.expire(notesKey(waNumber), Number(env("WA_COLLECT_TTL", "3600")));
+      await videoQueue.add("collect-note", { waNumber, msgId }, queueOptions(msgId));
+      return;
+    }
 
     if (activeJobId && ["confirm", "continue", "yes", "ok"].includes(normalized)) {
       await videoQueue.add("confirm-job", { waNumber, jobId: activeJobId, msgId }, queueOptions(msgId));
@@ -211,6 +270,20 @@ function activeJobKey(waNumber) {
   return `wa:user:${waNumber}:active_job`;
 }
 
+// b-roll 收集缓冲：一个用户在按 'go' 之前发来的所有素材（LIST），
+// 以及“2+ 视频时正在等用户回主视频编号”的标志。
+function collectKey(waNumber) {
+  return `wa:user:${waNumber}:collect`;
+}
+
+function awaitChoiceKey(waNumber) {
+  return `wa:user:${waNumber}:await_choice`;
+}
+
+function notesKey(waNumber) {
+  return `wa:user:${waNumber}:notes`;
+}
+
 async function withTimeout(promise, ms, fallback) {
   if (ms <= 0) return await promise;
   const timer = new Promise((r) => setTimeout(() => r(fallback), ms));
@@ -219,6 +292,21 @@ async function withTimeout(promise, ms, fallback) {
 
 function env(name, fallback = "") {
   return process.env[name] || fallback;
+}
+
+async function gatewaySendText(waNumber, text) {
+  const token = env("WA_TOKEN", env("WHATSAPP_ACCESS_TOKEN"));
+  const phoneId = env("WA_PHONE_ID", env("WHATSAPP_PHONE_NUMBER_ID"));
+  if (!token || !phoneId) return;
+  try {
+    await axios.post(
+      `https://graph.facebook.com/${env("WA_GRAPH_VERSION", "v21.0")}/${phoneId}/messages`,
+      { messaging_product: "whatsapp", to: waNumber, type: "text", text: { body: text } },
+      { headers: { Authorization: `Bearer ${token}` }, timeout: 10000 }
+    );
+  } catch (err) {
+    console.warn("[gateway] ack send failed:", err.message);
+  }
 }
 
 function whatsappVerifyToken() {
