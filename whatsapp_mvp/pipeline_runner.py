@@ -615,7 +615,20 @@ def _op_add_subtitles(src: str, op: dict, workdir: Path) -> Optional[str]:
 # reasons about WHEN to be in which mode (dominant vs workflow); the actual
 # pixel box a mode maps to is a rendering-layer concern, not a planning one.
 _DOMINANT_BOX = {"x": 60, "y": 104, "w": 960, "h": 1100}
-_WORKFLOW_BOX = {"x": 740, "y": 1200, "w": 300, "h": 531}
+# h was previously 531 -- below video-studio's documented floor of >=900px
+# for a Workflow-mode card (CLAUDE-v2.md §6a: a shorter card reveals only a
+# thin horizontal slice of the source video via objectFit:"cover", cropping
+# to head-only instead of showing chest/shoulders). Kept narrow (w=300, same
+# as before) rather than scaled up proportionally: a box narrower than the
+# source's own aspect ratio is HEIGHT-driven under objectFit:"cover" (crops
+# left/right, not top/bottom), which guarantees the full vertical extent of
+# the speaker is visible regardless of the exact source aspect ratio.
+# Top-anchored at the same y as _DOMINANT_BOX (104, not bottom-anchored at
+# 1200 like before) so the card's top edge stays fixed across the
+# Dominant<->Workflow transition, and so its bottom (1004) stays clear of
+# where content-zone graphics conventionally start (y=900 default) instead
+# of overlapping them for ~600px like the old bottom-anchored box did.
+_WORKFLOW_BOX = {"x": 740, "y": 104, "w": 300, "h": 900}
 
 
 def _mode_schedule_to_scenes(mode_schedule: list[dict]) -> list[dict]:
@@ -676,11 +689,13 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
     构建 props 并调用 P3 的稳定渲染入口：
     `npx remotion render XiaojinEditorial --props=<json>`。
 
-    章节/数据卡/仪表盘/倒计时/日历默认都走 content_planner 的完整 Data Display
-    Analysis（按 compose-director.md 的表格把每个数据点分到该用的图形，不再只有
-    count-up 一种）；调用方也可以显式传 op["chapters"] / op["data_cards"] /
-    op["gauges"] / op["countdowns"] / op["calendar_events"] / op["mode_schedule"]
-    覆盖（例如手工编排的演示）。
+    章节/数据卡/仪表盘/倒计时/日历/前后对比默认都走 content_planner 的完整 Data
+    Display Analysis（按 compose-director.md 的表格把每个数据点分到该用的图形，
+    不再只有 count-up 一种；前后对比用 BudgetRevealSection，多阶段流程时间线
+    挂在对应 takeover 章节的 sections[].timeline 上，见 SectionLayer）；调用方
+    也可以显式传 op["chapters"] / op["data_cards"] / op["gauges"] /
+    op["countdowns"] / op["calendar_events"] / op["before_after"] /
+    op["mode_schedule"] 覆盖（例如手工编排的演示）。
 
     QR + 联系方式（props["qrContact"]）不经过 content_planner 的语义判断——
     是否显示 QR 完全取决于调用方是否在 op["qr_contact"] 里给了真实联系方式，
@@ -725,6 +740,7 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         gauges = op.get("gauges") or []
         countdowns = op.get("countdowns") or []
         calendar_events = op.get("calendar_events") or []
+        before_after = op.get("before_after") or []
         mode_schedule = op.get("mode_schedule") or [{"frame": 0, "mode": "dominant"}]
         plan_intro = None
         plan_outro = None
@@ -737,13 +753,15 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         gauges = content_plan["gauges"]
         countdowns = content_plan["countdowns"]
         calendar_events = content_plan["calendar_events"]
+        before_after = content_plan.get("before_after") or []
         mode_schedule = content_plan["mode_schedule"]
         plan_intro = content_plan.get("intro")
         plan_outro = content_plan.get("outro")
         plan_sections = content_plan.get("sections") or []
         logger.info(
             f"  apply_style: 规划出 {len(chapters)} 个章节、{len(data_cards)} 个数据卡、"
-            f"{len(gauges)} 个仪表盘、{len(countdowns)} 个倒计时、{len(calendar_events)} 个日历"
+            f"{len(gauges)} 个仪表盘、{len(countdowns)} 个倒计时、{len(calendar_events)} 个日历、"
+            f"{len(before_after)} 个前后对比"
         )
 
     scenes = _mode_schedule_to_scenes(mode_schedule)
@@ -814,6 +832,8 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
             props["outro"] = outro
     if data_cards:
         props["dataCards"] = data_cards
+    if before_after:
+        props["beforeAfter"] = before_after
     if gauges:
         props["gauges"] = gauges
     if countdowns:

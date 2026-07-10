@@ -247,6 +247,88 @@
         }
       }
     },
+    "beforeAfter": {
+      "type": "array",
+      "description": "Dramatic two-value before/after reveals (e.g. a cost/metric that jumped over time) — 'before_after' rows of compose-director.md's Data Display Analysis table.",
+      "items": {
+        "type": "object",
+        "required": [
+          "kicker",
+          "leftLabel",
+          "leftValue",
+          "rightLabel",
+          "rightValue",
+          "mountFrame",
+          "secondRevealFrame"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "kicker": {
+            "type": "string",
+            "maxLength": 40
+          },
+          "leftLabel": {
+            "type": "string",
+            "maxLength": 24
+          },
+          "leftValue": {
+            "type": "number"
+          },
+          "leftPrefix": {
+            "type": "string"
+          },
+          "leftSuffix": {
+            "type": "string"
+          },
+          "leftDecimals": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "rightLabel": {
+            "type": "string",
+            "maxLength": 24
+          },
+          "rightValue": {
+            "type": "number"
+          },
+          "rightPrefix": {
+            "type": "string"
+          },
+          "rightSuffix": {
+            "type": "string"
+          },
+          "rightDecimals": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "mountFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "secondRevealFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "endFrame": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Frame this card starts a 15-frame fade-out. Omit only if no later card ever occupies the same x/y."
+          },
+          "x": {
+            "type": "number",
+            "default": 80
+          },
+          "y": {
+            "type": "number",
+            "default": 900
+          },
+          "width": {
+            "type": "number",
+            "default": 920
+          }
+        }
+      }
+    },
     "gauges": {
       "type": "array",
       "description": "Semicircle risk/status gauges — 'risk consequence' rows of compose-director.md's Data Display Analysis table.",
@@ -589,6 +671,58 @@
           },
           "warn": {
             "type": "boolean"
+          },
+          "timeline": {
+            "type": "object",
+            "description": "Full-canvas multi-stage process timeline filling this section's takeover (see TimelineSection). Only renders when this section's resolved colorMode is 'dark' — omit `icon` on sections that carry this, they occupy the same vertical space.",
+            "required": [
+              "heading",
+              "nodes"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "heading": {
+                "type": "string",
+                "maxLength": 40
+              },
+              "nodes": {
+                "type": "array",
+                "minItems": 2,
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "label",
+                    "revealFrame",
+                    "prefix",
+                    "target",
+                    "unit"
+                  ],
+                  "additionalProperties": false,
+                  "properties": {
+                    "label": {
+                      "type": "string",
+                      "maxLength": 24
+                    },
+                    "revealFrame": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "prefix": {
+                      "type": "string"
+                    },
+                    "target": {
+                      "type": "number"
+                    },
+                    "unit": {
+                      "type": "string"
+                    },
+                    "isTotal": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       }

@@ -11,7 +11,7 @@
  * projects except for hardcoded text — generalized to take that text as
  * props instead.
  */
-import { interpolate, useCurrentFrame } from "remotion";
+import { interpolate, spring, useCurrentFrame, useVideoConfig } from "remotion";
 import { APPLE, ColorMode, H, PALETTES, W } from "./theme";
 
 export interface IntroTitleProps {
@@ -35,6 +35,7 @@ export const IntroTitle: React.FC<IntroTitleProps> = ({
   labelFont = "inherit",
 }) => {
   const frame = useCurrentFrame();
+  const { fps } = useVideoConfig();
   const palette = PALETTES[colorMode];
   if (frame > introOutFrame + 12) return null;
 
@@ -50,6 +51,19 @@ export const IntroTitle: React.FC<IntroTitleProps> = ({
   });
   const opacity = enter * (1 - exit);
   const ty = (1 - enter) * 32;
+
+  // Title gets its own spring-scale entrance (the "main headline entrance"
+  // animation vocabulary) instead of just inheriting the scrim's fade+slide —
+  // a plain fade is fine for the supporting eyebrow/subtitle text, but not
+  // for the single biggest, most prominent element on screen.
+  const titleScale = spring({ frame, fps, config: { damping: 14, stiffness: 220 } }) * 0.2 + 0.8;
+  // Divider sweeps in from 0 width once the title has mostly landed, rather
+  // than popping to full width with everything else.
+  const dividerWidth = interpolate(frame, [14, 30], [0, 72], {
+    extrapolateLeft: "clamp",
+    extrapolateRight: "clamp",
+    easing: APPLE,
+  });
 
   return (
     <div
@@ -93,6 +107,7 @@ export const IntroTitle: React.FC<IntroTitleProps> = ({
           textAlign: "center",
           padding: "0 56px",
           textShadow: "0 4px 32px rgba(0,0,0,0.40)",
+          transform: `scale(${titleScale})`,
         }}
       >
         {title}
@@ -100,7 +115,7 @@ export const IntroTitle: React.FC<IntroTitleProps> = ({
 
       <div
         style={{
-          width: 72,
+          width: dividerWidth,
           height: 4,
           borderRadius: 2,
           background: palette.accent,

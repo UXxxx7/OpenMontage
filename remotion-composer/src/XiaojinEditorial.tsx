@@ -27,6 +27,7 @@ import Ajv2020 from "ajv/dist/2020";
 import { AbsoluteFill, CalculateMetadataFunction } from "remotion";
 import renderPropsSchema from "../../contracts/render_props.schema.json";
 import { BrandBar } from "./components/xiaojin/BrandBar";
+import { BudgetRevealSection, BudgetRevealSectionProps } from "./components/xiaojin/BudgetRevealSection";
 import { Calendar, CalendarProps } from "./components/xiaojin/Calendar";
 import { Captions, CaptionPhrase } from "./components/xiaojin/Captions";
 import { ChapterNav, Chapter } from "./components/xiaojin/ChapterNav";
@@ -65,6 +66,7 @@ export interface IntroInfo {
 /** Matches contract②'s dataCards item shape exactly — colorMode/fonts come from the parent. */
 export type DataCard = Omit<InfoCardProps, "colorMode" | "headingFont" | "labelFont">;
 export type Gauge = Omit<RiskGaugeProps, "colorMode" | "headingFont" | "labelFont">;
+export type BeforeAfter = Omit<BudgetRevealSectionProps, "headingFont" | "labelFont">;
 export type Countdown = Omit<CountdownRingProps, "colorMode" | "headingFont" | "labelFont">;
 export type CalendarEvent = Omit<CalendarProps, "colorMode" | "headingFont" | "labelFont">;
 export type QRContact = Omit<QRContactCardProps, "colorMode" | "headingFont" | "labelFont">;
@@ -98,6 +100,8 @@ export interface XiaojinEditorialProps extends Record<string, unknown> {
   sections?: Section[];
   /** Count-up stat cards (contract② "[P3 NEW capability]"). Renders alongside contentBeats, not in place of it. */
   dataCards?: DataCard[];
+  /** Dramatic two-value before/after reveals (e.g. a cost/metric that jumped over time). */
+  beforeAfter?: BeforeAfter[];
   /** Semicircle risk/status gauges — Data Display Analysis "risk consequence" rows. */
   gauges?: Gauge[];
   /** Circular countdown rings — Data Display Analysis "countdown days" rows. */
@@ -170,6 +174,7 @@ export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = ({
   contentBeats,
   sections,
   dataCards,
+  beforeAfter,
   gauges,
   countdowns,
   calendarEvents,
@@ -221,6 +226,14 @@ export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = ({
           key={i}
           {...card}
           colorMode={colorMode}
+          headingFont={headingFont}
+          labelFont={labelFont}
+        />
+      ))}
+      {beforeAfter?.map((reveal, i) => (
+        <BudgetRevealSection
+          key={i}
+          {...reveal}
           headingFont={headingFont}
           labelFont={labelFont}
         />
