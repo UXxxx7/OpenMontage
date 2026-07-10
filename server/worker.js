@@ -217,7 +217,7 @@ async function finalizeCollection({ waNumber }) {
   // 判不出主视频 → 保留交互，问编号；把 assign 存起来，编号回来后复用其 labels/edit_request
   await redis.set(assignKey(waNumber), JSON.stringify(assign || {}), "EX", Number(env("WA_COLLECT_TTL", "3600")));
   await redis.set(awaitChoiceKey(waNumber), "1", "EX", Number(env("WA_COLLECT_TTL", "3600")));
-  const lines = ["没看出哪个是*主视频*（出镜/口播那条），回复编号选一个，其余作为 b-roll："];
+  const lines = ["没看出哪个是*主视频*（出镜/口播那条）。可以：回复编号选一个，或再用一句话补充说明（例如“视频1是主视频，视频2讲到 VS Code 时插入”），我据此安排；其余作为 b-roll："];
   videos.forEach((v, i) => lines.push(`${i + 1}. 视频${v.caption ? ` — ${v.caption}` : ""}`));
   await safeSendText(waNumber, lines.join("\n"));
 }
@@ -225,17 +225,52 @@ async function finalizeCollection({ waNumber }) {
 async function collectionChoice({ waNumber, choice }) {
   const items = (await redis.lrange(collectKey(waNumber), 0, -1)).map((s) => JSON.parse(s));
   const videos = items.filter((i) => i.kind === "video");
-  const n = parseInt(String(choice).replace(/[^0-9]/g, ""), 10);
-  if (!n || n < 1 || n > videos.length) {
-    await safeSendText(waNumber, `请回复 1-${videos.length} 之间的编号，选择主视频。`);
+  if (videos.length === 0) {
+    // 素材已过期/被清空 → 退出选择态，别把用户卡住
+    await redis.del(awaitChoiceKey(waNumber));
+    await redis.del(assignKey(waNumber));
+    await safeSendText(waNumber, "素材好像已经过期或清空了，请重新发送视频后再回复 *go*。");
     return;
   }
-  await redis.del(awaitChoiceKey(waNumber));
-  let assign = { main_index: n, labels: {}, edit_request: "" };
-  const raw = await redis.get(assignKey(waNumber));
-  if (raw) { try { assign = JSON.parse(raw); } catch (e) { /* 用默认 */ } }
-  await redis.del(assignKey(waNumber));
-  await startWithMain(waNumber, items, videos[n - 1], assign);
+  const text = String(choice || "").trim();
+  const isBareNumber = /^\s*\d+\s*$/.test(text);
+
+  // 情况一：只回了一个编号 → 直接选主视频（沿用之前缓存的 labels/edit_request）
+  if (isBareNumber) {
+    const n = parseInt(text, 10);
+    if (n < 1 || n > videos.length) {
+      await safeSendText(waNumber, `请回复 1-${videos.length} 之间的编号，选择主视频。`);
+      return;
+    }
+    let assign = { main_index: n, labels: {}, edit_request: "" };
+    const raw = await redis.get(assignKey(waNumber));
+    if (raw) { try { assign = JSON.parse(raw); } catch (e) { /* 用默认 */ } }
+    assign.main_index = n;  // 用户手选的编号优先于 LLM 的判断
+    await redis.del(awaitChoiceKey(waNumber));
+    await redis.del(assignKey(waNumber));
+    await startWithMain(waNumber, items, videos[n - 1], assign);
+    return;
+  }
+
+  // 情况二：发的是一段文字说明 → 存进 notes，重新用 LLM 解析角色/说明/编辑要求
+  // （修复：以前这里只认编号，用户在“问主视频”阶段发的描述会被拒绝、丢失）
+  await redis.rpush(notesKey(waNumber), text);
+  await redis.expire(notesKey(waNumber), Number(env("WA_COLLECT_TTL", "3600")));
+  const notes = await buildNotes(waNumber, items);
+  const assign = await postAssign(videos.length, notes);
+  const mainNum = Number(assign && assign.main_index);
+  if (mainNum >= 1 && mainNum <= videos.length) {
+    // 这次文字里能判出主视频 → 直接开跑
+    await redis.del(awaitChoiceKey(waNumber));
+    await redis.del(assignKey(waNumber));
+    await startWithMain(waNumber, items, videos[mainNum - 1], assign);
+    return;
+  }
+  // 仍判不出主视频 → 缓存这次解析出的 labels/edit_request，继续问编号
+  await redis.set(assignKey(waNumber), JSON.stringify(assign || {}), "EX", Number(env("WA_COLLECT_TTL", "3600")));
+  const lines = ["收到你的说明。还差一步：哪个是*主视频*（出镜/口播那条）？回一个编号即可，其余作为 b-roll："];
+  videos.forEach((v, i) => lines.push(`${i + 1}. 视频${v.caption ? ` — ${v.caption}` : ""}`));
+  await safeSendText(waNumber, lines.join("\n"));
 }
 
 // 用 assign 的 label/edit_request 组装 b-roll 列表并开跑
