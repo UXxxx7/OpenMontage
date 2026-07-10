@@ -405,6 +405,51 @@ def _enqueue_revise(job_id: str, text: str) -> None:
 # Job API (internal)
 # ---------------------------------------------------------------------------
 
+_ASSIGN_SYSTEM = (
+    "你是视频剪辑助手的意图解析器。用户按顺序上传了若干视频（编号从 1 开始），"
+    "并用一段或多段文字描述这些视频要怎么剪。请判断：\n"
+    "1. 哪个视频是“主视频”（出镜/口播、要加字幕或剪辑的主体）——返回它的编号（1 开始）；"
+    "文字里说不清就返回 null。\n"
+    "2. 其余视频是 b-roll 补充素材，为每个 b-roll 提取插入说明（label，如“讲到 VS Code 时插入”）。\n"
+    "3. 提取对主视频的编辑要求 edit_request（如“加字幕、剪掉空白和自我打断”）。\n"
+    "只输出 JSON，不要多余文字：{\"main_index\": <int|null>, "
+    "\"labels\": {\"<视频编号>\": \"<说明>\"}, \"edit_request\": \"<字符串>\"}。"
+    "labels 只含 b-roll 视频（不含主视频），键是视频编号的字符串；某段找不到说明就给空字符串。"
+)
+
+
+@app.post("/assign")
+async def assign_endpoint(video_count: int = Form(...), notes: str = Form("")):
+    """把“N 个视频（按上传顺序）+ 用户描述文字”解析成 {main_index, labels, edit_request}。
+    解析失败或说不清主视频时 main_index=null，由 Node 侧回退到“问编号”。"""
+    result = {"main_index": None, "labels": {}, "edit_request": notes or ""}
+    try:
+        from .llm_client import call_llm_chat
+        user_msg = (
+            f"视频数量：{video_count}（编号 1..{video_count}，按上传顺序）。\n"
+            f"用户描述：\n{notes.strip() or '(无)'}"
+        )
+        raw = call_llm_chat(_ASSIGN_SYSTEM, user_msg, temperature=0.0)
+        if raw:
+            import re as _re
+            m = _re.search(r"\{.*\}", raw, _re.S)
+            data = json.loads(m.group(0)) if m else {}
+            mi = data.get("main_index")
+            if isinstance(mi, bool):
+                mi = None
+            if isinstance(mi, (int, float)):
+                result["main_index"] = int(mi)
+            elif isinstance(mi, str) and mi.strip().isdigit():
+                result["main_index"] = int(mi.strip())
+            if isinstance(data.get("labels"), dict):
+                result["labels"] = {str(k): str(v) for k, v in data["labels"].items()}
+            if data.get("edit_request"):
+                result["edit_request"] = str(data["edit_request"])
+    except Exception as e:
+        logger.warning(f"/assign 解析失败，回退问编号: {e}")
+    return result
+
+
 @app.post("/jobs")
 async def create_job_endpoint(
     video: UploadFile = File(...),

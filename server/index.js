@@ -187,9 +187,10 @@ async function handleMessage(message) {
         await videoQueue.add("finalize-collection", { waNumber, msgId }, queueOptions(msgId));
         return;
       }
-      // 收集态里发了其它文字 → 提醒怎么结束
-      await videoQueue.add("collect-nudge",
-        { waNumber, msgId, count: pendingCount }, queueOptions(msgId));
+      // 收集态里发了其它文字 → 当作对素材的描述，存进 notes 缓冲（go 时交给 LLM 解析）
+      await redis.rpush(notesKey(waNumber), text);
+      await redis.expire(notesKey(waNumber), Number(env("WA_COLLECT_TTL", "3600")));
+      await videoQueue.add("collect-note", { waNumber, msgId }, queueOptions(msgId));
       return;
     }
 
@@ -267,6 +268,10 @@ function collectKey(waNumber) {
 
 function awaitChoiceKey(waNumber) {
   return `wa:user:${waNumber}:await_choice`;
+}
+
+function notesKey(waNumber) {
+  return `wa:user:${waNumber}:notes`;
 }
 
 async function withTimeout(promise, ms, fallback) {

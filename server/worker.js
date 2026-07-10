@@ -58,6 +58,7 @@ const worker = new Worker(queueName, async (job) => {
       case "collect-ack": return collectAck(job.data);
       case "collect-nudge": return collectNudge(job.data);
       case "collect-cancel": return collectCancel(job.data);
+      case "collect-note": return collectNote(job.data);
       case "finalize-collection": return finalizeCollection(job.data);
       case "collection-choice": return collectionChoice(job.data);
       default: throw new Error(`Unknown job type: ${job.name}`);
@@ -168,12 +169,17 @@ async function sendHelp(waNumber) {
 
 async function collectAck({ waNumber, count, kind, caption }) {
   const noun = kind === "image" ? "图片" : "视频";
-  const note = caption
-    ? `（说明：${caption}）`
-    : "（建议给它配一句说明，例如“讲到 VS Code 时放这段”，这样才能自动对上位置）";
+  const note = caption ? `（说明：${caption}）` : "";
   await safeSendText(waNumber,
     `已收到第 ${count} 个${noun}${note}。\n` +
-    `可以继续发主视频和 b-roll 素材；全部发完后回复 *go*（或“开始/完成”）即可开始剪辑，回复 *cancel* 取消。`);
+    `可以继续发素材，也可以直接用文字描述（例如“视频1是主视频加字幕；视频2讲到 VS Code 时插入”）。` +
+    `全部发完后回复 *go*（或“开始/完成”）即可开始，回复 *cancel* 取消。`);
+}
+
+// 收集期发来的独立文字：存进 notes 缓冲，供 go 时的 LLM 解析用
+async function collectNote({ waNumber }) {
+  await safeSendText(waNumber,
+    `已记下你的描述。可继续发素材或补充描述；发完回复 *go* 开始。`);
 }
 
 async function collectNudge({ waNumber, count }) {
@@ -182,7 +188,8 @@ async function collectNudge({ waNumber, count }) {
 }
 
 async function collectCancel({ waNumber }) {
-  await safeSendText(waNumber, "已清空本次素材。重新发送视频即可开始。");
+  await redis.del(notesKey(waNumber));
+  await safeSendText(waNumber, "已清空本次素材与描述。重新发送视频即可开始。");
 }
 
 async function finalizeCollection({ waNumber }) {
@@ -192,18 +199,26 @@ async function finalizeCollection({ waNumber }) {
     await safeSendText(waNumber, "还没有收到主视频。请先发送一段你要编辑的视频，再回复 *go*。");
     return;
   }
+  // 汇总描述：各媒体配文 + 收集期发来的独立文字；交给 Python 的 LLM 解析角色/说明/编辑要求
+  const notes = await buildNotes(waNumber, items);
+  const assign = await postAssign(videos.length, notes);
+
   if (videos.length === 1) {
-    const mainItem = videos[0];
-    const broll = items.filter((i) => i !== mainItem);
-    await runCollectionJob(waNumber, mainItem, broll);
+    // 只有一个视频，它就是主，无需询问
+    await startWithMain(waNumber, items, videos[0], assign);
     return;
   }
-  // 2+ 视频 → 保留交互，问哪个是主视频（出镜/口播那条）
+  const mainNum = Number(assign && assign.main_index);
+  if (mainNum >= 1 && mainNum <= videos.length) {
+    // LLM 从文字判断出了主视频，直接开跑
+    await startWithMain(waNumber, items, videos[mainNum - 1], assign);
+    return;
+  }
+  // 判不出主视频 → 保留交互，问编号；把 assign 存起来，编号回来后复用其 labels/edit_request
+  await redis.set(assignKey(waNumber), JSON.stringify(assign || {}), "EX", Number(env("WA_COLLECT_TTL", "3600")));
   await redis.set(awaitChoiceKey(waNumber), "1", "EX", Number(env("WA_COLLECT_TTL", "3600")));
-  const lines = ["你发了多个视频，哪一个是*主视频*（出镜/口播的那条）？回复编号即可，其余视频会作为 b-roll 叠加进去："];
-  videos.forEach((v, i) => {
-    lines.push(`${i + 1}. 视频${v.caption ? ` — ${v.caption}` : ""}`);
-  });
+  const lines = ["没看出哪个是*主视频*（出镜/口播那条），回复编号选一个，其余作为 b-roll："];
+  videos.forEach((v, i) => lines.push(`${i + 1}. 视频${v.caption ? ` — ${v.caption}` : ""}`));
   await safeSendText(waNumber, lines.join("\n"));
 }
 
@@ -216,13 +231,64 @@ async function collectionChoice({ waNumber, choice }) {
     return;
   }
   await redis.del(awaitChoiceKey(waNumber));
-  const mainItem = videos[n - 1];
-  const broll = items.filter((i) => i !== mainItem);
-  await runCollectionJob(waNumber, mainItem, broll);
+  let assign = { main_index: n, labels: {}, edit_request: "" };
+  const raw = await redis.get(assignKey(waNumber));
+  if (raw) { try { assign = JSON.parse(raw); } catch (e) { /* 用默认 */ } }
+  await redis.del(assignKey(waNumber));
+  await startWithMain(waNumber, items, videos[n - 1], assign);
+}
+
+// 用 assign 的 label/edit_request 组装 b-roll 列表并开跑
+async function startWithMain(waNumber, items, mainItem, assign) {
+  const videos = items.filter((i) => i.kind === "video");
+  const labels = (assign && assign.labels) || {};
+  const brollItems = items.filter((i) => i !== mainItem).map((i) => {
+    let label = i.caption || "";
+    if (i.kind === "video") {
+      const num = videos.indexOf(i) + 1;  // 该视频的上传编号（1 开始）
+      label = labels[String(num)] || labels[num] || i.caption || "";
+    }
+    return { ...i, label };
+  });
+  const editRequest = (assign && assign.edit_request) || mainItem.caption || "";
+  await runCollectionJob(waNumber, mainItem, brollItems, editRequest);
+}
+
+// 汇总描述文字：各媒体 caption + 收集期独立文字（notes 缓冲）
+async function buildNotes(waNumber, items) {
+  const parts = [];
+  const videos = items.filter((i) => i.kind === "video");
+  items.forEach((i) => {
+    if (i.caption) {
+      const tag = i.kind === "video" ? `视频${videos.indexOf(i) + 1}` : "图片";
+      parts.push(`[${tag} 配文] ${i.caption}`);
+    }
+  });
+  const notes = await redis.lrange(notesKey(waNumber), 0, -1);
+  notes.forEach((t) => parts.push(t));
+  return parts.join("\n");
+}
+
+// 让 Python 用 LLM 解析：{main_index(1开始|null), labels{视频号:说明}, edit_request}
+async function postAssign(videoCount, notes) {
+  const fallback = { main_index: null, labels: {}, edit_request: notes || "" };
+  try {
+    const params = new URLSearchParams();
+    params.append("video_count", String(videoCount));
+    params.append("notes", notes || "");
+    const resp = await axios.post(`${pythonApiBase}/assign`, params.toString(), {
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      timeout: Number(env("WA_PYTHON_POST_TIMEOUT_MS", "30000")),
+    });
+    return resp.data || fallback;
+  } catch (err) {
+    console.warn(`[worker] /assign failed, fallback to ask-by-number: ${err.message}`);
+    return fallback;
+  }
 }
 
 // 下载主视频 + 所有 b-roll → 一次性 POST /jobs → 设活跃任务 → 等方案 → 回方案
-async function runCollectionJob(waNumber, mainItem, brollItems) {
+async function runCollectionJob(waNumber, mainItem, brollItems, editRequest) {
   if (!hasWACredentials()) {
     await sendText(waNumber, "Service is starting up. Please try again in a moment.");
     throw new Error("WhatsApp credentials not configured");
@@ -231,6 +297,7 @@ async function runCollectionJob(waNumber, mainItem, brollItems) {
   // 其余返回 0 直接退出，避免重复建任务（对抗性审查 #4）。
   const claimed = await redis.del(collectKey(waNumber));
   if (!claimed) return;
+  await redis.del(notesKey(waNumber));  // 清描述缓冲
   const brollNote = brollItems.length ? `，并叠加 ${brollItems.length} 段 b-roll` : "";
   await sendText(waNumber, `开始处理主视频${brollNote}，正在下载素材并生成剪辑方案...`);
 
@@ -242,11 +309,11 @@ async function runCollectionJob(waNumber, mainItem, brollItems) {
     for (const b of brollItems) {
       const p = await downloadWhatsAppMedia(b.mediaId, b.kind);
       tempPaths.push(p);
-      brollPaths.push({ path: p, label: b.caption || "", kind: b.kind });
+      brollPaths.push({ path: p, label: b.label || b.caption || "", kind: b.kind });
     }
     const created = await createPythonJobMulti(
       mainPath,
-      mainItem.caption || "Remove blank parts, add subtitles, and make it flow smoothly.",
+      editRequest || mainItem.caption || "Remove blank parts, add subtitles, and make it flow smoothly.",
       brollPaths);
     const jobId = created.job_id;
     await redis.set(activeJobKey(waNumber), jobId, "EX", Number(env("WA_ACTIVE_JOB_TTL", "86400")));
@@ -446,6 +513,16 @@ function collectKey(waNumber) {
 
 function awaitChoiceKey(waNumber) {
   return `wa:user:${waNumber}:await_choice`;
+}
+
+// 收集期用户发来的独立描述文字（LIST）
+function notesKey(waNumber) {
+  return `wa:user:${waNumber}:notes`;
+}
+
+// 判不出主视频时，暂存 LLM 的 labels/edit_request，等用户回编号后复用
+function assignKey(waNumber) {
+  return `wa:user:${waNumber}:assign`;
 }
 
 function authJsonHeaders() {

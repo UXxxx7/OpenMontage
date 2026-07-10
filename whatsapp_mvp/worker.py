@@ -358,7 +358,7 @@ def _run_llm_planner(job: Any) -> None:
     from .job_manager import get_assets
     broll = [a for a in get_assets(job) if a.get("role") == "broll"]
     if broll:
-        lines = ["可用 b-roll 素材（用户上传，用 insert_broll 按需插入；asset_ref 用下面的编号）："]
+        lines = ["用户上传的 b-roll 素材（上传并附说明＝明确要求你按说明把它们插进成片，必须处理，不是可选项）。逐段 emit insert_broll，asset_ref 用下面的编号："]
         for a in broll:
             lines.append(f"[b{a.get('order')}] 类型={a.get('kind')} 说明=\"{a.get('label') or '(无说明)'}\"")
         block = "\n".join(lines)
