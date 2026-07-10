@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Optional
+import os
+from typing import List, Optional
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import PlainTextResponse, FileResponse
@@ -409,6 +410,9 @@ async def create_job_endpoint(
     video: UploadFile = File(...),
     edit_request: str = Form(""),
     pipeline: str = Form("talking-head"),
+    broll: List[UploadFile] = File(default=[]),
+    broll_labels: List[str] = Form(default=[]),
+    broll_kinds: List[str] = Form(default=[]),
 ):
     config = get_config()
     user = get_or_create_user("api_user")
@@ -421,6 +425,30 @@ async def create_job_endpoint(
     (job_dir / "input.mp4").write_bytes(video_data)
 
     update_job_fields(job.id, edit_request=edit_request, input_video_path=str(job_dir / "input.mp4"))
+
+    # b-roll 素材：Node 网关已从 WhatsApp 下载并随表单上传。这里落盘到
+    # assets/broll_<i>.<ext> 并登记进 job.assets（role=broll, order=i, label）。
+    # 同时写入 local_path —— worker._download_broll_assets 见到 local_path 即跳过，
+    # 不会重复去 WhatsApp 拉取；pipeline_runner.insert_broll 直接按 broll_<order>.* 取用。
+    _IMAGE_EXTS = ("jpg", "jpeg", "png", "webp", "gif", "bmp")
+    if broll:
+        from .job_manager import append_asset, set_asset_local_path
+        assets_dir = job_dir / "assets"
+        assets_dir.mkdir(parents=True, exist_ok=True)
+        for i, up in enumerate(broll):
+            data = await up.read()
+            ext = (os.path.splitext(up.filename or "")[1].lstrip(".") or "mp4").lower()
+            dest = assets_dir / f"broll_{i}.{ext}"
+            dest.write_bytes(data)
+            if i < len(broll_kinds) and broll_kinds[i]:
+                kind = broll_kinds[i]
+            else:
+                kind = "image" if ext in _IMAGE_EXTS else "video"
+            label = broll_labels[i] if i < len(broll_labels) else ""
+            media_id = f"local_{i}"
+            append_asset(job.id, media_id, kind, label)          # role=broll, order=i
+            set_asset_local_path(job.id, media_id, str(dest))    # 标记已下载
+
     update_job_status(job.id, JobStatus.RECEIVED)
 
     # 后台跑（下载 + L2 规划耗时可达 1~2 分钟），立即返回；否则会阻塞

@@ -55,6 +55,11 @@ const worker = new Worker(queueName, async (job) => {
       case "cancel-job": return cancelJob(job.data);
       case "revise-job": return reviseJob(job.data);
       case "send-help": return sendHelp(job.data.waNumber);
+      case "collect-ack": return collectAck(job.data);
+      case "collect-nudge": return collectNudge(job.data);
+      case "collect-cancel": return collectCancel(job.data);
+      case "finalize-collection": return finalizeCollection(job.data);
+      case "collection-choice": return collectionChoice(job.data);
       default: throw new Error(`Unknown job type: ${job.name}`);
     }
   } catch (err) {
@@ -153,7 +158,141 @@ async function cancelJob({ waNumber, jobId }) {
 
 async function sendHelp(waNumber) {
   await sendText(waNumber,
-    "Send a video with a caption like: Remove blank parts, add Chinese subtitles.\nThen reply confirm, export, or cancel when prompted.");
+    "发一段视频并配上说明（例如：去掉空白、加中文字幕）。\n" +
+    "想加 b-roll？先发主视频、再发每段补充画面（各自配一句“讲到X时放这段”），" +
+    "全部发完回复 *go* 开始。");
+}
+
+// ── b-roll 收集态 ──────────────────────────────────────────────
+// 每收到一条素材回一句引导；用户回 'go' 收尾。2+ 视频时问哪个是主视频。
+
+async function collectAck({ waNumber, count, kind, caption }) {
+  const noun = kind === "image" ? "图片" : "视频";
+  const note = caption
+    ? `（说明：${caption}）`
+    : "（建议给它配一句说明，例如“讲到 VS Code 时放这段”，这样才能自动对上位置）";
+  await safeSendText(waNumber,
+    `已收到第 ${count} 个${noun}${note}。\n` +
+    `可以继续发主视频和 b-roll 素材；全部发完后回复 *go*（或“开始/完成”）即可开始剪辑，回复 *cancel* 取消。`);
+}
+
+async function collectNudge({ waNumber, count }) {
+  await safeSendText(waNumber,
+    `已收到 ${count} 个素材。发完后回复 *go* 开始剪辑，回复 *cancel* 清空重来。`);
+}
+
+async function collectCancel({ waNumber }) {
+  await safeSendText(waNumber, "已清空本次素材。重新发送视频即可开始。");
+}
+
+async function finalizeCollection({ waNumber }) {
+  const items = (await redis.lrange(collectKey(waNumber), 0, -1)).map((s) => JSON.parse(s));
+  const videos = items.filter((i) => i.kind === "video");
+  if (videos.length === 0) {
+    await safeSendText(waNumber, "还没有收到主视频。请先发送一段你要编辑的视频，再回复 *go*。");
+    return;
+  }
+  if (videos.length === 1) {
+    const mainItem = videos[0];
+    const broll = items.filter((i) => i !== mainItem);
+    await runCollectionJob(waNumber, mainItem, broll);
+    return;
+  }
+  // 2+ 视频 → 保留交互，问哪个是主视频（出镜/口播那条）
+  await redis.set(awaitChoiceKey(waNumber), "1", "EX", Number(env("WA_COLLECT_TTL", "3600")));
+  const lines = ["你发了多个视频，哪一个是*主视频*（出镜/口播的那条）？回复编号即可，其余视频会作为 b-roll 叠加进去："];
+  videos.forEach((v, i) => {
+    lines.push(`${i + 1}. 视频${v.caption ? ` — ${v.caption}` : ""}`);
+  });
+  await safeSendText(waNumber, lines.join("\n"));
+}
+
+async function collectionChoice({ waNumber, choice }) {
+  const items = (await redis.lrange(collectKey(waNumber), 0, -1)).map((s) => JSON.parse(s));
+  const videos = items.filter((i) => i.kind === "video");
+  const n = parseInt(String(choice).replace(/[^0-9]/g, ""), 10);
+  if (!n || n < 1 || n > videos.length) {
+    await safeSendText(waNumber, `请回复 1-${videos.length} 之间的编号，选择主视频。`);
+    return;
+  }
+  await redis.del(awaitChoiceKey(waNumber));
+  const mainItem = videos[n - 1];
+  const broll = items.filter((i) => i !== mainItem);
+  await runCollectionJob(waNumber, mainItem, broll);
+}
+
+// 下载主视频 + 所有 b-roll → 一次性 POST /jobs → 设活跃任务 → 等方案 → 回方案
+async function runCollectionJob(waNumber, mainItem, brollItems) {
+  if (!hasWACredentials()) {
+    await sendText(waNumber, "Service is starting up. Please try again in a moment.");
+    throw new Error("WhatsApp credentials not configured");
+  }
+  // 原子认领：DEL 返回被删键数。两条 'go'/两次编号并发时只有一个删到（返回 1），
+  // 其余返回 0 直接退出，避免重复建任务（对抗性审查 #4）。
+  const claimed = await redis.del(collectKey(waNumber));
+  if (!claimed) return;
+  const brollNote = brollItems.length ? `，并叠加 ${brollItems.length} 段 b-roll` : "";
+  await sendText(waNumber, `开始处理主视频${brollNote}，正在下载素材并生成剪辑方案...`);
+
+  const tempPaths = [];
+  try {
+    const mainPath = await downloadWhatsAppMedia(mainItem.mediaId, "video");
+    tempPaths.push(mainPath);
+    const brollPaths = [];
+    for (const b of brollItems) {
+      const p = await downloadWhatsAppMedia(b.mediaId, b.kind);
+      tempPaths.push(p);
+      brollPaths.push({ path: p, label: b.caption || "", kind: b.kind });
+    }
+    const created = await createPythonJobMulti(
+      mainPath,
+      mainItem.caption || "Remove blank parts, add subtitles, and make it flow smoothly.",
+      brollPaths);
+    const jobId = created.job_id;
+    await redis.set(activeJobKey(waNumber), jobId, "EX", Number(env("WA_ACTIVE_JOB_TTL", "86400")));
+
+    const status = await waitForStatus(jobId,
+      ["WAITING_CONFIRMATION", "NEEDS_CLARIFICATION", "PREVIEW_READY", "ERROR"],
+      Number(env("WA_PLAN_TIMEOUT_MS", "180000")));
+
+    if (status.status === "ERROR") {
+      throw new Error(status.error_message || "Python planning failed");
+    }
+    if (status.status === "NEEDS_CLARIFICATION") {
+      const q = status.planned_edit?.clarification_question || "我需要更多信息才能编辑这段视频。";
+      await sendText(waNumber, `${q}\n\n请补充细节后重新发送素材。`);
+      return;
+    }
+    if (status.status === "PREVIEW_READY") {
+      await sendText(waNumber, `Preview ready: ${fileUrl(jobId, "preview.mp4")}\nReply export to generate final video.`);
+      return;
+    }
+    await sendText(waNumber, formatPlanMessage(status));
+  } finally {
+    for (const p of tempPaths) await fs.promises.rm(p, { force: true });
+  }
+}
+
+async function createPythonJobMulti(videoPath, editRequest, brollPaths) {
+  const form = new FormData();
+  form.append("video", fs.createReadStream(videoPath),
+    { filename: "input.mp4", contentType: "video/mp4" });
+  form.append("edit_request", editRequest);
+  form.append("pipeline", "talking-head");
+  brollPaths.forEach((b, i) => {
+    const ext = path.extname(b.path) || (b.kind === "image" ? ".jpg" : ".mp4");
+    const ctype = b.kind === "image" ? "image/jpeg" : "video/mp4";
+    form.append("broll", fs.createReadStream(b.path),
+      { filename: `broll_${i}${ext}`, contentType: ctype });
+    form.append("broll_labels", b.label || "");
+    form.append("broll_kinds", b.kind || "video");
+  });
+  const resp = await axios.post(`${pythonApiBase}/jobs`, form, {
+    headers: form.getHeaders(),
+    maxBodyLength: Infinity, maxContentLength: Infinity,
+    timeout: Number(env("WA_PYTHON_CREATE_TIMEOUT_MS", "180000")),
+  });
+  return resp.data;
 }
 
 async function createPythonJob(videoPath, editRequest) {
@@ -222,7 +361,7 @@ async function waitForStatus(jobId, wanted, timeoutMs) {
   throw new Error(`Timed out waiting for ${jobId}`);
 }
 
-async function downloadWhatsAppMedia(mediaId) {
+async function downloadWhatsAppMedia(mediaId, kind = "video") {
   const token = whatsappToken();
   const info = await axios.get(`${graphBase}/${mediaId}`, {
     headers: { Authorization: `Bearer ${token}` },
@@ -230,7 +369,11 @@ async function downloadWhatsAppMedia(mediaId) {
   });
   const mediaUrl = info.data.url;
   if (!mediaUrl) throw new Error(`WhatsApp media ${mediaId} no download URL`);
-  const outPath = path.join(os.tmpdir(), `openmontage-wa-${mediaId}.mp4`);
+  const mime = info.data.mime_type || "";
+  const ext = kind === "image"
+    ? (mime.includes("png") ? "png" : mime.includes("webp") ? "webp" : "jpg")
+    : "mp4";
+  const outPath = path.join(os.tmpdir(), `openmontage-wa-${mediaId}.${ext}`);
   const resp = await axios.get(mediaUrl, {
     headers: { Authorization: `Bearer ${token}` },
     responseType: "stream",
@@ -295,6 +438,14 @@ function fileUrl(jobId, filename) {
 
 function activeJobKey(waNumber) {
   return `wa:user:${waNumber}:active_job`;
+}
+
+function collectKey(waNumber) {
+  return `wa:user:${waNumber}:collect`;
+}
+
+function awaitChoiceKey(waNumber) {
+  return `wa:user:${waNumber}:await_choice`;
 }
 
 function authJsonHeaders() {
