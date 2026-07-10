@@ -540,12 +540,21 @@ def _op_color_grade(src: str, op: dict, workdir: Path) -> Optional[str]:
     return r.data.get("output") or (r.artifacts[0] if r.artifacts else None)
 
 
+_BROLL_IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")
+
+
 def _op_insert_broll(src: str, op: dict, workdir: Path) -> Optional[str]:
-    """把用户上传的 b-roll 叠进成片（video_compose overlay，保留说话人原声，薄封装）。
+    """把用户上传的 b-roll 叠进成片（单次 ffmpeg 多层合成，保留说话人原声）。
     资产文件在 workdir/assets/broll_<asset_ref>.*（Phase 1 已下载）。
-    默认 PiP 右下角小窗；mode=cutaway 时全屏。整片收尾类，排在剪辑之后。
-    offset_seconds=start 让素材从插入点开始播；图片 loop 填满窗口。"""
-    from tools.video.video_compose import VideoCompose
+
+    输出方向自动跟随素材：主视频或任一 b-roll 为横屏 → 横屏画布，否则跟随主视频；
+    op.orientation ∈ {portrait,landscape} 可强制覆盖（用户说“横屏/竖屏”时规划器给）。
+    每段 mode：
+      - broll_main（默认）：b-roll 铺满画布，人物缩成右下小窗。
+      - cutaway：b-roll 铺满画布，不叠人物。
+      - pip：人物打底铺满，b-roll 缩成右下小窗（旧版式）。
+    讲话（无 b-roll）的时段：人物按画布方向居中，方向不符则两边/上下留黑。
+    整片收尾类，排在剪辑之后。"""
     items = op.get("items") or []
     if not items:
         return None
@@ -553,7 +562,9 @@ def _op_insert_broll(src: str, op: dict, workdir: Path) -> Optional[str]:
     base_w, base_h = _probe_dimensions(Path(src))
     if not base_w or not base_h:
         raise RuntimeError("insert_broll: 无法读取主视频画幅")
-    overlays: list[dict] = []
+
+    resolved: list[dict] = []
+    any_landscape = base_w > base_h
     for it in items:
         ref = it.get("asset_ref")
         start = _num(it.get("start_seconds"))
@@ -565,36 +576,92 @@ def _op_insert_broll(src: str, op: dict, workdir: Path) -> Optional[str]:
             logger.warning(f"  insert_broll: 找不到资产 broll_{ref}.*，跳过")
             continue
         asset = matches[0]
-        is_image = asset.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")
-        # 视频素材：窗口收到不超过素材本身时长，避免叠加末尾冻帧
+        is_image = asset.suffix.lower() in _BROLL_IMG_EXTS
         if not is_image:
+            # 视频素材：窗口收到不超过素材本身时长，避免叠加末尾冻帧
             clip_dur = _probe_duration(asset)
             if clip_dur and (end - start) > clip_dur:
                 end = start + clip_dur
-        mode = str(it.get("mode") or "pip").lower()
-        if mode == "cutaway":
-            w, h, x, y = base_w, base_h, 0, 0
-        else:  # 默认 PiP：右下角小窗，留脸
-            w = int(base_w * 0.38)
-            h = int(w * 9 / 16)
-            x = base_w - w - 40
-            y = base_h - h - 40
-        overlays.append({
-            "asset_path": str(asset), "x": x, "y": y, "width": w, "height": h,
-            "start_seconds": start, "end_seconds": end,
-            "offset_seconds": start,        # 从插入点开始播（配合 video_compose 新参数）
-            "loop": bool(is_image),         # 图片循环填满窗口
-        })
-    if not overlays:
+        bw, bh = _probe_dimensions(asset)
+        if bw and bh and bw > bh:
+            any_landscape = True
+        mode = str(it.get("mode") or "broll_main").lower()
+        if mode not in ("broll_main", "cutaway", "pip"):
+            mode = "broll_main"
+        resolved.append({"path": str(asset), "start": start, "end": end,
+                         "is_img": is_image, "mode": mode})
+    if not resolved:
         return None
+
+    orientation = str(op.get("orientation") or "auto").lower()
+    if orientation not in ("portrait", "landscape"):
+        orientation = "landscape" if any_landscape else "portrait"
+    out_w, out_h = (1920, 1080) if orientation == "landscape" else (1080, 1920)
+
     out = workdir / "_op_insert_broll.mp4"
-    r = VideoCompose().execute({
-        "operation": "overlay", "input_path": src,
-        "overlays": overlays, "output_path": str(out),
-    })
-    if not r.success:
-        raise RuntimeError(f"insert_broll 失败: {r.error}")
-    return r.data.get("output") or (r.artifacts[0] if r.artifacts else None)
+    _composite_broll(src, resolved, out, out_w, out_h,
+                     ins_h=round(out_h * 0.28), margin=round(out_w * 0.03))
+    return str(out)
+
+
+def _composite_broll(src: str, resolved: list, out: Path,
+                     out_w: int, out_h: int, ins_h: int, margin: int) -> None:
+    """单次 ffmpeg filter_complex：人物 pillarbox 打底 + 每段 b-roll 按 mode 叠加。
+    输入 0=人物（含原声/已烧字幕）；1..N=各 b-roll（图片用 -loop 输入）。"""
+    inputs: list[str] = ["-i", str(src)]
+    for r in resolved:
+        if r["is_img"]:
+            inputs += ["-loop", "1", "-t", f'{max(0.1, r["end"] - r["start"]):.3f}', "-i", r["path"]]
+        else:
+            inputs += ["-i", r["path"]]
+
+    main_idx = [i for i, r in enumerate(resolved) if r["mode"] == "broll_main"]
+    ins_map = {idx: k for k, idx in enumerate(main_idx)}
+    # 归一化：把每一路都统一成 yuv420p / SAR=1 / 30fps。真实手机/录屏素材的像素格式、
+    # 采样宽高比、帧率各不相同，overlay 混合异质流会在部分 ffmpeg 上报 "-22 Invalid
+    # argument / no packets"。统一后即可稳定合成。
+    _norm = ",format=yuv420p,setsar=1,fps=30"
+    fc: list[str] = []
+    # 人物拆流：1 路打底 + 每个 broll_main 一路小窗（未用的 split 输出会导致 ffmpeg 报错，故精确计数）
+    split_outs = "[spk_base]" + "".join(f"[ins{k}]" for k in range(len(main_idx)))
+    fc.append(f"[0:v]split={1 + len(main_idx)}{split_outs}")
+    fc.append(f"[spk_base]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease,"
+              f"pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:black{_norm}[base]")
+    for i, r in enumerate(resolved):
+        vin = f"{i + 1}:v"
+        offset = "" if r["is_img"] else f",setpts=PTS-STARTPTS+{r['start']}/TB"
+        if r["mode"] == "pip":
+            boxw = int(out_w * 0.38)
+            fc.append(f"[{vin}]scale={boxw}:-2{offset}{_norm}[bro{i}]")
+        else:  # broll_main / cutaway：铺满画布（等比放大后居中裁切）
+            fc.append(f"[{vin}]scale={out_w}:{out_h}:force_original_aspect_ratio=increase,"
+                      f"crop={out_w}:{out_h}{offset}{_norm}[bro{i}]")
+        if r["mode"] == "broll_main":
+            fc.append(f"[ins{ins_map[i]}]scale=-2:{ins_h}{_norm}[insv{i}]")
+    cur = "base"
+    for i, r in enumerate(resolved):
+        s, e = r["start"], r["end"]
+        if r["mode"] == "pip":
+            fc.append(f"[{cur}][bro{i}]overlay=W-w-{margin}:H-h-{margin}:enable='between(t,{s},{e})'[c{i}]")
+        elif r["mode"] == "cutaway":
+            fc.append(f"[{cur}][bro{i}]overlay=0:0:enable='between(t,{s},{e})'[c{i}]")
+        else:  # broll_main：先铺满，再叠人物小窗
+            fc.append(f"[{cur}][bro{i}]overlay=0:0:enable='between(t,{s},{e})'[m{i}]")
+            fc.append(f"[m{i}][insv{i}]overlay=W-w-{margin}:H-h-{margin}:enable='between(t,{s},{e})'[c{i}]")
+        cur = f"c{i}"
+    fc.append(f"[{cur}]null[outv]")
+    # 输出时长钉在主视频长度：b-roll 用 setpts 偏移后其流可能比主视频长（overlay 默认跟
+    # 最长流），不钉住会把成片拉长、末尾是无人物的残留 b-roll。
+    base_dur = _probe_duration(Path(src))
+    cmd = ["ffmpeg", "-y"] + inputs + ["-filter_complex", ";".join(fc),
+           "-map", "[outv]", "-map", "0:a?",
+           "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac"]
+    if base_dur and base_dur > 0:
+        cmd += ["-t", f"{base_dur:.3f}"]
+    cmd += [str(out), "-loglevel", "error"]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0 or not out.exists():
+        raise RuntimeError(f"insert_broll 合成失败: {proc.stderr[-500:]}")
 
 
 def _op_add_subtitles(src: str, op: dict, workdir: Path) -> Optional[str]:

@@ -77,14 +77,15 @@
                   "asset_ref": { "type": "integer", "description": "The broll asset's order index in job.assets (file is assets/broll_<asset_ref>.*)" },
                   "start_seconds": { "type": "number", "minimum": 0 },
                   "end_seconds": { "type": "number", "minimum": 0 },
-                  "mode": { "type": "string", "enum": ["pip", "cutaway"], "default": "pip" }
+                  "mode": { "type": "string", "enum": ["broll_main", "cutaway", "pip"], "default": "broll_main", "description": "broll_main: b-roll fills the frame, speaker shrinks to a bottom-right inset (default). cutaway: b-roll full-frame, no speaker. pip: speaker stays full, b-roll is the small inset." }
                 }
               }
-            }
+            },
+            "orientation": { "type": "string", "enum": ["auto", "portrait", "landscape"], "default": "auto", "description": "Output canvas. auto: landscape if the main video or any b-roll is landscape, else portrait. Set portrait/landscape only when the user explicitly asks for 竖屏/横屏." }
           },
           "required": ["type", "items"],
           "additionalProperties": false,
-          "$comment": "Overlay user-uploaded b-roll onto the video while the speaker's audio continues (video_compose overlay, offset+loop). Default PiP (keep the face); cutaway = full-frame. Finishing pass -- runs last so timing rides the transcript timeline (see design: timeline drift when combined with heavy cuts)."
+          "$comment": "Overlay user-uploaded b-roll while the speaker's audio continues (single ffmpeg composite). Default mode broll_main: b-roll fills the frame, speaker becomes a bottom-right inset; talking segments show the speaker centered with pillarbox/letterbox bars. Output orientation follows the sources (auto) unless forced. Finishing pass -- runs last so timing rides the transcript timeline."
         }
       ]
     }
