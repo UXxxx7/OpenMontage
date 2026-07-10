@@ -106,12 +106,18 @@ def render_still(remotion_dir: Path, props_path: Path, frame: int, out_png: Path
     # disabling QA stills AND the vision-review step that depends on them
     # on any Windows deployment).
     npx_bin = shutil.which("npx") or "npx"
-    cmd = [
-        npx_bin, "remotion", "still", "XiaojinEditorial", str(out_png),
+    from .remotion_bundle import ensure_remotion_bundle
+    bundle = ensure_remotion_bundle(Path(remotion_dir))
+    cmd = [npx_bin, "remotion", "still"] + ([bundle] if bundle else []) + [
+        "XiaojinEditorial", str(out_png),
         f"--frame={frame}", f"--props={props_path}", f"--scale={_SCALE}",
     ]
     try:
-        r = subprocess.run(cmd, cwd=remotion_dir, capture_output=True, text=True, timeout=_STILL_TIMEOUT_S)
+        # 每张 still 都是一次 headless Chrome 渲染——必须和整片渲染共用同一个
+        # 闸门，否则两个任务的 QA（视觉重试后各 8-12 张）并跑照样互踩。
+        from .concurrency import RENDER_SLOTS
+        with RENDER_SLOTS:
+            r = subprocess.run(cmd, cwd=remotion_dir, capture_output=True, text=True, timeout=_STILL_TIMEOUT_S)
     except Exception as e:
         logger.warning(f"  qa_stills: still f{frame} 渲染异常: {e}")
         return False

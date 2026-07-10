@@ -23,15 +23,12 @@ logger = logging.getLogger(__name__)
 # 画质增强是 CPU/内存大户——单机上两个同时跑会互相拖慢到集体超时（实测事故，
 # 2026-07-08）。给每类重活一个信号量各自排队：多用户的感受是"并行推进"，
 # 机器的现实是"重活永远只有 N 个在跑"。槽位数可用环境变量按机器调。
-import os as _os_mod
-import threading as _threading
-
-_TRANSCRIBE_SLOTS = _threading.Semaphore(int(_os_mod.getenv("OM_TRANSCRIBE_SLOTS", "1")))
-_RENDER_SLOTS = _threading.Semaphore(int(_os_mod.getenv("OM_RENDER_SLOTS", "1")))
-_ENHANCE_SLOTS = _threading.Semaphore(int(_os_mod.getenv("OM_ENHANCE_SLOTS", "1")))
-# 渲染子进程硬超时：卡死的渲染不许永久占坑（2026-07-09 实测：一个挂起任务
-# 瘫痪整条队列）。30 分钟对 60s 视频富余 4-5 倍。
-_RENDER_TIMEOUT_S = int(_os_mod.getenv("OM_RENDER_TIMEOUT_S", "1800"))
+from .concurrency import (
+    ENHANCE_SLOTS as _ENHANCE_SLOTS,
+    RENDER_SLOTS as _RENDER_SLOTS,
+    RENDER_TIMEOUT_S as _RENDER_TIMEOUT_S,
+    TRANSCRIBE_SLOTS as _TRANSCRIBE_SLOTS,
+)
 
 
 # ============================================================================
@@ -328,9 +325,10 @@ def calibrate_speaker_object_position(src: str, workdir: Path) -> str:
         from tools.analysis.face_tracker import FaceTracker
 
         out_json = workdir / "_op_apply_style_faces.json"
-        r = FaceTracker().execute({
-            "input_path": src, "output_path": str(out_json), "sample_fps": 3,
-        })
+        with _ENHANCE_SLOTS:  # opencv 人脸检测也是 CPU 大户，跨任务串行
+            r = FaceTracker().execute({
+                "input_path": src, "output_path": str(out_json), "sample_fps": 3,
+            })
         if not r.success:
             logger.warning(f"  apply_style: face_tracker 失败，用默认取景: {r.error}")
             return _DEFAULT_SPEAKER_OBJECT_POSITION
@@ -998,8 +996,10 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
 
     out = workdir / "_op_styled.mp4"
     npx_bin = shutil.which("npx") or "npx"  # Windows: subprocess needs the resolved npx.cmd, plain "npx" raises WinError 2
-    cmd = [
-        npx_bin, "remotion", "render", "XiaojinEditorial", str(out),
+    from .remotion_bundle import ensure_remotion_bundle
+    bundle = ensure_remotion_bundle(remotion_dir)
+    cmd = [npx_bin, "remotion", "render"] + ([bundle] if bundle else []) + [
+        "XiaojinEditorial", str(out),
         f"--props={props_path}",
         "--crf=18",
     ]
@@ -1097,10 +1097,13 @@ def transcribe_segments(src: str, workdir: Path) -> list[dict]:
     # 临时移除可能含非 ASCII 的 HF_TOKEN，避免 httpx header 编码错误
     _hf = _os.environ.pop("HF_TOKEN", None)
     try:
-        t = Transcriber().execute({
-            "input_path": src, "output_dir": str(workdir),
-            "model_size": config.faster_whisper_model,
-        })
+        # 规划路径的转写同样必须过闸——这是"两人同发卡 20 分钟"事故的元凶：
+        # 此处曾是裸调用，两个 Whisper 并跑互踩 CPU，规划双双拖过超时再重试。
+        with _TRANSCRIBE_SLOTS:
+            t = Transcriber().execute({
+                "input_path": src, "output_dir": str(workdir),
+                "model_size": config.faster_whisper_model,
+            })
     finally:
         if _hf is not None:
             _os.environ["HF_TOKEN"] = _hf
