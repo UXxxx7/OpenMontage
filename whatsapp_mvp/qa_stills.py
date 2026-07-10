@@ -31,11 +31,14 @@ _SCALE = 0.5
 _STILL_TIMEOUT_S = 120
 
 # Must match pipeline_runner's geometry (single source of truth would be a
-# circular import; these mirror _DOMINANT_BOX/_WORKFLOW_BOX, change together).
-# Workflow mode: card docks small at top-right (740,104 300x900); the
-# graphics (dataCards/gauges/countdowns/calendars/beforeAfter, default y=900,
-# and section takeovers spanning most of the canvas) occupy the freed canvas
-# — the fill check samples that region.
+# circular import; this mirrors _DOMINANT_BOX/_workflow_box, change together).
+# Workflow mode: card docks small at top-right, height fixed at 900 (P3:
+# width now varies 340-300px with how much on-screen content needs, see
+# pipeline_runner._workflow_box — height is what is_docked() below checks,
+# and it doesn't change across content widths). The graphics (dataCards/
+# gauges/countdowns/calendars/beforeAfter, default y=900, and section
+# takeovers spanning most of the canvas) occupy the freed canvas — the fill
+# check samples that region.
 _WORKFLOW_BOX_H = 900
 # Previously only a 330px/17%-of-frame-height band (y=860-1190) — a frame
 # could be entirely empty everywhere else in the canvas and still pass.

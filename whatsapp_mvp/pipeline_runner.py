@@ -694,32 +694,56 @@ def _op_add_subtitles(src: str, op: dict, workdir: Path) -> Optional[str]:
 # Dominant/Workflow floating-card geometry — matches the numbers already used
 # across video-studio's own compose-director.md-driven builds and
 # XiaojinEditorial's own demo defaultProps (Root.tsx). content_planner only
-# reasons about WHEN to be in which mode (dominant vs workflow); the actual
-# pixel box a mode maps to is a rendering-layer concern, not a planning one.
+# reasons about WHEN to be in which mode (dominant vs workflow), and (P3) how
+# WIDE the on-screen content is at that moment; the actual pixel box a mode
+# maps to is a rendering-layer concern, not a planning one.
 _DOMINANT_BOX = {"x": 60, "y": 104, "w": 960, "h": 1100}
-# h was previously 531 -- below video-studio's documented floor of >=900px
-# for a Workflow-mode card (CLAUDE-v2.md §6a: a shorter card reveals only a
-# thin horizontal slice of the source video via objectFit:"cover", cropping
-# to head-only instead of showing chest/shoulders). Kept narrow (w=300, same
-# as before) rather than scaled up proportionally: a box narrower than the
-# source's own aspect ratio is HEIGHT-driven under objectFit:"cover" (crops
-# left/right, not top/bottom), which guarantees the full vertical extent of
-# the speaker is visible regardless of the exact source aspect ratio.
-# Top-anchored at the same y as _DOMINANT_BOX (104, not bottom-anchored at
-# 1200 like before) so the card's top edge stays fixed across the
-# Dominant<->Workflow transition, and so its bottom (1004) stays clear of
-# where content-zone graphics conventionally start (y=900 default) instead
-# of overlapping them for ~600px like the old bottom-anchored box did.
-_WORKFLOW_BOX = {"x": 740, "y": 104, "w": 300, "h": 900}
+# h floor of 900 -- below video-studio's documented floor of >=900px for a
+# Workflow-mode card (CLAUDE-v2.md §6a: a shorter card reveals only a thin
+# horizontal slice of the source video via objectFit:"cover", cropping to
+# head-only instead of showing chest/shoulders). y stays top-anchored at the
+# same 104 as _DOMINANT_BOX so the card's top edge is fixed across the
+# Dominant<->Workflow transition. Width is now content-aware (P3, see
+# _workflow_box below) instead of a single fixed 300 -- HEIGHT-driven under
+# objectFit:"cover" regardless of the exact width chosen, so the full
+# vertical extent of the speaker stays visible either way.
+_WORKFLOW_Y = 104
+_WORKFLOW_H = 900
+_WORKFLOW_RIGHT_MARGIN = 40  # right edge of the box, matching the old fixed box's x=740+w=300=1040
+_WORKFLOW_CONTENT_GAP = 60  # clearance kept between the widest active content and the docked card
+_WORKFLOW_MIN_X = 560  # never let the card get narrower-cut than this even for the narrowest content
+_WORKFLOW_MAX_X = 740  # old fixed box's x -- also the ceiling once content needs the full content-zone width
+# Caller-supplied contentWidth of 920+ (full InfoCard/before_after/section
+# width) reproduces the exact pre-P3 box (x=740, w=300) -- used as the
+# default when a mode_schedule entry omits contentWidth (e.g. a hand-authored
+# op["mode_schedule"] override), so anything not opting into the new field
+# keeps today's already-verified geometry unchanged.
+_WORKFLOW_DEFAULT_CONTENT_WIDTH = 920
+_CONTENT_ZONE_X = 80  # matches content_planner's dataCards/beforeAfter default x
+
+
+def _workflow_box(content_width: int) -> dict:
+    """内容宽度(P3 content_planner 算出的 contentWidth) -> SpeakerCard Workflow
+    模式的具体像素框。窄内容（仪表盘/倒计时/日历/少行数的 InfoCard）不需要把
+    卡片挤到跟满宽内容一样窄——SpeakerCard 右边界固定，左边界随内容实际占用
+    宽度浮动；content_width>=600 时收敛到 P2 验证过的 (x=740, w=300) 不变。
+    """
+    right_edge = _CONTENT_ZONE_X + content_width
+    x = min(_WORKFLOW_MAX_X, max(_WORKFLOW_MIN_X, right_edge + _WORKFLOW_CONTENT_GAP))
+    w = 1080 - _WORKFLOW_RIGHT_MARGIN - x
+    return {"x": x, "y": _WORKFLOW_Y, "w": w, "h": _WORKFLOW_H}
 
 
 def _mode_schedule_to_scenes(mode_schedule: list[dict]) -> list[dict]:
     """content_planner 的 dominant/workflow 模式时间表 -> contract② 的 scenes（具体像素坐标）。"""
-    box_by_mode = {"dominant": _DOMINANT_BOX, "workflow": _WORKFLOW_BOX}
-    return [
-        {"frame": entry["frame"], **box_by_mode.get(entry.get("mode"), _DOMINANT_BOX)}
-        for entry in mode_schedule
-    ]
+    scenes = []
+    for entry in mode_schedule:
+        if entry.get("mode") == "workflow":
+            box = _workflow_box(entry.get("contentWidth", _WORKFLOW_DEFAULT_CONTENT_WIDTH))
+        else:
+            box = _DOMINANT_BOX
+        scenes.append({"frame": entry["frame"], **box})
+    return scenes
 
 
 def _run_enhancement_chain(src: str, workdir: Path) -> str:

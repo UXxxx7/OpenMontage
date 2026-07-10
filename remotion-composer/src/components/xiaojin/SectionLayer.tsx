@@ -9,7 +9,11 @@
  *
  * JSON-driven equivalent: each `Section` describes one takeover span.
  * Layout constants mirror the reference exactly (header at y=360,
- * icon at y=500, terracotta eyebrow letterSpacing 7 / big 800-weight title).
+ * terracotta eyebrow letterSpacing 7 / big 800-weight title). Below the
+ * header, a takeover either shows TimelineSection (when `timeline` is set)
+ * or a body-fill zone (icon + soft accent backdrop, scaled/positioned to
+ * occupy the same y=520-1500 band TimelineSection uses) — P3: a plain
+ * title+small-icon takeover used to leave most of the canvas empty below y~760.
  *
  * Layering contract: render this BEFORE ContentZone/graphics/SpeakerCard —
  * background first, data graphics and the card sit on top (reference's
@@ -132,12 +136,6 @@ export const SectionLayer: React.FC<{
               </div>
             )}
 
-            {Icon ? (
-              <div style={{ position: "absolute", left: 0, top: 500, width: "100%", display: "flex", justifyContent: "center" }}>
-                <Icon localFrame={local} color={accent} />
-              </div>
-            ) : null}
-
             {s.timeline && mode === "dark" ? (
               <TimelineSectionGraphic
                 heading={s.timeline.heading}
@@ -147,7 +145,38 @@ export const SectionLayer: React.FC<{
                 headingFont={headingFont}
                 labelFont={labelFont}
               />
-            ) : null}
+            ) : (
+              /* P3: a takeover with no `timeline` (the common case — most
+                 chapters don't have a matched multi-stage process) used to
+                 paint only the header (~y=360-490) and a small ~230px icon
+                 at y=500, leaving ~1000px of the 1920px canvas (everything
+                 below the icon down to the BrandBar at y=1824) empty. This
+                 body-fill zone spans the same y=520-1500 band
+                 TimelineSection's own track uses (already vetted to clear
+                 the caption band, see that file's TRACK_BOTTOM comment) so
+                 a plain takeover reads as intentionally full rather than a
+                 title floating over empty canvas, regardless of whether an
+                 icon was picked for this chapter. */
+              <div
+                style={{
+                  position: "absolute", left: 0, top: 520, width: "100%", height: 980,
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                }}
+              >
+                <div
+                  style={{
+                    position: "absolute", width: 640, height: 640, borderRadius: "50%",
+                    background: `radial-gradient(circle, ${accent}26 0%, ${accent}00 72%)`,
+                    transform: `scale(${0.9 + 0.1 * enter})`, opacity: enter,
+                  }}
+                />
+                {Icon ? (
+                  <div style={{ transform: "scale(2.3)" }}>
+                    <Icon localFrame={local} color={accent} />
+                  </div>
+                ) : null}
+              </div>
+            )}
           </div>
         );
       })}
