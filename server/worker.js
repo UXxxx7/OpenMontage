@@ -8,6 +8,7 @@ import axios from "axios";
 import FormData from "form-data";
 import { Worker, Queue } from "bullmq";
 import IORedis from "ioredis";
+import { resolveLang, t } from "./lang.js";
 
 config({ path: resolve(dirname(fileURLToPath(import.meta.url)), "../.env") });
 
@@ -16,6 +17,8 @@ const queueName = env("WA_QUEUE_NAME", "openmontage-video-jobs");
 const graphVersion = env("WA_GRAPH_VERSION", "v21.0");
 const graphBase = `https://graph.facebook.com/${graphVersion}`;
 const pythonApiBase = env("OPENMONTAGE_API_BASE", "http://localhost:8000").replace(/\/$/, "");
+// 判不出语言时的兜底（比如失败通知这类完全没有触发文本可看的场景）。
+const DEFAULT_LANG = env("WA_DEFAULT_LANG", "zh");
 
 const redis = new IORedis(REDIS_URL, {
   maxRetriesPerRequest: null,
@@ -57,7 +60,8 @@ const worker = new Worker(queueName, async (job) => {
       case "render-job": return renderJob(job.data);
       case "cancel-job": return cancelJob(job.data);
       case "revise-job": return reviseJob(job.data);
-      case "send-help": return sendHelp(job.data.waNumber);
+      case "send-help": return sendHelp(job.data);
+      case "answer-question": return answerQuestion(job.data);
       case "collect-ack": return collectAck(job.data);
       case "collect-nudge": return collectNudge(job.data);
       case "collect-cancel": return collectCancel(job.data);
@@ -92,16 +96,24 @@ worker.on("failed", async (job, error) => {
   console.error(`[worker] failed ${job?.name} ${job?.id}: ${error.message}`);
   const waNumber = job?.data?.waNumber;
   if (waNumber && !_SILENT_FAIL_JOBS.has(job?.name)) {
-    await safeSendText(waNumber, "Sorry, the video job failed. Please try again.");
+    const lang = resolveLang(DEFAULT_LANG, job?.data?.text, job?.data?.editRequest);
+    await safeSendText(waNumber, t(lang,
+      "抱歉，视频处理任务失败了，请重新尝试。",
+      "Sorry, the video job failed. Please try again."));
   }
 });
 
 async function editVideo({ waNumber, mediaId, editRequest }) {
+  const lang = resolveLang(DEFAULT_LANG, editRequest);
   if (!hasWACredentials()) {
-    await sendText(waNumber, "Service is starting up. Please send your video again in a moment.");
+    await sendText(waNumber, t(lang,
+      "服务正在启动，请稍后重新发送视频。",
+      "Service is starting up. Please send your video again in a moment."));
     throw new Error("WhatsApp credentials not configured");
   }
-  await sendText(waNumber, "Video received. Downloading and preparing edit plan...");
+  await sendText(waNumber, t(lang,
+    "视频已收到，正在下载并生成剪辑方案...",
+    "Video received. Downloading and preparing edit plan..."));
 
   const tempPath = await downloadWhatsAppMedia(mediaId);
   try {
@@ -114,22 +126,22 @@ async function editVideo({ waNumber, mediaId, editRequest }) {
     const status = await waitForStatus(jobId,
       ["WAITING_CONFIRMATION", "NEEDS_CLARIFICATION", "PREVIEW_READY", "ERROR"],
       Number(env("WA_PLAN_TIMEOUT_MS", "180000")));
+    const jobLang = resolveLang(lang, status.edit_request);
 
     if (status.status === "ERROR") {
       throw new Error(status.error_message || "Python planning failed");
     }
     if (status.status === "NEEDS_CLARIFICATION") {
-      const q = status.planned_edit?.clarification_question || "我需要更多信息才能编辑这段视频。";
-      await sendText(waNumber, `${q}\n\n请补充具体细节（例如从第几秒到第几秒），然后重新发送这段视频。`);
+      await sendText(waNumber, clarificationMessage(jobLang, status));
       return;
     }
     if (status.status === "PREVIEW_READY") {
-      await sendText(waNumber, previewText(jobId));
-      await armIdle(waNumber, jobId, "export");
+      await sendText(waNumber, previewReadyMessage(jobLang, jobId) + idleHint(jobLang, "export"));
+      await armIdle(waNumber, jobId, "export", jobLang);
       return;
     }
-    await sendText(waNumber, formatPlanMessage(status) + planIdleNotice());
-    await armIdle(waNumber, jobId, "confirm");
+    await sendText(waNumber, formatPlanMessage(status, jobLang) + idleHint(jobLang, "confirm"));
+    await armIdle(waNumber, jobId, "confirm", jobLang);
   } finally {
     await fs.promises.rm(tempPath, { force: true });
   }
@@ -137,22 +149,28 @@ async function editVideo({ waNumber, mediaId, editRequest }) {
 
 async function confirmJob({ waNumber, jobId }) {
   await disarmIdle(waNumber); // 用户已确认，作废"等待确认"的超时
+  const before = await getPythonJob(jobId).catch(() => null);
+  const lang = resolveLang(DEFAULT_LANG, before?.edit_request);
   await postPython(`/jobs/${encodeURIComponent(jobId)}/confirm`);
-  await sendText(waNumber, "Confirmed. Editing video now...");
+  await sendText(waNumber, t(lang, "已确认，正在剪辑视频...", "Confirmed. Editing video now..."));
   const status = await waitForStatus(jobId,
     ["PREVIEW_READY", "ERROR"],
     Number(env("WA_PIPELINE_TIMEOUT_MS", "900000")));
   if (status.status === "ERROR") {
     throw new Error(status.error_message || "Python pipeline failed");
   }
-  await sendText(waNumber, previewText(jobId));
-  await armIdle(waNumber, jobId, "export"); // 进入"等待导出"，重新计时
+  await sendText(waNumber, previewReadyMessage(lang, jobId) + idleHint(lang, "export"));
+  await armIdle(waNumber, jobId, "export", lang); // 进入"等待导出"，重新计时
 }
 
 async function renderJob({ waNumber, jobId }) {
   await disarmIdle(waNumber); // 用户已导出，作废"等待导出"的超时
+  const before = await getPythonJob(jobId).catch(() => null);
+  const lang = resolveLang(DEFAULT_LANG, before?.edit_request);
   await postPython(`/jobs/${encodeURIComponent(jobId)}/render`);
-  await sendText(waNumber, "Export started. Will send the final video when ready.");
+  await sendText(waNumber, t(lang,
+    "已开始导出，完成后会把最终视频发给你。",
+    "Export started. Will send the final video when ready."));
   const status = await waitForStatus(jobId,
     ["DONE", "ERROR"],
     Number(env("WA_RENDER_TIMEOUT_MS", "900000")));
@@ -161,56 +179,108 @@ async function renderJob({ waNumber, jobId }) {
   }
 
   // 成品通常 > 16MB，超出 WhatsApp 视频消息上限，统一以链接投递（走 PUBLIC_BASE_URL）
-  await sendText(waNumber, `Your final video is ready: ${fileUrl(jobId, "final.mp4")}`);
+  await sendText(waNumber, t(lang,
+    `最终视频已生成：${fileUrl(jobId, "final.mp4")}`,
+    `Your final video is ready: ${fileUrl(jobId, "final.mp4")}`));
   await redis.del(activeJobKey(waNumber));
 }
 
 async function cancelJob({ waNumber, jobId }) {
   await disarmIdle(waNumber); // 作废挂起的超时任务
+  const before = await getPythonJob(jobId).catch(() => null);
+  const lang = resolveLang(DEFAULT_LANG, before?.edit_request);
   await redis.del(activeJobKey(waNumber));
-  await sendText(waNumber, `Cancelled job ${jobId}. Send a new video when ready.`);
+  await sendText(waNumber, t(lang,
+    `已取消任务 ${jobId}。发送新视频即可重新开始。`,
+    `Cancelled job ${jobId}. Send a new video when ready.`));
 }
 
-async function sendHelp(waNumber) {
-  await sendText(waNumber,
+async function sendHelp({ waNumber, text }) {
+  const lang = resolveLang(DEFAULT_LANG, text);
+  await sendText(waNumber, t(lang,
     "发一段视频并配上说明（例如：去掉空白、加中文字幕）。\n" +
     "想加 b-roll？先发主视频、再发每段补充画面（各自配一句“讲到X时放这段”），" +
-    "全部发完回复 *go* 开始。");
+    "全部发完回复 *go* 开始。",
+    "Send a video with an instruction (e.g. \"remove dead air, add subtitles\").\n" +
+    "Want b-roll? Send the main video first, then each extra clip with a caption saying where it goes, " +
+    "then reply *go* when done."));
+}
+
+// 自由文本问答——网关侧收到一条既不是命令、也不在任何活跃任务/收集态里的
+// 文字时走这里，取代之前"一律回写死帮助文案"的答非所问。Python 的 /qa
+// 端点会真正读懂问题内容、按提问的语言回答；这里只是转发 + 兜底。
+async function answerQuestion({ waNumber, text }) {
+  try {
+    const resp = await axios.post(`${pythonApiBase}/qa`,
+      new URLSearchParams({ text: text || "" }).toString(),
+      {
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        timeout: Number(env("WA_QA_TIMEOUT_MS", "30000")),
+      });
+    const answer = resp.data && resp.data.answer;
+    if (answer) {
+      await safeSendText(waNumber, answer);
+      return;
+    }
+  } catch (err) {
+    console.warn(`[worker] /qa failed: ${err.message}`);
+  }
+  // Python 那边彻底不可用时的最后兜底——仍按语言回一句有用的话，而不是沉默
+  const lang = resolveLang(DEFAULT_LANG, text);
+  await safeSendText(waNumber, t(lang,
+    "发一段视频给我，我会自动剪辑。回复 confirm 确认方案，export 导出成片。也可以直接问我具体问题。",
+    "Send me a video and I'll edit it automatically. Reply confirm to approve the plan, " +
+    "export for the final cut. Feel free to ask me anything specific."));
 }
 
 // ── b-roll 收集态 ──────────────────────────────────────────────
 // 每收到一条素材回一句引导；用户回 'go' 收尾。2+ 视频时问哪个是主视频。
 
 async function collectAck({ waNumber, count, kind, caption }) {
-  const noun = kind === "image" ? "图片" : "视频";
-  const note = caption ? `（说明：${caption}）` : "";
-  await safeSendText(waNumber,
+  const lang = resolveLang(DEFAULT_LANG, caption);
+  const noun = t(lang, kind === "image" ? "图片" : "视频", kind === "image" ? "an image" : "a video");
+  const note = caption ? t(lang, `（说明：${caption}）`, ` (note: ${caption})`) : "";
+  await safeSendText(waNumber, t(lang,
     `已收到第 ${count} 个${noun}${note}。\n` +
     `可以继续发素材，也可以直接用文字描述（例如“视频1是主视频加字幕；视频2讲到 VS Code 时插入”）。` +
-    `全部发完后回复 *go*（或“开始/完成”）即可开始，回复 *cancel* 取消。`);
+    `全部发完后回复 *go*（或“开始/完成”）即可开始，回复 *cancel* 取消。`,
+    `Received item #${count}, ${noun}${note}.\n` +
+    `Keep sending more assets, or describe them in text (e.g. "video 1 is the main clip with ` +
+    `subtitles; insert video 2 when I mention VS Code"). Reply *go* when done, or *cancel* to clear.`));
 }
 
 // 收集期发来的独立文字：存进 notes 缓冲，供 go 时的 LLM 解析用
-async function collectNote({ waNumber }) {
-  await safeSendText(waNumber,
-    `已记下你的描述。可继续发素材或补充描述；发完回复 *go* 开始。`);
+async function collectNote({ waNumber, text }) {
+  const lang = resolveLang(DEFAULT_LANG, text);
+  await safeSendText(waNumber, t(lang,
+    "已记下你的描述。可继续发素材或补充描述；发完回复 *go* 开始。",
+    "Got your note. Keep sending assets or more notes; reply *go* when done."));
 }
 
-async function collectNudge({ waNumber, count }) {
-  await safeSendText(waNumber,
-    `已收到 ${count} 个素材。发完后回复 *go* 开始剪辑，回复 *cancel* 清空重来。`);
+async function collectNudge({ waNumber, count, text }) {
+  const lang = resolveLang(DEFAULT_LANG, text);
+  await safeSendText(waNumber, t(lang,
+    `已收到 ${count} 个素材。发完后回复 *go* 开始剪辑，回复 *cancel* 清空重来。`,
+    `Received ${count} assets so far. Reply *go* when done, or *cancel* to start over.`));
 }
 
-async function collectCancel({ waNumber }) {
+async function collectCancel({ waNumber, text }) {
+  const lang = resolveLang(DEFAULT_LANG, text);
   await redis.del(notesKey(waNumber));
-  await safeSendText(waNumber, "已清空本次素材与描述。重新发送视频即可开始。");
+  await safeSendText(waNumber, t(lang,
+    "已清空本次素材与描述。重新发送视频即可开始。",
+    "Cleared. Send a new video to start again."));
 }
 
-async function finalizeCollection({ waNumber }) {
+async function finalizeCollection({ waNumber, text }) {
   const items = (await redis.lrange(collectKey(waNumber), 0, -1)).map((s) => JSON.parse(s));
   const videos = items.filter((i) => i.kind === "video");
+  const captionSignal = items.map((i) => i.caption).find((c) => c);
+  const lang = resolveLang(DEFAULT_LANG, text, captionSignal);
   if (videos.length === 0) {
-    await safeSendText(waNumber, "还没有收到主视频。请先发送一段你要编辑的视频，再回复 *go*。");
+    await safeSendText(waNumber, t(lang,
+      "还没有收到主视频。请先发送一段你要编辑的视频，再回复 *go*。",
+      "No main video received yet. Send the video you want edited, then reply *go*."));
     return;
   }
   // 汇总描述：各媒体配文 + 收集期发来的独立文字；交给 Python 的 LLM 解析角色/说明/编辑要求
@@ -219,31 +289,41 @@ async function finalizeCollection({ waNumber }) {
 
   if (videos.length === 1) {
     // 只有一个视频，它就是主，无需询问
-    await startWithMain(waNumber, items, videos[0], assign);
+    await startWithMain(waNumber, items, videos[0], assign, lang);
     return;
   }
   const mainNum = Number(assign && assign.main_index);
   if (mainNum >= 1 && mainNum <= videos.length) {
     // LLM 从文字判断出了主视频，直接开跑
-    await startWithMain(waNumber, items, videos[mainNum - 1], assign);
+    await startWithMain(waNumber, items, videos[mainNum - 1], assign, lang);
     return;
   }
-  // 判不出主视频 → 保留交互，问编号；把 assign 存起来，编号回来后复用其 labels/edit_request
+  // 判不出主视频 → 保留交互，问编号；把 assign 和这轮判出的语言都存起来，
+  // 编号回来后（下一条消息可能只是一个数字，判不出语言）复用。
   await redis.set(assignKey(waNumber), JSON.stringify(assign || {}), "EX", Number(env("WA_COLLECT_TTL", "3600")));
   await redis.set(awaitChoiceKey(waNumber), "1", "EX", Number(env("WA_COLLECT_TTL", "3600")));
-  const lines = ["没看出哪个是*主视频*（出镜/口播那条）。可以：回复编号选一个，或再用一句话补充说明（例如“视频1是主视频，视频2讲到 VS Code 时插入”），我据此安排；其余作为 b-roll："];
-  videos.forEach((v, i) => lines.push(`${i + 1}. 视频${v.caption ? ` — ${v.caption}` : ""}`));
+  await redis.set(collectLangKey(waNumber), lang, "EX", Number(env("WA_COLLECT_TTL", "3600")));
+  const lines = [t(lang,
+    "没看出哪个是*主视频*（出镜/口播那条）。可以：回复编号选一个，或再用一句话补充说明（例如“视频1是主视频，视频2讲到 VS Code 时插入”），我据此安排；其余作为 b-roll：",
+    "Couldn't tell which one is the *main video* (the talking-head clip). Reply with a number, " +
+    "or describe it in a sentence (e.g. \"video 1 is the main one, insert video 2 when I mention VS Code\"); " +
+    "the rest become b-roll:")];
+  videos.forEach((v, i) => lines.push(`${i + 1}. ${t(lang, "视频", "Video")}${v.caption ? ` — ${v.caption}` : ""}`));
   await safeSendText(waNumber, lines.join("\n"));
 }
 
 async function collectionChoice({ waNumber, choice }) {
   const items = (await redis.lrange(collectKey(waNumber), 0, -1)).map((s) => JSON.parse(s));
   const videos = items.filter((i) => i.kind === "video");
+  const rememberedLang = await redis.get(collectLangKey(waNumber));
+  const lang = resolveLang(rememberedLang || DEFAULT_LANG, choice);
   if (videos.length === 0) {
     // 素材已过期/被清空 → 退出选择态，别把用户卡住
     await redis.del(awaitChoiceKey(waNumber));
     await redis.del(assignKey(waNumber));
-    await safeSendText(waNumber, "素材好像已经过期或清空了，请重新发送视频后再回复 *go*。");
+    await safeSendText(waNumber, t(lang,
+      "素材好像已经过期或清空了，请重新发送视频后再回复 *go*。",
+      "Assets seem to have expired or been cleared. Resend the video, then reply *go*."));
     return;
   }
   const text = String(choice || "").trim();
@@ -253,7 +333,9 @@ async function collectionChoice({ waNumber, choice }) {
   if (isBareNumber) {
     const n = parseInt(text, 10);
     if (n < 1 || n > videos.length) {
-      await safeSendText(waNumber, `请回复 1-${videos.length} 之间的编号，选择主视频。`);
+      await safeSendText(waNumber, t(lang,
+        `请回复 1-${videos.length} 之间的编号，选择主视频。`,
+        `Please reply with a number from 1-${videos.length} to choose the main video.`));
       return;
     }
     let assign = { main_index: n, labels: {}, edit_request: "" };
@@ -262,7 +344,8 @@ async function collectionChoice({ waNumber, choice }) {
     assign.main_index = n;  // 用户手选的编号优先于 LLM 的判断
     await redis.del(awaitChoiceKey(waNumber));
     await redis.del(assignKey(waNumber));
-    await startWithMain(waNumber, items, videos[n - 1], assign);
+    await redis.del(collectLangKey(waNumber));
+    await startWithMain(waNumber, items, videos[n - 1], assign, lang);
     return;
   }
 
@@ -272,23 +355,29 @@ async function collectionChoice({ waNumber, choice }) {
   await redis.expire(notesKey(waNumber), Number(env("WA_COLLECT_TTL", "3600")));
   const notes = await buildNotes(waNumber, items);
   const assign = await postAssign(videos.length, notes);
+  const textLang = resolveLang(lang, text);  // 这次的文字说明比之前的编号更能判断语言
   const mainNum = Number(assign && assign.main_index);
   if (mainNum >= 1 && mainNum <= videos.length) {
     // 这次文字里能判出主视频 → 直接开跑
     await redis.del(awaitChoiceKey(waNumber));
     await redis.del(assignKey(waNumber));
-    await startWithMain(waNumber, items, videos[mainNum - 1], assign);
+    await redis.del(collectLangKey(waNumber));
+    await startWithMain(waNumber, items, videos[mainNum - 1], assign, textLang);
     return;
   }
-  // 仍判不出主视频 → 缓存这次解析出的 labels/edit_request，继续问编号
+  // 仍判不出主视频 → 缓存这次解析出的 labels/edit_request + 语言，继续问编号
   await redis.set(assignKey(waNumber), JSON.stringify(assign || {}), "EX", Number(env("WA_COLLECT_TTL", "3600")));
-  const lines = ["收到你的说明。还差一步：哪个是*主视频*（出镜/口播那条）？回一个编号即可，其余作为 b-roll："];
-  videos.forEach((v, i) => lines.push(`${i + 1}. 视频${v.caption ? ` — ${v.caption}` : ""}`));
+  await redis.set(collectLangKey(waNumber), textLang, "EX", Number(env("WA_COLLECT_TTL", "3600")));
+  const lines = [t(textLang,
+    "收到你的说明。还差一步：哪个是*主视频*（出镜/口播那条）？回一个编号即可，其余作为 b-roll：",
+    "Got your description. One more step: which is the *main video* (the talking-head clip)? " +
+    "Reply with a number; the rest become b-roll:")];
+  videos.forEach((v, i) => lines.push(`${i + 1}. ${t(textLang, "视频", "Video")}${v.caption ? ` — ${v.caption}` : ""}`));
   await safeSendText(waNumber, lines.join("\n"));
 }
 
 // 用 assign 的 label/edit_request 组装 b-roll 列表并开跑
-async function startWithMain(waNumber, items, mainItem, assign) {
+async function startWithMain(waNumber, items, mainItem, assign, lang) {
   const videos = items.filter((i) => i.kind === "video");
   const labels = (assign && assign.labels) || {};
   const brollItems = items.filter((i) => i !== mainItem).map((i) => {
@@ -300,7 +389,7 @@ async function startWithMain(waNumber, items, mainItem, assign) {
     return { ...i, label };
   });
   const editRequest = (assign && assign.edit_request) || mainItem.caption || "";
-  await runCollectionJob(waNumber, mainItem, brollItems, editRequest);
+  await runCollectionJob(waNumber, mainItem, brollItems, editRequest, lang);
 }
 
 // 汇总描述文字：各媒体 caption + 收集期独立文字（notes 缓冲）
@@ -314,7 +403,7 @@ async function buildNotes(waNumber, items) {
     }
   });
   const notes = await redis.lrange(notesKey(waNumber), 0, -1);
-  notes.forEach((t) => parts.push(t));
+  notes.forEach((n) => parts.push(n));
   return parts.join("\n");
 }
 
@@ -337,9 +426,12 @@ async function postAssign(videoCount, notes) {
 }
 
 // 下载主视频 + 所有 b-roll → 一次性 POST /jobs → 设活跃任务 → 等方案 → 回方案
-async function runCollectionJob(waNumber, mainItem, brollItems, editRequest) {
+async function runCollectionJob(waNumber, mainItem, brollItems, editRequest, lang) {
+  const effLang = resolveLang(lang || DEFAULT_LANG, editRequest, mainItem.caption);
   if (!hasWACredentials()) {
-    await sendText(waNumber, "Service is starting up. Please try again in a moment.");
+    await sendText(waNumber, t(effLang,
+      "服务正在启动，请稍后再试。",
+      "Service is starting up. Please try again in a moment."));
     throw new Error("WhatsApp credentials not configured");
   }
   // 原子认领：DEL 返回被删键数。两条 'go'/两次编号并发时只有一个删到（返回 1），
@@ -347,8 +439,12 @@ async function runCollectionJob(waNumber, mainItem, brollItems, editRequest) {
   const claimed = await redis.del(collectKey(waNumber));
   if (!claimed) return;
   await redis.del(notesKey(waNumber));  // 清描述缓冲
-  const brollNote = brollItems.length ? `，并叠加 ${brollItems.length} 段 b-roll` : "";
-  await sendText(waNumber, `开始处理主视频${brollNote}，正在下载素材并生成剪辑方案...`);
+  const brollNote = brollItems.length
+    ? t(effLang, `，并叠加 ${brollItems.length} 段 b-roll`, ` with ${brollItems.length} b-roll clip(s)`)
+    : "";
+  await sendText(waNumber, t(effLang,
+    `开始处理主视频${brollNote}，正在下载素材并生成剪辑方案...`,
+    `Processing the main video${brollNote}, downloading assets and generating an edit plan...`));
 
   const tempPaths = [];
   try {
@@ -370,22 +466,22 @@ async function runCollectionJob(waNumber, mainItem, brollItems, editRequest) {
     const status = await waitForStatus(jobId,
       ["WAITING_CONFIRMATION", "NEEDS_CLARIFICATION", "PREVIEW_READY", "ERROR"],
       Number(env("WA_PLAN_TIMEOUT_MS", "180000")));
+    const jobLang = resolveLang(effLang, status.edit_request);
 
     if (status.status === "ERROR") {
       throw new Error(status.error_message || "Python planning failed");
     }
     if (status.status === "NEEDS_CLARIFICATION") {
-      const q = status.planned_edit?.clarification_question || "我需要更多信息才能编辑这段视频。";
-      await sendText(waNumber, `${q}\n\n请补充细节后重新发送素材。`);
+      await sendText(waNumber, clarificationMessage(jobLang, status));
       return;
     }
     if (status.status === "PREVIEW_READY") {
-      await sendText(waNumber, previewText(jobId));
-      await armIdle(waNumber, jobId, "export");
+      await sendText(waNumber, previewReadyMessage(jobLang, jobId) + idleHint(jobLang, "export"));
+      await armIdle(waNumber, jobId, "export", jobLang);
       return;
     }
-    await sendText(waNumber, formatPlanMessage(status) + planIdleNotice());
-    await armIdle(waNumber, jobId, "confirm");
+    await sendText(waNumber, formatPlanMessage(status, jobLang) + idleHint(jobLang, "confirm"));
+    await armIdle(waNumber, jobId, "confirm", jobLang);
   } finally {
     for (const p of tempPaths) await fs.promises.rm(p, { force: true });
   }
@@ -454,7 +550,9 @@ async function postPythonForm(pathname, text) {
 // 就地修订：用户在方案/预览阶段直接打字提意见 → Python 带反馈重规划 → 回新方案
 async function reviseJob({ waNumber, jobId, text }) {
   await disarmIdle(waNumber); // 用户发来修改意见＝有操作，作废旧超时；重规划后再计时
-  await sendText(waNumber, "收到修改意见，正在重新规划...");
+  const before = await getPythonJob(jobId).catch(() => null);
+  const lang = resolveLang(DEFAULT_LANG, text, before?.edit_request);
+  await sendText(waNumber, t(lang, "收到修改意见，正在重新规划...", "Got your feedback, revising the plan..."));
   await postPythonForm(`/jobs/${encodeURIComponent(jobId)}/revise`, text);
   const status = await waitForStatus(jobId,
     ["WAITING_CONFIRMATION", "NEEDS_CLARIFICATION", "ERROR"],
@@ -462,13 +560,15 @@ async function reviseJob({ waNumber, jobId, text }) {
   if (status.status === "ERROR") {
     throw new Error(status.error_message || "Revise failed");
   }
+  const jobLang = resolveLang(lang, status.edit_request);
   if (status.status === "NEEDS_CLARIFICATION") {
-    const q = status.planned_edit?.clarification_question || "需要更多信息才能继续。";
+    const q = status.planned_edit?.clarification_question ||
+      t(jobLang, "需要更多信息才能继续。", "I need more information to continue.");
     await sendText(waNumber, q);
     return;
   }
-  await sendText(waNumber, formatPlanMessage(status) + planIdleNotice());
-  await armIdle(waNumber, jobId, "confirm"); // 新方案又回到"等待确认"，重新计时
+  await sendText(waNumber, formatPlanMessage(status, jobLang) + idleHint(jobLang, "confirm"));
+  await armIdle(waNumber, jobId, "confirm", jobLang); // 新方案又回到"等待确认"，重新计时
 }
 
 async function waitForStatus(jobId, wanted, timeoutMs) {
@@ -539,16 +639,37 @@ async function sendVideo(to, videoPath, caption = "") {
   }, { headers: authJsonHeaders(), timeout: Number(env("WA_SEND_TIMEOUT_MS", "30000")) });
 }
 
-function formatPlanMessage(job) {
+function formatPlanMessage(job, lang) {
   const plan = job.planned_edit || {};
-  const lines = ["*Video edit plan*", "", plan.summary || "Edit plan prepared."];
+  const resolvedLang = lang || resolveLang(DEFAULT_LANG, plan.summary, job.edit_request);
+  const lines = [
+    t(resolvedLang, "*视频编辑方案*", "*Video edit plan*"),
+    "",
+    plan.summary || t(resolvedLang, "编辑方案已生成。", "Edit plan prepared."),
+  ];
   const ops = plan.edit_operations || [];
   if (ops.length) {
-    lines.push("", "*Operations:*");
-    ops.forEach((op, i) => lines.push(`${i + 1}. ${op.description || op.type || "Edit"}`));
+    lines.push("", t(resolvedLang, "*将执行的操作：*", "*Operations:*"));
+    ops.forEach((op, i) => lines.push(`${i + 1}. ${op.description || op.type || t(resolvedLang, "编辑", "Edit")}`));
   }
-  lines.push("", "Reply *confirm* to start, or *cancel* to stop.");
+  lines.push("", t(resolvedLang,
+    "回复 *confirm* 开始，或 *cancel* 取消。",
+    "Reply *confirm* to start, or *cancel* to stop."));
   return lines.join("\n");
+}
+
+function previewReadyMessage(lang, jobId) {
+  return t(lang,
+    `预览已生成：${fileUrl(jobId, "preview.mp4")}\n回复 export 导出最终视频。`,
+    `Preview ready: ${fileUrl(jobId, "preview.mp4")}\nReply export to generate final video.`);
+}
+
+function clarificationMessage(lang, status) {
+  const q = status.planned_edit?.clarification_question ||
+    t(lang, "我需要更多信息才能编辑这段视频。", "I need more details to edit this video.");
+  return `${q}\n\n${t(lang,
+    "请补充具体细节（例如从第几秒到第几秒），然后重新发送这段视频。",
+    "Please add more detail (e.g. which seconds), then resend the video.")}`;
 }
 
 function fileUrl(jobId, filename) {
@@ -570,13 +691,21 @@ function idleWarnMs() { return Number(env("WA_IDLE_WARN_MS", "300000")); }      
 function idleMins() { return Math.max(1, Math.round(idleTimeoutMs() / 60000)); }
 function idleWarnMins() { return Math.max(1, Math.round(idleWarnMs() / 60000)); }
 
-// 排定本次等待的超时提醒 + 自动取消。stage: "confirm" | "export"
-async function armIdle(waNumber, jobId, stage) {
+// 方案/预览消息后缀：告知多久内不操作会自动取消（双语）
+function idleHint(lang, stage) {
+  const act = stage === "export" ? "export/cancel" : "confirm/cancel";
+  return t(lang,
+    `\n（请在 ${idleMins()} 分钟内回复 ${act}，否则将自动取消本次剪辑）`,
+    `\n(Reply ${act} within ${idleMins()} min, or this edit auto-cancels)`);
+}
+
+// 排定本次等待的超时提醒 + 自动取消。stage: "confirm" | "export"；lang 用于双语提醒
+async function armIdle(waNumber, jobId, stage, lang) {
   const gen = await redis.incr(awaitGenKey(waNumber));
   const ttl = Math.ceil(idleTimeoutMs() / 1000) + 120;
-  await redis.set(awaitKey(waNumber), JSON.stringify({ jobId, stage, gen }), "EX", ttl);
+  await redis.set(awaitKey(waNumber), JSON.stringify({ jobId, stage, gen, lang }), "EX", ttl);
   await redis.expire(awaitGenKey(waNumber), ttl);
-  const data = { waNumber, jobId, stage, gen };
+  const data = { waNumber, jobId, stage, gen, lang };
   const base = { removeOnComplete: true, removeOnFail: true };
   await timers.add("idle-warn", data,
     { ...base, jobId: `iw:${waNumber}:${gen}`, delay: Math.max(1000, idleTimeoutMs() - idleWarnMs()) });
@@ -598,32 +727,26 @@ async function _idleStillValid(waNumber, jobId, gen) {
   return active === jobId;
 }
 
-async function idleWarn({ waNumber, jobId, stage, gen }) {
+async function idleWarn({ waNumber, jobId, stage, gen, lang }) {
   if (!(await _idleStillValid(waNumber, jobId, gen))) return;
-  const act = stage === "export" ? "export（导出）或 cancel（取消）" : "confirm（确认）或 cancel（取消）";
-  await safeSendText(waNumber,
-    `提醒：本次剪辑约 ${idleWarnMins()} 分钟后将因无操作自动取消。回复 ${act} 即可继续。`);
+  const L = lang || DEFAULT_LANG;
+  const act = stage === "export"
+    ? t(L, "export（导出）或 cancel（取消）", "export or cancel")
+    : t(L, "confirm（确认）或 cancel（取消）", "confirm or cancel");
+  await safeSendText(waNumber, t(L,
+    `提醒：本次剪辑约 ${idleWarnMins()} 分钟后将因无操作自动取消。回复 ${act} 即可继续。`,
+    `Reminder: this edit will auto-cancel in about ${idleWarnMins()} min without action. Reply ${act} to continue.`));
 }
 
-async function idleCancel({ waNumber, jobId, stage, gen }) {
+async function idleCancel({ waNumber, jobId, stage, gen, lang }) {
   if (!(await _idleStillValid(waNumber, jobId, gen))) return;
   await redis.del(activeJobKey(waNumber));
   await redis.del(awaitKey(waNumber));
   await redis.incr(awaitGenKey(waNumber)); // 再 bump，防止残留延时任务重复触发
-  await safeSendText(waNumber,
-    "本次剪辑因长时间无操作已自动取消。需要的话重新发送视频即可重新开始。");
-}
-
-// 预览消息文案：附上"可 cancel 取消"与"多久后自动取消"的提示
-function previewText(jobId) {
-  return `Preview ready: ${fileUrl(jobId, "preview.mp4")}\n` +
-    "Reply export to generate final video, or cancel to discard.\n" +
-    `（请在 ${idleMins()} 分钟内回复，否则将自动取消本次剪辑）`;
-}
-
-// 方案消息后缀：告诉用户多久内不确认会自动取消
-function planIdleNotice() {
-  return `\n（请在 ${idleMins()} 分钟内回复 confirm/cancel，否则将自动取消本次剪辑）`;
+  const L = lang || DEFAULT_LANG;
+  await safeSendText(waNumber, t(L,
+    "本次剪辑因长时间无操作已自动取消。需要的话重新发送视频即可重新开始。",
+    "This edit was auto-cancelled after a long idle. Send a new video to start again."));
 }
 
 function collectKey(waNumber) {
@@ -642,6 +765,12 @@ function notesKey(waNumber) {
 // 判不出主视频时，暂存 LLM 的 labels/edit_request，等用户回编号后复用
 function assignKey(waNumber) {
   return `wa:user:${waNumber}:assign`;
+}
+
+// “选主视频”这轮问答期间判出的语言，跨消息保留——用户下一条回复可能只是
+// 一个裸编号，本身没有任何语言信号，得延用上一步判出来的。
+function collectLangKey(waNumber) {
+  return `wa:user:${waNumber}:collect_lang`;
 }
 
 function authJsonHeaders() {
