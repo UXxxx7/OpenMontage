@@ -103,3 +103,6 @@ storage/
 remotion-composer/build
 remotion-composer/.bundle-cache
 remotion-composer/.bundle.lock
+
+# runtime logs (file handler in main.py)
+logs/
