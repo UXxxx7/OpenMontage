@@ -111,6 +111,40 @@ def _cleanup_old_generations(cache_dir: Path, keep: set[str]) -> None:
         shutil.rmtree(stale, ignore_errors=True)
 
 
+def sync_public_asset(remotion_dir: Path, rel_path: str) -> None:
+    """把项目 public/<rel_path> 同步补写进当前 bundle 目录。
+
+    预打包的 bundle 在打包那一刻快照了整个 public/；而每单任务的素材
+    （source.mp4 / qr.png）是打包之后才 staged 进项目 public/ 的——渲染和
+    QA stills 只从 bundle 内部解析静态文件（2026-07-13 实测：--public-dir
+    对预打包 serveUrl 无效），于是 bundle 一旦是热的，后续每一单的
+    apply_style 全部 404 失败、被优雅降级吞掉，用户拿到没套模板的半成品。
+    7-10"交回未剪视频"事故的直接根因即此（此前误诊为并发重写竞态——竞态
+    是真实存在的另一个问题，但当时的 404 是这个）。
+
+    往当前代目录补写按任务隔离的新文件是纯增量操作，不与"代目录不可变 +
+    原子切换"的设计冲突；此刻没有可用 bundle 就什么都不做——之后的
+    ensure_remotion_bundle 重打包会把项目 public/ 整体拷进去。"""
+    remotion_dir = Path(remotion_dir).resolve()
+    src_file = remotion_dir / "public" / rel_path
+    if not src_file.exists():
+        return
+    build_link = remotion_dir / "build"
+    try:
+        target = build_link.resolve(strict=True)
+    except OSError:
+        return  # 还没有任何 bundle（首次任务），重打包时会带上
+    if not (target / "index.html").exists():
+        return
+    dst = target / "public" / rel_path
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src_file, dst)
+    except OSError as e:
+        # 补写失败不该搞垮管线——但渲染大概率会 404，把线索留在日志里
+        logger.warning(f"  remotion: 素材补写进 bundle 失败（渲染可能 404）: {e}")
+
+
 def ensure_remotion_bundle(remotion_dir: Path) -> Optional[str]:
     """返回可直接喂给 still/render 的 bundle 目录（真实路径）；不可用时返回
     None（调用方回退到按次打包）。"""

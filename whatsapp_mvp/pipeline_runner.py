@@ -849,6 +849,10 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
     public_video_abs = remotion_dir / "public" / "jobs" / job_slug / "source.mp4"
     public_video_abs.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(src, public_video_abs)
+    # bundle 是打包时的 public/ 快照，这单的素材必须补写进去，否则整条
+    # apply_style（QA stills + 整片渲染）404 -> 降级交付半成品
+    from .remotion_bundle import sync_public_asset
+    sync_public_asset(remotion_dir, public_video_rel)
 
     # 人脸裁剪校准是确定性的（同一段视频每次算出来的结果一样），跟内容规划反馈
     # 无关，只需要在下面的重试闭包外面算一次——重试它只会得到一模一样的值。
@@ -974,6 +978,9 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
             qr_rel = f"jobs/{job_slug}/qr.png"
             qr_abs = remotion_dir / "public" / qr_rel
             if generate_qr(qr_input["contact_url"], qr_abs):
+                # 同 source.mp4：打包后生成的素材要补写进当前 bundle
+                from .remotion_bundle import sync_public_asset
+                sync_public_asset(remotion_dir, qr_rel)
                 qr_contact: dict[str, Any] = {
                     "qrSrc": qr_rel,
                     "contactName": qr_input.get("contact_name", ""),
