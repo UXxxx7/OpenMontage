@@ -88,13 +88,21 @@ def run_talking_head_pipeline(job: Job) -> dict[str, Any]:
         try:
             new_src = handler(src, op, job_dir)
         except Exception as e:
-            if op_type in _DEGRADABLE_OPS:
-                logger.warning(
-                    f"    {op_type}: 执行失败，优雅降级——保留上一步结果继续交付。原因: {e}"
-                )
-                degraded.append(op_type)
-                continue
-            raise
+            # 先自动重试一次再谈降级：渲染类失败里有一部分是瞬时的（资源争抢、
+            # 子进程偶发），一次重试能白捡回来；确定性失败则重试也快（在同一
+            # 个错误上再挂一次），代价可控。
+            logger.warning(f"    {op_type}: 执行失败，自动重试一次。原因: {e}")
+            try:
+                new_src = handler(src, op, job_dir)
+            except Exception as e2:
+                if op_type in _DEGRADABLE_OPS:
+                    logger.warning(
+                        f"    {op_type}: 重试仍失败，降级——保留上一步结果继续交付"
+                        f"（会显性告知用户，非静默）。原因: {e2}"
+                    )
+                    degraded.append(op_type)
+                    continue
+                raise
         if new_src and Path(new_src).exists() and str(Path(new_src).resolve()) != str(Path(src).resolve()):
             after = _probe_duration(Path(new_src))
             logger.info(f"    {op_type}: 时长 {before:.1f}s → {after:.1f}s"
@@ -845,14 +853,11 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
 
     remotion_dir = Path(config.openmontage_root) / "remotion-composer"
     job_slug = workdir.name
-    public_video_rel = f"jobs/{job_slug}/source.mp4"
-    public_video_abs = remotion_dir / "public" / "jobs" / job_slug / "source.mp4"
-    public_video_abs.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(src, public_video_abs)
-    # bundle 是打包时的 public/ 快照，这单的素材必须补写进去，否则整条
-    # apply_style（QA stills + 整片渲染）404 -> 降级交付半成品
-    from .remotion_bundle import sync_public_asset
-    sync_public_asset(remotion_dir, public_video_rel)
+    # 素材不再拷进 remotion public/：预打包 bundle 是 public/ 的打包时快照，
+    # 打包后 staged 的素材看不见（整类 404 事故的根源，含 7-10 那次）。改走
+    # 本机 API 的 /files 路由（SpeakerCard 对 http 开头的 src 直接透传），
+    # bundle 从此纯只读共享——没有素材同步问题，也没有 public/jobs 无限膨胀。
+    video_src_url = f"{config.local_api_base}/files/{job_slug}/{Path(src).name}"
 
     # 人脸裁剪校准是确定性的（同一段视频每次算出来的结果一样），跟内容规划反馈
     # 无关，只需要在下面的重试闭包外面算一次——重试它只会得到一模一样的值。
@@ -903,7 +908,7 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         scenes = _mode_schedule_to_scenes(mode_schedule)
 
         props: dict[str, Any] = {
-            "videoSrc": public_video_rel,
+            "videoSrc": video_src_url,
             "durationSeconds": duration,
             "colorMode": op.get("colorMode", "warm"),
             "speakerObjectPosition": speaker_object_position,
@@ -975,14 +980,11 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         qr_input = op.get("qr_contact") or {}
         if qr_input.get("contact_url"):
             from .qr_gen import generate_qr
-            qr_rel = f"jobs/{job_slug}/qr.png"
-            qr_abs = remotion_dir / "public" / qr_rel
+            # 同 videoSrc：生成进任务目录、走 /files 伺服，不进 remotion public/
+            qr_abs = workdir / "qr.png"
             if generate_qr(qr_input["contact_url"], qr_abs):
-                # 同 source.mp4：打包后生成的素材要补写进当前 bundle
-                from .remotion_bundle import sync_public_asset
-                sync_public_asset(remotion_dir, qr_rel)
                 qr_contact: dict[str, Any] = {
-                    "qrSrc": qr_rel,
+                    "qrSrc": f"{config.local_api_base}/files/{job_slug}/qr.png",
                     "contactName": qr_input.get("contact_name", ""),
                     "ctaLabel": qr_input.get("cta_label", "WhatsApp Now"),
                     "mountFrame": qr_input.get("mount_frame", max(0, round(duration * 30) - 200)),

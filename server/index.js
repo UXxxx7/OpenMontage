@@ -219,6 +219,11 @@ async function handleMessage(message) {
       await videoQueue.add("render-job", { waNumber, jobId: activeJobId, msgId }, queueOptions(msgId));
       return;
     }
+    // 按原方案整单重跑——预览有降级步骤（消息里已提示可 retry）或想再试一次
+    if (activeJobId && ["retry", "重试"].includes(normalized)) {
+      await videoQueue.add("retry-job", { waNumber, jobId: activeJobId, text, msgId }, queueOptions(msgId));
+      return;
+    }
     if (activeJobId && ["cancel", "no", "stop"].includes(normalized)) {
       await redis.del(activeJobKey(waNumber));
       await videoQueue.add("cancel-job", { waNumber, jobId: activeJobId, msgId }, queueOptions(msgId));

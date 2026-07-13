@@ -110,6 +110,12 @@ class Job(Base):
 
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
+    # 非致命失败被跳过的操作（JSON list，如 ["apply_style"]）。Node 网关靠它
+    # 在预览消息里如实告知用户"哪步没成、当前版本缺什么、可回复 retry"——
+    # 此前这信息只活在管线返回值里，Python 侧的提醒又走的是死代码发送路径，
+    # 用户从头到尾被蒙在鼓里。
+    degraded_operations: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime, default=datetime.datetime.utcnow
     )
@@ -181,6 +187,9 @@ def _migrate_schema(engine) -> None:
     if "assets" not in cols:
         with engine.begin() as conn:
             conn.execute(_text("ALTER TABLE jobs ADD COLUMN assets TEXT"))
+    if "degraded_operations" not in cols:
+        with engine.begin() as conn:
+            conn.execute(_text("ALTER TABLE jobs ADD COLUMN degraded_operations TEXT"))
 
 
 def _init_engine() -> None:

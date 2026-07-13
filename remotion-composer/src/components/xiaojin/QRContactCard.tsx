@@ -82,7 +82,7 @@ export const QRContactCard: React.FC<QRContactCardProps> = ({
             padding: 4,
           }}
         >
-          <Img src={staticFile(qrSrc)} style={{ width: "100%", height: "100%", objectFit: "contain" }} />
+          <Img src={qrSrc.startsWith("http") ? qrSrc : staticFile(qrSrc)} style={{ width: "100%", height: "100%", objectFit: "contain" }} />
         </div>
         <div style={{ flex: 1 }}>
           <div

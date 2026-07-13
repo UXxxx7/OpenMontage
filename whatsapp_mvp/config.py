@@ -55,6 +55,13 @@ class Config:
         default_factory=lambda: os.getenv("PUBLIC_BASE_URL", "http://localhost:8000")
     )
 
+    # 本机 API 地址——Remotion 渲染取素材用（videoSrc/qrSrc 走 /files 路由）。
+    # 必须是 localhost 直连，不能用 public_base_url：那个通常指向公网隧道，
+    # 渲染取素材绕公网一圈既慢又会在隧道换址后静默 404。
+    local_api_base: str = field(
+        default_factory=lambda: os.getenv("LOCAL_API_BASE", "http://127.0.0.1:8000")
+    )
+
     # LLM 规划器配置
     # provider 可选: deepseek | openai | claude | custom（中转站/OpenAI兼容）
     llm_provider: str = field(
