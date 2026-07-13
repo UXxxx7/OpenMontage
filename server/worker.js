@@ -6,7 +6,7 @@ import os from "os";
 import path from "path";
 import axios from "axios";
 import FormData from "form-data";
-import { Worker } from "bullmq";
+import { Worker, Queue } from "bullmq";
 import IORedis from "ioredis";
 
 config({ path: resolve(dirname(fileURLToPath(import.meta.url)), "../.env") });
@@ -45,6 +45,9 @@ async function checkReadiness() {
   return results;
 }
 
+// 用于排定"闲置超时"延时任务（warn/cancel）。与网关同一个队列，本 worker 自己消费。
+const timers = new Queue(queueName, { connection: redis });
+
 const worker = new Worker(queueName, async (job) => {
   console.log(`[worker] starting ${job.name} ${job.id}`);
   try {
@@ -61,6 +64,8 @@ const worker = new Worker(queueName, async (job) => {
       case "collect-note": return collectNote(job.data);
       case "finalize-collection": return finalizeCollection(job.data);
       case "collection-choice": return collectionChoice(job.data);
+      case "idle-warn": return idleWarn(job.data);
+      case "idle-cancel": return idleCancel(job.data);
       default: throw new Error(`Unknown job type: ${job.name}`);
     }
   } catch (err) {
@@ -80,10 +85,13 @@ worker.on("completed", (job) => {
   console.log(`[worker] completed ${job.name} ${job.id}`);
 });
 
+// 内部/后台任务失败不向用户报错（避免超时定时器等误发"job failed"）
+const _SILENT_FAIL_JOBS = new Set(["idle-warn", "idle-cancel", "collect-ack", "collect-nudge", "collect-note"]);
+
 worker.on("failed", async (job, error) => {
   console.error(`[worker] failed ${job?.name} ${job?.id}: ${error.message}`);
   const waNumber = job?.data?.waNumber;
-  if (waNumber) {
+  if (waNumber && !_SILENT_FAIL_JOBS.has(job?.name)) {
     await safeSendText(waNumber, "Sorry, the video job failed. Please try again.");
   }
 });
@@ -116,16 +124,19 @@ async function editVideo({ waNumber, mediaId, editRequest }) {
       return;
     }
     if (status.status === "PREVIEW_READY") {
-      await sendText(waNumber, `Preview ready: ${fileUrl(jobId, "preview.mp4")}\nReply export to generate final video.`);
+      await sendText(waNumber, previewText(jobId));
+      await armIdle(waNumber, jobId, "export");
       return;
     }
-    await sendText(waNumber, formatPlanMessage(status));
+    await sendText(waNumber, formatPlanMessage(status) + planIdleNotice());
+    await armIdle(waNumber, jobId, "confirm");
   } finally {
     await fs.promises.rm(tempPath, { force: true });
   }
 }
 
 async function confirmJob({ waNumber, jobId }) {
+  await disarmIdle(waNumber); // 用户已确认，作废"等待确认"的超时
   await postPython(`/jobs/${encodeURIComponent(jobId)}/confirm`);
   await sendText(waNumber, "Confirmed. Editing video now...");
   const status = await waitForStatus(jobId,
@@ -134,10 +145,12 @@ async function confirmJob({ waNumber, jobId }) {
   if (status.status === "ERROR") {
     throw new Error(status.error_message || "Python pipeline failed");
   }
-  await sendText(waNumber, `Preview ready: ${fileUrl(jobId, "preview.mp4")}\nReply export to generate final video.`);
+  await sendText(waNumber, previewText(jobId));
+  await armIdle(waNumber, jobId, "export"); // 进入"等待导出"，重新计时
 }
 
 async function renderJob({ waNumber, jobId }) {
+  await disarmIdle(waNumber); // 用户已导出，作废"等待导出"的超时
   await postPython(`/jobs/${encodeURIComponent(jobId)}/render`);
   await sendText(waNumber, "Export started. Will send the final video when ready.");
   const status = await waitForStatus(jobId,
@@ -153,6 +166,7 @@ async function renderJob({ waNumber, jobId }) {
 }
 
 async function cancelJob({ waNumber, jobId }) {
+  await disarmIdle(waNumber); // 作废挂起的超时任务
   await redis.del(activeJobKey(waNumber));
   await sendText(waNumber, `Cancelled job ${jobId}. Send a new video when ready.`);
 }
@@ -366,10 +380,12 @@ async function runCollectionJob(waNumber, mainItem, brollItems, editRequest) {
       return;
     }
     if (status.status === "PREVIEW_READY") {
-      await sendText(waNumber, `Preview ready: ${fileUrl(jobId, "preview.mp4")}\nReply export to generate final video.`);
+      await sendText(waNumber, previewText(jobId));
+      await armIdle(waNumber, jobId, "export");
       return;
     }
-    await sendText(waNumber, formatPlanMessage(status));
+    await sendText(waNumber, formatPlanMessage(status) + planIdleNotice());
+    await armIdle(waNumber, jobId, "confirm");
   } finally {
     for (const p of tempPaths) await fs.promises.rm(p, { force: true });
   }
@@ -437,6 +453,7 @@ async function postPythonForm(pathname, text) {
 
 // 就地修订：用户在方案/预览阶段直接打字提意见 → Python 带反馈重规划 → 回新方案
 async function reviseJob({ waNumber, jobId, text }) {
+  await disarmIdle(waNumber); // 用户发来修改意见＝有操作，作废旧超时；重规划后再计时
   await sendText(waNumber, "收到修改意见，正在重新规划...");
   await postPythonForm(`/jobs/${encodeURIComponent(jobId)}/revise`, text);
   const status = await waitForStatus(jobId,
@@ -450,7 +467,8 @@ async function reviseJob({ waNumber, jobId, text }) {
     await sendText(waNumber, q);
     return;
   }
-  await sendText(waNumber, formatPlanMessage(status));
+  await sendText(waNumber, formatPlanMessage(status) + planIdleNotice());
+  await armIdle(waNumber, jobId, "confirm"); // 新方案又回到"等待确认"，重新计时
 }
 
 async function waitForStatus(jobId, wanted, timeoutMs) {
@@ -540,6 +558,72 @@ function fileUrl(jobId, filename) {
 
 function activeJobKey(waNumber) {
   return `wa:user:${waNumber}:active_job`;
+}
+
+// ── 闲置超时（等待用户 confirm/export 时自动取消）────────────────────────────
+// await 键存当前等待态；gen 是"代次"计数：每推进/取消一步就 INCR 一次，
+// 之前排定的 warn/cancel 延时任务醒来时发现代次已变，就自作废（= 重置计时）。
+function awaitKey(waNumber) { return `wa:user:${waNumber}:await`; }
+function awaitGenKey(waNumber) { return `wa:user:${waNumber}:await_gen`; }
+function idleTimeoutMs() { return Number(env("WA_IDLE_TIMEOUT_MS", "1800000")); } // 默认 30 分钟
+function idleWarnMs() { return Number(env("WA_IDLE_WARN_MS", "300000")); }        // 到期前 5 分钟提醒
+function idleMins() { return Math.max(1, Math.round(idleTimeoutMs() / 60000)); }
+function idleWarnMins() { return Math.max(1, Math.round(idleWarnMs() / 60000)); }
+
+// 排定本次等待的超时提醒 + 自动取消。stage: "confirm" | "export"
+async function armIdle(waNumber, jobId, stage) {
+  const gen = await redis.incr(awaitGenKey(waNumber));
+  const ttl = Math.ceil(idleTimeoutMs() / 1000) + 120;
+  await redis.set(awaitKey(waNumber), JSON.stringify({ jobId, stage, gen }), "EX", ttl);
+  await redis.expire(awaitGenKey(waNumber), ttl);
+  const data = { waNumber, jobId, stage, gen };
+  const base = { removeOnComplete: true, removeOnFail: true };
+  await timers.add("idle-warn", data,
+    { ...base, jobId: `iw:${waNumber}:${gen}`, delay: Math.max(1000, idleTimeoutMs() - idleWarnMs()) });
+  await timers.add("idle-cancel", data,
+    { ...base, jobId: `ic:${waNumber}:${gen}`, delay: idleTimeoutMs() });
+}
+
+// 用户推进/取消一步 → 作废当前等待的超时任务（bump 代次），清等待态
+async function disarmIdle(waNumber) {
+  await redis.incr(awaitGenKey(waNumber));
+  await redis.del(awaitKey(waNumber));
+}
+
+// 延时任务醒来时：仅当代次未变且活跃任务仍是它，才算有效
+async function _idleStillValid(waNumber, jobId, gen) {
+  const cur = Number(await redis.get(awaitGenKey(waNumber)));
+  if (cur !== Number(gen)) return false;
+  const active = await redis.get(activeJobKey(waNumber));
+  return active === jobId;
+}
+
+async function idleWarn({ waNumber, jobId, stage, gen }) {
+  if (!(await _idleStillValid(waNumber, jobId, gen))) return;
+  const act = stage === "export" ? "export（导出）或 cancel（取消）" : "confirm（确认）或 cancel（取消）";
+  await safeSendText(waNumber,
+    `提醒：本次剪辑约 ${idleWarnMins()} 分钟后将因无操作自动取消。回复 ${act} 即可继续。`);
+}
+
+async function idleCancel({ waNumber, jobId, stage, gen }) {
+  if (!(await _idleStillValid(waNumber, jobId, gen))) return;
+  await redis.del(activeJobKey(waNumber));
+  await redis.del(awaitKey(waNumber));
+  await redis.incr(awaitGenKey(waNumber)); // 再 bump，防止残留延时任务重复触发
+  await safeSendText(waNumber,
+    "本次剪辑因长时间无操作已自动取消。需要的话重新发送视频即可重新开始。");
+}
+
+// 预览消息文案：附上"可 cancel 取消"与"多久后自动取消"的提示
+function previewText(jobId) {
+  return `Preview ready: ${fileUrl(jobId, "preview.mp4")}\n` +
+    "Reply export to generate final video, or cancel to discard.\n" +
+    `（请在 ${idleMins()} 分钟内回复，否则将自动取消本次剪辑）`;
+}
+
+// 方案消息后缀：告诉用户多久内不确认会自动取消
+function planIdleNotice() {
+  return `\n（请在 ${idleMins()} 分钟内回复 confirm/cancel，否则将自动取消本次剪辑）`;
 }
 
 function collectKey(waNumber) {
