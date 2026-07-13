@@ -454,6 +454,16 @@ async def assign_endpoint(video_count: int = Form(...), notes: str = Form("")):
     return result
 
 
+@app.post("/qa")
+async def qa_endpoint(text: str = Form(...)):
+    """自由文本问答——网关侧收到一条既不是命令、也不在任何活跃任务/收集态
+    里的文字时打这里，取代之前"一律回写死帮助文案"的答非所问。"""
+    from .qa_answer import answer_question
+
+    answer = answer_question(text)
+    return {"answer": answer}
+
+
 @app.post("/jobs")
 async def create_job_endpoint(
     video: UploadFile = File(...),
@@ -521,6 +531,10 @@ async def get_job_endpoint(job_id: str):
         "final_path": job.final_path,
         "planned_edit": json.loads(job.planned_edit) if job.planned_edit else None,
         "error_message": job.error_message,
+        # Node 侧回复用户的文案要按这条任务的语言走（不能写死英文/中文），
+        # edit_request 是用户自己敲的原话，是最可靠的语言信号——之前没往外
+        # 暴露，Node 只能瞎猜或者写死一种语言。
+        "edit_request": job.edit_request,
         "created_at": job.created_at.isoformat() if job.created_at else None,
         "updated_at": job.updated_at.isoformat() if job.updated_at else None,
     }

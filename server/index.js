@@ -6,6 +6,7 @@ import express from "express";
 import { Queue } from "bullmq";
 import IORedis from "ioredis";
 import axios from "axios";
+import { resolveLang, t } from "./lang.js";
 
 config({ path: resolve(dirname(fileURLToPath(import.meta.url)), "../.env") });
 
@@ -144,12 +145,18 @@ async function handleMessage(message) {
     try {
       ahead = (await videoQueue.getWaitingCount()) + (await videoQueue.getActiveCount());
     } catch {}
-    const noun = msgType === "image" ? "图片" : "视频";
-    const note = caption ? `（说明：${caption}）` : "";
-    await gatewaySendText(waNumber,
+    const lang = resolveLang(env("WA_DEFAULT_LANG", "zh"), caption);
+    const noun = t(lang, msgType === "image" ? "图片" : "视频", msgType === "image" ? "an image" : "a video");
+    const note = caption ? t(lang, `（说明：${caption}）`, ` (note: ${caption})`) : "";
+    const queueNote = ahead > 0
+      ? t(lang, `\n（当前有 ${ahead} 个任务在处理/排队，开始后需要多等一会）`,
+        `\n(${ahead} job(s) currently processing/queued — it'll take a bit longer once started)`)
+      : "";
+    await gatewaySendText(waNumber, t(lang,
       `已收到第 ${count} 个${noun}${note}。\n` +
-      `可以继续发素材，也可以用文字补充说明。全部发完回复 *go* 开始，回复 *cancel* 取消。` +
-      (ahead > 0 ? `\n（当前有 ${ahead} 个任务在处理/排队，开始后需要多等一会）` : ""));
+      `可以继续发素材，也可以用文字补充说明。全部发完回复 *go* 开始，回复 *cancel* 取消。${queueNote}`,
+      `Received item #${count}, ${noun}${note}.\n` +
+      `Keep sending more assets, or add a text description. Reply *go* when done, or *cancel* to clear.${queueNote}`));
     return;
   }
 
@@ -183,7 +190,7 @@ async function handleMessage(message) {
       if (cancelWords.includes(normalized)) {
         await redis.del(collectKey(waNumber));
         await redis.del(awaitChoiceKey(waNumber));
-        await videoQueue.add("collect-cancel", { waNumber, msgId }, queueOptions(msgId));
+        await videoQueue.add("collect-cancel", { waNumber, text, msgId }, queueOptions(msgId));
         return;
       }
       // 选主视频阶段：期待一个编号，交给 worker 校验并建任务
@@ -194,13 +201,13 @@ async function handleMessage(message) {
       }
       // 'go' 收尾：把缓冲里的素材定角色并开始
       if (goWords.includes(normalized)) {
-        await videoQueue.add("finalize-collection", { waNumber, msgId }, queueOptions(msgId));
+        await videoQueue.add("finalize-collection", { waNumber, text, msgId }, queueOptions(msgId));
         return;
       }
       // 收集态里发了其它文字 → 当作对素材的描述，存进 notes 缓冲（go 时交给 LLM 解析）
       await redis.rpush(notesKey(waNumber), text);
       await redis.expire(notesKey(waNumber), Number(env("WA_COLLECT_TTL", "3600")));
-      await videoQueue.add("collect-note", { waNumber, msgId }, queueOptions(msgId));
+      await videoQueue.add("collect-note", { waNumber, text, msgId }, queueOptions(msgId));
       return;
     }
 
@@ -222,7 +229,16 @@ async function handleMessage(message) {
       await videoQueue.add("revise-job", { waNumber, jobId: activeJobId, text, msgId }, queueOptions(msgId));
       return;
     }
-    await videoQueue.add("send-help", { waNumber, msgId }, queueOptions(msgId));
+    // 没有活跃任务、没在收集态 → 要么是要帮助文案的裸关键词，要么是一句
+    // 真正的问题。之前不分青红皂白一律回写死帮助文案，答非所问（用户原
+    // 话："不能做到用户问什么回答什么"）。现在只有裸关键词才走廉价的
+    // send-help，其余一律转发给真正读懂问题的 answer-question。
+    const helpWords = ["help", "帮助", "?", "？", "怎么用", "怎么玩"];
+    if (helpWords.includes(normalized)) {
+      await videoQueue.add("send-help", { waNumber, text, msgId }, queueOptions(msgId));
+      return;
+    }
+    await videoQueue.add("answer-question", { waNumber, text, msgId }, queueOptions(msgId));
   }
 }
 
