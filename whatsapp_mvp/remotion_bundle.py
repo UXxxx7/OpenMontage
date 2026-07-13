@@ -111,6 +111,12 @@ def _cleanup_old_generations(cache_dir: Path, keep: set[str]) -> None:
         shutil.rmtree(stale, ignore_errors=True)
 
 
+# 注：曾有一个 sync_public_asset() 把每单素材补写进 bundle 的 public/ 快照
+# （修"打包后 staged 的素材 404"）。现已被更彻底的方案取代：素材根本不进
+# public/，videoSrc/qrSrc 直接走本机 API 的 /files 路由（SpeakerCard 等组件
+# 对 http 开头的 src 透传），bundle 从此纯只读共享。
+
+
 def ensure_remotion_bundle(remotion_dir: Path) -> Optional[str]:
     """返回可直接喂给 still/render 的 bundle 目录（真实路径）；不可用时返回
     None（调用方回退到按次打包）。"""

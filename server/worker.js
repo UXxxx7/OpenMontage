@@ -59,6 +59,7 @@ const worker = new Worker(queueName, async (job) => {
       case "confirm-job": return confirmJob(job.data);
       case "render-job": return renderJob(job.data);
       case "cancel-job": return cancelJob(job.data);
+      case "retry-job": return retryJob(job.data);
       case "revise-job": return reviseJob(job.data);
       case "send-help": return sendHelp(job.data);
       case "answer-question": return answerQuestion(job.data);
@@ -136,7 +137,7 @@ async function editVideo({ waNumber, mediaId, editRequest }) {
       return;
     }
     if (status.status === "PREVIEW_READY") {
-      await sendText(waNumber, previewReadyMessage(jobLang, jobId) + idleHint(jobLang, "export"));
+      await sendText(waNumber, previewReadyMessage(jobLang, jobId, status.degraded_operations) + idleHint(jobLang, "export"));
       await armIdle(waNumber, jobId, "export", jobLang);
       return;
     }
@@ -159,8 +160,29 @@ async function confirmJob({ waNumber, jobId }) {
   if (status.status === "ERROR") {
     throw new Error(status.error_message || "Python pipeline failed");
   }
-  await sendText(waNumber, previewReadyMessage(lang, jobId) + idleHint(lang, "export"));
+  await sendText(waNumber, previewReadyMessage(lang, jobId, status.degraded_operations) + idleHint(lang, "export"));
   await armIdle(waNumber, jobId, "export", lang); // 进入"等待导出"，重新计时
+}
+
+// 整单按原方案重跑：预览有降级步骤（用户要完整效果）或 ERROR 后再试。
+// 与 revise 的区别：不改方案，只重执行。
+async function retryJob({ waNumber, jobId, text }) {
+  await disarmIdle(waNumber);
+  const before = await getPythonJob(jobId).catch(() => null);
+  const lang = resolveLang(DEFAULT_LANG, text, before?.edit_request);
+  await postPython(`/jobs/${encodeURIComponent(jobId)}/retry`);
+  await sendText(waNumber, t(lang,
+    "正在按原方案重新剪辑...",
+    "Retrying the edit with the same plan..."));
+  const status = await waitForStatus(jobId,
+    ["PREVIEW_READY", "ERROR"],
+    Number(env("WA_PIPELINE_TIMEOUT_MS", "900000")));
+  if (status.status === "ERROR") {
+    throw new Error(status.error_message || "Python pipeline failed");
+  }
+  const jobLang = resolveLang(lang, status.edit_request);
+  await sendText(waNumber, previewReadyMessage(jobLang, jobId, status.degraded_operations) + idleHint(jobLang, "export"));
+  await armIdle(waNumber, jobId, "export", jobLang);
 }
 
 async function renderJob({ waNumber, jobId }) {
@@ -476,7 +498,7 @@ async function runCollectionJob(waNumber, mainItem, brollItems, editRequest, lan
       return;
     }
     if (status.status === "PREVIEW_READY") {
-      await sendText(waNumber, previewReadyMessage(jobLang, jobId) + idleHint(jobLang, "export"));
+      await sendText(waNumber, previewReadyMessage(jobLang, jobId, status.degraded_operations) + idleHint(jobLang, "export"));
       await armIdle(waNumber, jobId, "export", jobLang);
       return;
     }
@@ -658,10 +680,25 @@ function formatPlanMessage(job, lang) {
   return lines.join("\n");
 }
 
-function previewReadyMessage(lang, jobId) {
-  return t(lang,
+function previewReadyMessage(lang, jobId, degradedOps) {
+  let msg = t(lang,
     `预览已生成：${fileUrl(jobId, "preview.mp4")}\n回复 export 导出最终视频。`,
     `Preview ready: ${fileUrl(jobId, "preview.mp4")}\nReply export to generate final video.`);
+  // 降级必须发声：某步非致命失败被跳过时（Python 侧已自动重试过一次），明确
+  // 告诉用户缺了什么、怎么补救——决不静默交付半成品假装全须全尾。
+  const ops = degradedOps || [];
+  if (ops.length) {
+    const labels = {
+      apply_style: t(lang, "品牌模板渲染", "branded template render"),
+      insert_broll: t(lang, "b-roll 合成", "b-roll compositing"),
+    };
+    const names = ops.map((o) => labels[o] || o).join(t(lang, "、", ", "));
+    msg += t(lang,
+      `\n\n⚠️ 注意：「${names}」这一步执行失败（已自动重试过一次），当前预览不含该效果，只包含已成功的步骤。\n回复 *retry* 重跑完整效果，或回复 *export* 接受当前版本。`,
+      `\n\n⚠️ Note: the "${names}" step failed (auto-retried once). This preview does not include that effect — ` +
+      `only the steps that succeeded.\nReply *retry* to re-run the full edit, or *export* to accept this version.`);
+  }
+  return msg;
 }
 
 function clarificationMessage(lang, status) {

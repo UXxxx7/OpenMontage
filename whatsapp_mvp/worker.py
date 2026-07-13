@@ -89,6 +89,10 @@ def run_pipeline(job_id: str) -> None:
                 job_id,
                 preview_path=result["preview_path"],
                 status=JobStatus.PREVIEW_READY,
+                # 持久化降级信息（没降级也要写空列表：覆盖上一轮 retry 的旧值）。
+                # Node 网关靠 GET /jobs 读它、在预览消息里如实告知用户——下面
+                # _safe_send 的提醒在网关模式下是死代码，用户实际看不到。
+                degraded_operations=json.dumps(result.get("degraded_operations") or []),
             )
             config = get_config()
             wa = WhatsAppClient(config)
