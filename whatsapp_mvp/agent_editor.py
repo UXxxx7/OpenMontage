@@ -535,12 +535,28 @@ def plan_video(request: str, video_path: str | None = None,
         import logging as _logging
         _logging.getLogger(__name__).warning("L2 多次重试仍返回空计划，使用确定性默认计划")
         plan = _default_plan(supported)
-        note = note or "已按默认方案剪辑（去口误、去静音、加字幕）"
+        # 即使回退默认方案，也要向用户说明理由（不静默兜底）。若模型上一版留了说明，
+        # 用它当原因；否则给通用原因。
+        _name = {"remove_filler": "去口误", "remove_silences": "去静音", "add_subtitles": "加字幕"}
+        _done = "、".join(_name.get(o.get("type"), str(o.get("type"))) for o in plan)
+        _reason = (note.strip() if note and note.strip()
+                   else "规划器多次没能给出具体的剪辑动作（常见于转录为空、或素材说明与视频内容对不上）")
+        note = (f"未能生成定制方案，原因：{_reason}。已按默认方案处理（{_done}）。"
+                "如需插入 b-roll 或更精细的剪辑，请把主视频/各 b-roll 的说明重发一次。")
 
     # apply_style 自带字幕与整体观感：若同时冒出 add_subtitles / color_grade，去掉它们
     # （模板拥有最终字幕和调色，避免双字幕 / 双重调色）
     if any(o.get("type") == "apply_style" for o in plan):
         plan = [o for o in plan if o.get("type") not in ("add_subtitles", "color_grade")]
+
+    # b-roll 守卫：素材事实里给了 b-roll（source_facts 含 insert_broll 指令），但最终
+    # 计划里一条 insert_broll 都没有 —— 不静默丢弃，明确告诉用户没插入以及可能的原因。
+    if source_facts and "insert_broll" in source_facts and not any(
+            o.get("type") == "insert_broll" for o in plan):
+        _extra = ("注意：你上传的 b-roll 这次没有被插入——通常是某段素材的说明没能和主视频"
+                  "转录里真实说过的话对应上（比如说明写的话主视频里没出现，或把两段的说明"
+                  "顺序搞反了）。请确认每段 b-roll 的说明指向主视频里真正说过的那句，然后重发。")
+        note = f"{note} {_extra}" if note else _extra
 
     art = build_edit_decisions(plan, Path(video_path) if video_path else Path("input.mp4"), duration, note)
     return {

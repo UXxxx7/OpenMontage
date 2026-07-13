@@ -100,3 +100,6 @@ storage/
 *.db
 .tmp/
 .pnpm-store/
+
+# runtime logs (file handler in main.py)
+logs/

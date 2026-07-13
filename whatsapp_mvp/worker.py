@@ -49,7 +49,7 @@ def process_incoming_message(job_id: str) -> None:
         # 零指令（视频不带文字）同样进 L2 规划：SYSTEM_BASE 定义了默认方案
         # （remove_filler → apply_style 出模板成片），无文字任务不再卡死在这一步。
         if not job.planned_edit:
-            _run_llm_planner(job)
+            _run_llm_planner(job, wa)
             job = get_job(job_id)  # 重新加载，获取最新状态
 
         # ── 步骤3: 发送确认消息 ──
@@ -75,6 +75,10 @@ def run_pipeline(job_id: str) -> None:
 
     try:
         update_job_status(job_id, JobStatus.RUNNING_PIPELINE)
+
+        # 进度预览：确认后到预览生成之间可能较久（剪辑 + b-roll 合成 + 渲染），先回一条
+        _safe_send(WhatsAppClient(get_config()), job.user.whatsapp_id,
+                   "开始剪辑与合成，正在生成预览…（含 b-roll 合成时会稍久）")
 
         from .pipeline_runner import run_talking_head_pipeline
 
@@ -335,10 +339,11 @@ def _script_stage(job: Any, input_path: Path) -> list:
         return []
 
 
-def _run_llm_planner(job: Any) -> None:
+def _run_llm_planner(job: Any, wa: Any = None) -> None:
     """用 L2 agent 规划编辑方案（读 manifest/skill + tool-calling + 自审 + schema 校验）。
 
     agent 出错时回退到 L1.5 关键词/结构化规划器，保证任务不中断。
+    传入 wa 时会在转录/规划两个较慢阶段前回传进度消息（进度预览）。
     """
     # 零指令：给 agent 一句明确的默认需求描述而不是空串（SYSTEM_BASE 定义了
     # 零指令默认方案：remove_filler → apply_style）
@@ -365,8 +370,12 @@ def _run_llm_planner(job: Any) -> None:
         source_facts = (source_facts + "\n\n" + block) if source_facts else block
 
     # Script 阶段：转录原始视频 + 产出 script artifact，转录喂给规划做转录感知剪辑
+    if wa:
+        _safe_send(wa, job.user.whatsapp_id, "正在转录语音并识别可剪辑片段…（这一步通常最花时间）")
     transcript = _script_stage(job, input_path)
 
+    if wa:
+        _safe_send(wa, job.user.whatsapp_id, "转录完成，正在生成剪辑方案…")
     try:
         from .agent_editor import plan_video
 
