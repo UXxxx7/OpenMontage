@@ -100,3 +100,6 @@ storage/
 *.db
 .tmp/
 .pnpm-store/
+remotion-composer/build
+remotion-composer/.bundle-cache
+remotion-composer/.bundle.lock
