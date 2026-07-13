@@ -130,7 +130,10 @@ def ensure_remotion_bundle(remotion_dir: Path) -> Optional[str]:
             return str(current)
 
         # 迁移：老代码把 build/ 当真实目录直接写，这台机器上可能还留着旧的。
-        # 符号链接没法 replace 一个非空真实目录（EISDIR），先挪开。
+        # 符号链接没法 replace 一个非空真实目录（EISDIR），先挪开。挪开后
+        # build_link 这个路径本身就不存在了（见下面 previous 的记录逻辑，
+        # 必须靠 legacy 变量记住它，不能再指望 build_link.is_symlink()）。
+        legacy = None
         if build_link.exists() and not build_link.is_symlink():
             legacy = cache_dir / f"legacy-{uuid.uuid4().hex[:8]}"
             cache_dir.mkdir(exist_ok=True)
@@ -157,8 +160,13 @@ def ensure_remotion_bundle(remotion_dir: Path) -> Optional[str]:
             return None
 
         # 切换前先记住上一代（在 replace 之前取，之后 build_link 就指向新的了），
-        # 保留它一段时间，避免正在读旧目录的调用被过早清理坑了。
-        previous = None
+        # 保留它一段时间，避免正在读旧目录的调用被过早清理坑了。刚迁移挪开的
+        # legacy 目录同样适用——它此刻还可能正被"迁移前就已经拿到 build/ 这个
+        # 字面路径"的调用读取，不能让它在这次 cleanup 里被立刻删掉（原 bug：
+        # 迁移分支跑完后 build_link 已不是符号链接，下面这个判断永远是
+        # False，legacy 从未进 keep，首次迁移当场就把它删了——正是这个 PR
+        # 本该修的那种"重建时删掉正在读的目录"事故，只是换成在迁移路径复现）。
+        previous = legacy
         if build_link.is_symlink():
             try:
                 previous = build_link.resolve()
