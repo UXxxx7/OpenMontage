@@ -98,6 +98,11 @@ app.post(["/webhook", "/webhook/whatsapp"], async (req, res) => {
     return res.sendStatus(401);
   }
   const messages = extractMessages(req.body);
+  // 先回 200 再处理（Meta 官方要求快速 ACK）：此前是处理完才返回，处理链里
+  // 有 Graph API 直发回执等慢操作，一旦超过 Meta 的等待窗口，这次投递会被
+  // 记为失败进重试队列——之后带着延迟补投回来，变成"幽灵消息"（2026-07-14
+  // 实测事故：换隧道空窗期滞留的旧视频事件在 4 分钟后补投，开出了并行重复任务）。
+  res.sendStatus(200);
   for (const message of messages) {
     try {
       await handleMessage(message);
@@ -105,7 +110,6 @@ app.post(["/webhook", "/webhook/whatsapp"], async (req, res) => {
       console.error("[webhook] handleMessage error:", err.message);
     }
   }
-  return res.sendStatus(200);
 });
 
 async function handleMessage(message) {
@@ -124,6 +128,21 @@ async function handleMessage(message) {
   if (!seen) {
     console.log(`[webhook] duplicate or timeout: ${msgId}`);
     return;
+  }
+
+  // 陈旧消息过滤：Meta 对投递失败的事件会排队重试（可长达数天），且补投
+  // 不保证沿用原消息 ID——仅靠 msgId 去重挡不住。隧道换址/服务重启的空窗
+  // 期滞留的旧消息，会在恢复后成批补投进来：几小时前的"发视频"现在才到，
+  // 用户视角就是机器人无缘无故自己开新单（2026-07-14 实测事故）。消息自带
+  // 用户发送时刻的 timestamp（epoch 秒），超龄直接丢弃。
+  const sentAt = Number(message.timestamp || 0);
+  const maxAgeS = Number(env("WA_MAX_MESSAGE_AGE_S", "600"));
+  if (sentAt && maxAgeS > 0) {
+    const ageS = Math.round(Date.now() / 1000 - sentAt);
+    if (ageS > maxAgeS) {
+      console.log(`[webhook] stale message dropped: ${msgId} age=${ageS}s type=${msgType}`);
+      return;
+    }
   }
 
   console.log(`[webhook] from=${waNumber} type=${msgType}`);
