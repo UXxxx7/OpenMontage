@@ -54,6 +54,10 @@ def main():
     # 结束就上场——两者结合后，前者的 endFrame 到后者的 mountFrame 之间应该
     # 有至少 MIN_GAP_AFTER_PREVIOUS_FRAMES 的间隔，而不是像只有钳制时那样
     # 严格相等（严格相等会让两者的 15 帧淡出/上场动画紧贴甚至重叠）。
+    # 时间上挨得近的两个图形现在 STACK（不同 y 车道共存，同一时刻整组退场），
+    # 而不是旧的"前一个消失后下一个才上场"串行——那正是"一次只有一张孤零零
+    # 卡片、画面大片留白"的系统性根因（确认过的用户反馈；参考成片
+    # CoverageSection 一个章节内 3-4 个元素积累共存）。
     plan = _to_frame_plan({"chapters": [], "data_points": [
         {"visual": "count_up", "title": "A",
          "rows": [{"label": "X", "seconds": 5.0, "value": 1}]},
@@ -61,20 +65,48 @@ def main():
          "rows": [{"label": "Y", "seconds": 7.0, "value": 2}]},
     ]}, duration=60.0)
     a, b = sorted(plan["data_cards"], key=lambda c: c["mountFrame"])
-    check("被接替的卡不与后一张重叠，且留有最小间隔",
-          a["endFrame"] <= b["mountFrame"] - MIN_GAP_AFTER_PREVIOUS_FRAMES,
-          {"a_end": a["endFrame"], "b_mount": b["mountFrame"]})
+    check("时间相近的两张卡堆叠共存（不同 y 车道），不再串行",
+          b["y"] > a["y"] and b["mountFrame"] < a["endFrame"],
+          {"a": (a["mountFrame"], a["endFrame"], a["y"]), "b": (b["mountFrame"], b["endFrame"], b["y"])})
+    check("同一堆叠的元素整组退场（endFrame 一致）",
+          a["endFrame"] == b["endFrame"], {"a_end": a["endFrame"], "b_end": b["endFrame"]})
     check("最后一张卡保留自己的停留窗口 endFrame", b.get("endFrame", 0) > b["mountFrame"], b.get("endFrame"))
 
-    # 5c. 跨类型同坑位也钳制（count_up 后接 gauge）
+    # 5c. 跨类型也一样堆叠（count_up 后接 gauge）
     plan = _to_frame_plan({"chapters": [], "data_points": [
         {"visual": "count_up", "title": "A", "rows": [{"label": "X", "seconds": 5.0, "value": 1}]},
         {"visual": "gauge", "seconds": 7.0, "title": "R", "leftLabel": "L", "rightLabel": "R", "value": 0.5},
     ]}, duration=60.0)
     card = plan["data_cards"][0]; gauge = plan["gauges"][0]
-    check("跨类型接力: 卡不与仪表盘重叠，且留有最小间隔",
-          card["endFrame"] <= gauge["mountFrame"] - MIN_GAP_AFTER_PREVIOUS_FRAMES,
-          {"card_end": card["endFrame"], "gauge_mount": gauge["mountFrame"]})
+    check("跨类型堆叠: 仪表盘在卡片下方车道共存",
+          gauge["y"] > card["y"] and card["endFrame"] == gauge["endFrame"],
+          {"card": (card["mountFrame"], card["endFrame"], card["y"]),
+           "gauge": (gauge["mountFrame"], gauge["endFrame"], gauge["y"])})
+
+    # 5b-2. 带 "pill" 的数据点在同一堆叠里生成伴随主图形的强调 pill
+    # （参考成片 CoverageSection 的 terracotta 收尾 pill），随堆叠整组退场。
+    plan = _to_frame_plan({"chapters": [], "data_points": [
+        {"visual": "count_up", "title": "A", "pill": "Policy Active — Renew in 30 Days",
+         "rows": [{"label": "X", "seconds": 5.0, "value": 1}]},
+    ]}, duration=60.0)
+    card = plan["data_cards"][0]
+    check("pill 生成且堆叠在主图形下方、随堆叠退场",
+          len(plan["pills"]) == 1
+          and plan["pills"][0]["y"] > card["y"]
+          and plan["pills"][0]["mountFrame"] > card["mountFrame"]
+          and plan["pills"][0]["endFrame"] == card["endFrame"],
+          {"card": (card["mountFrame"], card["endFrame"], card["y"]), "pills": plan["pills"]})
+
+    # 5c-2. 时间隔得远（超过 join window）的两个图形仍然各归各的段落，
+    # 前者必须在后者上场前完全退场（同 y 车道不重叠）。
+    plan = _to_frame_plan({"chapters": [], "data_points": [
+        {"visual": "count_up", "title": "A", "rows": [{"label": "X", "seconds": 5.0, "value": 1}]},
+        {"visual": "count_up", "title": "B", "rows": [{"label": "Y", "seconds": 40.0, "value": 2}]},
+    ]}, duration=60.0)
+    a, b = sorted(plan["data_cards"], key=lambda c: c["mountFrame"])
+    check("隔得远的图形不堆叠：前者在后者上场前退场",
+          a["y"] == b["y"] and a["endFrame"] < b["mountFrame"],
+          {"a": (a["mountFrame"], a["endFrame"], a["y"]), "b": (b["mountFrame"], b["endFrame"], b["y"])})
 
     # 6. intro/outro/双语章节映射（对齐 VeLL 参考成片的可自动化元素）
     plan = _to_frame_plan({
@@ -117,19 +149,33 @@ def main():
           _mode_at(modes, card_mount) == "workflow",
           {"mode_schedule": modes, "card_mount": card_mount})
 
-    # 7. quote 类型：无数据视频的画布动画来源；进 workflow 窗口；关键词透传
+    # 7. quote 类型：无数据视频的画布动画来源；进 workflow 窗口
     plan = _to_frame_plan({"chapters": [], "data_points": [
         {"visual": "quote", "seconds": 8.0, "text": "this changed everything", "attribution": "David"},
-    ], "atmosphere_keywords": ["renewal", "保障", "coverage"]}, duration=30.0)
+    ]}, duration=30.0)
     check("quote 映射 + 触发 workflow", len(plan["quotes"]) == 1
           and plan["quotes"][0]["text"] == "this changed everything"
           and any(m["mode"] == "workflow" for m in plan["mode_schedule"]),
           {"quotes": plan["quotes"], "modes": plan["mode_schedule"]})
-    check("atmosphere 关键词透传", plan["atmosphere_keywords"] == ["renewal", "保障", "coverage"])
+
+    # 7b. contact_cue：确认过的真实用户反馈——QR/联系方式卡之前固定钉在片尾
+    # 附近，跟视频里实际说"WhatsApp 我"的那一刻完全脱节。这里验证 mountFrame
+    # 锚定在该数据点自己的 seconds（减 lead），而不是任何 duration 相关的值。
+    plan = _to_frame_plan({"chapters": [], "data_points": [
+        {"visual": "contact_cue", "seconds": 34.0},
+    ]}, duration=44.0)
+    check("contact_cue 映射到实际说话的那一刻，不是片尾偏移",
+          plan["contact_cue"] is not None
+          and plan["contact_cue"]["mountFrame"] == round(34.0 * FPS) - MOUNT_LEAD_FRAMES,
+          plan["contact_cue"])
+
+    # 无 contact_cue 数据点时该字段应为 None（下游会退回 outro/duration 兜底）
+    plan_no_cue = _to_frame_plan({"chapters": [], "data_points": []}, duration=44.0)
+    check("无 contact_cue 时字段为 None", plan_no_cue["contact_cue"] is None)
 
     # 8. 密度下限：空档检测 / 确定性兜底 / 短片豁免
     from whatsapp_mvp.content_planner import (
-        _apply_richness_floor, _sparse_gaps, RICHNESS_WINDOW_FRAMES,
+        _apply_richness_floor, _fallback_quotes_for_gaps, _sparse_gaps, RICHNESS_WINDOW_FRAMES,
     )
     # 60s 视频、无任何画布事件 -> 中段应报告空档
     bare = _to_frame_plan({"chapters": []}, duration=60.0)
@@ -139,17 +185,38 @@ def main():
     # 短片(12s)豁免：intro+outro 已覆盖，不该报空档
     check("短视频豁免密度检查", _sparse_gaps(_to_frame_plan({"chapters": []}, 12.0), 12.0) == [])
 
-    # 确定性兜底(禁用重规划)：从空档内最长转写句合成金句
+    # 确定性兜底(禁用重规划)：从空档内最长转写句合成金句。段落间距 <8s
+    # (RICHNESS_WINDOW_FRAMES)，确保稀疏的 60s 裸计划里每个窗口都有转写句可挑，
+    # 不然"零残余空档"这个断言本身就不成立（8s 窗口下 60s 稀疏视频需要 ~7 个
+    # 窗口都有覆盖，而不是旧 12s 阈值下的 ~4 个）。
     segs = [
-        {"start": 10.0, "end": 13.0, "text": "this is the single most important thing to remember"},
-        {"start": 24.0, "end": 27.0, "text": "another decently long spoken line right here"},
-        {"start": 40.0, "end": 43.0, "text": "and one more full sentence near the end of it"},
+        {"start": 4.0, "end": 7.0, "text": "this is the single most important thing to remember"},
+        {"start": 12.0, "end": 15.0, "text": "another decently long spoken line right here"},
+        {"start": 20.0, "end": 23.0, "text": "a third full sentence in the middle of the video"},
+        {"start": 28.0, "end": 31.0, "text": "and a fourth one further along in the timeline"},
+        {"start": 36.0, "end": 39.0, "text": "getting close to the end but still going strong"},
+        {"start": 44.0, "end": 47.0, "text": "one more full sentence near the end of it"},
+        {"start": 51.0, "end": 54.0, "text": "and the final full sentence right before the outro"},
     ]
     fixed = _apply_richness_floor({"chapters": []}, bare, segs, 60.0, allow_replan=False)
     check("兜底金句用了空档内的原话", len(fixed["quotes"]) >= 2
           and fixed["quotes"][0]["text"].startswith("this is the single"), fixed["quotes"])
     check("兜底后无残余空档（有转写句可用的时段）", _sparse_gaps(fixed, 60.0) == [],
           {"before": gaps, "after": _sparse_gaps(fixed, 60.0)})
+
+    # 确认过的真实生产 bug：转写句只是"跨过"空档边界（不是完全落在窗口内）时，
+    # 旧的 containment 检查（start>=a_s and end<=b_s）会漏掉它——真实案例是一段
+    # 27s-39s 的空档，里面全是话，但每句话的起止都稍微越出窗口边界，旧逻辑判定
+    # "无可用转写句"，视频原样带着空白播出。这里构造同样的越界场景验证修复：
+    # 句子横跨窗口起点（cursor 之前开始，窗口内结束）。
+    overlap_gaps = [(round(12.0 * FPS), round(35.0 * FPS))]
+    overlap_segs = [
+        {"start": 9.0, "end": 15.0, "text": "a sentence that starts before the gap and ends inside it"},
+        {"start": 30.0, "end": 40.0, "text": "a sentence that starts inside the gap and ends after it"},
+    ]
+    overlap_fixed = _fallback_quotes_for_gaps(overlap_gaps, overlap_segs, set())
+    check("空档边界重叠(非完全包含)的转写句也能被兜底捡到",
+          len(overlap_fixed) >= 1, overlap_fixed)
 
     # 已有覆盖的计划不触发下限（原计划原样返回）
     covered_raw = {"chapters": [], "data_points": [

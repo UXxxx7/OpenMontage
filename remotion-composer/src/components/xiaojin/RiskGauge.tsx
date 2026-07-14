@@ -36,6 +36,8 @@ export interface RiskGaugeProps {
   endFrame?: number;
   x?: number;
   y?: number;
+  /** Fixed card width (e.g. the full 960px content-zone lane). Omit for content-sized. */
+  width?: number;
   colorMode: ColorMode;
   headingFont?: string;
   labelFont?: string;
@@ -109,6 +111,7 @@ export const RiskGauge: React.FC<RiskGaugeProps> = ({
   endFrame,
   x = 80,
   y = 900,
+  width,
   colorMode,
   headingFont = "inherit",
 }) => {
@@ -144,6 +147,9 @@ export const RiskGauge: React.FC<RiskGaugeProps> = ({
         borderRadius: 24,
         padding: "28px 28px 20px",
         boxShadow: `0 8px 32px ${palette.shadow}`,
+        // Fixed lane width centers the title/gauge (title is text-centered,
+        // GaugeSvg uses margin auto) instead of hugging the left edge.
+        width,
       }}
     >
       <div

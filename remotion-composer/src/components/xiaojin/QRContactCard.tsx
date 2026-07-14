@@ -24,6 +24,7 @@ export interface QRContactCardProps {
   mountFrame: number;
   x?: number;
   y?: number;
+  width?: number;
   colorMode: ColorMode;
   headingFont?: string;
   labelFont?: string;
@@ -37,6 +38,7 @@ export const QRContactCard: React.FC<QRContactCardProps> = ({
   mountFrame,
   x = 80,
   y = 780,
+  width = 920,
   colorMode,
   headingFont = "inherit",
   labelFont = "inherit",
@@ -54,7 +56,7 @@ export const QRContactCard: React.FC<QRContactCardProps> = ({
   const showPill = local >= 30;
 
   return (
-    <div style={{ position: "absolute", left: x, top: y, width: 920 }}>
+    <div style={{ position: "absolute", left: x, top: y, width }}>
       <div
         style={{
           opacity: interpolate(local, [0, 20], [0, 1], opts) * qrIn,

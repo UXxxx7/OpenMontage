@@ -279,14 +279,128 @@ def _op_remove_silences(src: str, op: dict, workdir: Path) -> Optional[str]:
 # 转写异常兜底 / 人脸校准取景 / 短语级字幕。均已在本机 e2e 验证过。
 # ---------------------------------------------------------------------------
 
+def _transcribe_elevenlabs(src: str, api_key: str):
+    """ElevenLabs Scribe transcription — same API video-use (video-studio's
+    own trim pipeline) uses, and for the same reason: retake-detection needs
+    consistent word-level text between two near-identical takes to tell them
+    apart, which local faster-whisper is meaningfully weaker at (confirmed
+    root cause of a real production bug — a retake survived filler-removal).
+
+    timestamps_granularity="word" is mandatory, not optional (video-studio's
+    edit-director.md, confirmed by direct testing there): omitting it makes
+    Scribe silently return degenerate word timing (multiple consecutive words
+    sharing one start==end timestamp), which would corrupt every downstream
+    frame calculation silently rather than erroring.
+
+    Returns an object shaped like the local Transcriber's ToolResult
+    (.success / .data / .error) so callers don't need to know which
+    provider ran.
+    """
+    import requests
+
+    from tools.base_tool import ToolResult
+
+    try:
+        with open(src, "rb") as f:
+            resp = requests.post(
+                "https://api.elevenlabs.io/v1/speech-to-text",
+                headers={"xi-api-key": api_key},
+                files={"file": (Path(src).name, f, "video/mp4")},
+                data={"model_id": "scribe_v1", "timestamps_granularity": "word"},
+                timeout=300,
+            )
+        resp.raise_for_status()
+    except Exception as e:
+        logger.warning(f"  ElevenLabs Scribe 转写调用异常: {e}")
+        return ToolResult(success=False, error=str(e))
+
+    data = resp.json()
+    # ElevenLabs returns "word" and "spacing" as separate token types (the
+    # space between two words is its own token) — faster-whisper instead
+    # bakes a leading space into each word's own text (e.g. " hello", " world",
+    # confirmed in tools/analysis/transcriber.py's direct `w.word` usage with
+    # no separate join-with-space step anywhere downstream). Dropping
+    # "spacing" tokens outright (as an earlier version of this function did)
+    # loses that leading space, and downstream caption-text concatenation —
+    # built assuming each word already carries it, like faster-whisper —
+    # then mashes every word together with no spaces at all (confirmed real
+    # bug: a rendered caption read "I'veeputthefullbreakdowninthis"). Fix:
+    # carry each preceding spacing token's text forward as this word's prefix.
+    raw_tokens = data.get("words", [])
+    word_timestamps = []
+    pending_prefix = ""
+    for tok in raw_tokens:
+        if tok.get("type") == "spacing":
+            pending_prefix += tok.get("text", "")
+            continue
+        if tok.get("type") != "word":
+            continue
+        word_timestamps.append({
+            "word": pending_prefix + tok["text"],
+            "start": round(tok["start"], 3),
+            "end": round(tok["end"], 3),
+        })
+        pending_prefix = ""
+
+    # Phrase-level segments too (id/start/end/text) — transcribe_segments()
+    # (the L2 agent's own planning-stage transcript, used specifically to
+    # spot retakes/repeated sentences before any op runs) needs this shape,
+    # not word_timestamps. Same GAP_THRESHOLD_MS=400 phrase-grouping video-use
+    # itself uses (tools/directors/edit-director.md Step 3) — new phrase
+    # whenever the gap since the last word exceeds 400ms.
+    GAP_THRESHOLD_MS = 400
+    segments: list[dict] = []
+    cur_words: list[str] = []
+    cur_start = cur_end = None
+    for w in word_timestamps:
+        start_ms, end_ms = w["start"] * 1000, w["end"] * 1000
+        if cur_words and (start_ms - cur_end) > GAP_THRESHOLD_MS:
+            # words already carry their own leading space (see word_timestamps
+            # above) — join with "" not " ", or every segment gets double
+            # spaces between words.
+            segments.append({"id": len(segments), "start": cur_start / 1000, "end": cur_end / 1000,
+                              "text": "".join(cur_words).strip()})
+            cur_words = []
+        if not cur_words:
+            cur_start = start_ms
+        cur_words.append(w["word"])
+        cur_end = end_ms
+    if cur_words:
+        segments.append({"id": len(segments), "start": cur_start / 1000, "end": cur_end / 1000,
+                          "text": " ".join(cur_words)})
+
+    return ToolResult(
+        success=True,
+        data={
+            "word_timestamps": word_timestamps,
+            "segments": segments,
+            "language": data.get("language_code"),
+            "duration_seconds": word_timestamps[-1]["end"] if word_timestamps else 0.0,
+        },
+    )
+
+
 def _safe_transcribe(src: str, workdir: Path, model_size: str):
-    """跑 Transcriber，把"工具报告失败"和"工具本身抛异常"统一收敛成返回 None。
+    """跑转写，把"工具报告失败"和"工具本身抛异常"统一收敛成返回 None。
+
+    config.transcribe_provider == "elevenlabs"（默认，见该字段注释）时走
+    _transcribe_elevenlabs；否则走本地 faster-whisper Transcriber 工具。
 
     faster-whisper/PyAV 对损坏/非视频输入会直接抛 av.error.InvalidDataError
     之类的异常（实测），不会走 ToolResult(success=False)；调用方拿到 None 再
     决定降级还是报错，而不是被底层异常炸穿。
     """
     import os as _os
+
+    config = get_config()
+    if config.transcribe_provider == "elevenlabs" and config.elevenlabs_api_key:
+        t = _transcribe_elevenlabs(src, config.elevenlabs_api_key)
+        if not t.success:
+            logger.warning(f"  转写失败: {t.error}")
+            return None
+        return t
+    if config.transcribe_provider == "elevenlabs":
+        logger.warning("  transcribe_provider=elevenlabs 但没配 ELEVENLABS_API_KEY，回退到本地 faster-whisper")
 
     from tools.analysis.transcriber import Transcriber
 
@@ -698,52 +812,80 @@ def _op_add_subtitles(src: str, op: dict, workdir: Path) -> Optional[str]:
 # WIDE the on-screen content is at that moment; the actual pixel box a mode
 # maps to is a rendering-layer concern, not a planning one.
 _DOMINANT_BOX = {"x": 60, "y": 104, "w": 960, "h": 1100}
-# h floor of 900 -- below video-studio's documented floor of >=900px for a
-# Workflow-mode card (CLAUDE-v2.md §6a: a shorter card reveals only a thin
-# horizontal slice of the source video via objectFit:"cover", cropping to
-# head-only instead of showing chest/shoulders). y stays top-anchored at the
-# same 104 as _DOMINANT_BOX so the card's top edge is fixed across the
-# Dominant<->Workflow transition. Width is now content-aware (P3, see
-# _workflow_box below) instead of a single fixed 300 -- HEIGHT-driven under
-# objectFit:"cover" regardless of the exact width chosen, so the full
-# vertical extent of the speaker stays visible either way.
-_WORKFLOW_Y = 104
-_WORKFLOW_H = 900
-_WORKFLOW_RIGHT_MARGIN = 40  # right edge of the box, matching the old fixed box's x=740+w=300=1040
-_WORKFLOW_CONTENT_GAP = 60  # clearance kept between the widest active content and the docked card
-_WORKFLOW_MIN_X = 560  # never let the card get narrower-cut than this even for the narrowest content
-_WORKFLOW_MAX_X = 740  # old fixed box's x -- also the ceiling once content needs the full content-zone width
+# Docked/side-pip geometry (content_width-dependent x/w narrowing) is gone —
+# confirmed real user complaint against that whole model: shrinking WIDTH and
+# docking the card to a side column leaves the entire opposite side and the
+# whole lower half of the canvas empty, with only faint atmosphere text to
+# fill it. video-studio's own validated reference (motion/vell-renewal-fresh's
+# RenewalFresh/SpeakerCard.tsx) does the opposite: the card stays FULL WIDTH,
+# anchored top-left at the exact same x/w as Dominant, and only HEIGHT shrinks
+# — freeing up a full-width band BELOW the card (RenewalFresh's own
+# CoverageSection.tsx: `CONTENT_TOP = 1040`, `left:40, right:40`) for content
+# to stack into, rather than a narrow side column beside it. Adopting that
+# model verbatim: Workflow keeps Dominant's x/w unchanged, only h differs, so
+# the card doesn't even move horizontally on the Dominant<->Workflow
+# transition — a pure vertical squeeze.
+# h=900, straight from the reference (RenewalFresh WORKFLOW = 1000x900): at
+# 960px wide the objectFit:cover crop is WIDTH-bound, so a shorter box shows
+# LESS of the speaker vertically, not a smaller card — h=700 was a confirmed
+# real bug that cropped the speaker to head-only. 900 shows face + chest.
+_WORKFLOW_BOX = {"x": 60, "y": 104, "w": 960, "h": 900}
+# Content zone directly below the Workflow card — full card width, starting
+# just under its bottom edge (104+900=1004, +36px gap=1040 — the reference's
+# own CONTENT_TOP). content_planner.py's data-display defaults must match
+# these exactly — see that file's own copy of these same numbers.
+_CONTENT_ZONE_X = 60
+_CONTENT_ZONE_Y = 1040
+_CONTENT_ZONE_WIDTH = 960
 # Caller-supplied contentWidth of 920+ (full InfoCard/before_after/section
-# width) reproduces the exact pre-P3 box (x=740, w=300) -- used as the
-# default when a mode_schedule entry omits contentWidth (e.g. a hand-authored
-# op["mode_schedule"] override), so anything not opting into the new field
-# keeps today's already-verified geometry unchanged.
+# width) is now only used to detect the SECTION_PIP_SENTINEL case (full-canvas
+# takeover) -- it no longer drives any card-width narrowing (see above), so
+# any ordinary value works identically. Kept as the default so a
+# hand-authored op["mode_schedule"] entry that omits contentWidth still
+# resolves to "regular workflow", not a section pip.
 _WORKFLOW_DEFAULT_CONTENT_WIDTH = 920
-_CONTENT_ZONE_X = 80  # matches content_planner's dataCards/beforeAfter default x
 
 
-def _workflow_box(content_width: int) -> dict:
-    """内容宽度(P3 content_planner 算出的 contentWidth) -> SpeakerCard Workflow
-    模式的具体像素框。窄内容（仪表盘/倒计时/日历/少行数的 InfoCard）不需要把
-    卡片挤到跟满宽内容一样窄——SpeakerCard 右边界固定，左边界随内容实际占用
-    宽度浮动；content_width>=600 时收敛到 P2 验证过的 (x=740, w=300) 不变。
+# 全画布章节接管（sections）期间 SpeakerCard 直接淡出隐藏，不再缩成小 pip——
+# 确认过的用户反馈：哪怕真小 pip（350x420 右下角）也逼着接管图形整体偏到左半
+# 边去躲它，warning 图标显得"很偏"，右侧和下方大片留白。参考成片的接管章节
+# 本来就是"图形拥有整个画布"；说话人这几秒消失完全可接受（音频还在继续）。
+_TAKEOVER_FADE_FRAMES = 15
+
+
+def _mode_schedule_to_scenes(mode_schedule: list[dict]) -> tuple[list[dict], list[dict]]:
+    """content_planner 的 dominant/workflow 模式时间表 -> contract② 的
+    (scenes, opacityKeyframes)。contentWidth>=SECTION_PIP_SENTINEL 的 workflow
+    段是全画布章节接管：卡片几何保持 _WORKFLOW_BOX 不动（反正看不见，避免
+    淡回来时从奇怪的位置飞入），透明度在段首淡出、在下一段开始时淡回。
     """
-    right_edge = _CONTENT_ZONE_X + content_width
-    x = min(_WORKFLOW_MAX_X, max(_WORKFLOW_MIN_X, right_edge + _WORKFLOW_CONTENT_GAP))
-    w = 1080 - _WORKFLOW_RIGHT_MARGIN - x
-    return {"x": x, "y": _WORKFLOW_Y, "w": w, "h": _WORKFLOW_H}
+    from .content_planner import SECTION_PIP_SENTINEL  # lazy import, matches this file's existing pattern
 
-
-def _mode_schedule_to_scenes(mode_schedule: list[dict]) -> list[dict]:
-    """content_planner 的 dominant/workflow 模式时间表 -> contract② 的 scenes（具体像素坐标）。"""
-    scenes = []
+    scenes: list[dict] = []
+    opacity: list[dict] = []
+    hidden = False
     for entry in mode_schedule:
-        if entry.get("mode") == "workflow":
-            box = _workflow_box(entry.get("contentWidth", _WORKFLOW_DEFAULT_CONTENT_WIDTH))
-        else:
-            box = _DOMINANT_BOX
-        scenes.append({"frame": entry["frame"], **box})
-    return scenes
+        f = entry["frame"]
+        is_workflow = entry.get("mode") == "workflow"
+        is_takeover = is_workflow and entry.get(
+            "contentWidth", _WORKFLOW_DEFAULT_CONTENT_WIDTH) >= SECTION_PIP_SENTINEL
+        scenes.append({"frame": f, **(_WORKFLOW_BOX if is_workflow else _DOMINANT_BOX)})
+        if is_takeover and not hidden:
+            opacity += [{"frame": max(0, f - 1), "opacity": 1.0},
+                        {"frame": f + _TAKEOVER_FADE_FRAMES, "opacity": 0.0}]
+            hidden = True
+        elif hidden and not is_takeover:
+            opacity += [{"frame": f, "opacity": 0.0},
+                        {"frame": f + _TAKEOVER_FADE_FRAMES, "opacity": 1.0}]
+            hidden = False
+    # interpolate() needs strictly increasing frames — drop any keyframe that
+    # would violate that (e.g. two takeovers closer together than the fades).
+    monotonic: list[dict] = []
+    for k in opacity:
+        if monotonic and k["frame"] <= monotonic[-1]["frame"]:
+            continue
+        monotonic.append(k)
+    return scenes, monotonic
 
 
 def _run_enhancement_chain(src: str, workdir: Path) -> str:
@@ -874,7 +1016,8 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
             plan_outro = None
             plan_sections = op.get("sections") or []
             plan_quotes = op.get("quotes") or []
-            plan_atmosphere = op.get("atmosphere_keywords") or []
+            plan_contact_cue = op.get("contact_cue")
+            plan_pills = op.get("pills") or []
         else:
             logger.info("  apply_style: 内容规划中（章节 + 数据展示分析）...")
             content_plan = plan_content(segments, duration, feedback=feedback)
@@ -889,14 +1032,15 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
             plan_outro = content_plan.get("outro")
             plan_sections = content_plan.get("sections") or []
             plan_quotes = content_plan.get("quotes") or []
-            plan_atmosphere = content_plan.get("atmosphere_keywords") or []
+            plan_contact_cue = content_plan.get("contact_cue")
+            plan_pills = content_plan.get("pills") or []
             logger.info(
                 f"  apply_style: 规划出 {len(chapters)} 个章节、{len(data_cards)} 个数据卡、"
                 f"{len(gauges)} 个仪表盘、{len(countdowns)} 个倒计时、{len(calendar_events)} 个日历、"
                 f"{len(before_after)} 个前后对比、{len(plan_quotes)} 条金句"
             )
 
-        scenes = _mode_schedule_to_scenes(mode_schedule)
+        scenes, speaker_opacity = _mode_schedule_to_scenes(mode_schedule)
 
         props: dict[str, Any] = {
             "videoSrc": public_video_rel,
@@ -908,12 +1052,14 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
             "chapters": chapters,
             "captions": captions,
         }
+        if speaker_opacity:
+            props["opacityKeyframes"] = speaker_opacity
         if plan_sections:
             props["sections"] = plan_sections
         if plan_quotes:
             props["quotes"] = plan_quotes
-        if plan_atmosphere:
-            props["atmosphereKeywords"] = plan_atmosphere
+        if plan_pills:
+            props["pills"] = plan_pills
 
         # 开场标题卡/片尾 CTA：模板一直支持（IntroTitle/OutroSection），此前管线从不
         # 生成——这是与 video-studio 手工参考成片(VeLL)最大的一块可自动化差距。
@@ -939,7 +1085,11 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
                 if mode_schedule and m["frame"] <= mode_schedule[-1]["frame"]:
                     continue
                 mode_schedule.append(m)
-            props["scenes"] = _mode_schedule_to_scenes(mode_schedule)
+            props["scenes"], speaker_opacity = _mode_schedule_to_scenes(mode_schedule)
+            if speaker_opacity:
+                props["opacityKeyframes"] = speaker_opacity
+            else:
+                props.pop("opacityKeyframes", None)
             # 段落接管同样不得在 intro 期间开始
             if props.get("sections"):
                 adjusted = []
@@ -953,11 +1103,26 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         outro = op.get("outro") or plan_outro
         if outro:
             duration_frames = max(1, round(duration * 30))
-            # 片尾最后 ~5s 交给 outro（不足 12s 的视频不上 outro，避免喧宾夺主）
+            # 片尾最后 ~5s 交给 outro（不足 12s 的视频不上 outro，避免喧宾夺主）。
+            # fromFrame 必须排在最后一个内容图形结束之后——OutroSection 画的是
+            # 不透明整幅背景，固定 duration-150 的旧算法在短片上会直接把片尾
+            # 附近的数据图形整个盖掉（确认过的真实 bug：一条 22.8s 的片子里
+            # $100K→$1.5M 的 before/after 预算揭晓排在 550-725 帧，outro 却在
+            # 535 帧就把画布糊上了——全片最有料的一个图形完全没露过面）。
+            # 内容排到片尾没剩多少空间时，宁可整个跳过 outro，也不盖内容。
             if duration_frames >= 360:
+                last_content_end = 0
+                for group in (data_cards, gauges, countdowns, calendar_events,
+                              before_after, plan_quotes, plan_pills):
+                    for g in group or []:
+                        end = min(int(g.get("endFrame", 0) or 0), duration_frames)
+                        last_content_end = max(last_content_end, end)
                 outro = dict(outro)
-                outro.setdefault("fromFrame", duration_frames - 150)
-                props["outro"] = outro
+                outro.setdefault("fromFrame", max(duration_frames - 150, last_content_end + 10))
+                if duration_frames - outro["fromFrame"] >= 60:
+                    props["outro"] = outro
+                else:
+                    logger.info("  apply_style: 片尾内容排满，跳过 outro（不盖住收尾图形）")
         if data_cards:
             props["dataCards"] = data_cards
         if gauges:
@@ -974,11 +1139,52 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
             qr_rel = f"jobs/{job_slug}/qr.png"
             qr_abs = remotion_dir / "public" / qr_rel
             if generate_qr(qr_input["contact_url"], qr_abs):
+                # Priority 1 (root fix): content_planner detected the actual
+                # moment the speaker says "WhatsApp me"/"scan the QR code"/etc
+                # (contact_cue) — mount the card exactly then, in the normal
+                # full-width content zone, same as every other data-display
+                # card. Confirmed real user complaint: the card previously
+                # only ever appeared near a generic end-of-video offset,
+                # completely disconnected from when the video actually talks
+                # about how to reach the speaker.
+                #
+                # Priority 2 (fallback, no contact_cue detected — e.g. the
+                # video never explicitly narrates a contact moment): anchor
+                # to the outro instead of an independent duration-based
+                # offset — the two used to be timed off separate constants
+                # (outro: duration-150, qrContact: duration-200), so the QR
+                # card would pop in ~1.7s BEFORE the outro it's meant to
+                # accompany, at its default y=780 which sits inside outro's
+                # own headline/CTA column. OutroSection's own content ends by
+                # local~52f (its footer reveal) and reserves y=88-1848 for
+                # itself, with its last element (footer) at y=1260 —
+                # mounting at outro.fromFrame+60 and y=1360 lands it just
+                # after outro's entrance finishes, below the footer.
+                #
+                # Priority 3 (last resort, no outro either): the original
+                # duration-based heuristic.
+                if plan_contact_cue and plan_contact_cue.get("mountFrame") is not None:
+                    default_mount = plan_contact_cue["mountFrame"]
+                    # y comes from the planner's stacking lane assignment —
+                    # the QR card may be stacked under another visual.
+                    default_x, default_y, default_w = (
+                        _CONTENT_ZONE_X, plan_contact_cue.get("y", _CONTENT_ZONE_Y), _CONTENT_ZONE_WIDTH)
+                else:
+                    outro_block = props.get("outro")
+                    if outro_block and outro_block.get("fromFrame") is not None:
+                        default_mount = outro_block["fromFrame"] + 60
+                        default_x, default_y, default_w = 80, 1360, 920
+                    else:
+                        default_mount = max(0, round(duration * 30) - 200)
+                        default_x, default_y, default_w = 80, 780, 920
                 qr_contact: dict[str, Any] = {
                     "qrSrc": qr_rel,
                     "contactName": qr_input.get("contact_name", ""),
                     "ctaLabel": qr_input.get("cta_label", "WhatsApp Now"),
-                    "mountFrame": qr_input.get("mount_frame", max(0, round(duration * 30) - 200)),
+                    "mountFrame": qr_input.get("mount_frame", default_mount),
+                    "x": qr_input.get("x", default_x),
+                    "y": qr_input.get("y", default_y),
+                    "width": qr_input.get("width", default_w),
                 }
                 if qr_input.get("contact_company"):
                     qr_contact["contactCompany"] = qr_input["contact_company"]
@@ -1021,19 +1227,42 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
     out = workdir / "_op_styled.mp4"
     npx_bin = shutil.which("npx") or "npx"  # Windows: subprocess needs the resolved npx.cmd, plain "npx" raises WinError 2
     from .remotion_bundle import ensure_remotion_bundle
-    bundle = ensure_remotion_bundle(remotion_dir)
+    bundle = ensure_remotion_bundle(remotion_dir, job_slug=job_slug)
+    # props_path/out must be absolute — this subprocess runs with cwd=remotion_dir,
+    # so a relative path (e.g. "storage/jobs/<id>/_op_apply_style_props.json")
+    # resolves against remotion-composer/ instead of the repo root, and Remotion
+    # rejects it outright ("neither valid JSON nor a file path to a valid JSON
+    # file"). Confirmed real production bug: apply_style silently degraded to
+    # the bare unstyled cut on every run where workdir happened to be relative,
+    # with qa_stills' own still-renders (same bug, same fix needed there) failing
+    # identically just before it.
     cmd = [npx_bin, "remotion", "render"] + ([bundle] if bundle else []) + [
-        "XiaojinEditorial", str(out),
-        f"--props={props_path}",
+        "XiaojinEditorial", str(out.resolve()),
+        f"--props={props_path.resolve()}",
         "--crf=18",
     ]
     logger.info(f"  apply_style: rendering via {' '.join(cmd)} (cwd={remotion_dir})")
-    with _RENDER_SLOTS:  # Remotion 渲染跨任务串行 + 硬超时防卡死占坑
-        result = subprocess.run(cmd, cwd=str(remotion_dir), capture_output=True, text=True,
-                                timeout=_RENDER_TIMEOUT_S)
-    if result.returncode != 0:
-        logger.error(f"apply_style render stderr: {result.stderr[-4000:]}")
-        raise RuntimeError(f"apply_style 渲染失败 (exit {result.returncode})")
+    # 重试一次：确认过真实生产 bug——同一份 props/视频独立跑总是成功，只有紧跟在
+    # qa_stills 那几次连续 still 渲染后面立刻起片渲染时才会报 "No frame found at
+    # position N"（Remotion 自己的 asset 缓存/本地 server 在 qa_stills 和整片渲染
+    # 之间交接时的瞬时状态，不是数据或编码问题——独立复现直接 1462/1462 渲染成功）。
+    # 跟这个文件里其它瞬时失败（LLM 调用、口误复核）已有的重试模式一致，不是发明
+    # 新机制。
+    last_result = None
+    for attempt in range(2):
+        with _RENDER_SLOTS:  # Remotion 渲染跨任务串行 + 硬超时防卡死占坑
+            result = subprocess.run(cmd, cwd=str(remotion_dir), capture_output=True, text=True,
+                                    timeout=_RENDER_TIMEOUT_S)
+        if result.returncode == 0:
+            last_result = None
+            break
+        last_result = result
+        if attempt == 0:
+            logger.warning(f"  apply_style: 渲染失败(exit {result.returncode})，重试一次: {result.stderr[-500:]}")
+
+    if last_result is not None:
+        logger.error(f"apply_style render stderr: {last_result.stderr[-4000:]}")
+        raise RuntimeError(f"apply_style 渲染失败 (exit {last_result.returncode})")
 
     return str(out) if out.exists() else None
 
@@ -1113,27 +1342,16 @@ def transcribe_segments(src: str, workdir: Path) -> list[dict]:
         except Exception:
             pass
 
-    import os as _os
-
-    from tools.analysis.transcriber import Transcriber
-
+    # 曾是对 Transcriber() 的裸调用，完全绕开 _safe_transcribe——意味着这条
+    # "规划阶段专门用来识别重复句/口误的转写"路径永远在用本地 faster-whisper，
+    # 从未真正走到 elevenlabs（确认过的真实生产 bug 根因之一：L2 规划阶段用
+    # 这里的转写判断要不要剪重录，判断本身就没吃到更准的转写）。改为调用
+    # _safe_transcribe 以复用同一套 provider 分流 + 并发闸门（_TRANSCRIBE_SLOTS）。
     config = get_config()
-    # 临时移除可能含非 ASCII 的 HF_TOKEN，避免 httpx header 编码错误
-    _hf = _os.environ.pop("HF_TOKEN", None)
-    try:
-        # 规划路径的转写同样必须过闸——这是"两人同发卡 20 分钟"事故的元凶：
-        # 此处曾是裸调用，两个 Whisper 并跑互踩 CPU，规划双双拖过超时再重试。
-        with _TRANSCRIBE_SLOTS:
-            t = Transcriber().execute({
-                "input_path": src, "output_dir": str(workdir),
-                "model_size": config.faster_whisper_model,
-            })
-    finally:
-        if _hf is not None:
-            _os.environ["HF_TOKEN"] = _hf
+    t = _safe_transcribe(src, workdir, config.faster_whisper_model)
 
-    if not t.success:
-        logger.warning(f"script 阶段转录失败: {t.error}")
+    if t is None or not t.success:
+        logger.warning(f"script 阶段转录失败: {getattr(t, 'error', 'unavailable')}")
         return []
 
     slim = [

@@ -141,11 +141,31 @@ class FaceEnhance(BaseTool):
 
         start = time.time()
 
+        # -fps_mode cfr -r <fps> is mandatory on a re-encode, not optional —
+        # this input is typically the clean CFR concat output of remove_filler
+        # (video_trimmer.py's _concat already applies this same fix), but
+        # re-encoding through a -vf filter without pinning the output frame
+        # rate can silently drift the result off CFR again. Confirmed real
+        # production bug: Remotion's compositor threw "No frame found at
+        # position N" partway through a render whose source had passed
+        # through face_enhance without this flag.
+        #
+        # Deliberately NOT probing the input's own r_frame_rate here: ffprobe
+        # reports a misleadingly high "common denominator" rate for a source
+        # that already has slightly irregular frame timing (confirmed: probing
+        # this exact input returned 120fps for what is a 30fps video, and
+        # forcing -r 120 quadrupled the frame count instead of fixing
+        # anything). The whole pipeline hardcodes 30fps throughout
+        # (content_planner.py's FPS=30, video_trimmer's own CFR fix), so pin
+        # to that fixed, known-correct value instead of trusting a live probe
+        # of a file that may already be the thing that's wrong.
+        fps = inputs.get("fps", 30)
         cmd = [
             "ffmpeg", "-y",
             "-i", str(input_path),
             "-vf", vf,
             "-c:v", codec, "-crf", str(crf),
+            "-fps_mode", "cfr", "-r", str(fps),
             "-c:a", "copy",
             str(output_path),
         ]

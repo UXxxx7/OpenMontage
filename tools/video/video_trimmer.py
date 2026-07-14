@@ -7,7 +7,6 @@ by default.
 
 from __future__ import annotations
 
-import json
 import time
 from pathlib import Path
 from typing import Any
@@ -215,20 +214,29 @@ class VideoTrimmer(BaseTool):
                     # Re-encode instead for frame-accurate cuts: -ss before -i
                     # + -t (not -to) after, per the same bug class as _cut
                     # above; crf 18 pins quality (the final concat re-encodes
-                    # once more, so segments must not degrade on this pass);
-                    # 30ms audio fades avoid clicks at joins (same treatment
-                    # video-use applies at its cut points).
+                    # once more, so segments must not degrade on this pass).
+                    #
+                    # Fade duration bumped 30ms -> 60ms (confirmed real bug: a
+                    # retake-removal join measured at only ~61ms of actual
+                    # silence between the two spliced sentences — 30ms fades
+                    # on each side leave almost no steady-state gap, reading as
+                    # an abrupt/"choppy" jump rather than a clean cut, even
+                    # though there's no technical corruption). 60ms per side
+                    # is still short enough to avoid clipping adjacent words
+                    # (paired with content_planner.py's FILLER_CUT_PAD_SECONDS)
+                    # but gives noticeably more breathing room at the splice.
                     cmd = ["ffmpeg", "-y"]
                     if seg_start is not None:
                         cmd.extend(["-ss", str(seg_start)])
                     cmd.extend(["-i", str(seg_input)])
                     if seg_end is not None:
                         cmd.extend(["-t", f"{max(0.0, float(seg_end) - float(seg_start or 0)):.3f}"])
+                    fade_d = 0.06
                     if seg_start is not None and seg_end is not None:
-                        fade_out_st = max(0.0, float(seg_end) - float(seg_start) - 0.03)
-                        cmd.extend(["-af", f"afade=t=in:d=0.03,afade=t=out:st={fade_out_st:.3f}:d=0.03"])
+                        fade_out_st = max(0.0, float(seg_end) - float(seg_start) - fade_d)
+                        cmd.extend(["-af", f"afade=t=in:d={fade_d},afade=t=out:st={fade_out_st:.3f}:d={fade_d}"])
                     else:
-                        cmd.extend(["-af", "afade=t=in:d=0.03"])
+                        cmd.extend(["-af", f"afade=t=in:d={fade_d}"])
                     cmd.extend([
                         "-c:v", "libx264", "-preset", "fast", "-crf", "18",
                         "-pix_fmt", "yuv420p",
@@ -257,7 +265,22 @@ class VideoTrimmer(BaseTool):
             # real render). Same fix video-studio already validated for this
             # exact bug class (CLAUDE-v2.md): re-encode at constant frame rate
             # instead of stream-copying the concat.
-            fps = self._probe_fps(temp_files[0]) if temp_files else 30.0
+            #
+            # Hardcoded to 30 rather than probed from temp_files[0]: that file
+            # is itself a segment just re-encoded from an arbitrary (non-
+            # keyframe) -ss/-t cut, and ffprobing an already-irregularly-cut
+            # source can read back a corrupted rate (e.g. a doubled/halved
+            # value) — which then gets baked into -r for the WHOLE concat
+            # output, silently multiplying or dropping frames across the
+            # entire final video (this is very likely the source of the
+            # "choppy cuts" reports: a filler-removal concat feeding a wrong
+            # frame count into every downstream step). Confirmed and fixed the
+            # same way earlier this session in tools/enhancement/face_enhance.py
+            # and color_grade.py, which hit this exact failure mode when their
+            # own _probe_fps() read 120fps off a 30fps source. The whole
+            # pipeline assumes 30fps throughout (content_planner.py's FPS=30),
+            # so there is nothing to gain by probing and real risk in doing so.
+            fps = 30.0
             cmd = [
                 "ffmpeg", "-y",
                 "-f", "concat", "-safe", "0",
@@ -289,22 +312,6 @@ class VideoTrimmer(BaseTool):
                     temp_dir.rmdir()
                 except OSError:
                     pass
-
-    def _probe_fps(self, path: Path) -> float:
-        """ffprobe the source frame rate, falling back to 30 if unavailable."""
-        cmd = [
-            "ffprobe", "-v", "quiet",
-            "-select_streams", "v:0",
-            "-show_entries", "stream=r_frame_rate",
-            "-of", "json", str(path),
-        ]
-        try:
-            result = self.run_command(cmd)
-            stream = json.loads(result.stdout)["streams"][0]
-            num, _, den = stream["r_frame_rate"].partition("/")
-            return float(num) / float(den) if den else float(num)
-        except Exception:
-            return 30.0
 
     @staticmethod
     def _build_atempo_chain(factor: float) -> str:

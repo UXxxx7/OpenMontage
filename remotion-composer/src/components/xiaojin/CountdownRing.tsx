@@ -33,6 +33,8 @@ export interface CountdownRingProps {
   endFrame?: number;
   x?: number;
   y?: number;
+  /** Fixed card width (e.g. the full 960px content-zone lane). Omit for content-sized. */
+  width?: number;
   colorMode: ColorMode;
   headingFont?: string;
   labelFont?: string;
@@ -50,6 +52,7 @@ export const CountdownRing: React.FC<CountdownRingProps> = ({
   endFrame,
   x = 80,
   y = 900,
+  width,
   colorMode,
   headingFont = "inherit",
   labelFont = "inherit",
@@ -91,6 +94,10 @@ export const CountdownRing: React.FC<CountdownRingProps> = ({
         boxShadow: `0 8px 32px ${palette.shadow}`,
         display: "flex",
         alignItems: "center",
+        // When given a fixed lane width (full content zone), center the
+        // ring+text group instead of leaving them hugging the left edge.
+        justifyContent: width !== undefined ? "center" : "flex-start",
+        width,
         gap: 28,
       }}
     >

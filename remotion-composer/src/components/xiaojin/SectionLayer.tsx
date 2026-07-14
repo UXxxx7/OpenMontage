@@ -146,32 +146,32 @@ export const SectionLayer: React.FC<{
                 labelFont={labelFont}
               />
             ) : (
-              /* P3: a takeover with no `timeline` (the common case — most
-                 chapters don't have a matched multi-stage process) used to
-                 paint only the header (~y=360-490) and a small ~230px icon
-                 at y=500, leaving ~1000px of the 1920px canvas (everything
-                 below the icon down to the BrandBar at y=1824) empty. This
-                 body-fill zone spans the same y=520-1500 band
-                 TimelineSection's own track uses (already vetted to clear
-                 the caption band, see that file's TRACK_BOTTOM comment) so
-                 a plain takeover reads as intentionally full rather than a
-                 title floating over empty canvas, regardless of whether an
-                 icon was picked for this chapter. */
+              /* Centered full-width icon zone. History: this zone bounced
+                 between full-canvas-centered (overlapped the old side-docked
+                 SpeakerCard pip) and left-column-constrained (dodged the pip
+                 but read as visibly OFF-CENTER — confirmed user complaint
+                 about the warning icon "just being like that"). The pip is
+                 gone now: pipeline_runner hides the SpeakerCard entirely
+                 during takeovers via opacityKeyframes, so the graphic owns
+                 the whole canvas and centers cleanly. Vertical span 500-1000
+                 stays clear of the header block (y=360) above and the
+                 content zone (y=1040, where any data card scheduled during
+                 the takeover renders) below. */
               <div
                 style={{
-                  position: "absolute", left: 0, top: 520, width: "100%", height: 980,
+                  position: "absolute", left: 0, top: 500, width: "100%", height: 500,
                   display: "flex", alignItems: "center", justifyContent: "center",
                 }}
               >
                 <div
                   style={{
-                    position: "absolute", width: 640, height: 640, borderRadius: "50%",
+                    position: "absolute", width: 440, height: 440, borderRadius: "50%",
                     background: `radial-gradient(circle, ${accent}26 0%, ${accent}00 72%)`,
                     transform: `scale(${0.9 + 0.1 * enter})`, opacity: enter,
                   }}
                 />
                 {Icon ? (
-                  <div style={{ transform: "scale(2.3)" }}>
+                  <div style={{ transform: "scale(2.2)" }}>
                     <Icon localFrame={local} color={accent} />
                   </div>
                 ) : null}

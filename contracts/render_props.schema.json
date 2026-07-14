@@ -384,6 +384,11 @@
           "y": {
             "type": "number",
             "default": 900
+          },
+          "width": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Fixed card width (e.g. the full 960px content-zone lane). Omit for content-sized."
           }
         }
       }
@@ -442,6 +447,11 @@
           "y": {
             "type": "number",
             "default": 900
+          },
+          "width": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Fixed card width (e.g. the full 960px content-zone lane). Omit for content-sized."
           }
         }
       }
@@ -536,6 +546,11 @@
         "y": {
           "type": "number",
           "default": 780
+        },
+        "width": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Fixed card width (e.g. the full 960px content-zone lane). Omit for content-sized."
         }
       }
     },
@@ -773,6 +788,42 @@
       "items": {
         "type": "string",
         "maxLength": 16
+      }
+    },
+    "pills": {
+      "type": "array",
+      "description": "Full-width terracotta takeaway pills stacked under their primary data-display graphics (AccentPill) — the reference build's 'Policy Active — Renew in 30 Days' move that keeps a content stack visually full.",
+      "items": {
+        "type": "object",
+        "required": [
+          "text",
+          "mountFrame"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 60
+          },
+          "mountFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "endFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "x": {
+            "type": "integer"
+          },
+          "y": {
+            "type": "integer"
+          },
+          "width": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
       }
     }
   }

@@ -141,15 +141,19 @@ export const SpeakerCard: React.FC<SpeakerCardProps> = ({
           height: "100%",
           objectFit: "cover",
           objectPosition,
-          filter: "contrast(1.06) brightness(0.95) saturate(1.06)",
+          filter: "contrast(1.06) brightness(0.88) saturate(1.06)",
         }}
       />
+      {/* Top scrim to tame blown-out exposure/lens flare — the 0.30-opacity/
+          32%-falloff version this replaced was too weak/shallow for footage
+          with a genuinely overexposed light source (confirmed against real
+          production footage: highlights stayed blown out past 32% down). */}
       <div
         style={{
           position: "absolute",
           inset: 0,
           background:
-            "linear-gradient(180deg, rgba(20,12,6,0.30) 0%, rgba(20,12,6,0) 32%)",
+            "linear-gradient(180deg, rgba(20,12,6,0.55) 0%, rgba(20,12,6,0) 45%)",
           pointerEvents: "none",
         }}
       />
