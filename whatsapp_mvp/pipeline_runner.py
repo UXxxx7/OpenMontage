@@ -570,6 +570,14 @@ def _op_insert_broll(src: str, op: dict, workdir: Path) -> Optional[str]:
         if ref is None or start is None or end is None or end <= start:
             continue
         matches = sorted(assets_dir.glob(f"broll_{ref}.*"))
+        # gen_prompt: 没上传素材但给了文字 prompt → 用所选 provider 生成一段再合成
+        if not matches and it.get("gen_prompt"):
+            from .broll_providers import generate_broll_via
+            assets_dir.mkdir(parents=True, exist_ok=True)
+            _gen_out = assets_dir / f"broll_{ref}.mp4"
+            if generate_broll_via(it.get("gen_provider", "omni"), it["gen_prompt"], _gen_out,
+                                  aspect=("9:16" if base_h >= base_w else "16:9")):
+                matches = [_gen_out]
         if not matches:
             logger.warning(f"  insert_broll: 找不到资产 broll_{ref}.*，跳过")
             continue
