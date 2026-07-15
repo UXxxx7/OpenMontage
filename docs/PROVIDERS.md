@@ -15,7 +15,7 @@ Everything you need to know about every provider in OpenMontage — setup instru
 | 3 | **$0** | ElevenLabs | Premium TTS + music + SFX (10K chars/month free) |
 | 4 | **$0** | Piper (local install) | Fully offline TTS — no API key, no cost, no network |
 | 5 | **~$0.03/image** | fal.ai | FLUX images + Kling/Veo/MiniMax video + Recraft — broad single-key image + video coverage |
-| 6 | **~$0.04/image** | OpenAI | DALL-E 3 images + OpenAI TTS |
+| 6 | **~$0.05/image** | OpenAI | GPT Image 2 images + OpenAI TTS |
 | 7 | **~$0.04/image** | Google Imagen | Imagen 4 images (shares the Google API key) |
 | 8 | **$12/month** | Runway | Gen-4 video — highest quality AI video |
 | 9 | **pay-as-you-go** | HeyGen | Avatar videos, multi-model video gateway |
@@ -33,14 +33,15 @@ PEXELS_API_KEY=              # Stock photos + videos
 PIXABAY_API_KEY=             # Stock photos + videos
 
 # GOOGLE (one key, two tools, generous free tier)
-GOOGLE_API_KEY=              # Google TTS + Google Imagen
+GOOGLE_API_KEY=              # Google TTS + Google Imagen + Gemini Omni video
 
 # VOICE + MUSIC
 ELEVENLABS_API_KEY=          # TTS, music, sound effects (10K chars/month free)
-OPENAI_API_KEY=              # OpenAI TTS + DALL-E 3 images
+OPENAI_API_KEY=              # OpenAI TTS + GPT Image 2 images
 XAI_API_KEY=                 # xAI Grok image generation/editing + Grok video generation
 DOUBAO_SPEECH_API_KEY=       # Volcengine Doubao Speech TTS (strong Mandarin narration)
 DOUBAO_SPEECH_VOICE_TYPE=    # Default Doubao speaker/voice type
+DASHSCOPE_API_KEY=           # Alibaba DashScope (Qwen image gen, TTS, ASR with word timestamps)
 
 # MULTI-MODEL GATEWAY (one key, 6+ tools)
 FAL_KEY=                     # FLUX, Recraft, Kling, Veo, MiniMax video
@@ -91,6 +92,43 @@ Current xAI docs pricing for the Grok media models:
 | `grok-imagine-video` input images | $0.002 per input image |
 
 OpenMontage now uses those published rates in the Grok tool estimators.
+
+---
+
+### Alibaba DashScope — Qwen Image + TTS + ASR
+
+> **Best for Chinese-language production.** One key unlocks Qwen-Image generation, Qwen-TTS Mandarin narration, and Qwen-ASR with word-level timestamps — the only DashScope path that provides word-level granularity for subtitle alignment.
+
+**Tools unlocked:** `dashscope_image`, `dashscope_tts`, `dashscope_asr`
+**Env var:** `DASHSCOPE_API_KEY`
+
+#### Setup
+
+1. Go to [dashscope.aliyun.com](https://dashscope.aliyun.com/)
+2. Create an Alibaba Cloud account if you don't have one
+3. Generate an API key in the DashScope console
+4. Add to `.env`: `DASHSCOPE_API_KEY=sk-...`
+
+#### What it's best for
+
+- Chinese-language image generation with strong prompt understanding (Qwen-Image)
+- Natural Mandarin narration (Qwen-TTS, Cherry voice)
+- Word-level timestamp transcription for subtitle alignment (Qwen-ASR filetrans)
+- Replacing the broken `whisperx` slot for ASR
+
+#### API notes
+
+DashScope's `/compatible-mode/v1/` only supports `/chat/completions` and `/embeddings`. Image gen, TTS, and ASR all use DashScope-native endpoints with nested `{model, input, parameters}` request shape — not OpenAI-compatible paths.
+
+The ASR tool (`qwen3-asr-flash-filetrans`) uses an async submit-poll pattern. Audio must be at a publicly accessible URL (local files are not supported). Word timestamps are in milliseconds, normalized to seconds by the tool.
+
+#### Pricing
+
+| Model | Price |
+|------|-------|
+| `qwen-image-2.0-pro` | ~$0.02 per image (check console for current rates) |
+| `qwen3-tts-flash` | ~$0.000015 per character |
+| `qwen3-asr-flash-filetrans` | Per-minute billing (check console) |
 
 ---
 
@@ -207,12 +245,12 @@ Doubao Speech 2.0 is billed by character package or usage in Volcengine. OpenMon
 
 ---
 
-### Google — TTS + Imagen (Shared Key)
+### Google — TTS + Imagen + Gemini Omni Video (Shared Key)
 
-> **One key, two tools.** Google Cloud TTS has 700+ voices in 50+ languages — the strongest localization option. Imagen 4 generates high-quality images.
+> **One key, three tools.** Google Cloud TTS has 700+ voices in 50+ languages — the strongest localization option. Imagen 4 generates high-quality images. Gemini Omni Flash generates and *conversationally edits* short videos — the only provider in the fleet that can refine a clip with natural language instead of regenerating it.
 
-**Tools unlocked:** `google_tts`, `google_imagen`
-**Env var:** `GOOGLE_API_KEY`
+**Tools unlocked:** `google_tts`, `google_imagen`, `gemini_omni_video`
+**Env var:** `GOOGLE_API_KEY` (or `GEMINI_API_KEY` — either works; `GEMINI_API_KEY` takes precedence)
 
 #### Setup
 
@@ -227,7 +265,7 @@ Doubao Speech 2.0 is billed by character package or usage in Volcengine. OpenMon
 2. Click **Enable**
 3. Make sure your API key's restrictions allow the Text-to-Speech API
 
-**For Imagen**, enable the Generative Language API:
+**For Imagen and Gemini Omni video**, enable the Generative Language API:
 1. Visit [console.cloud.google.com/apis/library/generativelanguage.googleapis.com](https://console.cloud.google.com/apis/library/generativelanguage.googleapis.com)
 2. Click **Enable**
 
@@ -253,7 +291,15 @@ The free tiers apply *independently* — you get 1M Standard AND 1M WaveNet AND 
 
 **Free tier for Imagen:** None. Paid tier only.
 
-**New account bonus:** Google Cloud offers **$300 in free credits** for new accounts (90-day trial), applicable to both TTS and Imagen.
+#### Gemini Omni Video Pricing
+
+| Model | Price | Notes |
+|-------|-------|-------|
+| `gemini-omni-flash-preview` | ~$0.10 per second of video | Billed as 5,792 output tokens/sec of 720p video at $17.50/1M tokens |
+
+Generates 3–10 second clips at 720p/24fps with synthesized audio, plus stateful conversational editing (`edit_video` via `previous_interaction_id`). **Paid tier only — no free tier.** A typical 8-second clip costs ~$0.80; each edit turn generates a new clip and bills again.
+
+**New account bonus:** Google Cloud offers **$300 in free credits** for new accounts (90-day trial), applicable to TTS, Imagen, and Gemini Omni video.
 
 #### Google TTS Voice Types
 
@@ -276,7 +322,7 @@ Google TTS offers 700+ voices across 50+ languages. Voice names follow the patte
 
 ### OpenAI — TTS + Image Generation
 
-> **Solid all-rounder.** DALL-E 3 handles complex multi-element compositions well. TTS is fast and affordable.
+> **Solid all-rounder.** GPT Image 2 handles complex multi-element compositions and in-image text well. TTS is fast and affordable.
 
 **Tools unlocked:** `openai_tts`, `openai_image`
 **Env var:** `OPENAI_API_KEY`
@@ -301,10 +347,14 @@ Google TTS offers 700+ voices across 50+ languages. Voice names follow the patte
 
 | Model | Size | Quality | Price per image |
 |-------|------|---------|----------------|
-| DALL-E 3 | 1024x1024 | standard | $0.040 |
-| DALL-E 3 | 1024x1024 | hd | $0.080 |
-| DALL-E 3 | 1024x1792 | standard | $0.080 |
-| DALL-E 3 | 1024x1792 | hd | $0.120 |
+| GPT Image 2 | 1024x1024 | low | $0.006 |
+| GPT Image 2 | 1024x1024 | medium | $0.053 |
+| GPT Image 2 | 1024x1024 | high | $0.211 |
+| GPT Image 2 | 1024x1536 / 1536x1024 | low | $0.005 |
+| GPT Image 2 | 1024x1536 / 1536x1024 | medium | $0.041 |
+| GPT Image 2 | 1024x1536 / 1536x1024 | high | $0.165 |
+
+> **Note:** DALL-E 2/3 were shut down by OpenAI on 2026-05-12, and the `gpt-image-1` family (`gpt-image-1-mini`, `gpt-image-1.5`) retires 2026-12-01 — `gpt-image-2` is OpenAI's recommended replacement ([deprecations](https://developers.openai.com/api/docs/deprecations)).
 
 **Free tier:** None. Requires prepaid billing. Previously offered $5 in free credits for new accounts (discontinued for most signups).
 
@@ -672,7 +722,7 @@ First run downloads the model (~4GB). Subsequent runs use the cached model.
 
 **VRAM requirement:** 4GB+ (8GB recommended for 1024x1024 images)
 
-**Supports:** Negative prompts, seeds, custom sizes. Quality is lower than FLUX or DALL-E 3 but completely free and offline.
+**Supports:** Negative prompts, seeds, custom sizes. Quality is lower than FLUX or GPT Image 2 but completely free and offline.
 
 ---
 
@@ -722,7 +772,7 @@ These tools require only FFmpeg or Python packages — no GPU, no API key.
 | **Pexels** | `PEXELS_API_KEY` | `pexels_image`, `pexels_video` | Free |
 | **Pixabay** | `PIXABAY_API_KEY` | `pixabay_image`, `pixabay_video` | Free |
 | **Piper** | — (install only) | `piper_tts` | Free |
-| **Google** | `GOOGLE_API_KEY` | `google_tts`, `google_imagen` | Free tier + paid |
+| **Google** | `GOOGLE_API_KEY` (or `GEMINI_API_KEY`) | `google_tts`, `google_imagen`, `gemini_omni_video` | Free tier (TTS) + paid (Imagen, Omni video) |
 | **ElevenLabs** | `ELEVENLABS_API_KEY` | `elevenlabs_tts`, `music_gen` | Free tier + paid |
 | **fal.ai** | `FAL_KEY` | `flux_image`, `recraft_image`, `kling_video`, `veo_video`, `minimax_video` | Pay-as-you-go |
 | **OpenAI** | `OPENAI_API_KEY` | `openai_tts`, `openai_image` | Paid only |
@@ -743,8 +793,8 @@ How many providers cover each capability:
 
 | Capability | Cloud Providers | Local Providers | Free Options |
 |-----------|----------------|-----------------|--------------|
-| **Image Generation** | FLUX, Grok, Google Imagen, DALL-E 3, Recraft | Local Diffusion | Pexels, Pixabay (stock) |
-| **Video Generation** | Grok, Kling, Runway, Veo, Higgsfield, MiniMax, HeyGen | WAN, Hunyuan, CogVideo, LTX | Pexels, Pixabay (stock) |
+| **Image Generation** | FLUX, Grok, Google Imagen, GPT Image 2, Recraft | Local Diffusion | Pexels, Pixabay (stock) |
+| **Video Generation** | Grok, Kling, Runway, Veo, Gemini Omni, Higgsfield, MiniMax, HeyGen | WAN, Hunyuan, CogVideo, LTX | Pexels, Pixabay (stock) |
 | **Text-to-Speech** | ElevenLabs, Google TTS, OpenAI | Piper | Piper, Google free tier, ElevenLabs free tier |
 | **Music Generation** | ElevenLabs, Suno | — | ElevenLabs free tier |
 | **Post-Production** | — | FFmpeg (compose, stitch, trim, mix, enhance, grade) | All free |

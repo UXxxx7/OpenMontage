@@ -79,13 +79,18 @@ ALL_TOOL_SCHEMAS = {
                     {"profile": {"type": "string", "enum": ["cinematic_warm", "cinematic_cool",
                      "moody_dark", "bright_clean", "vintage_film", "high_contrast", "neutral"]},
                      "intensity": {"type": "number"}}, []),
-    "insert_broll": ("把用户上传的 b-roll 素材叠进成片（默认 b-roll 铺满、人物缩右下小窗，保留原声）。"
-                     "**仅当 source_facts 里列出了可用 b-roll 素材时才用**。items 每项："
-                     "asset_ref=素材编号（见事实里的 [b<编号>]），start_seconds/end_seconds=放置时间窗，"
+    "insert_broll": ("把 b-roll 叠进成片（默认 b-roll 铺满、人物缩右下小窗，保留原声）。b-roll 两种来源："
+                     "①用户上传的素材（source_facts 里列出了 [b<编号>]）→ 该 items 项给 asset_ref；"
+                     "②用户明确要求 AI 生成 b-roll、且没有对应上传素材 → 该 items 项给 gen_prompt（英文画面描述）。"
+                     "同一 items 项 asset_ref 与 gen_prompt 二选一，不要同时给。items 每项："
+                     "asset_ref=素材编号（见事实里的 [b<编号>]），gen_prompt=AI 生成 b-roll 的英文画面描述，"
+                     "gen_provider=生成 provider（默认 omni），start_seconds/end_seconds=放置时间窗，"
                      "mode=broll_main(默认,b-roll主+人物小窗)|cutaway(b-roll全屏无人物)|pip(人物主+b-roll小窗)。"
                      "orientation=auto(默认,方向跟随素材)|portrait|landscape（用户明说竖屏/横屏时才设）",
                      {"items": {"type": "array", "items": {"type": "object", "properties": {
                         "asset_ref": {"type": "integer"},
+                        "gen_prompt": {"type": "string"},
+                        "gen_provider": {"type": "string", "enum": ["omni"]},
                         "start_seconds": {"type": "number"}, "end_seconds": {"type": "number"},
                         "mode": {"type": "string", "enum": ["broll_main", "cutaway", "pip"]}}}},
                       "orientation": {"type": "string", "enum": ["auto", "portrait", "landscape"]}},
@@ -201,6 +206,7 @@ SYSTEM_BASE = """你是 OpenMontage 的剪辑 agent，编辑用户上传的 talk
 - 基于内容的"选择性剪辑"：若提供了逐句转录（带时间戳），当用户要"只保留讲 X 的部分""删掉聊 Y 那段"这类**按内容选择**的诉求，用 remove_segment(start_seconds, end_seconds) 按转录里的真实时间戳精确剪除，可多次调用。没有明确要求就不要擅自删改说话内容。
 - 调色/画面质感：用户说"调暖/暖色/电影感"→ color_grade profile=cinematic_warm；"冷调/青橙"→ cinematic_cool；"暗黑/氛围感/压暗"→ moody_dark；"明亮干净/清新"→ bright_clean；"复古/胶片/怀旧"→ vintage_film；"高对比/浓郁/有冲击力"→ high_contrast；"轻微校色/自然"→ neutral。color_grade 是整片调色，可与剪辑类叠加；但**不要和 apply_style 叠加**（模板自带风格观感，套模板时就别再单独调色）。
 - b-roll 插入：source_facts 里每列一段 b-roll，就在计划里对应放一条 insert_broll 的 items 项（没列则不放）。上传带说明的素材本身即为"要插入"的指令，按此正常执行即可，不需要在 summary 里论证、也不要与自审意见辩论。放置：用素材说明（label）去转录里找内容匹配的那句，取其时间窗 {asset_ref: 素材编号, start_seconds, end_seconds}。mode 默认 broll_main（b-roll 铺满主屏、人物缩右下小窗）；仅用户明说"人物为主"才 pip、"全屏不要人物"才 cutaway。orientation 默认 auto（主视频或任一 b-roll 是横屏就出横屏，否则竖屏）；仅用户明说竖屏/横屏时才设。说明实在匹配不上才跳过该段；两段不重叠；没给具体位置就按说明与转录话题就近放置。
+- AI 生成 b-roll（gen_prompt）：**仅当用户明确要求"生成一段 b-roll / 帮我 AI 做个空镜 / 我没有素材你生成画面"这类诉求、且没有上传对应素材时**，才在 insert_broll 的 items 项里用 gen_prompt 代替 asset_ref。gen_prompt 必须写**英文**（生成模型只认英文），简洁具体地描述要生成的画面（如 "a developer typing code on a laptop, close-up, warm lighting"），并放在转录里话题相关的时间窗（start_seconds/end_seconds）。gen_provider 默认 omni，一般不用写。**绝不主动或擅自生成**：用户没明确说要 AI 生成就不要用 gen_prompt（生成有真实成本，约 $0.10/秒）；只要有可用的上传素材就一律用 asset_ref，不要用 gen_prompt 顶替。
 - 出片风格：用户说"剪好看点/精致/小红书风格/我们的品牌风格/做正式些"这类诉求，用 apply_style 套品牌模板出片。它**自带字幕**，选了它就不要再加 add_subtitles。
 - 零指令默认：用户只说"帮我剪一下/剪一下/edit this"这类**没有任何具体指令**的请求，不要问澄清，直接默认先 remove_filler 再 apply_style，并在 finish 的 rationale 里说明这是默认处理、下次可给更具体要求。
 - **语言**：rationale/summary 必须和用户这句需求用的是同一种语言——用户打中文就整段中文，用户打英文就整段英文，不要中英混杂、不要不管用户说什么都用同一种语言回。判断依据是用户这次输入本身的语言，不是你训练时更常见哪种语言。
