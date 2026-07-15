@@ -286,8 +286,8 @@ async function collectNudge({ waNumber, count, text }) {
     `Received ${count} assets so far. Reply *go* when done, or *cancel* to start over.`));
 }
 
-async function collectCancel({ waNumber, text }) {
-  const lang = resolveLang(DEFAULT_LANG, text);
+async function collectCancel({ waNumber, text, captionSignal }) {
+  const lang = resolveLang(DEFAULT_LANG, text, captionSignal);
   await redis.del(notesKey(waNumber));
   await safeSendText(waNumber, t(lang,
     "已清空本次素材与描述。重新发送视频即可开始。",

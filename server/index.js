@@ -188,9 +188,19 @@ async function handleMessage(message) {
     if (awaitingChoice || pendingCount > 0) {
       // 任何阶段都允许取消（含“选主视频”阶段 —— 修 #5）
       if (cancelWords.includes(normalized)) {
+        // "cancel" 本身是裸指令词，不带语言信息（resolveLang 设计上会正确
+        // 跳过它）——真正的信号在已收集素材的配文里，但 collectKey 这行
+        // 删完 worker 那边就再也读不到了，必须在删除前把配文取出来一起
+        // 传过去，不然只能退回默认语言（2026-07-15 实测：英文配文传视频后
+        // 回 cancel，收到的是中文回执）。
+        let captionSignal;
+        try {
+          const items = (await redis.lrange(collectKey(waNumber), 0, -1)).map((s) => JSON.parse(s));
+          captionSignal = items.map((i) => i.caption).find((c) => c);
+        } catch {}
         await redis.del(collectKey(waNumber));
         await redis.del(awaitChoiceKey(waNumber));
-        await videoQueue.add("collect-cancel", { waNumber, text, msgId }, queueOptions(msgId));
+        await videoQueue.add("collect-cancel", { waNumber, text, captionSignal, msgId }, queueOptions(msgId));
         return;
       }
       // 选主视频阶段：期待一个编号，交给 worker 校验并建任务
