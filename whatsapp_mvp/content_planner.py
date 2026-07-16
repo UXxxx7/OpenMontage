@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import date
 from typing import Any, Optional
 
@@ -808,9 +809,9 @@ FILLER_SYSTEM_PROMPT = """You are a video editor. You are given a talking-head v
 
 Cut:
 - Filler words used as verbal padding: "um", "uh", "like" (when not meaningful), "you know", "I mean" (when just a verbal tic), false starts ("we— we should", cut the abandoned "we—").
-- Stutters and self-corrections: if the speaker restarts a phrase or repeats themselves to get it right, cut the earlier failed attempt(s) and keep only the final clean version.
+- Stutters and self-corrections: if the speaker restarts a phrase or repeats themselves to get it right, cut the ENTIRE earlier failed attempt, not just the part where it visibly breaks off. A common mistake: the speaker gets partway through a sentence cleanly, stumbles or trails off, then restarts and says the WHOLE thing again from the top in a complete, clean version. It's tempting to only cut the broken tail (since the opening words sounded fine on their own) — but if that opening content is said again in the clean restart, the entire earlier attempt is now redundant and must be cut in full, back to wherever the repeated content begins — not just the part that breaks off. Test: after your cuts, read the remaining transcript straight through — if any clause or sentence's content still appears twice, you under-cut; extend the cut range backward to the start of that clause. Example: ORIGINAL "...your premium is $8,400. I've put the full breakdown in this video. So you can have —" [restart] "I've put the full breakdown in this video so you have everything in one place." → WRONG: cut only "So you can have" (leaves "I've put the full breakdown in this video" duplicated). RIGHT: cut the entire first "I've put the full breakdown in this video. So you can have" — the whole failed attempt — keeping only the second, complete instance.
 - Do NOT cut: meaningful words, correct sentences, or pauses that are just natural speech rhythm (that is a separate, silence-only cleanup step — you are only removing WORDS the speaker didn't mean to leave in, not silence).
-- Be conservative: if you're not sure a word is filler, keep it. A clean-but-untouched take is better than an over-aggressive cut that removes real content.
+- Be conservative about content that is NOT repeated elsewhere: if you're not sure a word is filler and it doesn't reappear in a cleaner form later, keep it. But conservatism does not apply to the repeated-clause case above — once content is confirmed to reappear in a cleaner later version, the earlier instance must be cut in full, even if individual words in it looked fine in isolation.
 - Cuts must be at word boundaries — you can only cut whole words from the numbered list, never partial words.
 
 Output ONLY valid JSON, no markdown, no prose:
@@ -877,6 +878,97 @@ def _words_in_keep_ranges(words: list[dict], keep_ranges: list[dict]) -> list[di
     return kept
 
 
+def _subtract_spans(keep_ranges: list[dict], cut_spans: list[dict]) -> list[dict]:
+    """从 keep_ranges 里再挖掉 cut_spans——用于机械兜底事后追加裁剪，不用重新
+    走一遍 LLM 的 cut_indices 逻辑。"""
+    result: list[tuple[float, float]] = []
+    for r in keep_ranges:
+        segments = [(r["start_seconds"], r["end_seconds"])]
+        for cs in cut_spans:
+            cs_s, cs_e = cs["start_seconds"], cs["end_seconds"]
+            new_segments = []
+            for s, e in segments:
+                if cs_e <= s or cs_s >= e:
+                    new_segments.append((s, e))
+                    continue
+                if cs_s > s:
+                    new_segments.append((s, cs_s))
+                if cs_e < e:
+                    new_segments.append((cs_e, e))
+            segments = new_segments
+        result.extend((s, e) for s, e in segments if e > s)
+    result.sort(key=lambda p: p[0])
+    return [{"start_seconds": s, "end_seconds": e} for s, e in result]
+
+
+_CLAUSE_END_RE = re.compile(r"[.?!]$")
+_WORD_CHARS_RE = re.compile(r"[^\w']")
+
+
+def _split_into_clauses(kept_words: list[dict]) -> list[list[dict]]:
+    clauses: list[list[dict]] = []
+    cur: list[dict] = []
+    for w in kept_words:
+        cur.append(w)
+        if _CLAUSE_END_RE.search(w["word"].strip()):
+            clauses.append(cur)
+            cur = []
+    if cur:
+        clauses.append(cur)
+    return clauses
+
+
+def _clause_signature(clause: list[dict]) -> set[str]:
+    return {t for w in clause if (t := _WORD_CHARS_RE.sub("", w["word"].lower()))}
+
+
+def _dedupe_repeated_clauses(words: list[dict], keep_ranges: list[dict]) -> list[dict]:
+    """机械兜底：LLM 判断"重录该剪多少"时，容易只剪掉明显断掉的尾巴，漏剪前面
+    单独看语法通顺、但内容在后面被完整重说了一遍的部分（真实事故：2026-07-16
+    用户反馈"重复的话还是没剪掉"，加强过 prompt + 明确给了同款反例仍未收敛——
+    flash 档模型对这种"往后扫描确认重复、再回头改前面已经做的裁剪"的推理不够
+    稳，靠 prompt 措辞压不住，改用不依赖模型能力的确定性兜底）。
+
+    把保留下来的内容按句末标点切成从句，两两比较词汇重叠度；重叠度高的判定为
+    同一次内容的两次表达，只留后一个（说话人的最终修正版），前一个整段追加进
+    裁剪——不管 LLM 那一轮判断有没有意识到这是重录。
+    """
+    kept = _words_in_keep_ranges(words, keep_ranges)
+    clauses = _split_into_clauses(kept)
+    if len(clauses) < 2:
+        return keep_ranges
+
+    redundant_spans = []
+    for i in range(len(clauses)):
+        if len(clauses[i]) < 3:  # 太短的从句（如"Take care."）词汇重叠天然就高，跳过避免误伤
+            continue
+        sig_i = _clause_signature(clauses[i])
+        if not sig_i:
+            continue
+        for j in range(i + 1, len(clauses)):
+            sig_j = _clause_signature(clauses[j])
+            if not sig_j:
+                continue
+            # 用"容纳率"（更短从句的词有多少比例被更长从句覆盖）而不是 Jaccard——
+            # 重录的后半段通常比前半段更完整（加了没说完的结尾），用 max 分母的
+            # Jaccard 算出来的重叠度会被拉低，min 分母才能准确反映"包含关系"。
+            overlap = len(sig_i & sig_j) / min(len(sig_i), len(sig_j))
+            if overlap >= 0.7:
+                redundant_spans.append({
+                    "start_seconds": clauses[i][0]["start"],
+                    "end_seconds": clauses[i][-1]["end"],
+                })
+                logger.info(
+                    "content_planner: 机械兜底检出重复从句，追加剪掉更早的版本: "
+                    f"'{' '.join(w['word'] for w in clauses[i])}'"
+                )
+                break  # i 已判定冗余，不用再跟后面的从句比较
+
+    if not redundant_spans:
+        return keep_ranges
+    return _subtract_spans(keep_ranges, redundant_spans)
+
+
 VERIFY_FILLER_SYSTEM_PROMPT = """You are reviewing another editor's filler/retake removal
 work on a talking-head video. You are given the transcript AS IT WILL PLAY AFTER their
 cuts (word list, in order, with timestamps) — the filler/retake words they identified
@@ -923,6 +1015,10 @@ def plan_filler_removal(words: list[dict], duration: float) -> list[dict]:
         return []
 
     keep_ranges = _plan_filler_removal_once(words, duration)
+    # 机械兜底紧跟在 LLM 判断后面跑，不管后面复核有没有触发——LLM 容易只剪掉
+    # 重录里明显断掉的尾巴，漏剪前面单独看语法通顺、但内容后面被完整重说了
+    # 一遍的部分；这一步不依赖模型能力，靠词汇重叠度确定性地补刀。
+    keep_ranges = _dedupe_repeated_clauses(words, keep_ranges)
 
     review = verify_filler_removal(words, keep_ranges)
     if review is None or review.get("clean", True):
@@ -931,6 +1027,7 @@ def plan_filler_removal(words: list[dict], duration: float) -> list[dict]:
     issue = str(review.get("issue", ""))[:200]
     logger.warning(f"content_planner: 口误复核发现遗留问题，重新判断一次: {issue}")
     keep_ranges = _plan_filler_removal_once(words, duration, feedback=issue)
+    keep_ranges = _dedupe_repeated_clauses(words, keep_ranges)
 
     review2 = verify_filler_removal(words, keep_ranges)
     if review2 is not None and not review2.get("clean", True):
