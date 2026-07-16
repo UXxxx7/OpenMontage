@@ -571,6 +571,9 @@ async def get_job_endpoint(job_id: str):
         # 非致命失败被跳过的操作（如 ["apply_style"]）。Node 侧预览消息靠它
         # 如实告知"哪步没成 + 可回复 retry"，不再静默交付半成品。
         "degraded_operations": json.loads(job.degraded_operations) if job.degraded_operations else [],
+        # AI 生成累计花费（b-roll/背景音乐等）。Node 侧预览消息靠它如实告知
+        # 用户/团队这单实际花了多少钱，不再是"哪儿都看不见"的隐性支出。
+        "generation_cost_usd": job.generation_cost_usd or 0.0,
         "created_at": job.created_at.isoformat() if job.created_at else None,
         "updated_at": job.updated_at.isoformat() if job.updated_at else None,
     }
@@ -595,7 +598,7 @@ async def retry_job_endpoint(job_id: str):
     if not job.planned_edit:
         raise HTTPException(status_code=400, detail="Job has no edit plan to retry")
     update_job_fields(job_id, status=JobStatus.RUNNING_PIPELINE,
-                      error_message=None, degraded_operations=None)
+                      error_message=None, degraded_operations=None, generation_cost_usd=None)
     _run_in_background(_enqueue_pipeline, job_id)
     return {"job_id": job_id, "status": "RUNNING_PIPELINE"}
 

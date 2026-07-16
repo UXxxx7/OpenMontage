@@ -93,6 +93,8 @@ def run_pipeline(job_id: str) -> None:
                 # Node 网关靠 GET /jobs 读它、在预览消息里如实告知用户——下面
                 # _safe_send 的提醒在网关模式下是死代码，用户实际看不到。
                 degraded_operations=json.dumps(result.get("degraded_operations") or []),
+                # AI 生成累计花费（同理覆盖旧值，没生成过就是 0）。
+                generation_cost_usd=result.get("generation_cost_usd") or 0.0,
             )
             config = get_config()
             wa = WhatsAppClient(config)
