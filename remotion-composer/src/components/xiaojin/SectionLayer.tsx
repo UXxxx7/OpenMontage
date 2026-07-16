@@ -44,10 +44,10 @@ export interface Section {
   warn?: boolean;
   /**
    * Full-canvas multi-stage process timeline filling the rest of this
-   * section's takeover (see TimelineSection). Only renders when this
-   * section's resolved colorMode is "dark" — the graphic is hardcoded for a
-   * dark canvas (see TimelineSection's doc comment) and would not read
-   * against a warm/cream section.
+   * section's takeover (see TimelineSection). Fix D6（2026-07-16）：used to
+   * only render when this section's resolved colorMode was "dark" —
+   * TimelineSection is now palette-aware and renders correctly in warm mode
+   * too, so this works regardless of colorMode.
    */
   timeline?: {
     heading: string;
@@ -136,12 +136,13 @@ export const SectionLayer: React.FC<{
               </div>
             )}
 
-            {s.timeline && mode === "dark" ? (
+            {s.timeline ? (
               <TimelineSectionGraphic
                 heading={s.timeline.heading}
                 mountFrame={s.fromFrame}
                 endFrame={s.toFrame}
                 nodes={s.timeline.nodes}
+                colorMode={mode}
                 headingFont={headingFont}
                 labelFont={labelFont}
               />

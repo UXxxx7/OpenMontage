@@ -15,6 +15,49 @@
 
 ---
 
+## 2026-07-16 — Animation-quality pass: process_timeline unlocked for warm mode, criterion-loop coverage extended, backtest-driven fixes
+- **Who**: Claude (background session, real-backtest-driven)
+- **Branch/commit**: whatsapp-studio (uncommitted at time of writing — see session)
+- **What changed**:
+  - `content_planner.py`: D3 (speaker restored before video end), D4 (takeover section
+    start anchored to first real content, not the raw chapter boundary), D5 (timeline
+    hard-cap sized to actual available budget instead of a fixed 8s guess that's
+    mathematically impossible to fit on any video <27s), D6 (stopped force-overriding
+    `dark: true` on every process_timeline chapter).
+  - `pipeline_runner.py`: C5 (props_lint retry loop bounded + best-of, was single-retry),
+    C6 (best-of comparison is now richness-aware — was findings-count-only, which let a
+    content-free replan "win" over a richer-but-imperfect one), C9 (fixed a disk/memory
+    desync where the props_lint loop's winning candidate wasn't always what actually got
+    written to the file the render command reads from).
+  - `props_lint.py`: new checks `element_mounts_during_card_transition`,
+    `low_visual_richness`, `section_takeover_lacks_content`.
+  - `qa_stills.py`: transition-boundary frame sampling, 4 new vision-checklist items
+    (Transitions/Reference-match/Cohesion/Beat-to-caption-sync), wired the pre-existing-
+    but-unused `batch-stills.mjs` in with per-job `inputProps` support (measured 2.9x
+    speedup on a real job: 50.1s → 17.1s for the same 6 stills).
+  - `remotion-composer/src/components/xiaojin/TimelineSection.tsx` +
+    `SectionLayer.tsx`: TimelineSection now reads `theme.ts` palettes instead of
+    hardcoded dark-canvas colors; SectionLayer no longer gates it behind
+    `mode === "dark"`.
+  - `remotion-composer/src/components/xiaojin/{StatsHookIntro,TitleImpactIntro,
+    ChipsIntro}.tsx` (new): the 3 previously-unported video-studio intro patterns,
+    wired through `XiaojinEditorial.tsx` + `contracts/render_props.schema.json` +
+    `content_planner.py`'s SYSTEM_PROMPT, defaulting to the original `title_card`
+    behavior when unset.
+- **Why / impact**: Every fix here traces to a concrete finding from real, genuine
+  end-to-end backtests (dajaai-walking-fresh, MrBeastRaw) run through the actual
+  FastAPI server + Agent SDK pipeline, not synthetic repros alone — see
+  `whatsapp_mvp/CLAUDE.md` Rules 4 and 5 for the two most subtle ones (empty
+  full-canvas takeovers, and the criterion-loop disk-desync bug). ⚠️ contract
+  change — `render_props.schema.json`'s `intro` object gained optional
+  `variant`/`brandLabel` fields (additive, backward-compatible, existing fixtures
+  still validate).
+- **Status**: 🧪 to verify — unit/script test suite green (21 pytest + 97+ content_planner
+  checks + golden extraction + props_lint), TSX `tsc --noEmit` clean, D6 verified via
+  direct still render, C9 verified by code review + real-job reproduction. A fresh
+  end-to-end backtest re-confirming D6+C9 together in the live pipeline was still
+  running at last check — see session for outcome.
+
 ## 2026-07-08 — P3 hotfix: stop demo defaultProps leaking into real renders; ioredis error listener
 - **Who**: P3
 - **Branch/commit**: feat/template-and-gateway / d53bfdd

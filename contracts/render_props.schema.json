@@ -507,6 +507,11 @@
           "y": {
             "type": "number",
             "default": 900
+          },
+          "width": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Card width (default 720, was 460 — biggened per user feedback to fill more of the content-zone lane)."
           }
         }
       }
@@ -565,6 +570,13 @@
           "type": "string"
         },
         "subtitle": {
+          "type": "string"
+        },
+        "variant": {
+          "type": "string",
+          "enum": ["title_card", "stats_hook", "title_impact", "chips"]
+        },
+        "brandLabel": {
           "type": "string"
         }
       }
@@ -820,6 +832,210 @@
             "type": "integer"
           },
           "width": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "zoneHeaders": {
+      "type": "array",
+      "description": "[Phase 2] Compact left-aligned section headers for normal (non-takeover) chapters that own data — the content-zone equivalent of SectionLayer's big centered header. Mechanically derived by content_planner from chapter labels, not a new LLM field.",
+      "items": {
+        "type": "object",
+        "required": [
+          "title",
+          "fromFrame",
+          "toFrame"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "title": {
+            "type": "string",
+            "maxLength": 20
+          },
+          "titleEn": {
+            "type": "string",
+            "maxLength": 24
+          },
+          "fromFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "toFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "x": {
+            "type": "number"
+          },
+          "y": {
+            "type": "number"
+          }
+        }
+      }
+    },
+    "stepLists": {
+      "type": "array",
+      "description": "[Phase 2] Ghosted numbered step skeletons — each row activates at its own spoken beat. New content_planner visual type 'step_list', for sequential how-to/process passages that don't warrant the dark full-canvas timeline.",
+      "items": {
+        "type": "object",
+        "required": [
+          "steps",
+          "mountFrame"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "title": {
+            "type": "string",
+            "maxLength": 40
+          },
+          "steps": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 5,
+            "items": {
+              "type": "object",
+              "required": [
+                "label",
+                "activateOffset"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "label": {
+                  "type": "string",
+                  "maxLength": 24
+                },
+                "labelEn": {
+                  "type": "string",
+                  "maxLength": 28
+                },
+                "sub": {
+                  "type": "string",
+                  "maxLength": 32
+                },
+                "activateOffset": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "description": "Frame (relative to the card's own mountFrame) this step activates."
+                }
+              }
+            }
+          },
+          "mountFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "endFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "x": {
+            "type": "number",
+            "default": 60
+          },
+          "y": {
+            "type": "number",
+            "default": 1040
+          },
+          "width": {
+            "type": "number",
+            "default": 960
+          }
+        }
+      }
+    },
+    "topicCards": {
+      "type": "array",
+      "description": "[Phase 2] Icon + statement cards for spoken supporting lines with no hard data. New content_planner visual type 'topic_card'.",
+      "items": {
+        "type": "object",
+        "required": [
+          "headline",
+          "mountFrame"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "icon": {
+            "type": "string",
+            "enum": [
+              "chat",
+              "lightbulb",
+              "check",
+              "sparkle"
+            ]
+          },
+          "headline": {
+            "type": "string",
+            "maxLength": 60
+          },
+          "sub": {
+            "type": "string",
+            "maxLength": 80
+          },
+          "mountFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "endFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "x": {
+            "type": "number",
+            "default": 60
+          },
+          "y": {
+            "type": "number",
+            "default": 1040
+          },
+          "width": {
+            "type": "number",
+            "default": 960
+          }
+        }
+      }
+    },
+    "cornerCards": {
+      "type": "array",
+      "description": "[Phase 2] Compact illustration overlays anchored inside the SpeakerCard (bottom-left corner, dodging the face) — never during a section takeover or quote (card is hidden then). New content_planner visual type 'corner_card'.",
+      "items": {
+        "type": "object",
+        "required": [
+          "variant",
+          "mountFrame"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "variant": {
+            "type": "string",
+            "enum": [
+              "chat",
+              "progress"
+            ]
+          },
+          "appName": {
+            "type": "string",
+            "maxLength": 24
+          },
+          "message": {
+            "type": "string",
+            "maxLength": 60
+          },
+          "label": {
+            "type": "string",
+            "maxLength": 24
+          },
+          "percent": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 100
+          },
+          "mountFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "endFrame": {
             "type": "integer",
             "minimum": 0
           }

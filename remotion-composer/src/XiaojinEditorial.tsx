@@ -53,17 +53,24 @@ import { Captions, CaptionPhrase } from "./components/xiaojin/Captions";
 import { ChapterNav, Chapter } from "./components/xiaojin/ChapterNav";
 import { ComplianceBar } from "./components/xiaojin/ComplianceBar";
 import { ContentBeat, ContentZone } from "./components/xiaojin/ContentZone";
+import { CornerCard, CornerCardProps } from "./components/xiaojin/CornerCard";
 import { Section, SectionLayer } from "./components/xiaojin/SectionLayer";
 import { QuoteCard, QuoteCardProps } from "./components/xiaojin/QuoteCard";
 import { CountdownRing, CountdownRingProps } from "./components/xiaojin/CountdownRing";
 import { InfoCard, InfoCardProps } from "./components/xiaojin/InfoCard";
 import { IntroTitle } from "./components/xiaojin/IntroTitle";
+import { StatsHookIntro } from "./components/xiaojin/StatsHookIntro";
+import { TitleImpactIntro } from "./components/xiaojin/TitleImpactIntro";
+import { ChipsIntro } from "./components/xiaojin/ChipsIntro";
 import { OutroSection } from "./components/xiaojin/OutroSection";
 import { AccentPill, AccentPillProps } from "./components/xiaojin/AccentPill";
 import { QRContactCard, QRContactCardProps } from "./components/xiaojin/QRContactCard";
 import { RainbowProgressBar } from "./components/xiaojin/RainbowProgressBar";
 import { RiskGauge, RiskGaugeProps } from "./components/xiaojin/RiskGauge";
 import { SpeakerCard, SpeakerCardOpacityKeyframe, SpeakerCardScene } from "./components/xiaojin/SpeakerCard";
+import { StepList, StepListProps } from "./components/xiaojin/StepList";
+import { TopicCard, TopicCardProps } from "./components/xiaojin/TopicCard";
+import { ZoneHeader, ZoneHeaderProps } from "./components/xiaojin/ZoneHeader";
 import { ColorMode } from "./components/xiaojin/theme";
 
 export interface ComplianceInfo {
@@ -83,6 +90,16 @@ export interface IntroInfo {
   eyebrow: string;
   title: string;
   subtitle: string;
+  /**
+   * Which of the 4 video-studio CLAUDE-xiaojin-editorial.md intro patterns to
+   * render. Omit (or "title_card") for the original, unchanged behavior —
+   * IntroTitle, a dark scrim over the speaker footage. The other 3 variants
+   * were previously unported; added 2026-07-16 for visual variety across
+   * jobs so every video doesn't open the same way regardless of content tone.
+   */
+  variant?: "title_card" | "stats_hook" | "title_impact" | "chips";
+  /** Only used by variant "title_impact" — top-right brand chip. Omit to skip it. */
+  brandLabel?: string;
 }
 
 /** Matches contract②'s dataCards item shape exactly — colorMode/fonts come from the parent. */
@@ -94,6 +111,10 @@ export type CalendarEvent = Omit<CalendarProps, "colorMode" | "headingFont" | "l
 export type Pill = Omit<AccentPillProps, "colorMode" | "headingFont">;
 export type QRContact = Omit<QRContactCardProps, "colorMode" | "headingFont" | "labelFont">;
 export type Quote = Omit<QuoteCardProps, "colorMode" | "headingFont" | "labelFont">;
+export type ZoneHeaderItem = Omit<ZoneHeaderProps, "colorMode" | "headingFont" | "labelFont">;
+export type StepListItem = Omit<StepListProps, "colorMode" | "headingFont" | "labelFont">;
+export type TopicCardItem = Omit<TopicCardProps, "colorMode" | "headingFont" | "labelFont">;
+export type CornerCardItem = CornerCardProps;
 
 export interface OutroInfo {
   kicker: string;
@@ -136,6 +157,14 @@ export interface XiaojinEditorialProps extends Record<string, unknown> {
   calendarEvents?: CalendarEvent[];
   /** Full-width terracotta takeaway pills stacked under their primary graphics (see AccentPill). */
   pills?: Pill[];
+  /** Compact left-aligned section headers for normal (non-takeover) chapters — see ZoneHeader. */
+  zoneHeaders?: ZoneHeaderItem[];
+  /** Ghosted numbered step skeletons, activating one row per spoken beat — see StepList. */
+  stepLists?: StepListItem[];
+  /** Icon + statement cards for supporting lines with no hard data — see TopicCard. */
+  topicCards?: TopicCardItem[];
+  /** Compact illustration overlays anchored inside the SpeakerCard — see CornerCard. */
+  cornerCards?: CornerCardItem[];
   /** QR + WhatsApp CTA close. Only set when a real contact URL was actually supplied. */
   qrContact?: QRContact;
   /** "Pattern 2" dark title-card intro (see IntroTitle's doc comment). Omit to skip. */
@@ -208,6 +237,10 @@ export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = ({
   gauges,
   countdowns,
   calendarEvents,
+  zoneHeaders,
+  stepLists,
+  topicCards,
+  cornerCards,
   qrContact,
   intro,
   outro,
@@ -236,7 +269,11 @@ export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = ({
         opacityKeyframes={opacityKeyframes}
         objectPosition={speakerObjectPosition}
         colorMode={colorMode}
-      />
+      >
+        {cornerCards?.map((card, i) => (
+          <CornerCard key={i} {...card} />
+        ))}
+      </SpeakerCard>
       {/*
         contentBeats/dataCards/outro all render AFTER SpeakerCard (not
         before) so none of them are ever silently hidden behind it — confirmed
@@ -251,6 +288,9 @@ export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = ({
         whether the caller's scene schedule actually shrinks the card first.
       */}
       {contentBeats ? <ContentZone beats={contentBeats} /> : null}
+      {zoneHeaders?.map((header, i) => (
+        <ZoneHeader key={i} {...header} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+      ))}
       {quotes?.map((q, i) => (
         <QuoteCard key={`q${i}`} {...q} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
       ))}
@@ -306,6 +346,12 @@ export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = ({
           headingFont={headingFont}
         />
       ))}
+      {stepLists?.map((list, i) => (
+        <StepList key={i} {...list} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+      ))}
+      {topicCards?.map((card, i) => (
+        <TopicCard key={i} {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+      ))}
       {/* outro renders BEFORE qrContact (not the other way around): OutroSection
           paints an opaque full-canvas background (y=88 to H-72). Rendering
           qrContact first meant it silently sat UNDERNEATH that background
@@ -336,7 +382,35 @@ export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = ({
           labelFont={labelFont}
         />
       ) : null}
-      {intro ? (
+      {intro && intro.variant === "stats_hook" ? (
+        <StatsHookIntro
+          eyebrow={intro.eyebrow}
+          title={intro.title}
+          subtitle={intro.subtitle}
+          introOutFrame={introOutFrame}
+          colorMode={colorMode}
+          headingFont={headingFont}
+          labelFont={labelFont}
+        />
+      ) : intro && intro.variant === "title_impact" ? (
+        <TitleImpactIntro
+          eyebrow={intro.eyebrow}
+          title={intro.title}
+          subtitle={intro.subtitle}
+          brandLabel={intro.brandLabel}
+          introOutFrame={introOutFrame}
+          colorMode={colorMode}
+          headingFont={headingFont}
+          labelFont={labelFont}
+        />
+      ) : intro && intro.variant === "chips" ? (
+        <ChipsIntro
+          chapters={chapters}
+          introOutFrame={introOutFrame}
+          colorMode={colorMode}
+          labelFont={labelFont}
+        />
+      ) : intro ? (
         <IntroTitle
           eyebrow={intro.eyebrow}
           title={intro.title}

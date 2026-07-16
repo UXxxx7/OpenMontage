@@ -55,10 +55,10 @@ const GaugeSvg: React.FC<{ fillPct: number; age: number; leftLabel: string; righ
   leftLabel,
   rightLabel,
 }) => {
-  const R = 110;
+  const R = 150;
   const cx = R + 16;
   const cy = R + 10;
-  const SW = 16;
+  const SW = 20;
   const pathLen = Math.PI * R;
 
   const trackD = `M ${cx - R},${cy} A ${R},${R} 0 0,1 ${cx + R},${cy}`;
@@ -73,30 +73,46 @@ const GaugeSvg: React.FC<{ fillPct: number; age: number; leftLabel: string; righ
   const color = gaugeColorFor(fillPct);
 
   return (
-    <svg width={(R + 16) * 2} height={R + 40} style={{ display: "block", margin: "0 auto" }}>
-      <path d={trackD} fill="none" stroke="rgba(255,255,255,0.08)" strokeWidth={SW} strokeLinecap="round" />
-      <path
-        d={trackD}
-        fill="none"
-        stroke={color}
-        strokeWidth={SW}
-        strokeLinecap="round"
-        strokeDasharray={`${fillLen} ${pathLen}`}
-        strokeDashoffset={0}
-      />
-      {age > 5 && (
-        <>
-          <line x1={cx} y1={cy} x2={nx} y2={ny} stroke={color} strokeWidth={4} strokeLinecap="round" />
-          <circle cx={cx} cy={cy} r={7} fill={color} />
-        </>
-      )}
-      <text x={12} y={cy + 28} textAnchor="start" fill="rgba(79,157,105,0.8)" fontSize={14} fontWeight={700}>
-        {leftLabel}
-      </text>
-      <text x={(R + 16) * 2 - 12} y={cy + 28} textAnchor="end" fill="rgba(207,84,72,0.8)" fontSize={14} fontWeight={700}>
-        {rightLabel}
-      </text>
-    </svg>
+    <div style={{ width: (R + 16) * 2, margin: "0 auto" }}>
+      <svg width={(R + 16) * 2} height={R + 10} style={{ display: "block" }}>
+        <path d={trackD} fill="none" stroke="rgba(255,255,255,0.08)" strokeWidth={SW} strokeLinecap="round" />
+        <path
+          d={trackD}
+          fill="none"
+          stroke={color}
+          strokeWidth={SW}
+          strokeLinecap="round"
+          strokeDasharray={`${fillLen} ${pathLen}`}
+          strokeDashoffset={0}
+        />
+        {age > 5 && (
+          <>
+            <line x1={cx} y1={cy} x2={nx} y2={ny} stroke={color} strokeWidth={5} strokeLinecap="round" />
+            <circle cx={cx} cy={cy} r={9} fill={color} />
+          </>
+        )}
+      </svg>
+      {/* End labels as a flex row, NOT SVG text anchored to the arc's fixed
+          edges — confirmed real regression from sizing this component up:
+          at the bigger fontSize, long labels ("COVERAGE AT RISK" etc, up to
+          16 chars per _plan_gauge's own truncation) collided in the middle
+          of the now-only-modestly-wider arc. A flex row gives each label its
+          own half of the width and truncates independently instead. */}
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 12, marginTop: 10, padding: "0 4px" }}>
+        <span style={{
+          fontSize: 16, fontWeight: 700, color: "rgba(79,157,105,0.8)",
+          whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+        }}>
+          {leftLabel}
+        </span>
+        <span style={{
+          fontSize: 16, fontWeight: 700, color: "rgba(207,84,72,0.8)", textAlign: "right",
+          whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+        }}>
+          {rightLabel}
+        </span>
+      </div>
+    </div>
   );
 };
 
@@ -155,12 +171,12 @@ export const RiskGauge: React.FC<RiskGaugeProps> = ({
       <div
         style={{
           fontFamily: headingFont,
-          fontSize: 13,
+          fontSize: 16,
           fontWeight: 600,
           color: "rgba(255,255,255,0.45)",
           letterSpacing: 3,
           textTransform: "uppercase",
-          marginBottom: 18,
+          marginBottom: 20,
           textAlign: "center",
         }}
       >

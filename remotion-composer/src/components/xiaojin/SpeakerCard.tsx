@@ -41,6 +41,12 @@ export interface SpeakerCardProps {
   colorMode?: ColorMode;
   /** Frames for the first-appearance rise-in. Default 26 (matches the reference build). */
   enterFrames?: number;
+  /**
+   * Rendered inside the card's own positioned div (e.g. CornerCard) — so an
+   * overlay anchored here travels/scales/hides with the card automatically
+   * instead of needing to duplicate this component's scene interpolation.
+   */
+  children?: React.ReactNode;
 }
 
 // A bare multi-point interpolate() over sparse, widely-spaced scenes glides
@@ -79,6 +85,7 @@ export const SpeakerCard: React.FC<SpeakerCardProps> = ({
   objectPosition = "50% 35%",
   colorMode = "warm",
   enterFrames = 26,
+  children,
 }) => {
   const frame = useCurrentFrame();
   const palette = PALETTES[colorMode];
@@ -157,6 +164,7 @@ export const SpeakerCard: React.FC<SpeakerCardProps> = ({
           pointerEvents: "none",
         }}
       />
+      {children}
     </div>
   );
 };

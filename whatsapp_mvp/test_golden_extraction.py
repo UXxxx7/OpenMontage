@@ -197,7 +197,13 @@ def main():
             "Leftover false start before 'If you have any questions just WhatsApp me directly or...'",
         ],
     })
-    retry_cut = json.dumps({"cut_word_indices": fs_ranges[0] + fs_ranges[1] + fs_ranges[2]})  # fixes all 3
+    # Monotonic retries (Fix A): the retry round is only shown the words still
+    # kept after round 1 (retake #1 already cut), not the full original list —
+    # so its response indices must be relative to THAT subset, not to words3.
+    kept_after_round1 = [i for i in range(len(words3)) if i not in fs_ranges[0]]
+    retry_cut = json.dumps({
+        "cut_word_indices": [kept_after_round1.index(i) for i in fs_ranges[1] + fs_ranges[2]]
+    })  # fixes retakes #2 and #3 (retake #1 stays cut from round 1 — never resurrected)
     verify_clean = json.dumps({"clean": True})
 
     with mock.patch.object(content_planner, "call_llm_chat",

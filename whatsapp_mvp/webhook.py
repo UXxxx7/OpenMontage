@@ -518,12 +518,58 @@ async def create_job_endpoint(
     return {"job_id": job.id, "status": job.status.value}
 
 
+def _animations_summary(job) -> Optional[list]:
+    """从 apply_style 的最终 props 里提取"这条视频实际包含哪些动画"的人话
+    清单——确认过的真实用户反馈：预览消息只会念模板简介（"floating cards +
+    karaoke subtitles..."，条条视频一模一样），从不说这条视频真正规划出了
+    什么动画，用户要收到成片才发现是空的。props 是渲染的唯一事实来源，
+    从它读就不会说谎。"""
+    props_path = job.job_dir / "_op_apply_style_props.json"
+    if not props_path.exists():
+        return None
+    try:
+        props = json.loads(props_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    names: list[str] = []
+    for c in props.get("countdowns") or []:
+        names.append(f"Countdown ring — {c.get('headline') or str(c.get('value', ''))}")
+    for c in props.get("calendarEvents") or []:
+        names.append(f"Calendar reveal — {c.get('month')}/{c.get('targetDay')} {c.get('eventLabel', '')}".strip())
+    for c in props.get("dataCards") or []:
+        rows = ", ".join(str(r.get("label", "")) for r in (c.get("rows") or []))
+        names.append(f"Count-up data card — {c.get('title') or rows}")
+    for g in props.get("gauges") or []:
+        names.append(f"Risk gauge — {g.get('title') or g.get('rightLabel', '')}")
+    for b in props.get("beforeAfter") or []:
+        names.append(f"Before/after comparison — {b.get('kicker', '')}")
+    for s in props.get("stepLists") or []:
+        names.append(f"{len(s.get('steps') or [])}-step process list — {s.get('title', '')}".strip(" —"))
+    for tc in props.get("topicCards") or []:
+        names.append(f"Topic card — {str(tc.get('headline', ''))[:30]}")
+    for q in props.get("quotes") or []:
+        names.append(f"Quote typography — {str(q.get('text', ''))[:30]}")
+    for cc in props.get("cornerCards") or []:
+        names.append(f"Corner app card — {cc.get('appName') or cc.get('variant', '')}")
+    for sec in props.get("sections") or []:
+        if sec.get("timeline"):
+            names.append(f"Multi-stage timeline — {sec['timeline'].get('heading', '')}")
+        else:
+            names.append(f"Full-canvas section — {sec.get('title', '')}")
+    if props.get("intro"):
+        names.append("Intro title card")
+    if props.get("outro"):
+        names.append("Outro CTA card")
+    return names
+
+
 @app.get("/jobs/{job_id}")
 async def get_job_endpoint(job_id: str):
     job = get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     return {
+        "animations": _animations_summary(job),
         "job_id": job.id,
         "status": job.status.value,
         "input_video_path": job.input_video_path,

@@ -29,6 +29,10 @@ logger = logging.getLogger(__name__)
 _FPS = 30
 _SCALE = 0.5
 _STILL_TIMEOUT_S = 120
+# Fix C8：一次批处理调用的整体超时——批处理本身就是要省掉 N 次单独冷启动，
+# 单帧超时(_STILL_TIMEOUT_S)乘以帧数会过于宽松，但也不能卡在原地不动；给
+# 每帧留够时间的同时设一个绝对上限，超了就当批处理失败，回退到逐帧路径。
+_BATCH_TIMEOUT_S = 180
 
 # Must match pipeline_runner's geometry (single source of truth would be a
 # circular import; this mirrors _DOMINANT_BOX/_workflow_box, change together).
@@ -75,9 +79,21 @@ def is_docked(scenes: list[dict], frame: int) -> bool:
     return abs(_card_h_at(scenes, frame) - _WORKFLOW_BOX_H) < 1
 
 
+def _transition_windows(scenes: list[dict]) -> list[tuple[int, int]]:
+    """跟 props_lint._transition_windows 同一套定义(改动要两边一起改，见本
+    文件顶部关于跟 pipeline_runner 几何镜像的注释)——SpeakerCard 正在两个
+    scene 关键帧之间变形(w/h 改变)的帧区间。"""
+    windows = []
+    for i in range(len(scenes) - 1):
+        a, b = scenes[i], scenes[i + 1]
+        if a.get("w") != b.get("w") or a.get("h") != b.get("h"):
+            windows.append((a["frame"], b["frame"]))
+    return windows
+
+
 def pick_qa_frames(props: dict) -> list[int]:
     """codex 的抽查点：intro 落位、每张数据卡全展开、每个前后对比卡全展开、
-    每个全画布接管的中点、全屏区间中点、片尾。"""
+    每个全画布接管的中点、全屏区间中点、片尾、每次卡片转场前后各一帧。"""
     duration_frames = max(1, round(props["durationSeconds"] * _FPS))
     frames = {min(props.get("introOutFrame", 20) + 15, duration_frames - 1)}
     for card in props.get("dataCards", []):
@@ -99,6 +115,14 @@ def pick_qa_frames(props: dict) -> list[int]:
     full_frames = [f for f in range(0, duration_frames, 30) if not is_docked(scenes, f)]
     if full_frames:
         frames.add(full_frames[len(full_frames) // 2])
+    # Fix C7：CLAUDE-v2.md §9 "Transitions"标准要求的抽查方式——每次转场取
+    # 前后各一帧(f[start-8]/f[end+8])，"outgoing cluster fully gone in the
+    # SECOND still, not fading in the first"这条只有视觉能判断，之前完全没
+    # 采样过转场前后的帧对，视觉复审拿到的都是转场以外的帧，没法评价转场
+    # 干不干净。
+    for win_start, win_end in _transition_windows(scenes):
+        frames.add(max(0, min(win_start - 8, duration_frames - 1)))
+        frames.add(max(0, min(win_end + 8, duration_frames - 1)))
     return sorted(f for f in frames if 0 <= f < duration_frames)
 
 
@@ -136,6 +160,51 @@ def render_still(remotion_dir: Path, props_path: Path, frame: int, out_png: Path
         logger.warning(f"  qa_stills: still f{frame} 渲染失败: {(r.stderr or '').strip()[-300:]}")
         return False
     return out_png.exists()
+
+
+def render_stills_batch(
+    remotion_dir: Path, props_path: Path, frames: list[int], out_dir: Path
+) -> Optional[dict[int, Path]]:
+    """Fix C8（2026-07-16）：一次 Node 进程渲染全部 stills，而不是每帧一次
+    `npx remotion still`（每次都要重新起 Node+Chrome）。跟 CLAUDE-v2.md §11
+    记录的 video-studio 同款优化同一个原理——bundle 一次、Chrome 开一次，
+    这个仓库自己在 remotion-composer/scripts/batch-stills.mjs 里已经有一份
+    移植好但从未真正接进管线的实现（只是没人传 inputProps，也没接到这里）。
+    成功返回 {frame: png_path}；任何一步失败返回 None，调用方回退到
+    render_still() 逐帧路径——批处理只是加速器，不是新的失败模式。"""
+    script = remotion_dir / "scripts" / "batch-stills.mjs"
+    if not script.exists():
+        return None
+    node_bin = shutil.which("node") or "node"  # same WinError 2 guard as npx elsewhere in this module
+    from .remotion_bundle import ensure_remotion_bundle
+    bundle = ensure_remotion_bundle(Path(remotion_dir), job_slug=props_path.parent.name)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    frames_arg = ",".join(str(f) for f in frames)
+    cmd = [node_bin, str(script.resolve()), "XiaojinEditorial", str(out_dir.resolve()),
+           frames_arg, str(_SCALE), str(props_path.resolve())]
+    if bundle:
+        cmd.append(bundle)
+    try:
+        from .concurrency import RENDER_SLOTS
+        with RENDER_SLOTS:
+            r = subprocess.run(cmd, cwd=remotion_dir, capture_output=True, text=True, timeout=_BATCH_TIMEOUT_S)
+    except Exception as e:
+        logger.warning(f"  qa_stills: 批量渲染异常，回退逐帧: {e}")
+        return None
+    if r.returncode != 0:
+        logger.warning(f"  qa_stills: 批量渲染失败，回退逐帧: {(r.stderr or '').strip()[-300:]}")
+        return None
+    result: dict[int, Path] = {}
+    for f in frames:
+        png = out_dir / f"f{f}.png"
+        if png.exists():
+            result[f] = png
+    if len(result) != len(frames):
+        logger.warning(
+            f"  qa_stills: 批量渲染只产出 {len(result)}/{len(frames)} 张，回退逐帧补齐缺失的"
+        )
+        return None
+    return result
 
 
 def check_content_fill(png_path: Path, props: dict, frame: int) -> Optional[dict]:
@@ -182,9 +251,20 @@ def run_props_qa(props: dict, props_path: Path, remotion_dir: Path, out_dir: Pat
         return result
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    for frame in pick_qa_frames(props):
-        png = out_dir / f"qa_f{frame}.png"
-        if not render_still(remotion_dir, props_path, frame, png):
+    frames = pick_qa_frames(props)
+    # Fix C8：先试批处理（一次 bundle + 一次 Chrome，见 render_stills_batch）；
+    # 失败（脚本不存在/超时/产出不全）就回退到原来逐帧 render_still 的路径，
+    # 批处理只是加速器，两条路径最终产出同一种 {frame: png} 形状，下游检查
+    # 逻辑不用关心走的是哪一条。
+    batch_pngs = render_stills_batch(remotion_dir, props_path, frames, out_dir)
+    for frame in frames:
+        if batch_pngs is not None:
+            png = batch_pngs.get(frame)
+            ok = png is not None
+        else:
+            png = out_dir / f"qa_f{frame}.png"
+            ok = render_still(remotion_dir, props_path, frame, png)
+        if not ok:
             result["findings"].append({"check": "still_render_failed", "frame": frame})
             continue
         result["stills"].append({"frame": frame, "path": str(png)})
@@ -216,6 +296,19 @@ _VISION_CHECKLIST = """这些是同一条竖屏(1080x1920)成片视频在不同�
 3. 空画布：说话人卡片缩小时，腾出的画面是否大面积空白（没有任何内容填充）？
 4. 文字问题：是否有文字被截断、溢出容器、或小到不可读？
 5. 对比度：文字/图形与背景颜色是否难以分辨？
+6. 转场是否干净（Fix C7，CLAUDE-v2.md §9 "Transitions"）：部分图片是紧挨着卡片转场
+   前后各取的一对（按拍摄顺序相邻的两张，索引连续）——后一张里，前一张还在场的元素
+   应该已经完全消失，不能是"消失了一半"还叠在正在移动/变形的卡片上。
+7. 是否符合品牌视觉识别（Fix C7，CLAUDE-v2.md §9 "Reference match"）：说话人应该
+   在一张浮动圆角卡片里，绝不铺满全屏（除非是全画布接管场景）；背景应该是暖米色
+   或深色两者之一，不应该是纯黑/纯白；应该能看到顶部章节导航条和底部彩虹进度条。
+8. 视觉是否统一连贯（Fix C7，CLAUDE-v2.md §9 "Visual cohesion"）：所有抽帧里的
+   字体、卡片圆角、阴影深浅是否一致？有没有哪一帧的配色/风格明显跳脱，像是另一条
+   视频混进来的？
+9. 图形是否配合口播内容（Fix C7，CLAUDE-v2.md §9 "Beat-to-caption sync"）：每张
+   图里如果烧录了字幕文字，读一下字幕说的是什么，再看当前画面上的图形/数据卡内容
+   是否真的跟这句话有关——不要求精确对应，但明显文不对题（比如字幕在说完全不相关
+   的内容，画面上却是上一个话题的图表还没撤）算一个问题。
 
 输出 JSON（只输出 JSON）：{"findings": [{"frame_index": 第几张图(从0起), "issue": "一句话描述", "severity": "high|low"}], "overall": "一句话总评"}
 没有问题就输出 {"findings": [], "overall": "..."}。不要为了凑数报告不存在的问题。"""
