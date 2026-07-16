@@ -969,6 +969,39 @@ def _dedupe_repeated_clauses(words: list[dict], keep_ranges: list[dict]) -> list
     return _subtract_spans(keep_ranges, redundant_spans)
 
 
+# 单个词正常发音很少超过这个时长（哪怕说话人刻意拖长）。超过的部分极可能是
+# Whisper word-level 强制对齐把一段没有转写出文字的音频错误地记在了这个词
+# 头上——不是这个词真的说了这么久。
+_MAX_PLAUSIBLE_WORD_DURATION = 1.2
+
+
+def _flag_unaccounted_audio(words: list[dict]) -> list[dict]:
+    """兜底：真实事故（2026-07-16）——同一句话说话人重说了一遍，Whisper 转写
+    整条长视频时在解码层面把重复的这段话整体吞掉（一个字都没出现在词表
+    里），但强制对齐还是要给这段音频找个落脚点，于是全扣在了相邻词
+    "or" 头上，把它的时长标成了将近 5 秒（正常应 0.1-0.2 秒）。cut_word_indices
+    只能对"词表里出现的词"做判断，这段话从没作为词出现过，LLM 和后面的
+    机械兜底（_dedupe_repeated_clauses，按文本比较）都无从判断、无从剪——
+    结果这段没人审查过的音频靠这个超长时长被原样带进了成片。
+
+    这里直接在源头拦截：扫出任何时长异常的词，把超出合理时长之后的部分
+    当作"不知道是什么内容，默认不能进成片"，转成强制裁剪区间。宁可保守
+    切掉一段听不出问题的音频，也不能放行一段没人看过的内容。
+    """
+    spans = []
+    for w in words:
+        dur = w["end"] - w["start"]
+        if dur > _MAX_PLAUSIBLE_WORD_DURATION:
+            excess_start = w["start"] + _MAX_PLAUSIBLE_WORD_DURATION
+            spans.append({"start_seconds": excess_start, "end_seconds": w["end"]})
+            logger.warning(
+                f"content_planner: 词 '{w['word']}' 时长异常({dur:.2f}s @ "
+                f"{w['start']:.2f}-{w['end']:.2f})，疑似转写吞掉了一段未知内容，"
+                f"强制裁掉 {excess_start:.2f}-{w['end']:.2f}"
+            )
+    return spans
+
+
 VERIFY_FILLER_SYSTEM_PROMPT = """You are reviewing another editor's filler/retake removal
 work on a talking-head video. You are given the transcript AS IT WILL PLAY AFTER their
 cuts (word list, in order, with timestamps) — the filler/retake words they identified
@@ -1014,6 +1047,12 @@ def plan_filler_removal(words: list[dict], duration: float) -> list[dict]:
         logger.info("content_planner: 没有词级时间戳，跳过口误检测")
         return []
 
+    # 转写层面的兜底，跟 LLM 判断/机械去重是两码事：扫出时长离谱的词，把它们
+    # 疑似"吞掉了未知内容"的部分记下来，最后无论走哪条 return 路径都强制裁掉
+    # ——不依赖 LLM 或后面任何按文本比较的逻辑（那段内容压根没作为词出现过，
+    # 它们看不到）。
+    unaccounted_spans = _flag_unaccounted_audio(words)
+
     keep_ranges = _plan_filler_removal_once(words, duration)
     # 机械兜底紧跟在 LLM 判断后面跑，不管后面复核有没有触发——LLM 容易只剪掉
     # 重录里明显断掉的尾巴，漏剪前面单独看语法通顺、但内容后面被完整重说了
@@ -1022,7 +1061,7 @@ def plan_filler_removal(words: list[dict], duration: float) -> list[dict]:
 
     review = verify_filler_removal(words, keep_ranges)
     if review is None or review.get("clean", True):
-        return keep_ranges
+        return _subtract_spans(keep_ranges, unaccounted_spans) if unaccounted_spans else keep_ranges
 
     issue = str(review.get("issue", ""))[:200]
     logger.warning(f"content_planner: 口误复核发现遗留问题，重新判断一次: {issue}")
@@ -1035,4 +1074,4 @@ def plan_filler_removal(words: list[dict], duration: float) -> list[dict]:
             f"content_planner: 重试后口误复核仍不通过，按最新结果继续交付而不是无限重试: "
             f"{str(review2.get('issue', ''))[:200]}"
         )
-    return keep_ranges
+    return _subtract_spans(keep_ranges, unaccounted_spans) if unaccounted_spans else keep_ranges
