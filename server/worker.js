@@ -137,7 +137,7 @@ async function editVideo({ waNumber, mediaId, editRequest }) {
       return;
     }
     if (status.status === "PREVIEW_READY") {
-      await sendText(waNumber, previewReadyMessage(jobLang, jobId, status.degraded_operations) + idleHint(jobLang, "export"));
+      await sendText(waNumber, previewReadyMessage(jobLang, jobId, status.degraded_operations, status.generation_cost_usd) + idleHint(jobLang, "export"));
       await armIdle(waNumber, jobId, "export", jobLang);
       return;
     }
@@ -160,7 +160,7 @@ async function confirmJob({ waNumber, jobId }) {
   if (status.status === "ERROR") {
     throw new Error(status.error_message || "Python pipeline failed");
   }
-  await sendText(waNumber, previewReadyMessage(lang, jobId, status.degraded_operations) + idleHint(lang, "export"));
+  await sendText(waNumber, previewReadyMessage(lang, jobId, status.degraded_operations, status.generation_cost_usd) + idleHint(lang, "export"));
   await armIdle(waNumber, jobId, "export", lang); // 进入"等待导出"，重新计时
 }
 
@@ -181,7 +181,7 @@ async function retryJob({ waNumber, jobId, text }) {
     throw new Error(status.error_message || "Python pipeline failed");
   }
   const jobLang = resolveLang(lang, status.edit_request);
-  await sendText(waNumber, previewReadyMessage(jobLang, jobId, status.degraded_operations) + idleHint(jobLang, "export"));
+  await sendText(waNumber, previewReadyMessage(jobLang, jobId, status.degraded_operations, status.generation_cost_usd) + idleHint(jobLang, "export"));
   await armIdle(waNumber, jobId, "export", jobLang);
 }
 
@@ -498,7 +498,7 @@ async function runCollectionJob(waNumber, mainItem, brollItems, editRequest, lan
       return;
     }
     if (status.status === "PREVIEW_READY") {
-      await sendText(waNumber, previewReadyMessage(jobLang, jobId, status.degraded_operations) + idleHint(jobLang, "export"));
+      await sendText(waNumber, previewReadyMessage(jobLang, jobId, status.degraded_operations, status.generation_cost_usd) + idleHint(jobLang, "export"));
       await armIdle(waNumber, jobId, "export", jobLang);
       return;
     }
@@ -680,7 +680,7 @@ function formatPlanMessage(job, lang) {
   return lines.join("\n");
 }
 
-function previewReadyMessage(lang, jobId, degradedOps) {
+function previewReadyMessage(lang, jobId, degradedOps, generationCostUsd) {
   let msg = t(lang,
     `预览已生成：${fileUrl(jobId, "preview.mp4")}\n回复 export 导出最终视频。`,
     `Preview ready: ${fileUrl(jobId, "preview.mp4")}\nReply export to generate final video.`);
@@ -691,12 +691,22 @@ function previewReadyMessage(lang, jobId, degradedOps) {
     const labels = {
       apply_style: t(lang, "品牌模板渲染", "branded template render"),
       insert_broll: t(lang, "b-roll 合成", "b-roll compositing"),
+      add_music: t(lang, "背景音乐", "background music"),
     };
     const names = ops.map((o) => labels[o] || o).join(t(lang, "、", ", "));
     msg += t(lang,
       `\n\n⚠️ 注意：「${names}」这一步执行失败（已自动重试过一次），当前预览不含该效果，只包含已成功的步骤。\n回复 *retry* 重跑完整效果，或回复 *export* 接受当前版本。`,
       `\n\n⚠️ Note: the "${names}" step failed (auto-retried once). This preview does not include that effect — ` +
       `only the steps that succeeded.\nReply *retry* to re-run the full edit, or *export* to accept this version.`);
+  }
+  // 生成类操作（AI 生成 b-roll/背景音乐）花的是真金白银——只要发生过就显性
+  // 报出来，不当成隐性成本；没生成任何东西的普通任务不加这行，避免每条消息
+  // 都刷"$0.00"的噪音。
+  const cost = Number(generationCostUsd) || 0;
+  if (cost > 0) {
+    msg += t(lang,
+      `\n\n💰 本次 AI 生成花费：$${cost.toFixed(2)}`,
+      `\n\n💰 AI generation cost for this edit: $${cost.toFixed(2)}`);
   }
   return msg;
 }
