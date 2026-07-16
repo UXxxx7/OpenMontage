@@ -56,6 +56,7 @@ const worker = new Worker(queueName, async (job) => {
   try {
     switch (job.name) {
       case "edit-video": return editVideo(job.data);
+      case "croll-generate": return crollGenerate(job.data);
       case "confirm-job": return confirmJob(job.data);
       case "render-job": return renderJob(job.data);
       case "cancel-job": return cancelJob(job.data);
@@ -146,6 +147,66 @@ async function editVideo({ waNumber, mediaId, editRequest }) {
   } finally {
     await fs.promises.rm(tempPath, { force: true });
   }
+}
+
+// C-roll：一张照片 -> Python 那边看图写文案 + HeyGen 生成数字人说话视频 ->
+// 落地成 input.mp4 后自动接入常规规划管线。跟 editVideo 是同一个形状（下载
+// 素材 -> 建 Python 任务 -> 等方案 -> 回复），区别只在素材是照片、Python 侧
+// 多了一段生成耗时——所以用单独一个更长的超时（WA_CROLL_TIMEOUT_MS），
+// 不跟普通视频规划的 WA_PLAN_TIMEOUT_MS 混用，免得两边互相牵制去调参数。
+async function crollGenerate({ waNumber, mediaId, caption }) {
+  const lang = resolveLang(DEFAULT_LANG, caption);
+  if (!hasWACredentials()) {
+    await sendText(waNumber, t(lang,
+      "服务正在启动，请稍后重新发送照片。",
+      "Service is starting up. Please send your photo again in a moment."));
+    throw new Error("WhatsApp credentials not configured");
+  }
+  const tempPath = await downloadWhatsAppMedia(mediaId, "image");
+  try {
+    const created = await createPythonCrollJob(tempPath, lang, caption);
+    const jobId = created.job_id;
+    await redis.set(activeJobKey(waNumber), jobId, "EX",
+      Number(env("WA_ACTIVE_JOB_TTL", "86400")));
+
+    const status = await waitForStatus(jobId,
+      ["WAITING_CONFIRMATION", "NEEDS_CLARIFICATION", "PREVIEW_READY", "ERROR"],
+      Number(env("WA_CROLL_TIMEOUT_MS", "480000")));
+    const jobLang = resolveLang(lang, status.edit_request);
+
+    if (status.status === "ERROR") {
+      throw new Error(status.error_message || "C-roll generation failed");
+    }
+    if (status.status === "NEEDS_CLARIFICATION") {
+      await sendText(waNumber, clarificationMessage(jobLang, status));
+      return;
+    }
+    if (status.status === "PREVIEW_READY") {
+      await sendText(waNumber, previewReadyMessage(jobLang, jobId, status.degraded_operations, status.generation_cost_usd) + idleHint(jobLang, "export"));
+      await armIdle(waNumber, jobId, "export", jobLang);
+      return;
+    }
+    await sendText(waNumber, formatPlanMessage(status, jobLang) + idleHint(jobLang, "confirm"));
+    await armIdle(waNumber, jobId, "confirm", jobLang);
+  } finally {
+    await fs.promises.rm(tempPath, { force: true });
+  }
+}
+
+async function createPythonCrollJob(photoPath, lang, hint) {
+  const form = new FormData();
+  const ext = path.extname(photoPath) || ".jpg";
+  form.append("photo", fs.createReadStream(photoPath),
+    { filename: `photo${ext}`, contentType: ext === ".png" ? "image/png" : "image/jpeg" });
+  form.append("hint", hint || "");
+  form.append("lang", lang);
+  form.append("pipeline", "talking-head");
+  const resp = await axios.post(`${pythonApiBase}/croll`, form, {
+    headers: form.getHeaders(),
+    maxBodyLength: Infinity, maxContentLength: Infinity,
+    timeout: Number(env("WA_PYTHON_CREATE_TIMEOUT_MS", "180000")),
+  });
+  return resp.data;
 }
 
 async function confirmJob({ waNumber, jobId }) {

@@ -207,6 +207,73 @@ def revise_plan(job_id: str, feedback: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# C-roll：照片 -> AI 文案 -> HeyGen 数字人说话视频 -> 接入常规剪辑管线
+# ---------------------------------------------------------------------------
+
+def generate_croll(job_id: str, photo_path: str, lang: str = "zh", hint: str = "") -> None:
+    """POST /croll 的后台编排：看图写文案 -> HeyGen 上传/生成/轮询下载 ->
+    把成品当 input.mp4 接入 process_incoming_message，从这一步起跟普通视频
+    任务走的是完全同一条路（转写/L2 规划/confirm/apply_style/add_music 等
+    一个都不用改）。任何一步失败都落 ERROR + 具体原因，不留在中间状态卡死。
+    """
+    logger.info(f"Worker: 开始生成 C-roll {job_id}")
+    job = get_job(job_id)
+    if job is None:
+        return
+
+    try:
+        from . import heygen_croll
+        from .croll_script import write_script
+
+        if not heygen_croll.is_available():
+            raise RuntimeError("HEYGEN_API_KEY 未配置，C-roll 功能不可用")
+
+        script = write_script(photo_path, lang=lang, hint=hint)
+        if not script:
+            raise RuntimeError("看图写文案失败（视觉 LLM 不可用或未返回内容）")
+        logger.info(f"  C-roll 文案（{job_id}）: {script[:80]}")
+
+        talking_photo_id = heygen_croll.upload_talking_photo(Path(photo_path))
+        if not talking_photo_id:
+            raise RuntimeError("HeyGen 照片上传失败")
+
+        video_id = heygen_croll.generate_talking_video(talking_photo_id, script, lang=lang)
+        if not video_id:
+            raise RuntimeError("HeyGen 视频生成提交失败")
+
+        input_path = job.job_dir / "input.mp4"
+        ok = heygen_croll.poll_and_download(video_id, input_path, timeout_s=300)
+        if not ok:
+            raise RuntimeError("HeyGen 视频生成超时或失败")
+
+        duration = heygen_croll.probe_duration_seconds(input_path)
+        cost = heygen_croll.estimate_cost(duration)
+        if cost:
+            from .pipeline_runner import _record_generation_cost
+            _record_generation_cost(job.job_dir, "croll_heygen", cost)
+        logger.info(f"  C-roll 视频生成完成（{job_id}）: {duration:.1f}s, ${cost}")
+
+        # edit_request 是给 L2 剪辑规划器的"编辑指令"，跟 script（数字人要说的话）
+        # 是两码事——之前这里直接把 script 塞进 edit_request 是个真实 bug：会让
+        # 剪辑规划器把口播文案当成编辑指令去理解，而不是按零指令默认（remove_filler
+        # + apply_style）处理。这里应该用用户当初给的方向提示（可能是空的）。
+        update_job_fields(
+            job_id,
+            edit_request=hint or "",
+            input_video_path=str(input_path),
+        )
+
+        # 从这里起完全复用普通视频任务的路径：转写 + L2 规划 + 发确认消息
+        # （Node 网关模式下 _safe_send 是死代码，但 Node 本来就轮询 GET
+        # /jobs/{id} 拿状态，不依赖这条直发路径）。
+        process_incoming_message(job_id)
+
+    except Exception as e:
+        logger.exception(f"C-roll 生成出错 {job_id}: {e}")
+        update_job_status(job_id, JobStatus.ERROR, str(e))
+
+
+# ---------------------------------------------------------------------------
 # Phase 3: 下载 WhatsApp 视频
 # ---------------------------------------------------------------------------
 
