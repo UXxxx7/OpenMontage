@@ -602,21 +602,40 @@ def _op_insert_broll(src: str, op: dict, workdir: Path) -> Optional[str]:
         ref = it.get("asset_ref")
         start = _num(it.get("start_seconds"))
         end = _num(it.get("end_seconds"))
-        if ref is None or start is None or end is None or end <= start:
+        has_gen = bool(it.get("gen_prompt"))
+        if start is None or end is None or end <= start:
             continue
-        matches = sorted(assets_dir.glob(f"broll_{ref}.*"))
-        # gen_prompt: 没上传素材但给了文字 prompt → 用所选 provider 生成一段再合成
-        if not matches and it.get("gen_prompt"):
+        if ref is None and not has_gen:
+            continue
+        ref_key = ref if ref is not None else f"gen{int(round(start))}s"
+        # gen_force：用户明确要重新生成时，先删掉本 job 已缓存的生成片再重生成。
+        # 仅对纯生成项（ref is None）生效——绝不删用户上传的素材；并按真值语义判断，
+        # 避免字符串 "false" 被当成真而误触发重生成。
+        _fv = it.get("gen_force")
+        _force = (_fv.strip().lower() in ("true", "1", "yes")) if isinstance(_fv, str) else bool(_fv)
+        if has_gen and ref is None and _force:
+            for _stale in assets_dir.glob(f"broll_{ref_key}.*"):
+                try:
+                    _stale.unlink()
+                except OSError:
+                    pass
+        matches = sorted(assets_dir.glob(f"broll_{ref_key}.*"))
+        if matches and has_gen:
+            logger.info(f"  insert_broll: 复用已生成的 b-roll {matches[0].name}（同一 job 不重复生成，省成本）")
+        # gen_prompt: 没上传素材但给了文字 prompt 且无缓存 → 用所选 provider 生成一段再合成
+        if not matches and has_gen:
             from .broll_providers import generate_broll_via
             assets_dir.mkdir(parents=True, exist_ok=True)
-            _gen_out = assets_dir / f"broll_{ref}.mp4"
+            _gen_out = assets_dir / f"broll_{ref_key}.mp4"
             _gen_result = generate_broll_via(it.get("gen_provider", "omni"), it["gen_prompt"], _gen_out,
                                              aspect=("9:16" if base_h >= base_w else "16:9"))
             if _gen_result:
                 matches = [_gen_out]
-                _record_generation_cost(workdir, f"insert_broll[{ref}]", _gen_result.get("cost_usd") or 0.0)
+                _record_generation_cost(workdir, f"insert_broll[{ref_key}]", _gen_result.get("cost_usd") or 0.0)
+            else:
+                logger.warning(f"  insert_broll: gen_prompt 生成失败（provider={it.get('gen_provider','omni')}），跳过该段")
         if not matches:
-            logger.warning(f"  insert_broll: 找不到资产 broll_{ref}.*，跳过")
+            logger.warning(f"  insert_broll: 找不到资产 broll_{ref_key}.*，跳过")
             continue
         asset = matches[0]
         is_image = asset.suffix.lower() in _BROLL_IMG_EXTS
