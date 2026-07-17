@@ -44,6 +44,7 @@ import { QRContactCard, QRContactCardProps } from "./components/xiaojin/QRContac
 import { RainbowProgressBar } from "./components/xiaojin/RainbowProgressBar";
 import { RiskGauge, RiskGaugeProps } from "./components/xiaojin/RiskGauge";
 import { SpeakerCard, SpeakerCardOpacityKeyframe, SpeakerCardScene } from "./components/xiaojin/SpeakerCard";
+import { Presenter, PresenterProps } from "./components/xiaojin/Presenter";
 import { ColorMode } from "./components/xiaojin/theme";
 
 export interface ComplianceInfo {
@@ -130,6 +131,8 @@ export interface XiaojinEditorialProps extends Record<string, unknown> {
    */
   compliance?: ComplianceInfo;
   brand?: BrandInfo;
+  /** presenter mode: speaker inset in the lower zone during b-roll windows. */
+  presenter?: PresenterProps;
   headingFont?: string;
   labelFont?: string;
 }
@@ -192,6 +195,7 @@ export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = ({
   outro,
   compliance,
   brand,
+  presenter,
   headingFont = "inherit",
   labelFont = "inherit",
 }) => {
@@ -312,6 +316,7 @@ export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = ({
           labelFont={labelFont}
         />
       ) : null}
+      {presenter ? <Presenter {...presenter} colorMode={colorMode} /> : null}
       <ChapterNav
         chapters={chapters}
         introOutFrame={introOutFrame}
