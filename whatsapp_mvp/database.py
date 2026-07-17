@@ -11,6 +11,7 @@ from sqlalchemy import (
     Column,
     DateTime,
     Enum as SAEnum,
+    Float,
     ForeignKey,
     Integer,
     String,
@@ -116,6 +117,11 @@ class Job(Base):
     # 用户从头到尾被蒙在鼓里。
     degraded_operations: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
+    # AI 生成花的真金白银累计（b-roll/背景音乐等，来自 pipeline_runner 的
+    # 成本账本）。Node 网关靠它在预览消息里如实告知花费，防止用户/团队
+    # 完全看不到生成类操作的真实成本。
+    generation_cost_usd: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime, default=datetime.datetime.utcnow
     )
@@ -190,6 +196,9 @@ def _migrate_schema(engine) -> None:
     if "degraded_operations" not in cols:
         with engine.begin() as conn:
             conn.execute(_text("ALTER TABLE jobs ADD COLUMN degraded_operations TEXT"))
+    if "generation_cost_usd" not in cols:
+        with engine.begin() as conn:
+            conn.execute(_text("ALTER TABLE jobs ADD COLUMN generation_cost_usd FLOAT"))
 
 
 def _init_engine() -> None:
