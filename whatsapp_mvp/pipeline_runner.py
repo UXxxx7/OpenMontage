@@ -77,6 +77,14 @@ def run_talking_head_pipeline(job: Job) -> dict[str, Any]:
     )
     others = [op for op in video_ops if op.get("type") != "remove_segment"]
     ordered_ops = removes + others
+    # presenter 模式：同一方案里 insert_broll 与 apply_style 并存时，让 b-roll 用
+    # cutaway 铺满卡片、人物交给模板在下方渲染（见 _op_insert_broll / _op_apply_style）。
+    # 先清掉上一轮残留的 _presenter.json，避免改方案后放出"幽灵人物小窗"。
+    (job_dir / "_presenter.json").unlink(missing_ok=True)
+    if any(o.get("type") == "apply_style" for o in ordered_ops):
+        for _o in ordered_ops:
+            if _o.get("type") == "insert_broll":
+                _o["_presenter"] = True
     if len(removes) > 1:
         logger.info(f"  {len(removes)} 段 remove_segment 将按起点降序执行（防时间轴错位）")
 
@@ -655,6 +663,19 @@ def _op_insert_broll(src: str, op: dict, workdir: Path) -> Optional[str]:
     if not resolved:
         return None
 
+    # presenter 模式：把 broll_main 项转成 cutaway（卡片只放 b-roll、不烧人物），
+    # 并记下人物视频与各 b-roll 时间窗，交给 apply_style 在模板下方渲染人物小窗。
+    if op.get("_presenter"):
+        _pwins = []
+        for _r in resolved:
+            if _r["mode"] == "broll_main":
+                _r["mode"] = "cutaway"
+                _pwins.append({"start": _r["start"], "end": _r["end"]})
+        if _pwins:
+            (workdir / "_presenter.json").write_text(
+                json.dumps({"person_src": Path(src).name, "windows": _pwins}, ensure_ascii=False),
+                encoding="utf-8")
+
     orientation = str(op.get("orientation") or "auto").lower()
     if orientation not in ("portrait", "landscape"):
         orientation = "landscape" if any_landscape else "portrait"
@@ -786,7 +807,7 @@ def _composite_broll(src: str, resolved: list, out: Path,
             fc.append(f"[{cur}][bro{i}]overlay=0:0:enable='between(t,{s},{e})'[c{i}]")
         else:  # broll_main：先铺满，再叠人物小窗
             fc.append(f"[{cur}][bro{i}]overlay=0:0:enable='between(t,{s},{e})'[m{i}]")
-            fc.append(f"[m{i}][insv{i}]overlay=W-w-{margin}:H-h-{margin}:enable='between(t,{s},{e})'[c{i}]")
+            fc.append(f"[m{i}][insv{i}]overlay=W-w-{margin}:H*0.70-h:enable='between(t,{s},{e})'[c{i}]")
         cur = f"c{i}"
     fc.append(f"[{cur}]null[outv]")
     # 输出时长钉在主视频长度：b-roll 用 setpts 偏移后其流可能比主视频长（overlay 默认跟
@@ -995,6 +1016,31 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
     # 人脸裁剪校准是确定性的（同一段视频每次算出来的结果一样），跟内容规划反馈
     # 无关，只需要在下面的重试闭包外面算一次——重试它只会得到一模一样的值。
     speaker_object_position = op.get("speaker_object_position") or calibrate_speaker_object_position(src, workdir)
+
+    # presenter：insert_broll 以 presenter 模式跑过时留下的人物视频+时间窗，
+    # 渲染成模板下方的人物小窗（卡片此时只放 b-roll，人脸不再烧进画面被裁）。
+    presenter_prop = None
+    _presenter_meta = workdir / "_presenter.json"
+    if _presenter_meta.exists():
+        try:
+            _pm = json.loads(_presenter_meta.read_text(encoding="utf-8"))
+            _psrc = _pm.get("person_src")
+            _pwins = [
+                {"fromFrame": max(0, round(float(w["start"]) * 30)),
+                 "toFrame": max(0, round(float(w["end"]) * 30))}
+                for w in (_pm.get("windows") or [])
+                if w.get("start") is not None and w.get("end") is not None
+            ]
+            if _psrc and _pwins:
+                presenter_prop = {
+                    "src": f"{config.local_api_base}/files/{job_slug}/{_psrc}",
+                    "windows": _pwins,
+                    "x": 604, "y": 1270, "w": 400, "h": 440, "radius": 28,
+                    "objectPosition": speaker_object_position,
+                }
+        except Exception as _e:
+            logger.warning(f"  apply_style: presenter 元数据解析失败，跳过下方人物小窗: {_e}")
+
     props_path = workdir / "_op_apply_style_props.json"
 
     def _build(feedback: Optional[str] = None) -> dict[str, Any]:
@@ -1050,6 +1096,8 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
             "chapters": chapters,
             "captions": captions,
         }
+        if presenter_prop:
+            props["presenter"] = presenter_prop
         if plan_sections:
             props["sections"] = plan_sections
         if plan_quotes:
