@@ -171,7 +171,7 @@ async function crollGenerate({ waNumber, mediaId, caption }) {
 
     const status = await waitForStatus(jobId,
       ["WAITING_CONFIRMATION", "NEEDS_CLARIFICATION", "PREVIEW_READY", "ERROR"],
-      Number(env("WA_CROLL_TIMEOUT_MS", "480000")));
+      Number(env("WA_CROLL_TIMEOUT_MS", "1200000")));
     const jobLang = resolveLang(lang, status.edit_request);
 
     if (status.status === "ERROR") {
