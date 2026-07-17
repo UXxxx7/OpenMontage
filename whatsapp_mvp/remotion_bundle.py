@@ -186,7 +186,22 @@ def ensure_remotion_bundle(remotion_dir: Path) -> Optional[str]:
         if tmp_link.exists() or tmp_link.is_symlink():
             tmp_link.unlink()
         tmp_link.symlink_to(new_dir, target_is_directory=True)
-        tmp_link.replace(build_link)
+        # Windows：os.replace 无法覆盖"真实目录"（WinError 5 拒绝访问）。build 若是
+        # 残留的真实目录（非符号链接）就先删掉再切；对短暂占用（杀软/索引持句柄）重试几次。
+        for _swap_attempt in range(5):
+            try:
+                if build_link.exists() and not build_link.is_symlink():
+                    shutil.rmtree(build_link, ignore_errors=True)
+                tmp_link.replace(build_link)
+                break
+            except OSError:
+                if _swap_attempt == 4:
+                    try:
+                        tmp_link.unlink()
+                    except OSError:
+                        pass
+                    raise
+                time.sleep(0.5)
 
         keep = {new_dir.name}
         if previous and previous.parent == cache_dir:

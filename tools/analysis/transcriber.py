@@ -147,11 +147,19 @@ class Transcriber(BaseTool):
         model = WhisperModel(model_size, device=device, compute_type=compute_type)
 
         # Transcribe
+        # condition_on_previous_text=False：默认 True 会用前面片段的转写文本当
+        # 上下文偏置后面片段的识别，短促单人口播视频用不上这种长距离一致性，
+        # 代价却是滚雪球式听错——实测在一条真实测试视频上把 "just whatsapp me
+        # directly" 连续 10/26 次听成语义不通的 "just what's happening
+        # directly"（前文全是"保单/保费"这类词，把不常见词 WhatsApp 带偏），
+        # 下游口误检测在错误文本上怎么判断都剪不干净。关掉这个参数后同一段
+        # 音频立刻转写正确，问题消失（2026-07-16 实测复现 + 验证）。
         segments_iter, info = model.transcribe(
             str(input_path),
             language=language,
             word_timestamps=True,
             vad_filter=True,
+            condition_on_previous_text=False,
         )
 
         segments = []
