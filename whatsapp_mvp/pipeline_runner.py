@@ -1215,6 +1215,84 @@ def _floor_shift_zone_headers(headers: Optional[list[dict]], floor: int) -> None
         h["toFrame"] += delta
 
 
+_CARD_TRANSITION_FRAMES = 20  # SpeakerCard.tsx 自己的收缩转场时长，跟 Fix C2 的 +20 同一个常量
+
+
+def _mode_at(mode_schedule: list[dict], frame: int) -> str:
+    """mode_schedule（按 frame 升序的状态变化点列表）在给定帧生效的模式。"""
+    mode = "dominant"
+    for entry in mode_schedule:
+        if entry["frame"] > frame:
+            break
+        mode = entry.get("mode", mode)
+    return mode
+
+
+def _next_docked_frame(mode_schedule: list[dict], after_frame: int) -> Optional[int]:
+    """after_frame（含）之后，卡片真正收缩完成（workflow 模式生效 +
+    转场动画播完）的第一帧；后面再没有 workflow 窗口就返回 None。"""
+    for entry in mode_schedule:
+        if entry["frame"] >= after_frame and entry.get("mode") == "workflow":
+            return entry["frame"] + _CARD_TRANSITION_FRAMES
+    return None
+
+
+def _shift_off_dominant_windows(items: Optional[list[dict]], mode_schedule: list[dict]) -> None:
+    """Fix C24（2026-07-20，真实生产复现——job_452ef6c48100，用户在渲染出的
+    截图里直接抓到）：content-zone 元素（zoneHeaders/dataCards/gauges/...）
+    的固定 Y 坐标（_CONTENT_ZONE_Y，见 content_planner.py）假设卡片此刻是
+    docked（收起，矮）状态。Fix C2 只处理了片头这一次 dominant 窗口——但
+    dominant/workflow 会在视频中段按内容反复交替（Fix C14 的注释已经说明
+    这是"内容本身决定的真实时间点，不该跟着挪"这条设计本身没错），每一次
+    卡片重新变回 Dominant（未收起，更高）都会重现同一个 bug：真实复现里
+    COVERAGE、RISK 两个 zoneHeader 各自的整个显示区间都恰好落在了这样一次
+    Dominant 窗口内，标题文字在真实渲染出的截图里直接叠在说话人身上，不是
+    卡片下方的奶油区。
+
+    这里不改 mode_schedule 本身（dominant/workflow 交替是内容驱动的真实
+    时间点，改了就是在动 Fix C14 特意保留不动的东西）——而是反过来让
+    content-zone 元素避让：任何 mountFrame 落在 dominant/hidden 窗口内的
+    元素，顺延到卡片真正收缩完成的那一帧，跟 Fix C2 一样只平移不压缩
+    （保留原有停留时长）。已经落在 workflow 窗口内的元素是 no-op。后面
+    再没有 workflow 窗口了（最后一段一直是 Dominant 到片尾）就保持原状，
+    没有更好的位置可躲。
+    """
+    for g in items or []:
+        if not isinstance(g, dict) or "mountFrame" not in g:
+            continue
+        if _mode_at(mode_schedule, g["mountFrame"]) == "workflow":
+            continue
+        target = _next_docked_frame(mode_schedule, g["mountFrame"])
+        if target is None:
+            continue
+        delta = target - g["mountFrame"]
+        if delta <= 0:
+            continue
+        g["mountFrame"] += delta
+        if "endFrame" in g:
+            g["endFrame"] += delta
+        if "secondRevealFrame" in g:
+            g["secondRevealFrame"] += delta
+
+
+def _shift_off_dominant_windows_headers(headers: Optional[list[dict]], mode_schedule: list[dict]) -> None:
+    """跟 _shift_off_dominant_windows 同样的避让逻辑，ZoneHeader 的字段名是
+    fromFrame/toFrame。"""
+    for h in headers or []:
+        if not isinstance(h, dict) or "fromFrame" not in h:
+            continue
+        if _mode_at(mode_schedule, h["fromFrame"]) == "workflow":
+            continue
+        target = _next_docked_frame(mode_schedule, h["fromFrame"])
+        if target is None:
+            continue
+        delta = target - h["fromFrame"]
+        if delta <= 0:
+            continue
+        h["fromFrame"] += delta
+        h["toFrame"] += delta
+
+
 def _run_enhancement_chain(src: str, workdir: Path) -> str:
     with _ENHANCE_SLOTS:  # face/color/audio 增强都是 ffmpeg/模型重活，跨任务串行
         return _run_enhancement_chain_inner(src, workdir)
@@ -1323,8 +1401,24 @@ def _fill_intro_lead_dead_space(props: dict, findings: list[dict], captions: lis
 
     gap_start_ms, gap_end_ms = gap_start / FPS * 1000, gap_end / FPS * 1000
     overlapping = [c for c in captions if c["startMs"] < gap_end_ms and c["endMs"] > gap_start_ms]
+    # Fix C25（2026-07-20，真实生产复现——job_452ef6c48100，用户反馈"it's David
+    # from... 没用啊"）：这条 gap 紧跟在 intro 后面，overlapping[0] 常常正好是
+    # captions[0]——全片第一句话，几乎总是"Hi, it's <name> from <company>"这类
+    # 自我介绍/问候。这段身份信息 IntroTitle 卡片在片头已经完整展示过一次
+    # （姓名+公司），这里再截一小段同样的话塞进一张卡，既不提供新信息，字数
+    # 上限还经常把整句砍在词中间——用户截图看到的就是这种"半句自我介绍+省略号"
+    # 的卡片。C10 这条 finding 自己给出的建议原文已经写明这种情况可以不补：
+    # "如果这段时间说的是纯问候/自我介绍...没有数字/工具名可以提前挂上去"——
+    # 之前的实现没有落实这句话，无条件用 overlapping[0] 的文字兜底。这里改成：
+    # 命中"第一句话"这个具体、可判断的情况时，宁可让这段时间保持"只有说话人
+    # +字幕"（intro 卡片已经把身份信息交代过了），也不插入一张重复、且大概率
+    # 被截断的卡片——跟"_fallback_topic_cards_for_gaps 被删掉"是同一个教训，
+    # 这次是把它落实到 C13 自己身上。
+    is_self_intro_repeat = bool(captions) and bool(overlapping) and overlapping[0] is captions[0]
     _MAX_HEADLINE_CHARS = 16
-    if overlapping:
+    if is_self_intro_repeat:
+        return props
+    elif overlapping:
         text = overlapping[0]["text"].strip()
         headline = text if len(text) <= _MAX_HEADLINE_CHARS else text[:_MAX_HEADLINE_CHARS] + "…"
     else:
@@ -1707,6 +1801,13 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
                            before_after, plan_quotes, plan_pills, plan_step_lists, plan_topic_cards):
                 _floor_shift_graphics(_items, _mount_floor)
             _floor_shift_zone_headers(plan_zone_headers, _mount_floor)
+
+            # Fix C24: 片头这一次 dominant 窗口处理完了，但视频中段还会按内容
+            # 反复回到 Dominant——同一类避让要对每一次窗口都做，不只是片头。
+            for _items in (data_cards, gauges, countdowns, calendar_events,
+                           before_after, plan_quotes, plan_pills, plan_step_lists, plan_topic_cards):
+                _shift_off_dominant_windows(_items, mode_schedule)
+            _shift_off_dominant_windows_headers(plan_zone_headers, mode_schedule)
 
             # 段落接管同样不得在 intro 期间开始
             if props.get("sections"):

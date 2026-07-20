@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from whatsapp_mvp.pipeline_runner import (
     _floor_shift_graphics, _floor_shift_zone_headers, _QUOTE_MIN_START_FRAMES,
+    _shift_off_dominant_windows, _shift_off_dominant_windows_headers,
+    _fill_intro_lead_dead_space,
 )
 
 FAILED = []
@@ -93,6 +95,86 @@ def test_no_op_on_empty_or_none():
     check("None/空列表不报错", not raised)
 
 
+# Fix C24 回归测试——真实生产复现 job_452ef6c48100：COVERAGE/RISK 这两个
+# zoneHeader 各自的整个显示区间都落在了一次视频中段的 Dominant 窗口内
+# （mode_schedule 在片头之后按内容反复回到 Dominant 是设计如此，Fix C14 的
+# 注释已经说明——问题是 content-zone 元素的固定 Y 坐标没有跟着躲开）。
+_MID_VIDEO_MODE_SCHEDULE = [
+    {"frame": 0, "mode": "dominant"},
+    {"frame": 40, "mode": "workflow"},
+    {"frame": 200, "mode": "dominant"},   # 卡片中途重新变大（内容驱动，真实时间点）
+    {"frame": 592, "mode": "workflow"},   # 收回 docked——转场再花 _CARD_TRANSITION_FRAMES(20) 帧完成
+]
+
+
+def test_shift_off_dominant_windows_pushes_past_mid_video_hold():
+    items = [{"mountFrame": 378, "endFrame": 592}]  # 落在 200-592 这次 dominant 窗口内
+    _shift_off_dominant_windows(items, _MID_VIDEO_MODE_SCHEDULE)
+    check("落在中段 dominant 窗口内的图形被推到卡片真正收起之后",
+          items[0]["mountFrame"] == 592 + 20, items[0])
+    check("平移保留原有停留时长", items[0]["endFrame"] - items[0]["mountFrame"] == 592 - 378, items[0])
+
+
+def test_shift_off_dominant_windows_no_op_when_already_workflow():
+    items = [{"mountFrame": 100, "endFrame": 300}]  # 落在 40-200 这段 workflow 窗口内
+    _shift_off_dominant_windows(items, _MID_VIDEO_MODE_SCHEDULE)
+    check("已经在 workflow 窗口内的图形不受影响", items[0] == {"mountFrame": 100, "endFrame": 300}, items[0])
+
+
+def test_shift_off_dominant_windows_headers_same_behavior():
+    headers = [{"fromFrame": 378, "toFrame": 592}]
+    _shift_off_dominant_windows_headers(headers, _MID_VIDEO_MODE_SCHEDULE)
+    check("zoneHeader 用 fromFrame/toFrame 字段也一样被推移",
+          headers[0]["fromFrame"] == 612 and headers[0]["toFrame"] == 612 + (592 - 378), headers[0])
+
+
+def test_shift_off_dominant_windows_leaves_unrescuable_item_alone():
+    # 最后一段一直是 Dominant 到片尾，没有下一个 workflow 窗口可以躲。
+    schedule = [{"frame": 0, "mode": "dominant"}, {"frame": 40, "mode": "workflow"},
+                {"frame": 900, "mode": "dominant"}]
+    items = [{"mountFrame": 950, "endFrame": 1000}]
+    _shift_off_dominant_windows(items, schedule)
+    check("找不到后续 workflow 窗口时保持原状（没有更好的位置可躲）",
+          items[0] == {"mountFrame": 950, "endFrame": 1000}, items[0])
+
+
+# Fix C25 回归测试——真实生产复现 job_452ef6c48100，用户反馈"it's David
+# from... 没用啊"：intro 结束后的死空间恰好被全片第一句话（自我介绍）覆盖，
+# machine 兜底截了一小段塞进卡片，跟片头 IntroTitle 已经展示过的身份信息
+# 重复，还经常被字数上限砍在词中间。
+_MINIMAL_INTRO_GAP_PROPS = {
+    "durationSeconds": 20.0,
+    "introOutFrame": 80,
+    "scenes": [
+        {"frame": 0, "x": 60, "y": 104, "w": 960, "h": 1100},
+        {"frame": 20, "x": 60, "y": 104, "w": 960, "h": 900},
+    ],
+    "dataCards": [{"title": "T", "x": 60, "y": 1170, "width": 960, "mountFrame": 300, "endFrame": 450,
+                   "rows": [{"label": "X", "value": 1, "mountOffset": 0}]}],
+}
+_INTRO_GAP_FINDING = [{"check": "intro_lead_dead_space", "gap_start": 80, "gap_end": 200}]
+
+
+def test_self_intro_repeat_is_not_inserted():
+    captions = [
+        {"startMs": 1000, "endMs": 6000, "text": "it's David from Pacific life quick reminder"},
+        {"startMs": 6000, "endMs": 9000, "text": "your policy is coming up for renewal"},
+    ]
+    result = _fill_intro_lead_dead_space(dict(_MINIMAL_INTRO_GAP_PROPS), _INTRO_GAP_FINDING, captions)
+    check("gap 恰好被全片第一句话(自我介绍)覆盖时，不插入重复的兜底卡片",
+          not result.get("topicCards"), result.get("topicCards"))
+
+
+def test_non_first_caption_still_gets_fallback_card():
+    captions = [
+        {"startMs": -3000, "endMs": -1000, "text": "an earlier line before this gap, not the first caption"},
+        {"startMs": 1000, "endMs": 6000, "text": "some genuinely later content overlapping the gap"},
+    ]
+    result = _fill_intro_lead_dead_space(dict(_MINIMAL_INTRO_GAP_PROPS), _INTRO_GAP_FINDING, captions)
+    check("gap 被非首句字幕覆盖时，兜底逻辑照常插入卡片（既有行为不受影响）",
+          bool(result.get("topicCards")), result.get("topicCards"))
+
+
 def main():
     test_shifts_below_floor_preserving_duration()
     test_before_after_second_reveal_frame_shifts_too()
@@ -100,6 +182,12 @@ def main():
     test_zone_headers_shift_from_to_frame()
     test_quote_min_start_floor_keeps_facecam_visible_at_video_open()
     test_no_op_on_empty_or_none()
+    test_shift_off_dominant_windows_pushes_past_mid_video_hold()
+    test_shift_off_dominant_windows_no_op_when_already_workflow()
+    test_shift_off_dominant_windows_headers_same_behavior()
+    test_shift_off_dominant_windows_leaves_unrescuable_item_alone()
+    test_self_intro_repeat_is_not_inserted()
+    test_non_first_caption_still_gets_fallback_card()
 
     print()
     if FAILED:
