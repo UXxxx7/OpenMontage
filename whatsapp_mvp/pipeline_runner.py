@@ -310,6 +310,29 @@ def _transcribe_elevenlabs(src: str, api_key: str):
                 timeout=300,
             )
         resp.raise_for_status()
+    except requests.HTTPError as e:
+        # Fix C11（2026-07-17，真实生产复现）：ElevenLabs 对"配额用完"和"key 无效/
+        # 无权限"都回同一个 401，resp.raise_for_status() 抛出的异常字符串只有
+        # "401 Client Error: Unauthorized for url: ..."，完全看不出是哪一种——
+        # 逼着上一次调试花了几个小时才靠直接 curl 打 /v1/user 才挖出真正原因
+        # (免费档 10000 字符/月配额，body 里其实一直带着
+        # {"detail":{"code":"quota_exceeded","message":"...You have N credits
+        # remaining..."}})。这里改成优先读 body 里的 code/message，让日志一次
+        # 到位区分"配额用完"（等重置或升级套餐，换 key 没用——新账号一样只有
+        # 10000/月）和"key 真的无效/无权限"（换 key 才有用）。
+        detail = None
+        try:
+            detail = e.response.json().get("detail") if e.response is not None else None
+        except (ValueError, AttributeError):
+            pass
+        if isinstance(detail, dict) and detail.get("code") == "quota_exceeded":
+            msg = f"quota_exceeded: {detail.get('message', '')}（免费档配额用完——等月度重置或升级套餐，换 key 无效）"
+        elif isinstance(detail, dict) and detail.get("message"):
+            msg = f"{detail.get('code', 'error')}: {detail['message']}"
+        else:
+            msg = str(e)
+        logger.warning(f"  ElevenLabs Scribe 转写调用异常: {msg}")
+        return ToolResult(success=False, error=msg)
     except Exception as e:
         logger.warning(f"  ElevenLabs Scribe 转写调用异常: {e}")
         return ToolResult(success=False, error=str(e))
