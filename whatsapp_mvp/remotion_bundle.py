@@ -15,6 +15,7 @@ import logging
 import shutil
 import subprocess
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -22,6 +23,31 @@ logger = logging.getLogger(__name__)
 
 _BUNDLE_LOCK = threading.Lock()
 _BUNDLE_TIMEOUT_S = 300
+
+
+def _clean_stale_build_artifacts(remotion_dir: Path, build: Path) -> None:
+    """Fix C17（2026-07-17，来自友人提供的 WINDOWS_REMOTION_WINERROR5.md，一份
+    独立记录过的 Windows 专属排查文档）：Remotion 重建 bundle 的最后一步是把
+    临时目录 `.build.tmp-xxxx` 改名成 `build`；`build` 已存在（上一次构建
+    中途被打断——例如进程被杀、机器休眠、渲染超时——没跑到改名那一步就留下的
+    半成品）或被外部进程（杀毒软件扫描/资源管理器/编辑器）占着句柄时，Windows
+    会拒绝这次改名，报 `[WinError 5] 拒绝访问`；Linux/macOS 不受影响。
+    `_BUNDLE_LOCK` 只挡得住同一个 Python 进程内的并发重建，挡不住上一次进程
+    崩溃/被杀留下的残留目录——这正是本会话里我自己 `taskkill` 一个卡住的
+    验证脚本时会造成的那种残留，如果它当时恰好在重建 bundle。
+
+    这里只处理"最常见、最能靠代码解决"的一种：主动清掉上一次遗留的
+    `.build.tmp-*` 临时目录，重建前给改名腾出干净的落点——不清 `build` 本身，
+    因为 `build` 存在且够新的时候是合法的缓存复用路径（见调用方的 marker
+    检查），乱删会把有效缓存也删掉。外部进程持有的持续性文件锁没法在代码里
+    解决（原文档已经写明，删了要重启程序才能清句柄），仍需要人工按文档处理。
+    """
+    for stale in remotion_dir.glob(".build.tmp-*"):
+        try:
+            shutil.rmtree(stale, ignore_errors=True)
+            logger.info(f"  remotion: 清理上次遗留的临时打包目录 {stale.name}")
+        except Exception as e:
+            logger.warning(f"  remotion: 清理 {stale.name} 失败（忽略，继续）: {e}")
 
 
 def _src_mtime(remotion_dir: Path) -> float:
@@ -82,18 +108,32 @@ def ensure_remotion_bundle(remotion_dir: Path, job_slug: Optional[str] = None) -
                 _sync_job_public_assets(remotion_dir, build, job_slug)
             return str(build)
         npx = shutil.which("npx") or "npx"
+        _clean_stale_build_artifacts(remotion_dir, build)
         logger.info("  remotion: 预打包 bundle（src 有更新或首次）...")
-        try:
-            r = subprocess.run(
-                [npx, "remotion", "bundle", "--out-dir", str(build)],
-                cwd=remotion_dir, capture_output=True, text=True,
-                timeout=_BUNDLE_TIMEOUT_S,
-            )
-        except Exception as e:
-            logger.warning(f"  remotion: bundle 失败（回退按次打包）: {e}")
-            return None
-        if r.returncode != 0 or not marker.exists():
-            logger.warning(f"  remotion: bundle 失败（回退按次打包）: {(r.stderr or '')[-300:]}")
+        r = None
+        for attempt in range(2):  # 一次原始尝试 + 一次 WinError 5 专用重试，见 Fix C17
+            try:
+                r = subprocess.run(
+                    [npx, "remotion", "bundle", "--out-dir", str(build)],
+                    cwd=remotion_dir, capture_output=True, text=True,
+                    timeout=_BUNDLE_TIMEOUT_S,
+                )
+            except Exception as e:
+                logger.warning(f"  remotion: bundle 失败（回退按次打包）: {e}")
+                return None
+            if r.returncode == 0 and marker.exists():
+                break
+            # WinError 5 多半是瞬时的外部句柄占用（例如杀毒软件短暂扫描新写入
+            # 的文件）——原文档验证过持续性占用重试没用，但瞬时占用等一下再
+            # 清一次残留、重试一次经常就过了，不需要每次都动用文档里的手动步骤。
+            if attempt == 0 and "WinError 5" in (r.stderr or ""):
+                logger.warning("  remotion: bundle 遇到 WinError 5（可能是瞬时占用），1s 后重试一次")
+                time.sleep(1)
+                _clean_stale_build_artifacts(remotion_dir, build)
+                continue
+            break
+        if r is None or r.returncode != 0 or not marker.exists():
+            logger.warning(f"  remotion: bundle 失败（回退按次打包）: {(r.stderr or '')[-300:] if r else ''}")
             return None
         logger.info("  remotion: bundle 就绪")
         if job_slug:
