@@ -26,6 +26,26 @@ _AUDIO_EXTENSIONS = frozenset({".mp3", ".wav", ".aac", ".flac", ".ogg", ".m4a", 
 _IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".svg"})
 
 
+def _probed_audio_codec(probe: dict) -> str:
+    """`technical_probe`'s audio codec lives in one of two shapes depending on
+    which probe path populated it: the `audio_probe` tool returns a nested
+    `{"audio": {"codec": ..., ...}}`, while the ffprobe-direct fallback (used
+    only when `audio_probe` is unavailable) returns a flat `"audio_codec"`
+    key. Confirmed real production bug (2026-07-17, job_ac00838adea9): every
+    caller here only ever checked the flat key, so any file actually probed
+    via `audio_probe` (the normal, preferred path) always read as having no
+    audio_codec — even with a real AAC stereo track sitting right there in
+    `technical_probe["audio"]["codec"]` — and got summarized as "without
+    audio". That false signal fed straight into planning and produced a plan
+    that skipped remove_filler/apply_style entirely (both need transcription,
+    which the plan believed was impossible) in favor of blind manually-guessed
+    timestamp cuts — a real, shipped, user-visible regression, not just a
+    wrong label. Check both shapes here once, so every caller gets the right
+    answer regardless of which probe path ran.
+    """
+    return probe.get("audio_codec") or (probe.get("audio") or {}).get("codec") or ""
+
+
 def detect_media_type(path: Path) -> Optional[str]:
     """Classify a file as video, audio, or image by extension."""
     ext = path.suffix.lower()
@@ -279,7 +299,7 @@ def review_source_media(
         if media_type == "video":
             dur = probe.get("duration_seconds", 0)
             res = probe.get("resolution", "unknown")
-            has_audio = bool(probe.get("audio_codec"))
+            has_audio = bool(_probed_audio_codec(probe))
             entry["content_summary"] = (
                 f"Video file: {dur:.1f}s at {res}, "
                 f"{'with' if has_audio else 'without'} audio"
@@ -366,7 +386,7 @@ def _infer_video_usability(probe: dict, transcript: Optional[str]) -> list[str]:
         uses.append("b-roll")
     if transcript:
         uses.append("source dialogue")
-    if probe.get("audio_codec"):
+    if _probed_audio_codec(probe):
         uses.append("source audio")
     return uses or ["short clip"]
 

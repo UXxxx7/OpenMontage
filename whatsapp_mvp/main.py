@@ -38,6 +38,8 @@ def main():
 
 def worker():
     """Start the RQ worker."""
+    import sys
+
     from whatsapp_mvp.config import get_config
     import rq
     from redis import Redis
@@ -45,9 +47,19 @@ def worker():
     config = get_config()
     redis_conn = Redis.from_url(config.redis_url)
 
-    with rq.Connection(redis_conn):
-        worker_instance = rq.Worker("whatsapp_mvp")
-        worker_instance.work()
+    # rq.Worker forks a child process per job (os.fork) to isolate it — fork()
+    # doesn't exist on Windows at all, so the default Worker crashes with
+    # AttributeError on the very first job it picks up (confirmed: it logged
+    # the job starting, then died immediately, taking the whole worker process
+    # down with it — every job after that just sat queued forever with no
+    # worker left to claim it). SimpleWorker runs the job in-process instead
+    # of forking; that's RQ's own documented Windows workaround. Only switch
+    # on Windows — SimpleWorker skips the process-isolation forked Worker
+    # gives you for free (a segfault/OOM in one job can't be contained), so
+    # keep the real Worker on Linux/macOS where fork actually works.
+    worker_cls = rq.SimpleWorker if sys.platform == "win32" else rq.Worker
+    worker_instance = worker_cls("whatsapp_mvp", connection=redis_conn)
+    worker_instance.work()
 
 
 if __name__ == "__main__":

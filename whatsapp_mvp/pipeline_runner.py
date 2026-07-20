@@ -322,14 +322,207 @@ def _op_remove_silences(src: str, op: dict, workdir: Path) -> Optional[str]:
 # 转写异常兜底 / 人脸校准取景 / 短语级字幕。均已在本机 e2e 验证过。
 # ---------------------------------------------------------------------------
 
+def _transcribe_elevenlabs(src: str, api_key: str):
+    """ElevenLabs Scribe transcription — same API video-use (video-studio's
+    own trim pipeline) uses, and for the same reason: retake-detection needs
+    consistent word-level text between two near-identical takes to tell them
+    apart, which local faster-whisper is meaningfully weaker at (confirmed
+    root cause of a real production bug — a retake survived filler-removal).
+
+    timestamps_granularity="word" is mandatory, not optional (video-studio's
+    edit-director.md, confirmed by direct testing there): omitting it makes
+    Scribe silently return degenerate word timing (multiple consecutive words
+    sharing one start==end timestamp), which would corrupt every downstream
+    frame calculation silently rather than erroring.
+
+    Returns an object shaped like the local Transcriber's ToolResult
+    (.success / .data / .error) so callers don't need to know which
+    provider ran.
+    """
+    import requests
+
+    from tools.base_tool import ToolResult
+
+    try:
+        with open(src, "rb") as f:
+            resp = requests.post(
+                "https://api.elevenlabs.io/v1/speech-to-text",
+                headers={"xi-api-key": api_key},
+                files={"file": (Path(src).name, f, "video/mp4")},
+                data={"model_id": "scribe_v1", "timestamps_granularity": "word"},
+                timeout=300,
+            )
+        resp.raise_for_status()
+    except requests.HTTPError as e:
+        # Fix C11（2026-07-17，真实生产复现）：ElevenLabs 对"配额用完"和"key 无效/
+        # 无权限"都回同一个 401，resp.raise_for_status() 抛出的异常字符串只有
+        # "401 Client Error: Unauthorized for url: ..."，完全看不出是哪一种——
+        # 逼着上一次调试花了几个小时才靠直接 curl 打 /v1/user 才挖出真正原因
+        # (免费档 10000 字符/月配额，body 里其实一直带着
+        # {"detail":{"code":"quota_exceeded","message":"...You have N credits
+        # remaining..."}})。这里改成优先读 body 里的 code/message，让日志一次
+        # 到位区分"配额用完"（等重置或升级套餐，换 key 没用——新账号一样只有
+        # 10000/月）和"key 真的无效/无权限"（换 key 才有用）。
+        detail = None
+        try:
+            detail = e.response.json().get("detail") if e.response is not None else None
+        except (ValueError, AttributeError):
+            pass
+        if isinstance(detail, dict) and detail.get("code") == "quota_exceeded":
+            msg = f"quota_exceeded: {detail.get('message', '')}（免费档配额用完——等月度重置或升级套餐，换 key 无效）"
+        elif isinstance(detail, dict) and detail.get("message"):
+            msg = f"{detail.get('code', 'error')}: {detail['message']}"
+        else:
+            msg = str(e)
+        logger.warning(f"  ElevenLabs Scribe 转写调用异常: {msg}")
+        return ToolResult(success=False, error=msg)
+    except Exception as e:
+        logger.warning(f"  ElevenLabs Scribe 转写调用异常: {e}")
+        return ToolResult(success=False, error=str(e))
+
+    data = resp.json()
+    # ElevenLabs returns "word" and "spacing" as separate token types (the
+    # space between two words is its own token) — faster-whisper instead
+    # bakes a leading space into each word's own text (e.g. " hello", " world",
+    # confirmed in tools/analysis/transcriber.py's direct `w.word` usage with
+    # no separate join-with-space step anywhere downstream). Dropping
+    # "spacing" tokens outright (as an earlier version of this function did)
+    # loses that leading space, and downstream caption-text concatenation —
+    # built assuming each word already carries it, like faster-whisper —
+    # then mashes every word together with no spaces at all (confirmed real
+    # bug: a rendered caption read "I'veeputthefullbreakdowninthis"). Fix:
+    # carry each preceding spacing token's text forward as this word's prefix.
+    raw_tokens = data.get("words", [])
+    word_timestamps = []
+    pending_prefix = ""
+    for tok in raw_tokens:
+        if tok.get("type") == "spacing":
+            pending_prefix += tok.get("text", "")
+            continue
+        if tok.get("type") != "word":
+            continue
+        word_timestamps.append({
+            "word": pending_prefix + tok["text"],
+            "start": round(tok["start"], 3),
+            "end": round(tok["end"], 3),
+        })
+        pending_prefix = ""
+
+    # Phrase-level segments too (id/start/end/text) — transcribe_segments()
+    # (the L2 agent's own planning-stage transcript, used specifically to
+    # spot retakes/repeated sentences before any op runs) needs this shape,
+    # not word_timestamps. Same GAP_THRESHOLD_MS=400 phrase-grouping video-use
+    # itself uses (tools/directors/edit-director.md Step 3) — new phrase
+    # whenever the gap since the last word exceeds 400ms.
+    GAP_THRESHOLD_MS = 400
+    segments: list[dict] = []
+    cur_words: list[str] = []
+    cur_start = cur_end = None
+    for w in word_timestamps:
+        start_ms, end_ms = w["start"] * 1000, w["end"] * 1000
+        if cur_words and (start_ms - cur_end) > GAP_THRESHOLD_MS:
+            # words already carry their own leading space (see word_timestamps
+            # above) — join with "" not " ", or every segment gets double
+            # spaces between words.
+            segments.append({"id": len(segments), "start": cur_start / 1000, "end": cur_end / 1000,
+                              "text": "".join(cur_words).strip()})
+            cur_words = []
+        if not cur_words:
+            cur_start = start_ms
+        cur_words.append(w["word"])
+        cur_end = end_ms
+    if cur_words:
+        segments.append({"id": len(segments), "start": cur_start / 1000, "end": cur_end / 1000,
+                          "text": " ".join(cur_words)})
+
+    return ToolResult(
+        success=True,
+        data={
+            "word_timestamps": word_timestamps,
+            "segments": segments,
+            "language": data.get("language_code"),
+            "duration_seconds": word_timestamps[-1]["end"] if word_timestamps else 0.0,
+        },
+    )
+
+
 def _safe_transcribe(src: str, workdir: Path, model_size: str):
-    """跑 Transcriber，把"工具报告失败"和"工具本身抛异常"统一收敛成返回 None。
+    """跑转写，把"工具报告失败"和"工具本身抛异常"统一收敛成返回 None。
+
+    config.transcribe_provider == "elevenlabs"（默认，见该字段注释）时优先走
+    _transcribe_elevenlabs；ElevenLabs 没配密钥、或配了但调用失败（401/限流/
+    网络异常等，任何原因）都会回退到本地 faster-whisper，而不是直接放弃——
+    只有本地 faster-whisper 也失败时才真正返回 None。
 
     faster-whisper/PyAV 对损坏/非视频输入会直接抛 av.error.InvalidDataError
     之类的异常（实测），不会走 ToolResult(success=False)；调用方拿到 None 再
     决定降级还是报错，而不是被底层异常炸穿。
     """
     import os as _os
+
+    from tools.base_tool import ToolResult
+
+    # Fix C18（2026-07-17，video-use 的 SKILL.md 明确写过这条教训——"Cache
+    # transcripts per source. Never re-transcribe unless the source file
+    # itself changed"——whatsapp_mvp 一直没有这层缓存）：同一个 job 里
+    # _safe_transcribe 最多被调用 4 次（remove_filler / add_subtitles /
+    # apply_style / transcribe_segments），每次的 src 是流水线上不同阶段的
+    # 产物（原始输入 / 剪过口误的 / 过完 face+color+audio 增强的……），字节
+    # 内容互不相同，天真按文件内容/路径做缓存 key 完全不会命中。但只要
+    # remove_filler 没有真的剪任何东西（没有口误/复述需要去掉——真实视频里
+    # 相当常见），从它到 apply_style 之间讲的话、每个词的时间戳全都没变，
+    # 中间的增强步骤全部用 -fps_mode cfr（Rule 11 已经确认过）保时长不变，
+    # 只是重新编码了画质/音质——这种情况下重新转写一次纯粹是浪费配额。
+    # 用时长做安全的等价判断：只有当前 src 的时长跟缓存里记录的时长几乎
+    # 相等（<0.05s 误差）才命中——这基本等价于"帧数完全一致"，比路径/mtime
+    # 更能反映"内容真的没变"，且一旦剪过东西时长必然不同，缓存不会被误用
+    # 到那种情况（那种情况本来就应该、也确实会重新转写）。缓存范围只到
+    # workdir（即单个 job），不跨 job，不会有内容混淆的风险。
+    cache_path = workdir / "_transcript_cache.json"
+    try:
+        src_duration = _probe_duration(Path(src))
+    except Exception:
+        src_duration = -1.0
+    if cache_path.exists() and src_duration > 0:
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if abs(cached.get("duration_seconds", -999) - src_duration) < 0.05:
+                logger.info(
+                    f"  转写命中缓存（时长 {src_duration:.2f}s 与缓存一致，"
+                    "视为同一段语音内容的另一次重新编码，跳过重新转写）"
+                )
+                return ToolResult(success=True, data=cached["data"])
+        except (json.JSONDecodeError, OSError, KeyError):
+            pass  # 缓存损坏/格式不对就当没有，走下面正常转写，不阻断流程
+
+    def _save_cache(data: dict) -> None:
+        if src_duration <= 0:
+            return
+        try:
+            cache_path.write_text(
+                json.dumps({"duration_seconds": src_duration, "data": data}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass  # 写缓存失败不影响本次转写结果，只是下次少一次命中机会
+
+    config = get_config()
+    if config.transcribe_provider == "elevenlabs" and config.elevenlabs_api_key:
+        t = _transcribe_elevenlabs(src, config.elevenlabs_api_key)
+        if t.success:
+            _save_cache(t.data)
+            return t
+        # 确认过的真实生产 bug：ElevenLabs 密钥"配了但被拒绝"(401/过期/限流/
+        # 网络异常)时，以前直接在这里 return None——调用方把这当成"完全没有
+        # 转写"，整条视频降级成无字幕、无任何图形，即使转写本来是可以靠本地
+        # faster-whisper 顶上的。只有"没配密钥"这一种情况以前会走到下面的
+        # 本地回退分支；"配了但用不了"反而是更常见、更该有回退的那种失败。
+        # ElevenLabs 调用失败时也一样回退到本地，而不是直接放弃整条视频的
+        # 字幕/图形——质量略降(faster-whisper 在识别复述片段上确实弱一些，
+        # 见 _transcribe_elevenlabs 的文档注释)，但远好于完全没有。
+        logger.warning(f"  ElevenLabs 转写失败({t.error})，回退到本地 faster-whisper")
+    elif config.transcribe_provider == "elevenlabs":
+        logger.warning("  transcribe_provider=elevenlabs 但没配 ELEVENLABS_API_KEY，回退到本地 faster-whisper")
 
     from tools.analysis.transcriber import Transcriber
 
@@ -351,6 +544,7 @@ def _safe_transcribe(src: str, workdir: Path, model_size: str):
     if not t.success:
         logger.warning(f"  转写失败: {t.error}")
         return None
+    _save_cache(t.data)
     return t
 
 
@@ -860,52 +1054,165 @@ def _op_add_subtitles(src: str, op: dict, workdir: Path) -> Optional[str]:
 # WIDE the on-screen content is at that moment; the actual pixel box a mode
 # maps to is a rendering-layer concern, not a planning one.
 _DOMINANT_BOX = {"x": 60, "y": 104, "w": 960, "h": 1100}
-# h floor of 900 -- below video-studio's documented floor of >=900px for a
-# Workflow-mode card (CLAUDE-v2.md §6a: a shorter card reveals only a thin
-# horizontal slice of the source video via objectFit:"cover", cropping to
-# head-only instead of showing chest/shoulders). y stays top-anchored at the
-# same 104 as _DOMINANT_BOX so the card's top edge is fixed across the
-# Dominant<->Workflow transition. Width is now content-aware (P3, see
-# _workflow_box below) instead of a single fixed 300 -- HEIGHT-driven under
-# objectFit:"cover" regardless of the exact width chosen, so the full
-# vertical extent of the speaker stays visible either way.
-_WORKFLOW_Y = 104
-_WORKFLOW_H = 900
-_WORKFLOW_RIGHT_MARGIN = 40  # right edge of the box, matching the old fixed box's x=740+w=300=1040
-_WORKFLOW_CONTENT_GAP = 60  # clearance kept between the widest active content and the docked card
-_WORKFLOW_MIN_X = 560  # never let the card get narrower-cut than this even for the narrowest content
-_WORKFLOW_MAX_X = 740  # old fixed box's x -- also the ceiling once content needs the full content-zone width
+# Docked/side-pip geometry (content_width-dependent x/w narrowing) is gone —
+# confirmed real user complaint against that whole model: shrinking WIDTH and
+# docking the card to a side column leaves the entire opposite side and the
+# whole lower half of the canvas empty, with only faint atmosphere text to
+# fill it. video-studio's own validated reference (motion/vell-renewal-fresh's
+# RenewalFresh/SpeakerCard.tsx) does the opposite: the card stays FULL WIDTH,
+# anchored top-left at the exact same x/w as Dominant, and only HEIGHT shrinks
+# — freeing up a full-width band BELOW the card (RenewalFresh's own
+# CoverageSection.tsx: `CONTENT_TOP = 1040`, `left:40, right:40`) for content
+# to stack into, rather than a narrow side column beside it. Adopting that
+# model verbatim: Workflow keeps Dominant's x/w unchanged, only h differs, so
+# the card doesn't even move horizontally on the Dominant<->Workflow
+# transition — a pure vertical squeeze.
+# h=900, straight from the reference (RenewalFresh WORKFLOW = 1000x900): at
+# 960px wide the objectFit:cover crop is WIDTH-bound, so a shorter box shows
+# LESS of the speaker vertically, not a smaller card — h=700 was a confirmed
+# real bug that cropped the speaker to head-only. 900 shows face + chest.
+_WORKFLOW_BOX = {"x": 60, "y": 104, "w": 960, "h": 900}
+# Content zone directly below the Workflow card — full card width, starting
+# just under its bottom edge (104+900=1004, +36px gap=1040 — the reference's
+# own CONTENT_TOP). content_planner.py's data-display defaults must match
+# these exactly — see that file's own copy of these same numbers.
+_CONTENT_ZONE_X = 60
+_CONTENT_ZONE_Y = 1040
+_CONTENT_ZONE_WIDTH = 960
 # Caller-supplied contentWidth of 920+ (full InfoCard/before_after/section
-# width) reproduces the exact pre-P3 box (x=740, w=300) -- used as the
-# default when a mode_schedule entry omits contentWidth (e.g. a hand-authored
-# op["mode_schedule"] override), so anything not opting into the new field
-# keeps today's already-verified geometry unchanged.
+# width) is now only used to detect the SECTION_PIP_SENTINEL case (full-canvas
+# takeover) -- it no longer drives any card-width narrowing (see above), so
+# any ordinary value works identically. Kept as the default so a
+# hand-authored op["mode_schedule"] entry that omits contentWidth still
+# resolves to "regular workflow", not a section pip.
 _WORKFLOW_DEFAULT_CONTENT_WIDTH = 920
-_CONTENT_ZONE_X = 80  # matches content_planner's dataCards/beforeAfter default x
 
 
-def _workflow_box(content_width: int) -> dict:
-    """内容宽度(P3 content_planner 算出的 contentWidth) -> SpeakerCard Workflow
-    模式的具体像素框。窄内容（仪表盘/倒计时/日历/少行数的 InfoCard）不需要把
-    卡片挤到跟满宽内容一样窄——SpeakerCard 右边界固定，左边界随内容实际占用
-    宽度浮动；content_width>=600 时收敛到 P2 验证过的 (x=740, w=300) 不变。
+# 全画布章节接管（sections）期间 SpeakerCard 直接淡出隐藏，不再缩成小 pip——
+# 确认过的用户反馈：哪怕真小 pip（350x420 右下角）也逼着接管图形整体偏到左半
+# 边去躲它，warning 图标显得"很偏"，右侧和下方大片留白。参考成片的接管章节
+# 本来就是"图形拥有整个画布"；说话人这几秒消失完全可接受（音频还在继续）。
+_TAKEOVER_FADE_FRAMES = 15
+
+
+_TRANSITION_HOLD_FRAMES = 20  # 一次真实卡片变形动画的合理时长——见 _insert_transition_holds
+
+
+def _insert_transition_holds(scenes: list[dict]) -> list[dict]:
+    """Fix C21（2026-07-17，真实生产复现，同一天内两次——job_1b7254abcd66 的
+    (180,592)、job_ac00838adea9 的 (180,298)/(758,1193)）：`interpolate()`
+    只拿到两个尺寸不同的关键帧时，会在它们之间的*整段*间隔里连续插值——如果
+    下一次真正的几何变化要再过几百帧才发生（例如一个全画布接管在很久之后
+    才结束，卡片才收回 workflow 尺寸），卡片就被 Remotion 判定成"一直在缓慢
+    变形"长达十几秒，其间任何真实内容挂上去都会被 element_mounts_during_
+    card_transition 拦下来——即使卡片早就视觉上稳定在目标尺寸，只是数据里
+    没有一个"提前到达"的关键帧去停住插值。
+
+    今天早些时候试过反过来改 props_lint._transition_windows（把检测窗口
+    强行缩短），但那是被三个当时已经验证过的用例依赖的公共函数，一动就
+    连带破坏了 Fix C13b/C19 依赖的、真正需要"整段间隔都算过渡"这个语义的
+    intro 场景（0→180 那种紧邻的两帧，是真的在整段内连续变形）——检测函数
+    本身没错，错的是喂给它的数据在几何变化之后没有一个"到达并停住"的关键帧。
+
+    这里改成从数据源头修：两个几何不同、且间隔超过 _TRANSITION_HOLD_FRAMES
+    的相邻 scene 关键帧之间，插入一个"提前到达"的关键帧——跟后一个关键帧
+    尺寸相同，落在前一个关键帧之后 _TRANSITION_HOLD_FRAMES 帧的位置。插值
+    在这个新关键帧之前是真过渡（跟原来一样，短且合理），之后到下一个真实
+    关键帧因为两端尺寸相同、不再被判定为过渡——不用改 _transition_windows
+    这个已经验证过、被多处依赖的检测函数一个字，只是让它看到的数据更准确。
     """
-    right_edge = _CONTENT_ZONE_X + content_width
-    x = min(_WORKFLOW_MAX_X, max(_WORKFLOW_MIN_X, right_edge + _WORKFLOW_CONTENT_GAP))
-    w = 1080 - _WORKFLOW_RIGHT_MARGIN - x
-    return {"x": x, "y": _WORKFLOW_Y, "w": w, "h": _WORKFLOW_H}
+    if not scenes:
+        return scenes
+    out = [scenes[0]]
+    for cur in scenes[1:]:
+        prev = out[-1]
+        box_changed = prev.get("w") != cur.get("w") or prev.get("h") != cur.get("h")
+        gap = cur["frame"] - prev["frame"]
+        if box_changed and gap > _TRANSITION_HOLD_FRAMES:
+            hold_frame = prev["frame"] + _TRANSITION_HOLD_FRAMES
+            out.append({"frame": hold_frame, "x": cur["x"], "y": cur["y"], "w": cur["w"], "h": cur["h"]})
+        out.append(cur)
+    return out
 
 
-def _mode_schedule_to_scenes(mode_schedule: list[dict]) -> list[dict]:
-    """content_planner 的 dominant/workflow 模式时间表 -> contract② 的 scenes（具体像素坐标）。"""
-    scenes = []
+def _mode_schedule_to_scenes(mode_schedule: list[dict]) -> tuple[list[dict], list[dict]]:
+    """content_planner 的 dominant/workflow 模式时间表 -> contract② 的
+    (scenes, opacityKeyframes)。contentWidth>=SECTION_PIP_SENTINEL 的 workflow
+    段是全画布章节接管：卡片几何保持 _WORKFLOW_BOX 不动（反正看不见，避免
+    淡回来时从奇怪的位置飞入），透明度在段首淡出、在下一段开始时淡回。
+    """
+    from .content_planner import SECTION_PIP_SENTINEL  # lazy import, matches this file's existing pattern
+
+    scenes: list[dict] = []
+    opacity: list[dict] = []
+    hidden = False
     for entry in mode_schedule:
-        if entry.get("mode") == "workflow":
-            box = _workflow_box(entry.get("contentWidth", _WORKFLOW_DEFAULT_CONTENT_WIDTH))
-        else:
-            box = _DOMINANT_BOX
-        scenes.append({"frame": entry["frame"], **box})
-    return scenes
+        f = entry["frame"]
+        is_workflow = entry.get("mode") == "workflow"
+        is_takeover = is_workflow and entry.get(
+            "contentWidth", _WORKFLOW_DEFAULT_CONTENT_WIDTH) >= SECTION_PIP_SENTINEL
+        scenes.append({"frame": f, **(_WORKFLOW_BOX if is_workflow else _DOMINANT_BOX)})
+        if is_takeover and not hidden:
+            opacity += [{"frame": max(0, f - 1), "opacity": 1.0},
+                        {"frame": f + _TAKEOVER_FADE_FRAMES, "opacity": 0.0}]
+            hidden = True
+        elif hidden and not is_takeover:
+            opacity += [{"frame": f, "opacity": 0.0},
+                        {"frame": f + _TAKEOVER_FADE_FRAMES, "opacity": 1.0}]
+            hidden = False
+    scenes = _insert_transition_holds(scenes)
+    # interpolate() needs strictly increasing frames — drop any keyframe that
+    # would violate that (e.g. two takeovers closer together than the fades).
+    monotonic: list[dict] = []
+    for k in opacity:
+        if monotonic and k["frame"] <= monotonic[-1]["frame"]:
+            continue
+        monotonic.append(k)
+    return scenes, monotonic
+
+
+# QuoteCard 是唯一"solo"(占满整个画布)的图形类型——用户明确反馈过：不能
+# 让它在视频刚开始、观众还没看到/听到说话人开口的这段时间内就上场盖脸。
+# 7s 留出足够时间让片头标题卡（如果有）播完 + 说话人至少露脸说上一两句话。
+_QUOTE_MIN_START_FRAMES = 210  # 7s @ 30fps
+
+
+def _floor_shift_graphics(items: Optional[list[dict]], floor: int) -> None:
+    """把 items 里每个图形的挂载时间整体钳到 floor 之后（原地修改）——整体
+    平移 mountFrame/endFrame（以及 beforeAfter 自己的 secondRevealFrame），
+    保留原有停留时长，而不是只把起点拉后却让终点留在原地压缩甚至压成负
+    时长。count_up 的 rows[].mountOffset、step_list 的 steps[].activateOffset
+    都是相对卡片自己 mountFrame 的相对值，卡片整体平移后自动保持正确，不用
+    额外处理。
+
+    Fix C2：确认过的真实 bug——intro 期间卡片保持 Dominant（未收起），但图形
+    自己的 mountFrame 没有跟着 intro 的 mode_schedule 延迟一起往后挪，
+    countdown 直接画在了还没让开位置的大卡上面。
+    """
+    for g in items or []:
+        if not isinstance(g, dict) or "mountFrame" not in g:
+            continue
+        delta = floor - g["mountFrame"]
+        if delta <= 0:
+            continue
+        g["mountFrame"] += delta
+        if "endFrame" in g:
+            g["endFrame"] += delta
+        if "secondRevealFrame" in g:  # beforeAfter's own second-value beat
+            g["secondRevealFrame"] += delta
+
+
+def _floor_shift_zone_headers(headers: Optional[list[dict]], floor: int) -> None:
+    """跟 _floor_shift_graphics 同样的整体平移，但 ZoneHeader 用的字段名是
+    fromFrame/toFrame，不是 mountFrame/endFrame。"""
+    for h in headers or []:
+        if not isinstance(h, dict) or "fromFrame" not in h:
+            continue
+        delta = floor - h["fromFrame"]
+        if delta <= 0:
+            continue
+        h["fromFrame"] += delta
+        h["toFrame"] += delta
 
 
 def _run_enhancement_chain(src: str, workdir: Path) -> str:
@@ -951,6 +1258,197 @@ def _run_enhancement_chain_inner(src: str, workdir: Path) -> str:
             logger.warning(f"  apply_style: {name} 未产出文件，跳过")
 
     return src
+
+
+# Fix C5（2026-07-16）：跟 content_planner.plan_content 的 criterion loop 用同一个
+# 有界重试次数——用户明确要求过循环要"KEEP LOOPING AND EXITING WHEN YOU'VE
+# FULFILLED THE CRITERION"，且不是只对某一条视频生效。之前 props_lint 这一层
+# 只重试一次，见 _op_apply_style 里那段旧注释。
+_PROPS_LINT_MAX_ATTEMPTS = 3
+
+# 参与"丰富度"计分的 props 字段——每一项都是真正的动画/图形，不是纯文字。
+_RICHNESS_FIELDS = (
+    "dataCards", "gauges", "countdowns", "calendarEvents", "beforeAfter",
+    "stepLists", "topicCards", "cornerCards", "quotes",
+)
+
+
+def _fill_intro_lead_dead_space(props: dict, findings: list[dict], captions: list[dict]) -> dict:
+    """Fix C13（2026-07-17，真实生产复现——同一支 backtest 视频连续 3 轮重规划
+    都没修掉 intro_lead_dead_space，最终交付版本仍是长达 5.2s 的纯说话人+字幕
+    空白，用户直接在渲染出的截图里抓到）。
+
+    这条 finding 的检测（Rule 9/props_lint.py）从没失手过——三次独立 backtest
+    都精准报出同一类缺口；但把它当反馈文字喂给 LLM 重规划，三轮下来没有一次
+    真正补上过。跟 D3-D6/E2 是同一类教训：LLM 对某条 finding 反复失败，就不该
+    继续指望"这次会听话"，该换成确定性保证。这里不追加一次 LLM 调用，直接在
+    最终交付的 props 上机械地插入一个轻量 topicCard 盖住缺口——内容取这段时间
+    实际讲的字幕原文（掐头去尾，不超过 _MAX_HEADLINE_CHARS），不是编造的品牌语
+    ——跟"_fallback_topic_cards_for_gaps 被删掉"不是同一类问题：那个是对*所有*
+    稀疏 gap 无差别地机械填充、多次重复才显得像"为了有而有的弹窗"；这里只在
+    "LLM 已经真实尝试过 3 轮、专门针对 intro 这一个位置仍然失败"之后才触发一次，
+    是保底，不是默认行为。
+    """
+    from .content_planner import FPS, _CONTENT_ZONE_X, _CONTENT_ZONE_Y
+    from .props_lint import lint_props, _transition_windows
+
+    gap = next((f for f in findings if f.get("check") == "intro_lead_dead_space"), None)
+    if gap is None:
+        return props
+
+    gap_start, gap_end = gap["gap_start"], gap["gap_end"]
+    # gap_start 就是 introOutFrame（props_lint.py 里这条 check 的定义）——但卡片
+    # 实际收到 workflow 尺寸的时间点不一定等于 introOutFrame+20：Fix C14 把它
+    # 的上限设在 introOutFrame+100，真实收缩点可能落在 20-100 之间任何地方。
+    # 用真实的 scenes 过渡窗口而不是猜一个固定偏移——固定 +20 在 C14 落地前
+    # 曾经把这张卡直接放进了仍在变形的过渡区间，反而多产生一条
+    # element_mounts_during_card_transition（验证时抓到的真实回归）。
+    mount = gap_start + 20
+    for win_start, win_end in _transition_windows(props.get("scenes") or []):
+        if win_start < mount < win_end:
+            mount = win_end
+    # Fix C13b（2026-07-17，真实生产复现——job_b7e1b7f96481，用户 WhatsApp 上
+    # 真实收到降级交付后发现）：这里原来是 max(mount+20, gap_end-10)，两个候选
+    # 取较大值——但 gap_end 是"第一个真实内容元素挂载的那一帧"，取较大值在
+    # mount 本身已经很晚（贴着 gap_end）时会让 end 反而超出 gap_end，把卡片
+    # 的尾巴伸进下一个真实元素的地盘，制造一条新的 element_overlap，安全阀
+    # 因此拒绝插入——保底本身失效，intro_lead_dead_space 原样交付给用户，
+    # 最终触发 vision QA 的"空画布"判定和整段降级。改成夹在 gap_end 这个硬
+    # 上限以内：还是尽量给够 20 帧的最小展示时长，但绝不越界侵入下一个元素
+    # 的时间窗——真的挤不下（mount 本身已经 >= gap_end）就老实放弃插入，
+    # 好过插入一个会引发新重叠的版本。
+    end = min(max(mount + 20, gap_end - 10), gap_end)
+    if end <= mount:
+        return props
+
+    gap_start_ms, gap_end_ms = gap_start / FPS * 1000, gap_end / FPS * 1000
+    overlapping = [c for c in captions if c["startMs"] < gap_end_ms and c["endMs"] > gap_start_ms]
+    _MAX_HEADLINE_CHARS = 16
+    if overlapping:
+        text = overlapping[0]["text"].strip()
+        headline = text if len(text) <= _MAX_HEADLINE_CHARS else text[:_MAX_HEADLINE_CHARS] + "…"
+    else:
+        headline = "AI EDIT"  # 这段时间没有任何字幕可用时的最后兜底，不编造具体内容
+
+    filler_card = {
+        "headline": headline, "icon": "sparkle",
+        "x": _CONTENT_ZONE_X, "y": _CONTENT_ZONE_Y, "width": 960,
+        "mountFrame": mount, "endFrame": end,
+    }
+    candidate = dict(props)
+    candidate["topicCards"] = [*(props.get("topicCards") or []), filler_card]
+
+    # 保底本身不能制造新问题——插入前后都跑一次 lint。光比总数不够：验证时
+    # 真实抓到过一次总数持平(5->5)但内容换了的回归——intro_lead_dead_space
+    # 和 low_visual_richness 消失，换成了一条新的 element_over_card 重复项
+    # 和一条新的 element_mounts_during_card_transition，总数假装没变化，实际
+    # 是拿一个已知问题换了两个新问题。改成比较 check 类型集合：新版本不能
+    # 出现插入前完全没有过的 check 类型，哪怕总数打平或更少。
+    before_findings = lint_props(props)
+    after_findings = lint_props(candidate)
+    before_checks = {f["check"] for f in before_findings}
+    after_checks = {f["check"] for f in after_findings}
+    new_check_types = after_checks - before_checks
+    if new_check_types or len(after_findings) > len(before_findings):
+        logger.warning(
+            f"  apply_style: intro_lead_dead_space 确定性兜底会引入新问题"
+            f"({len(before_findings)}->{len(after_findings)} findings, 新增类型: "
+            f"{new_check_types or '无，但总数变多'})，放弃插入，保留原版本（Fix C13 安全阀）"
+        )
+        return props
+
+    logger.info(
+        f"  apply_style: intro_lead_dead_space 3 轮重规划仍未解决，确定性兜底插入"
+        f"轻量 topicCard('{headline}') 覆盖第 {mount}-{end} 帧（Fix C13）"
+    )
+    return candidate
+
+
+def _demote_content_free_takeovers(props: dict, findings: list[dict]) -> dict:
+    """Fix C15（2026-07-17，真实生产复现——同一支 dajaai-walking backtest 视频，
+    用户截图直接抓到）：'流程/PROCESS' 接管区间(417-657)既没有 timeline 也没有
+    icon，SectionLayer 只能画标题+一个纯装饰性的模糊光斑——跟 Rule 4 记录的
+    bug 视觉上一模一样，但根因不同：Rule 4 那次是 TimelineSection 被写死只在
+    dark 模式渲染，这次是 content_planner 这一轮的方案压根没给这个接管章节挂
+    timeline/icon 中的任何一个。
+
+    跟 intro_lead_dead_space（Fix C13）同一类教训：LLM 三轮重规划都没修好，
+    该换成确定性保证，不再赌"这次会听话"。这里选 props_lint 自己给的第三个
+    选项——"这段内容其实不值得全画布接管，改回普通 workflow 模式"——而不是
+    硬造一个 timeline：这个章节自己的 stepList（DIGITAL HUMAN PROCESS，
+    mountFrame 367-978）已经完整覆盖了 417-657 这整个接管区间，说话人被藏起来
+    换来的只有一个空气泡，内容一点没多。直接去掉这个 section（不再全画布接管）
+    + 去掉对应的说话人隐藏关键帧，说话人正常留在画面上，stepList 该怎么显示
+    还怎么显示，不需要凭空造内容。
+
+    只删 sections 列表本身不够——真正驱动说话人可见度的是 opacityKeyframes，
+    是渲染时读的独立字段，不是从 sections 派生的；只删 sections 会留下"说话人
+    仍不可见，但连装饰性光斑都没了"的更差状态（纯空气泡）。两个字段必须一起改。
+    """
+    bad = [f for f in findings if f.get("check") == "section_takeover_lacks_content"]
+    if not bad:
+        return props
+    bad_spans = [(f["fromFrame"], f["toFrame"]) for f in bad]
+
+    candidate = dict(props)
+    candidate["sections"] = [
+        s for s in (props.get("sections") or [])
+        if (s.get("fromFrame"), s.get("toFrame")) not in bad_spans
+    ]
+    # 淡出/淡回的关键帧紧贴 fromFrame/toFrame 但不完全等于（_workflow_mode_schedule
+    # 的事件扫描 + _TAKEOVER_FADE_FRAMES 淡入淡出会有几帧偏移），用缓冲区间匹配
+    # 而不是精确相等。
+    _BUFFER = 20
+    old_opacity = props.get("opacityKeyframes") or []
+    new_opacity = [
+        k for k in old_opacity
+        if not any(fr - _BUFFER <= k["frame"] <= to + _BUFFER for fr, to in bad_spans)
+    ]
+    if new_opacity:
+        candidate["opacityKeyframes"] = new_opacity
+    else:
+        candidate.pop("opacityKeyframes", None)
+
+    from .props_lint import lint_props
+    before_findings = lint_props(props)
+    after_findings = lint_props(candidate)
+    before_checks = {f["check"] for f in before_findings}
+    after_checks = {f["check"] for f in after_findings}
+    new_check_types = after_checks - before_checks
+    if new_check_types or len(after_findings) > len(before_findings):
+        logger.warning(
+            f"  apply_style: section_takeover_lacks_content 确定性兜底会引入新问题"
+            f"({len(before_findings)}->{len(after_findings)} findings, 新增类型: "
+            f"{new_check_types or '无，但总数变多'})，放弃降级，保留原版本（Fix C15 安全阀）"
+        )
+        return props
+
+    logger.info(
+        f"  apply_style: section_takeover_lacks_content 3 轮重规划仍未解决，"
+        f"确定性降级为普通 workflow 模式（去掉 {len(bad_spans)} 个空内容接管，"
+        f"说话人保持可见）（Fix C15）"
+    )
+    return candidate
+
+
+def _visual_richness(props: dict) -> int:
+    """Fix C6（2026-07-16）：确认过的真实生产 bug——MrBeast backtest
+    (job_95e1e08b0995)第一轮规划出了完整的 TIMELINE 时间线图形 + 数据卡 +
+    前后对比；props_lint 发现 2 处 element_overlap 后触发重新规划，新一轮
+    plan_content 是完全独立的 LLM 调用（不是在旧方案上打补丁），随机生成出
+    一版丢了时间线、丢了数据卡、只剩一张前后对比卡的方案——但这一版恰好
+    没有 element_overlap，findings 数量比第一轮少，于是 Fix C5 的 best-of
+    比较（只看 len(candidate_findings) < len(best_findings)）就把它当"更好"
+    采用了，把真正的动画内容换成了"说话人+字幕"的空壳。用户原话："why did
+    you not include animations...it's almost every video"——根因就是这个
+    比较完全不看内容丰不丰富，只看有没有几何问题，而一个内容空空如也的
+    方案天然不会有任何东西可以重叠。这个函数给 candidate 算一个丰富度分数
+    （数出所有真正带图形/动画的 props 字段一共有多少项，process_timeline
+    额外算 1 项），下面 C5 的比较逻辑据此拒绝"findings 更少但内容更寡淡"的
+    候选版本。"""
+    score = sum(len(props.get(f) or []) for f in _RICHNESS_FIELDS)
+    score += sum(1 for s in (props.get("sections") or []) if s.get("timeline"))
+    return score
 
 
 def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
@@ -1000,10 +1498,26 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         logger.warning("  apply_style: 转写不可用（降级为无字幕/无图形版本）")
         segments: list[dict] = []
         captions: list[dict] = []
+        word_timestamps: list[dict] = []
     else:
         segments = t.data.get("segments") or []
+        word_timestamps = t.data.get("word_timestamps") or []
         # 短语级字幕（词级时间戳重组），不是 5-6 行的 segment 大段
-        captions = build_caption_phrases(t.data.get("word_timestamps") or [], segments)
+        captions = build_caption_phrases(word_timestamps, segments)
+
+        # Fix A4：对"剪完之后真正会播出的内容"做最后一道确定性检查——转写的
+        # 是已经剪过口误的视频，这里的 word_timestamps 就是最终播出文本。
+        # 不依赖 LLM，纯规则扫一遍重复短语；抓的是"remove_filler 那一步的 LLM
+        # 判断+复核+确定性兜底全都没拦住"这种极端情况（理论上不该发生，但这是
+        # 最后一次还能在渲染前发现的机会）。只打日志，不阻断渲染。
+        from .content_planner import _cut_duplicate_phrases
+        leftover_dupes = _cut_duplicate_phrases(word_timestamps, set())
+        if leftover_dupes:
+            dupe_words = " ".join(word_timestamps[i]["word"] for i in sorted(leftover_dupes))
+            logger.warning(
+                f"  apply_style: 最终播出内容里检测到疑似遗留重复短语（remove_filler 应该已经剪掉但没有）: "
+                f"{dupe_words}"
+            )
 
     remotion_dir = Path(config.openmontage_root) / "remotion-composer"
     job_slug = workdir.name
@@ -1062,10 +1576,15 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
             plan_outro = None
             plan_sections = op.get("sections") or []
             plan_quotes = op.get("quotes") or []
-            plan_atmosphere = op.get("atmosphere_keywords") or []
+            plan_contact_cue = op.get("contact_cue")
+            plan_pills = op.get("pills") or []
+            plan_zone_headers = op.get("zone_headers") or []
+            plan_step_lists = op.get("step_lists") or []
+            plan_topic_cards = op.get("topic_cards") or []
+            plan_corner_cards = op.get("corner_cards") or []
         else:
             logger.info("  apply_style: 内容规划中（章节 + 数据展示分析）...")
-            content_plan = plan_content(segments, duration, feedback=feedback)
+            content_plan = plan_content(segments, duration, feedback=feedback, word_timestamps=word_timestamps)
             chapters = content_plan["chapters"]
             data_cards = content_plan["data_cards"]
             gauges = content_plan["gauges"]
@@ -1077,14 +1596,19 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
             plan_outro = content_plan.get("outro")
             plan_sections = content_plan.get("sections") or []
             plan_quotes = content_plan.get("quotes") or []
-            plan_atmosphere = content_plan.get("atmosphere_keywords") or []
+            plan_contact_cue = content_plan.get("contact_cue")
+            plan_pills = content_plan.get("pills") or []
+            plan_zone_headers = content_plan.get("zone_headers") or []
+            plan_step_lists = content_plan.get("step_lists") or []
+            plan_topic_cards = content_plan.get("topic_cards") or []
+            plan_corner_cards = content_plan.get("corner_cards") or []
             logger.info(
                 f"  apply_style: 规划出 {len(chapters)} 个章节、{len(data_cards)} 个数据卡、"
                 f"{len(gauges)} 个仪表盘、{len(countdowns)} 个倒计时、{len(calendar_events)} 个日历、"
                 f"{len(before_after)} 个前后对比、{len(plan_quotes)} 条金句"
             )
 
-        scenes = _mode_schedule_to_scenes(mode_schedule)
+        scenes, speaker_opacity = _mode_schedule_to_scenes(mode_schedule)
 
         props: dict[str, Any] = {
             "videoSrc": video_src_url,
@@ -1096,14 +1620,24 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
             "chapters": chapters,
             "captions": captions,
         }
+        if speaker_opacity:
+            props["opacityKeyframes"] = speaker_opacity
         if presenter_prop:
             props["presenter"] = presenter_prop
         if plan_sections:
             props["sections"] = plan_sections
         if plan_quotes:
             props["quotes"] = plan_quotes
-        if plan_atmosphere:
-            props["atmosphereKeywords"] = plan_atmosphere
+        if plan_pills:
+            props["pills"] = plan_pills
+        if plan_zone_headers:
+            props["zoneHeaders"] = plan_zone_headers
+        if plan_step_lists:
+            props["stepLists"] = plan_step_lists
+        if plan_topic_cards:
+            props["topicCards"] = plan_topic_cards
+        if plan_corner_cards:
+            props["cornerCards"] = plan_corner_cards
 
         # 开场标题卡/片尾 CTA：模板一直支持（IntroTitle/OutroSection），此前管线从不
         # 生成——这是与 video-studio 手工参考成片(VeLL)最大的一块可自动化差距。
@@ -1117,11 +1651,33 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
             # intro 期间卡片必须保持 Dominant(近全屏)——标题是压在大卡上的
             # (VeLL 参考)。把 introOutFrame 之前开始的 workflow 段推迟到 intro
             # 结束后 20 帧，避免标题叠在停靠小卡+背景上。
+            #
+            # Fix C14（2026-07-17，真实生产复现，dajaai-walking backtest）：上面
+            # 这条只管"太早"（workflow 提前到 intro 还没播完就开始）——完全没管
+            # "太晚"的反方向。第一段 workflow 的起始帧来自 _flush_stack 里的
+            # stack_start，直接等于第一个内容点自己的 mountFrame（content_planner.py
+            # 行 997），跟 introOutFrame 毫无关系。真实撞上的案例：第一个内容点
+            # 直到第 236 帧才 mount，intro 在第 80 帧就已经结束，卡片就这么继续
+            # 保持全尺寸又空占了 150 帧(5s)——props_lint 的 intro_lead_dead_space
+            # 抓到的正是这段。这里补对称的上限：第一段 workflow 最迟从
+            # intro_out + _MAX_DOMINANT_HOLD_FRAMES 开始，卡片按时收起，即使这时候
+            # 还没有真实内容能填满收起后的位置也一样——腾出来的空当交给 props_lint
+            # 的 intro_lead_dead_space + pipeline_runner._fill_intro_lead_dead_space
+            # （Fix C13）兜底填一张轻量卡，好过卡片顶着全尺寸空转。只夹住*第一段*
+            # workflow（第一个 mode=="workflow" 的项）——后面的 workflow/dominant
+            # 交替是内容本身决定的真实时间点，不该跟着挪。
+            _MAX_DOMINANT_HOLD_FRAMES = 100  # intro 结束后最多再保持满打满算 ~3.3s 全尺寸
+            first_workflow_seen = False
             clamped = []
             for m in mode_schedule:
                 m = dict(m)
                 if m.get("mode") == "workflow" and m["frame"] < intro_out + 20:
                     m["frame"] = intro_out + 20
+                elif (not first_workflow_seen and m.get("mode") == "workflow"
+                        and m["frame"] > intro_out + _MAX_DOMINANT_HOLD_FRAMES):
+                    m["frame"] = intro_out + _MAX_DOMINANT_HOLD_FRAMES
+                if m.get("mode") == "workflow":
+                    first_workflow_seen = True
                 clamped.append(m)
             # 保持严格递增（推迟后可能与后续项撞帧）
             mode_schedule = []
@@ -1129,7 +1685,29 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
                 if mode_schedule and m["frame"] <= mode_schedule[-1]["frame"]:
                     continue
                 mode_schedule.append(m)
-            props["scenes"] = _mode_schedule_to_scenes(mode_schedule)
+            props["scenes"], speaker_opacity = _mode_schedule_to_scenes(mode_schedule)
+            if speaker_opacity:
+                props["opacityKeyframes"] = speaker_opacity
+            else:
+                props.pop("opacityKeyframes", None)
+
+            # Fix C2：intro 期间卡片保持 Dominant，上面只推迟了 mode_schedule
+            # 本身（决定卡片什么时候开始收缩），但没动各个图形自己的
+            # mountFrame——确认过的真实 bug：countdown 在 intro 卡片还没收起
+            # (仍是 Dominant 大卡)的时候就已经 mountFrame=91 上场了，图形直接
+            # 画在还没让开位置的大卡上面。图形要等卡片真正收缩完成（mode_
+            # schedule 的 workflow 转场在 intro_out+20 触发，SpeakerCard.tsx
+            # 自己的 TRANSITION_FRAMES=20 决定转场再花 20 帧完成）才能上场。
+            # Operate on the LOCAL variables directly, not props[...] — several
+            # of these (dataCards/gauges/countdowns/calendarEvents/beforeAfter)
+            # aren't assigned into props until further below, so reading them
+            # back via props.get(...) here would silently no-op.
+            _mount_floor = intro_out + 20 + 20  # intro_out+20(clamp) + TRANSITION_FRAMES(20)
+            for _items in (data_cards, gauges, countdowns, calendar_events,
+                           before_after, plan_quotes, plan_pills, plan_step_lists, plan_topic_cards):
+                _floor_shift_graphics(_items, _mount_floor)
+            _floor_shift_zone_headers(plan_zone_headers, _mount_floor)
+
             # 段落接管同样不得在 intro 期间开始
             if props.get("sections"):
                 adjusted = []
@@ -1140,14 +1718,44 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
                     if sec["toFrame"] - sec["fromFrame"] >= 40:
                         adjusted.append(sec)
                 props["sections"] = adjusted
+
+        # QuoteCard 是唯一"solo"(占满整个画布，把说话人完全盖住)的图形类型
+        # ——确认过的真实用户反馈：LLM 把开场问候语（"Hi there, it's David
+        # from Pacific Life."）当成 quote 素材，导致刚看完片头(甚至没有片头
+        # 时从第 0 帧起)就立刻被一张文字卡盖住脸，说话人露脸的第一个真正
+        # 时刻反而被挡掉了。这条地板线不依赖 intro 是否存在（上面那个 C2
+        # 区块整个包在 `if intro:` 里，没有片头标题卡时完全不会跑，之前这
+        # 类视频完全没有保护）——任何 quote 都不能在视频最开始这段"先让观众
+        # 看到人、听到人说话"的缓冲期内上场。
+        # _floor_shift_graphics only ever pushes an item LATER (no-op if it's
+        # already past the floor), so this is safe to apply unconditionally
+        # on top of whatever the `if intro:` block above already did.
+        _floor_shift_graphics(plan_quotes, _QUOTE_MIN_START_FRAMES)
+
         outro = op.get("outro") or plan_outro
         if outro:
             duration_frames = max(1, round(duration * 30))
-            # 片尾最后 ~5s 交给 outro（不足 12s 的视频不上 outro，避免喧宾夺主）
+            # 片尾最后 ~5s 交给 outro（不足 12s 的视频不上 outro，避免喧宾夺主）。
+            # fromFrame 必须排在最后一个内容图形结束之后——OutroSection 画的是
+            # 不透明整幅背景，固定 duration-150 的旧算法在短片上会直接把片尾
+            # 附近的数据图形整个盖掉（确认过的真实 bug：一条 22.8s 的片子里
+            # $100K→$1.5M 的 before/after 预算揭晓排在 550-725 帧，outro 却在
+            # 535 帧就把画布糊上了——全片最有料的一个图形完全没露过面）。
+            # 内容排到片尾没剩多少空间时，宁可整个跳过 outro，也不盖内容。
             if duration_frames >= 360:
+                last_content_end = 0
+                for group in (data_cards, gauges, countdowns, calendar_events,
+                              before_after, plan_quotes, plan_pills,
+                              plan_step_lists, plan_topic_cards):
+                    for g in group or []:
+                        end = min(int(g.get("endFrame", 0) or 0), duration_frames)
+                        last_content_end = max(last_content_end, end)
                 outro = dict(outro)
-                outro.setdefault("fromFrame", duration_frames - 150)
-                props["outro"] = outro
+                outro.setdefault("fromFrame", max(duration_frames - 150, last_content_end + 10))
+                if duration_frames - outro["fromFrame"] >= 60:
+                    props["outro"] = outro
+                else:
+                    logger.info("  apply_style: 片尾内容排满，跳过 outro（不盖住收尾图形）")
         if data_cards:
             props["dataCards"] = data_cards
         if gauges:
@@ -1164,11 +1772,52 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
             # 同 videoSrc：生成进任务目录、走 /files 伺服，不进 remotion public/
             qr_abs = workdir / "qr.png"
             if generate_qr(qr_input["contact_url"], qr_abs):
+                # Priority 1 (root fix): content_planner detected the actual
+                # moment the speaker says "WhatsApp me"/"scan the QR code"/etc
+                # (contact_cue) — mount the card exactly then, in the normal
+                # full-width content zone, same as every other data-display
+                # card. Confirmed real user complaint: the card previously
+                # only ever appeared near a generic end-of-video offset,
+                # completely disconnected from when the video actually talks
+                # about how to reach the speaker.
+                #
+                # Priority 2 (fallback, no contact_cue detected — e.g. the
+                # video never explicitly narrates a contact moment): anchor
+                # to the outro instead of an independent duration-based
+                # offset — the two used to be timed off separate constants
+                # (outro: duration-150, qrContact: duration-200), so the QR
+                # card would pop in ~1.7s BEFORE the outro it's meant to
+                # accompany, at its default y=780 which sits inside outro's
+                # own headline/CTA column. OutroSection's own content ends by
+                # local~52f (its footer reveal) and reserves y=88-1848 for
+                # itself, with its last element (footer) at y=1260 —
+                # mounting at outro.fromFrame+60 and y=1360 lands it just
+                # after outro's entrance finishes, below the footer.
+                #
+                # Priority 3 (last resort, no outro either): the original
+                # duration-based heuristic.
+                if plan_contact_cue and plan_contact_cue.get("mountFrame") is not None:
+                    default_mount = plan_contact_cue["mountFrame"]
+                    # y comes from the planner's stacking lane assignment —
+                    # the QR card may be stacked under another visual.
+                    default_x, default_y, default_w = (
+                        _CONTENT_ZONE_X, plan_contact_cue.get("y", _CONTENT_ZONE_Y), _CONTENT_ZONE_WIDTH)
+                else:
+                    outro_block = props.get("outro")
+                    if outro_block and outro_block.get("fromFrame") is not None:
+                        default_mount = outro_block["fromFrame"] + 60
+                        default_x, default_y, default_w = 80, 1360, 920
+                    else:
+                        default_mount = max(0, round(duration * 30) - 200)
+                        default_x, default_y, default_w = 80, 780, 920
                 qr_contact: dict[str, Any] = {
                     "qrSrc": f"{config.local_api_base}/files/{job_slug}/qr.png",
                     "contactName": qr_input.get("contact_name", ""),
                     "ctaLabel": qr_input.get("cta_label", "WhatsApp Now"),
-                    "mountFrame": qr_input.get("mount_frame", max(0, round(duration * 30) - 200)),
+                    "mountFrame": qr_input.get("mount_frame", default_mount),
+                    "x": qr_input.get("x", default_x),
+                    "y": qr_input.get("y", default_y),
+                    "width": qr_input.get("width", default_w),
                 }
                 if qr_input.get("contact_company"):
                     qr_contact["contactCompany"] = qr_input["contact_company"]
@@ -1182,6 +1831,101 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         return props
 
     props = _build()
+
+    # Fix C4：确定性的 props 层面几何×时间重叠检查（whatsapp_mvp/props_lint.py）
+    # ——不需要真的渲染/看 stills，直接从最终 props 的数字算出一整类真实发生
+    # 过的视觉 bug（header 画在还没收起的卡片上、说话人被隐藏太久且没恢复、
+    # outro 落在隐藏区间里等，见 job_e44166eb8c38）。跑在 QA stills 之前，因为
+    # 这一步几乎不花钱（纯 Python 计算），能在浪费一次渲染/视觉复核之前先把
+    # 明显的问题喂回内容规划重试。真正从根源上消除这几类 bug 的是 Fix C1/C2
+    # （header 窗口跟随内容、图形挂载时间不早于卡片收起完成）和 content_planner
+    # 的 Fix D1/D2/D3（接管时长上限、隐藏时长预算、片尾前强制恢复说话人）——
+    # 这一层是诊断/安全网，不做额外的几何硬裁剪，只负责发现问题并把内容规划
+    # 逼着重试。
+    #
+    # Fix C5（2026-07-16）：这里原本只重试一次，重试后不管有没有更好都直接
+    # 拿第二次的结果去交付，即使它比第一次还差。跟 content_planner.plan_content
+    # 的 criterion loop 统一成同一套架构（用户明确要求过——"KEEP LOOPING AND
+    # EXITING WHEN YOU'VE FULFILLED THE CRITERION"，且要对所有视频生效，不是
+    # 只在出问题的那一条上补丁）：有界循环，findings 清空就提前退出；轮数
+    # 用尽后交付 findings 最少的一版（best-of），而不是无条件用最后一轮。
+    from .props_lint import lint_props
+
+    def _run_props_lint(p: dict) -> list[dict]:
+        return lint_props(p)
+
+    best_props, best_findings = props, _run_props_lint(props)
+    best_richness = _visual_richness(props)
+    attempt = 1
+    while best_findings and attempt <= _PROPS_LINT_MAX_ATTEMPTS:
+        logger.warning(
+            f"  apply_style: props_lint 第 {attempt}/{_PROPS_LINT_MAX_ATTEMPTS} 轮发现 "
+            f"{len(best_findings)} 处问题，重新规划: {[f['check'] for f in best_findings]}"
+        )
+        lint_feedback = "; ".join(f["detail"] for f in best_findings)[:600]
+        candidate = _build(feedback=lint_feedback)
+        candidate_findings = _run_props_lint(candidate)
+        candidate_richness = _visual_richness(candidate)
+        # Fix C6：findings 更少不够——还要求丰富度没有下降，否则一个几乎
+        # 没有图形内容的空壳方案会因为"天然没什么可以重叠"而赢得比较，把
+        # 真正的动画内容换掉（见上面 _visual_richness 的完整案例）。两个条件
+        # 都满足才采用这一轮；丰富度下降就算 findings 更少也不换。
+        if len(candidate_findings) < len(best_findings) and candidate_richness >= best_richness:
+            best_props, best_findings, best_richness = candidate, candidate_findings, candidate_richness
+        elif len(candidate_findings) < len(best_findings):
+            logger.warning(
+                f"  apply_style: props_lint 第 {attempt}/{_PROPS_LINT_MAX_ATTEMPTS} 轮的重规划"
+                f"findings 更少({len(candidate_findings)} < {len(best_findings)})，但丰富度从 "
+                f"{best_richness} 降到 {candidate_richness}——拒绝采用，保留内容更丰富的版本"
+            )
+        attempt += 1
+    if best_findings:
+        logger.warning(
+            f"  apply_style: props_lint {_PROPS_LINT_MAX_ATTEMPTS} 轮后仍有 "
+            f"{len(best_findings)} 处问题，交付问题最少的一版（不阻断渲染）: "
+            f"{[f['check'] for f in best_findings]}"
+        )
+    elif attempt > 1:
+        logger.info(f"  apply_style: props_lint 全部通过（第 {attempt - 1}/{_PROPS_LINT_MAX_ATTEMPTS} 轮重试后）")
+    def _apply_deterministic_guarantees(p: dict) -> dict:
+        """Fix C16（2026-07-17，真实生产复现——同一支 backtest 视频，用户截图
+        直接抓到的"截图4"問題重规划 3 轮后仍在，一路查下去发现 C13/C15 从没被
+        真正应用过）：这两个确定性保底只挂在 props_lint 重试循环*后面*一次，
+        但 qa_stills 视觉复审如果抓到 high 严重度问题，下面会整段调用
+        `props = _build(feedback=...)` 重新规划——这是全新一次内容规划，产出
+        的新 props 从没经过 props_lint 循环、更没经过 C13/C15，直接原样送去
+        渲染。C13/C15 的保底逻辑因此形同虚设：只要视觉复审恰好在第一轮就抓到
+        问题（这条 backtest 真实发生的情况——C13 自己的安全阀又刚好拒绝了
+        插入，intro_lead_dead_space 缺口原样留着，被 vision QA 判成"空画布"
+        high severity），保底代码从头到尾没有执行的机会。抽成一个函数，在
+        主循环后、以及 qa_stills 触发的每一次重规划后都调用，不管 props 是
+        从哪条路径产出的，最终送去渲染的版本都保证经过同一套确定性检查。
+        """
+        findings = _run_props_lint(p)
+        if findings:
+            p = _fill_intro_lead_dead_space(p, findings, captions)
+            findings = _run_props_lint(p)
+        if findings:
+            p = _demote_content_free_takeovers(p, findings)
+            findings = _run_props_lint(p)
+        return p
+
+    props = _apply_deterministic_guarantees(best_props)
+    best_findings = _run_props_lint(props)
+    # Fix C9（2026-07-16）：确认过的真实生产 bug——_build() 每次调用都会无条件
+    # 把自己产出的 props 写到 props_path（见 _build 最后一行），循环跑完之后
+    # 磁盘上留的是*最后一次*调用的内容，不一定是 best_props（只有当赢家恰好
+    # 是最后一次调用时两者才碰巧一致，dajaai backtest 的真实一跑就撞上了不
+    # 一致的情况：第 2 轮赢了 best_props，第 3 轮又调用一次 _build 但没有更
+    # 好，磁盘上却被第 3 轮的内容覆盖了）。实际渲染命令读的是 props_path
+    # 这个文件，不是这个函数里的 Python 变量——磁盘和内存不同步，意味着
+    # C5/C6 循环选出的"最佳版本"可能根本没有被真正渲染，整个丰富度比较沦为
+    # 摆设。循环结束后必须显式把 best_props 写回磁盘，不能假设某次内部调用
+    # 顺带写对了。
+    props_path.write_text(json.dumps(props, ensure_ascii=False), encoding="utf-8")
+    (workdir / "props_lint.json").write_text(
+        json.dumps(best_findings, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
     # 渲染整片前抽 QA stills 做机器检查 + 视觉复审（video-studio CLAUDE-v2 §9
     # "score before you ship" 自我修正循环的自动化版本）。视觉复审本身
@@ -1201,7 +1945,13 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         if major:
             feedback = "; ".join(f"still #{f.get('frame_index')}: {f.get('issue', '')}" for f in major)[:500]
             logger.warning(f"  apply_style: 视觉复审发现问题，重新规划一次: {feedback}")
-            props = _build(feedback=feedback)
+            props = _apply_deterministic_guarantees(_build(feedback=feedback))
+            # _build() 自己已经无条件写过一次 props_path（未经确定性保底的版本，
+            # 见 Fix C9 的注释）——这里必须用保底之后的版本覆盖写回去，否则
+            # run_props_qa/最终渲染读到的还是磁盘上那份没经过 C13/C15 的旧内容
+            # （跟 C9 是同一类"内存和磁盘不同步"教训，只是这次是 Fix C16 引入的
+            # 新调用点）。
+            props_path.write_text(json.dumps(props, ensure_ascii=False), encoding="utf-8")
             qa_result = run_props_qa(props, props_path, remotion_dir, workdir / "qa_stills")
             vision_findings = (qa_result.get("vision_review") or {}).get("findings") or []
             major = [f for f in vision_findings if f.get("severity") == "high"]
@@ -1212,18 +1962,41 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
     npx_bin = shutil.which("npx") or "npx"  # Windows: subprocess needs the resolved npx.cmd, plain "npx" raises WinError 2
     from .remotion_bundle import ensure_remotion_bundle
     bundle = ensure_remotion_bundle(remotion_dir)
+    # props_path/out must be absolute — this subprocess runs with cwd=remotion_dir,
+    # so a relative path (e.g. "storage/jobs/<id>/_op_apply_style_props.json")
+    # resolves against remotion-composer/ instead of the repo root, and Remotion
+    # rejects it outright ("neither valid JSON nor a file path to a valid JSON
+    # file"). Confirmed real production bug: apply_style silently degraded to
+    # the bare unstyled cut on every run where workdir happened to be relative,
+    # with qa_stills' own still-renders (same bug, same fix needed there) failing
+    # identically just before it.
     cmd = [npx_bin, "remotion", "render"] + ([bundle] if bundle else []) + [
-        "XiaojinEditorial", str(out),
-        f"--props={props_path}",
+        "XiaojinEditorial", str(out.resolve()),
+        f"--props={props_path.resolve()}",
         "--crf=18",
     ]
     logger.info(f"  apply_style: rendering via {' '.join(cmd)} (cwd={remotion_dir})")
-    with _RENDER_SLOTS:  # Remotion 渲染跨任务串行 + 硬超时防卡死占坑
-        result = subprocess.run(cmd, cwd=str(remotion_dir), capture_output=True, text=True,
-                                timeout=_RENDER_TIMEOUT_S)
-    if result.returncode != 0:
-        logger.error(f"apply_style render stderr: {result.stderr[-4000:]}")
-        raise RuntimeError(f"apply_style 渲染失败 (exit {result.returncode})")
+    # 重试一次：确认过真实生产 bug——同一份 props/视频独立跑总是成功，只有紧跟在
+    # qa_stills 那几次连续 still 渲染后面立刻起片渲染时才会报 "No frame found at
+    # position N"（Remotion 自己的 asset 缓存/本地 server 在 qa_stills 和整片渲染
+    # 之间交接时的瞬时状态，不是数据或编码问题——独立复现直接 1462/1462 渲染成功）。
+    # 跟这个文件里其它瞬时失败（LLM 调用、口误复核）已有的重试模式一致，不是发明
+    # 新机制。
+    last_result = None
+    for attempt in range(2):
+        with _RENDER_SLOTS:  # Remotion 渲染跨任务串行 + 硬超时防卡死占坑
+            result = subprocess.run(cmd, cwd=str(remotion_dir), capture_output=True, text=True,
+                                    timeout=_RENDER_TIMEOUT_S)
+        if result.returncode == 0:
+            last_result = None
+            break
+        last_result = result
+        if attempt == 0:
+            logger.warning(f"  apply_style: 渲染失败(exit {result.returncode})，重试一次: {result.stderr[-500:]}")
+
+    if last_result is not None:
+        logger.error(f"apply_style render stderr: {last_result.stderr[-4000:]}")
+        raise RuntimeError(f"apply_style 渲染失败 (exit {last_result.returncode})")
 
     return str(out) if out.exists() else None
 
@@ -1336,27 +2109,16 @@ def transcribe_segments(src: str, workdir: Path) -> list[dict]:
         except Exception:
             pass
 
-    import os as _os
-
-    from tools.analysis.transcriber import Transcriber
-
+    # 曾是对 Transcriber() 的裸调用，完全绕开 _safe_transcribe——意味着这条
+    # "规划阶段专门用来识别重复句/口误的转写"路径永远在用本地 faster-whisper，
+    # 从未真正走到 elevenlabs（确认过的真实生产 bug 根因之一：L2 规划阶段用
+    # 这里的转写判断要不要剪重录，判断本身就没吃到更准的转写）。改为调用
+    # _safe_transcribe 以复用同一套 provider 分流 + 并发闸门（_TRANSCRIBE_SLOTS）。
     config = get_config()
-    # 临时移除可能含非 ASCII 的 HF_TOKEN，避免 httpx header 编码错误
-    _hf = _os.environ.pop("HF_TOKEN", None)
-    try:
-        # 规划路径的转写同样必须过闸——这是"两人同发卡 20 分钟"事故的元凶：
-        # 此处曾是裸调用，两个 Whisper 并跑互踩 CPU，规划双双拖过超时再重试。
-        with _TRANSCRIBE_SLOTS:
-            t = Transcriber().execute({
-                "input_path": src, "output_dir": str(workdir),
-                "model_size": config.faster_whisper_model,
-            })
-    finally:
-        if _hf is not None:
-            _os.environ["HF_TOKEN"] = _hf
+    t = _safe_transcribe(src, workdir, config.faster_whisper_model)
 
-    if not t.success:
-        logger.warning(f"script 阶段转录失败: {t.error}")
+    if t is None or not t.success:
+        logger.warning(f"script 阶段转录失败: {getattr(t, 'error', 'unavailable')}")
         return []
 
     slim = [

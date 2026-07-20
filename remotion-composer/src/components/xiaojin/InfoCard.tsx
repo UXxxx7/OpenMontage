@@ -129,17 +129,17 @@ export const InfoCard: React.FC<InfoCardProps> = ({
         background: "rgba(13,17,23,0.86)",
         borderLeft: warn ? `4px solid ${palette.bad}` : undefined,
         borderRadius: 16,
-        padding: "20px 24px",
+        padding: "24px 28px",
         boxShadow: "0 8px 32px rgba(0,0,0,0.32)",
         opacity: cardEntry * exitFade,
         transform: `translateY(${(1 - cardEntry) * 16}px)`,
       }}
     >
-      <div style={{ fontFamily: headingFont, fontSize: 11, fontWeight: 600, letterSpacing: 3, color: warn ? palette.bad : "rgba(255,255,255,0.55)", marginBottom: 4 }}>
+      <div style={{ fontFamily: headingFont, fontSize: 13, fontWeight: 600, letterSpacing: 3, color: warn ? palette.bad : "rgba(255,255,255,0.55)", marginBottom: 6 }}>
         {title.toUpperCase()}
       </div>
       {subtitle ? (
-        <div style={{ fontFamily: labelFont, fontSize: 15, fontWeight: 700, letterSpacing: 2, color: "#FFFFFF", marginBottom: 10 }}>
+        <div style={{ fontFamily: labelFont, fontSize: 18, fontWeight: 700, letterSpacing: 2, color: "#FFFFFF", marginBottom: 12 }}>
           {subtitle}
         </div>
       ) : null}
@@ -168,8 +168,8 @@ export const InfoCard: React.FC<InfoCardProps> = ({
             style={{
               background: "rgba(255,255,255,0.06)",
               borderRadius: 10,
-              padding: "12px 16px",
-              marginBottom: 8,
+              padding: "16px 20px",
+              marginBottom: 10,
               display: "flex",
               justifyContent: "space-between",
               alignItems: "center",
@@ -177,18 +177,18 @@ export const InfoCard: React.FC<InfoCardProps> = ({
               transform: `translateX(${(1 - rowEntry) * -40}px)`,
             }}
           >
-            <span style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-              <span style={{ fontFamily: labelFont, fontSize: 18, fontWeight: 700, color: "#FFFFFF" }}>{row.label}</span>
+            <span style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+              <span style={{ fontFamily: labelFont, fontSize: 26, fontWeight: 700, color: "#FFFFFF" }}>{row.label}</span>
               {row.labelEn ? (
-                <span style={{ fontFamily: labelFont, fontSize: 11, fontWeight: 600, letterSpacing: 2, color: "#FFFFFF", opacity: 0.5, textTransform: "uppercase" }}>
+                <span style={{ fontFamily: labelFont, fontSize: 13, fontWeight: 600, letterSpacing: 2, color: "#FFFFFF", opacity: 0.5, textTransform: "uppercase" }}>
                   {row.labelEn}
                 </span>
               ) : null}
             </span>
             <span>
-              <span style={{ fontFamily: headingFont, fontSize: 26, fontWeight: 800, color: tone }}>{displayValue}</span>
+              <span style={{ fontFamily: headingFont, fontSize: 52, fontWeight: 800, color: tone, fontVariantNumeric: "tabular-nums" }}>{displayValue}</span>
               {row.unit ? (
-                <span style={{ fontFamily: labelFont, fontSize: 12, fontWeight: 600, color: "#FFFFFF", opacity: 0.7, marginLeft: 4 }}>
+                <span style={{ fontFamily: labelFont, fontSize: 18, fontWeight: 600, color: "#FFFFFF", opacity: 0.7, marginLeft: 6 }}>
                   {row.unit}
                 </span>
               ) : null}

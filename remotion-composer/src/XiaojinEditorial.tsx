@@ -24,8 +24,28 @@
  * component's own doc comment for what did NOT get ported, and why).
  */
 import Ajv2020 from "ajv/dist/2020";
+import { loadFont as loadInter } from "@remotion/google-fonts/Inter";
+import { loadFont as loadNotoSansTC } from "@remotion/google-fonts/NotoSansTC";
 import { AbsoluteFill, CalculateMetadataFunction } from "remotion";
 import renderPropsSchema from "../../contracts/render_props.schema.json";
+
+// headingFont/labelFont defaulted to CSS "inherit" (no font loaded at all)
+// and pipeline_runner.py never sets them — every real production render
+// was falling back to whatever generic font the render environment
+// happened to have, not the reference build's Inter/Noto Sans TC (confirmed:
+// zero references to headingFont/labelFont anywhere in pipeline_runner.py
+// or content_planner.py). Loading and defaulting to the same fonts
+// video-studio's vell-renewal-fresh reference uses — tc (includes latin) for
+// headings so both languages render correctly, inter for the small
+// UPPERCASE labels/eyebrows, matching how the reference assigns them.
+const { fontFamily: _defaultHeadingFont } = loadNotoSansTC("normal", {
+  weights: ["500", "700", "800"],
+  subsets: ["chinese-traditional", "latin"],
+});
+const { fontFamily: _defaultLabelFont } = loadInter("normal", {
+  weights: ["400", "500", "600", "700", "800"],
+  subsets: ["latin"],
+});
 import { BrandBar } from "./components/xiaojin/BrandBar";
 import { BudgetRevealSection, BudgetRevealSectionProps } from "./components/xiaojin/BudgetRevealSection";
 import { Calendar, CalendarProps } from "./components/xiaojin/Calendar";
@@ -33,17 +53,24 @@ import { Captions, CaptionPhrase } from "./components/xiaojin/Captions";
 import { ChapterNav, Chapter } from "./components/xiaojin/ChapterNav";
 import { ComplianceBar } from "./components/xiaojin/ComplianceBar";
 import { ContentBeat, ContentZone } from "./components/xiaojin/ContentZone";
+import { CornerCard, CornerCardProps } from "./components/xiaojin/CornerCard";
 import { Section, SectionLayer } from "./components/xiaojin/SectionLayer";
 import { QuoteCard, QuoteCardProps } from "./components/xiaojin/QuoteCard";
-import { Atmosphere } from "./components/xiaojin/Atmosphere";
 import { CountdownRing, CountdownRingProps } from "./components/xiaojin/CountdownRing";
 import { InfoCard, InfoCardProps } from "./components/xiaojin/InfoCard";
 import { IntroTitle } from "./components/xiaojin/IntroTitle";
+import { StatsHookIntro } from "./components/xiaojin/StatsHookIntro";
+import { TitleImpactIntro } from "./components/xiaojin/TitleImpactIntro";
+import { ChipsIntro } from "./components/xiaojin/ChipsIntro";
 import { OutroSection } from "./components/xiaojin/OutroSection";
+import { AccentPill, AccentPillProps } from "./components/xiaojin/AccentPill";
 import { QRContactCard, QRContactCardProps } from "./components/xiaojin/QRContactCard";
 import { RainbowProgressBar } from "./components/xiaojin/RainbowProgressBar";
 import { RiskGauge, RiskGaugeProps } from "./components/xiaojin/RiskGauge";
 import { SpeakerCard, SpeakerCardOpacityKeyframe, SpeakerCardScene } from "./components/xiaojin/SpeakerCard";
+import { StepList, StepListProps } from "./components/xiaojin/StepList";
+import { TopicCard, TopicCardProps } from "./components/xiaojin/TopicCard";
+import { ZoneHeader, ZoneHeaderProps } from "./components/xiaojin/ZoneHeader";
 import { Presenter, PresenterProps } from "./components/xiaojin/Presenter";
 import { ColorMode } from "./components/xiaojin/theme";
 
@@ -64,6 +91,16 @@ export interface IntroInfo {
   eyebrow: string;
   title: string;
   subtitle: string;
+  /**
+   * Which of the 4 video-studio CLAUDE-xiaojin-editorial.md intro patterns to
+   * render. Omit (or "title_card") for the original, unchanged behavior —
+   * IntroTitle, a dark scrim over the speaker footage. The other 3 variants
+   * were previously unported; added 2026-07-16 for visual variety across
+   * jobs so every video doesn't open the same way regardless of content tone.
+   */
+  variant?: "title_card" | "stats_hook" | "title_impact" | "chips";
+  /** Only used by variant "title_impact" — top-right brand chip. Omit to skip it. */
+  brandLabel?: string;
 }
 
 /** Matches contract②'s dataCards item shape exactly — colorMode/fonts come from the parent. */
@@ -72,8 +109,13 @@ export type Gauge = Omit<RiskGaugeProps, "colorMode" | "headingFont" | "labelFon
 export type BeforeAfter = Omit<BudgetRevealSectionProps, "headingFont" | "labelFont">;
 export type Countdown = Omit<CountdownRingProps, "colorMode" | "headingFont" | "labelFont">;
 export type CalendarEvent = Omit<CalendarProps, "colorMode" | "headingFont" | "labelFont">;
+export type Pill = Omit<AccentPillProps, "colorMode" | "headingFont">;
 export type QRContact = Omit<QRContactCardProps, "colorMode" | "headingFont" | "labelFont">;
 export type Quote = Omit<QuoteCardProps, "colorMode" | "headingFont" | "labelFont">;
+export type ZoneHeaderItem = Omit<ZoneHeaderProps, "colorMode" | "headingFont" | "labelFont">;
+export type StepListItem = Omit<StepListProps, "colorMode" | "headingFont" | "labelFont">;
+export type TopicCardItem = Omit<TopicCardProps, "colorMode" | "headingFont" | "labelFont">;
+export type CornerCardItem = CornerCardProps;
 
 export interface OutroInfo {
   kicker: string;
@@ -104,8 +146,6 @@ export interface XiaojinEditorialProps extends Record<string, unknown> {
   sections?: Section[];
   /** Pull-quote typography moments (data-less videos' canvas motion). */
   quotes?: Quote[];
-  /** Faint drifting keyword texture behind everything (this video's own vocabulary). */
-  atmosphereKeywords?: string[];
   /** Count-up stat cards (contract② "[P3 NEW capability]"). Renders alongside contentBeats, not in place of it. */
   dataCards?: DataCard[];
   /** Dramatic two-value before/after reveals (e.g. a cost/metric that jumped over time). */
@@ -116,6 +156,16 @@ export interface XiaojinEditorialProps extends Record<string, unknown> {
   countdowns?: Countdown[];
   /** Mini-calendars with a pulsing target-date marker — Data Display Analysis "specific date" rows. */
   calendarEvents?: CalendarEvent[];
+  /** Full-width terracotta takeaway pills stacked under their primary graphics (see AccentPill). */
+  pills?: Pill[];
+  /** Compact left-aligned section headers for normal (non-takeover) chapters — see ZoneHeader. */
+  zoneHeaders?: ZoneHeaderItem[];
+  /** Ghosted numbered step skeletons, activating one row per spoken beat — see StepList. */
+  stepLists?: StepListItem[];
+  /** Icon + statement cards for supporting lines with no hard data — see TopicCard. */
+  topicCards?: TopicCardItem[];
+  /** Compact illustration overlays anchored inside the SpeakerCard — see CornerCard. */
+  cornerCards?: CornerCardItem[];
   /** QR + WhatsApp CTA close. Only set when a real contact URL was actually supplied. */
   qrContact?: QRContact;
   /** "Pattern 2" dark title-card intro (see IntroTitle's doc comment). Omit to skip. */
@@ -184,28 +234,29 @@ export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = ({
   contentBeats,
   sections,
   quotes,
-  atmosphereKeywords,
+  pills,
   dataCards,
   beforeAfter,
   gauges,
   countdowns,
   calendarEvents,
+  zoneHeaders,
+  stepLists,
+  topicCards,
+  cornerCards,
   qrContact,
   intro,
   outro,
   compliance,
   brand,
   presenter,
-  headingFont = "inherit",
-  labelFont = "inherit",
+  headingFont = _defaultHeadingFont,
+  labelFont = _defaultLabelFont,
 }) => {
   const bg = colorMode === "warm" ? "#F2EBE0" : "#0D1117";
 
   return (
     <AbsoluteFill style={{ background: bg }}>
-      {atmosphereKeywords?.length ? (
-        <Atmosphere keywords={atmosphereKeywords} colorMode={colorMode} headingFont={headingFont} />
-      ) : null}
       {/* Full-canvas section takeovers render FIRST — they are backgrounds;
           the card, graphics and chrome all sit above them. */}
       {sections?.length ? (
@@ -222,7 +273,11 @@ export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = ({
         opacityKeyframes={opacityKeyframes}
         objectPosition={speakerObjectPosition}
         colorMode={colorMode}
-      />
+      >
+        {cornerCards?.map((card, i) => (
+          <CornerCard key={i} {...card} />
+        ))}
+      </SpeakerCard>
       {/*
         contentBeats/dataCards/outro all render AFTER SpeakerCard (not
         before) so none of them are ever silently hidden behind it — confirmed
@@ -237,6 +292,9 @@ export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = ({
         whether the caller's scene schedule actually shrinks the card first.
       */}
       {contentBeats ? <ContentZone beats={contentBeats} /> : null}
+      {zoneHeaders?.map((header, i) => (
+        <ZoneHeader key={i} {...header} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+      ))}
       {quotes?.map((q, i) => (
         <QuoteCard key={`q${i}`} {...q} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
       ))}
@@ -284,14 +342,29 @@ export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = ({
           labelFont={labelFont}
         />
       ))}
-      {qrContact ? (
-        <QRContactCard
-          {...qrContact}
+      {pills?.map((pill, i) => (
+        <AccentPill
+          key={i}
+          {...pill}
           colorMode={colorMode}
           headingFont={headingFont}
-          labelFont={labelFont}
         />
-      ) : null}
+      ))}
+      {stepLists?.map((list, i) => (
+        <StepList key={i} {...list} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+      ))}
+      {topicCards?.map((card, i) => (
+        <TopicCard key={i} {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+      ))}
+      {/* outro renders BEFORE qrContact (not the other way around): OutroSection
+          paints an opaque full-canvas background (y=88 to H-72). Rendering
+          qrContact first meant it silently sat UNDERNEATH that background
+          whenever both were populated for the same job — the QR card was
+          fully computed and mounted, just permanently hidden. pipeline_runner
+          also now anchors qrContact's mountFrame/y off outro's own frame and
+          footer position when outro is present (see _build_apply_style_props),
+          so the two read as one continuous end-card moment instead of two
+          independently-timed overlays that happen to occupy the same span. */}
       {outro ? (
         <OutroSection
           kicker={outro.kicker}
@@ -305,7 +378,43 @@ export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = ({
           font={headingFont}
         />
       ) : null}
-      {intro ? (
+      {qrContact ? (
+        <QRContactCard
+          {...qrContact}
+          colorMode={colorMode}
+          headingFont={headingFont}
+          labelFont={labelFont}
+        />
+      ) : null}
+      {intro && intro.variant === "stats_hook" ? (
+        <StatsHookIntro
+          eyebrow={intro.eyebrow}
+          title={intro.title}
+          subtitle={intro.subtitle}
+          introOutFrame={introOutFrame}
+          colorMode={colorMode}
+          headingFont={headingFont}
+          labelFont={labelFont}
+        />
+      ) : intro && intro.variant === "title_impact" ? (
+        <TitleImpactIntro
+          eyebrow={intro.eyebrow}
+          title={intro.title}
+          subtitle={intro.subtitle}
+          brandLabel={intro.brandLabel}
+          introOutFrame={introOutFrame}
+          colorMode={colorMode}
+          headingFont={headingFont}
+          labelFont={labelFont}
+        />
+      ) : intro && intro.variant === "chips" ? (
+        <ChipsIntro
+          chapters={chapters}
+          introOutFrame={introOutFrame}
+          colorMode={colorMode}
+          labelFont={labelFont}
+        />
+      ) : intro ? (
         <IntroTitle
           eyebrow={intro.eyebrow}
           title={intro.title}

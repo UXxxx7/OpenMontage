@@ -148,11 +148,20 @@ class ColorGrade(BaseTool):
 
         start = time.time()
 
+        # -fps_mode cfr -r <fps> mandatory on re-encode — see face_enhance.py's
+        # matching fix comment; this input is typically face_enhance's own
+        # output, so without this flag here too, any drift compounds. Pinned
+        # to a fixed 30 (not a live probe of this input) for the same reason
+        # documented there: probing an already-slightly-irregular source
+        # returns a misleading rate (confirmed: 120 instead of 30) and forcing
+        # that makes it worse, not better.
+        fps = inputs.get("fps", 30)
         cmd = [
             "ffmpeg", "-y",
             "-i", str(input_path),
             "-vf", vf,
             "-c:v", codec, "-crf", str(crf),
+            "-fps_mode", "cfr", "-r", str(fps), "-g", str(int(fps)),
             "-c:a", "copy",
             str(output_path),
         ]

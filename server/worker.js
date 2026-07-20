@@ -138,7 +138,7 @@ async function editVideo({ waNumber, mediaId, editRequest }) {
       return;
     }
     if (status.status === "PREVIEW_READY") {
-      await sendText(waNumber, previewReadyMessage(jobLang, jobId, status.degraded_operations, status.generation_cost_usd) + idleHint(jobLang, "export"));
+      await sendText(waNumber, previewReadyMessage(jobLang, jobId, status.animations, status.degraded_operations, status.generation_cost_usd) + idleHint(jobLang, "export"));
       await armIdle(waNumber, jobId, "export", jobLang);
       return;
     }
@@ -221,7 +221,7 @@ async function confirmJob({ waNumber, jobId }) {
   if (status.status === "ERROR") {
     throw new Error(status.error_message || "Python pipeline failed");
   }
-  await sendText(waNumber, previewReadyMessage(lang, jobId, status.degraded_operations, status.generation_cost_usd) + idleHint(lang, "export"));
+  await sendText(waNumber, previewReadyMessage(lang, jobId, status.animations, status.degraded_operations, status.generation_cost_usd) + idleHint(lang, "export"));
   await armIdle(waNumber, jobId, "export", lang); // 进入"等待导出"，重新计时
 }
 
@@ -242,7 +242,7 @@ async function retryJob({ waNumber, jobId, text }) {
     throw new Error(status.error_message || "Python pipeline failed");
   }
   const jobLang = resolveLang(lang, status.edit_request);
-  await sendText(waNumber, previewReadyMessage(jobLang, jobId, status.degraded_operations, status.generation_cost_usd) + idleHint(jobLang, "export"));
+  await sendText(waNumber, previewReadyMessage(jobLang, jobId, status.animations, status.degraded_operations, status.generation_cost_usd) + idleHint(jobLang, "export"));
   await armIdle(waNumber, jobId, "export", jobLang);
 }
 
@@ -559,7 +559,7 @@ async function runCollectionJob(waNumber, mainItem, brollItems, editRequest, lan
       return;
     }
     if (status.status === "PREVIEW_READY") {
-      await sendText(waNumber, previewReadyMessage(jobLang, jobId, status.degraded_operations, status.generation_cost_usd) + idleHint(jobLang, "export"));
+      await sendText(waNumber, previewReadyMessage(jobLang, jobId, status.animations, status.degraded_operations, status.generation_cost_usd) + idleHint(jobLang, "export"));
       await armIdle(waNumber, jobId, "export", jobLang);
       return;
     }
@@ -741,10 +741,18 @@ function formatPlanMessage(job, lang) {
   return lines.join("\n");
 }
 
-function previewReadyMessage(lang, jobId, degradedOps, generationCostUsd) {
+function previewReadyMessage(lang, jobId, animations, degradedOps, generationCostUsd) {
+  // 用户明确反馈：以前这条消息只念模板简介（条条视频一模一样），从不说这条
+  // 视频实际包含哪些动画。Python API 的 GET /jobs/{id} 现在带 animations
+  // （从最终渲染 props 提取的真实清单）——有就逐条列出来。
+  let animBlock = "";
+  if (Array.isArray(animations) && animations.length > 0) {
+    const items = animations.map((a) => `• ${a}`).join("\n");
+    animBlock = t(lang, `本片动画：\n${items}\n`, `Animations in this cut:\n${items}\n`);
+  }
   let msg = t(lang,
-    `预览已生成：${fileUrl(jobId, "preview.mp4")}\n回复 export 导出最终视频。`,
-    `Preview ready: ${fileUrl(jobId, "preview.mp4")}\nReply export to generate final video.`);
+    `预览已生成：${fileUrl(jobId, "preview.mp4")}\n${animBlock}回复 export 导出最终视频。`,
+    `Preview ready: ${fileUrl(jobId, "preview.mp4")}\n${animBlock}Reply export to generate final video.`);
   // 降级必须发声：某步非致命失败被跳过时（Python 侧已自动重试过一次），明确
   // 告诉用户缺了什么、怎么补救——决不静默交付半成品假装全须全尾。
   const ops = degradedOps || [];

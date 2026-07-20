@@ -41,6 +41,12 @@ export interface SpeakerCardProps {
   colorMode?: ColorMode;
   /** Frames for the first-appearance rise-in. Default 26 (matches the reference build). */
   enterFrames?: number;
+  /**
+   * Rendered inside the card's own positioned div (e.g. CornerCard) — so an
+   * overlay anchored here travels/scales/hides with the card automatically
+   * instead of needing to duplicate this component's scene interpolation.
+   */
+  children?: React.ReactNode;
 }
 
 // A bare multi-point interpolate() over sparse, widely-spaced scenes glides
@@ -79,6 +85,7 @@ export const SpeakerCard: React.FC<SpeakerCardProps> = ({
   objectPosition = "50% 35%",
   colorMode = "warm",
   enterFrames = 26,
+  children,
 }) => {
   const frame = useCurrentFrame();
   const palette = PALETTES[colorMode];
@@ -141,18 +148,23 @@ export const SpeakerCard: React.FC<SpeakerCardProps> = ({
           height: "100%",
           objectFit: "cover",
           objectPosition,
-          filter: "contrast(1.06) brightness(0.95) saturate(1.06)",
+          filter: "contrast(1.06) brightness(0.88) saturate(1.06)",
         }}
       />
+      {/* Top scrim to tame blown-out exposure/lens flare — the 0.30-opacity/
+          32%-falloff version this replaced was too weak/shallow for footage
+          with a genuinely overexposed light source (confirmed against real
+          production footage: highlights stayed blown out past 32% down). */}
       <div
         style={{
           position: "absolute",
           inset: 0,
           background:
-            "linear-gradient(180deg, rgba(20,12,6,0.30) 0%, rgba(20,12,6,0) 32%)",
+            "linear-gradient(180deg, rgba(20,12,6,0.55) 0%, rgba(20,12,6,0) 45%)",
           pointerEvents: "none",
         }}
       />
+      {children}
     </div>
   );
 };
