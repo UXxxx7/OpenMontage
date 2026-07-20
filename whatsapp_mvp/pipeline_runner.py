@@ -933,6 +933,46 @@ _WORKFLOW_DEFAULT_CONTENT_WIDTH = 920
 _TAKEOVER_FADE_FRAMES = 15
 
 
+_TRANSITION_HOLD_FRAMES = 20  # 一次真实卡片变形动画的合理时长——见 _insert_transition_holds
+
+
+def _insert_transition_holds(scenes: list[dict]) -> list[dict]:
+    """Fix C21（2026-07-17，真实生产复现，同一天内两次——job_1b7254abcd66 的
+    (180,592)、job_ac00838adea9 的 (180,298)/(758,1193)）：`interpolate()`
+    只拿到两个尺寸不同的关键帧时，会在它们之间的*整段*间隔里连续插值——如果
+    下一次真正的几何变化要再过几百帧才发生（例如一个全画布接管在很久之后
+    才结束，卡片才收回 workflow 尺寸），卡片就被 Remotion 判定成"一直在缓慢
+    变形"长达十几秒，其间任何真实内容挂上去都会被 element_mounts_during_
+    card_transition 拦下来——即使卡片早就视觉上稳定在目标尺寸，只是数据里
+    没有一个"提前到达"的关键帧去停住插值。
+
+    今天早些时候试过反过来改 props_lint._transition_windows（把检测窗口
+    强行缩短），但那是被三个当时已经验证过的用例依赖的公共函数，一动就
+    连带破坏了 Fix C13b/C19 依赖的、真正需要"整段间隔都算过渡"这个语义的
+    intro 场景（0→180 那种紧邻的两帧，是真的在整段内连续变形）——检测函数
+    本身没错，错的是喂给它的数据在几何变化之后没有一个"到达并停住"的关键帧。
+
+    这里改成从数据源头修：两个几何不同、且间隔超过 _TRANSITION_HOLD_FRAMES
+    的相邻 scene 关键帧之间，插入一个"提前到达"的关键帧——跟后一个关键帧
+    尺寸相同，落在前一个关键帧之后 _TRANSITION_HOLD_FRAMES 帧的位置。插值
+    在这个新关键帧之前是真过渡（跟原来一样，短且合理），之后到下一个真实
+    关键帧因为两端尺寸相同、不再被判定为过渡——不用改 _transition_windows
+    这个已经验证过、被多处依赖的检测函数一个字，只是让它看到的数据更准确。
+    """
+    if not scenes:
+        return scenes
+    out = [scenes[0]]
+    for cur in scenes[1:]:
+        prev = out[-1]
+        box_changed = prev.get("w") != cur.get("w") or prev.get("h") != cur.get("h")
+        gap = cur["frame"] - prev["frame"]
+        if box_changed and gap > _TRANSITION_HOLD_FRAMES:
+            hold_frame = prev["frame"] + _TRANSITION_HOLD_FRAMES
+            out.append({"frame": hold_frame, "x": cur["x"], "y": cur["y"], "w": cur["w"], "h": cur["h"]})
+        out.append(cur)
+    return out
+
+
 def _mode_schedule_to_scenes(mode_schedule: list[dict]) -> tuple[list[dict], list[dict]]:
     """content_planner 的 dominant/workflow 模式时间表 -> contract② 的
     (scenes, opacityKeyframes)。contentWidth>=SECTION_PIP_SENTINEL 的 workflow
@@ -958,6 +998,7 @@ def _mode_schedule_to_scenes(mode_schedule: list[dict]) -> tuple[list[dict], lis
             opacity += [{"frame": f, "opacity": 0.0},
                         {"frame": f + _TAKEOVER_FADE_FRAMES, "opacity": 1.0}]
             hidden = False
+    scenes = _insert_transition_holds(scenes)
     # interpolate() needs strictly increasing frames — drop any keyframe that
     # would violate that (e.g. two takeovers closer together than the fades).
     monotonic: list[dict] = []
