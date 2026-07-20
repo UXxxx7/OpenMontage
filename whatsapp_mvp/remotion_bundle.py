@@ -140,9 +140,14 @@ def _cleanup_old_generations(cache_dir: Path, keep: set[str]) -> None:
 # 对 http 开头的 src 透传），bundle 从此纯只读共享。
 
 
-def ensure_remotion_bundle(remotion_dir: Path) -> Optional[str]:
+def ensure_remotion_bundle(remotion_dir: Path, job_slug: Optional[str] = None) -> Optional[str]:
     """返回可直接喂给 still/render 的 bundle 目录（真实路径）；不可用时返回
-    None（调用方回退到按次打包）。"""
+    None（调用方回退到按次打包）。
+
+    job_slug：向后兼容参数，接受但不使用。本版设计已移除 bundle public/ 素材同步
+    （见本文件顶部注释），videoSrc/qrSrc 一律走本机 API 的 /files 路由，still/render
+    都不需要把素材写进 bundle。qa_stills.py 仍按旧签名传 job_slug，这里接住以避免
+    TypeError（#38 合并残留：新版 remotion_bundle + 旧版 qa_stills 调用签名不一致）。"""
     remotion_dir = Path(remotion_dir).resolve()  # 相对路径+cwd 组合会把 out-dir 解析进嵌套目录（实测）
     cache_dir = remotion_dir / _CACHE_DIRNAME
     build_link = remotion_dir / "build"

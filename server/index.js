@@ -268,7 +268,7 @@ async function handleMessage(message) {
       return;
     }
 
-    if (activeJobId && ["confirm", "continue", "yes", "ok"].includes(normalized)) {
+    if (activeJobId && ["confirm", "continue", "yes", "ok", "go", "start", "done", "开始", "完成", "好了", "继续"].includes(normalized)) {
       await videoQueue.add("confirm-job", { waNumber, jobId: activeJobId, msgId }, queueOptions(msgId));
       return;
     }
