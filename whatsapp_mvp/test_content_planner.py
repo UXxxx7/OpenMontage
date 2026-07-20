@@ -9,7 +9,7 @@ from whatsapp_mvp.content_planner import (
     FPS, MOUNT_LEAD_FRAMES, MIN_GAP_AFTER_PREVIOUS_FRAMES, _to_frame_plan, _zero_value_titles,
     _ground_data_point_seconds, _number_candidates, _find_grounded_seconds, _workflow_mode_schedule,
     _find_grounded_word, _keyword_matches, _KEYWORD_EXIT_HOLD_FRAMES, _COUNT_UP_ROW_ANIM_FRAMES,
-    _STACK_EXIT_BUFFER_FRAMES, _TAKEOVER_HARD_CAP_FRAMES,
+    _STACK_EXIT_BUFFER_FRAMES, _TAKEOVER_HARD_CAP_FRAMES, _resolve_same_slot_overlaps,
 )
 
 FAILED = []
@@ -747,6 +747,45 @@ def main():
           and plan_short_video_timeline["sections"][0]["toFrame"] == 213
           and plan_short_video_timeline["sections"][0]["toFrame"] < _TAKEOVER_HARD_CAP_FRAMES,
           plan_short_video_timeline["sections"])
+
+    # 11d. Fix E1/E2 回归——真实 job_73e873e4f7e1（用户下载 preview(11).mp4 后
+    # 逐帧检查抓到的两个问题）：
+    #   E1: process_timeline 节点间隔从 30 帧收紧变成"还没长完线就开始长下
+    #       一段"，用户原话"everything just appears and disappears too fast"。
+    #   E2: 一张 dataCard 跟一张 topicCard 完全同坑位(x,y)、时间又重叠，
+    #       topicCard 画在后面(盖住 dataCard)，"Total Duration: 5 months"这
+    #       张卡整个存活期间从没被看到过——不是视觉上乱，是内容彻底不可见。
+    plan_e1 = _to_frame_plan({
+        "chapters": [
+            {"at_seconds": 0, "label": "PLAN"},
+            {"at_seconds": 5.4, "label": "STEPS", "takeover": True},
+            {"at_seconds": 9.5, "label": "TOTAL"},
+        ],
+        "process_timeline": {
+            "chapter_label": "STEPS", "heading": "PIPELINE",
+            "stages": [
+                {"label": "IDEA", "seconds": 6.4, "target": 4, "unit": "WEEKS", "prefix": "~"},
+                {"label": "FILMING", "seconds": 6.8, "target": 2, "unit": "WEEKS", "prefix": ""},
+                {"label": "EDITING", "seconds": 7.2, "target": 3, "unit": "WEEKS", "prefix": ""},
+            ],
+        },
+    }, duration=17.0)
+    e1_nodes = plan_e1["sections"][0]["timeline"]["nodes"]
+    e1_gaps = [e1_nodes[i]["revealFrame"] - e1_nodes[i - 1]["revealFrame"] for i in range(1, len(e1_nodes))]
+    check("E1: 时间线相邻节点间隔 >= 60 帧(2s)，不是被压缩到 30 帧",
+          all(g >= 60 for g in e1_gaps), e1_gaps)
+
+    dc = [{"title": "From Start to Finish", "x": 60, "y": 1170, "width": 960,
+           "mountFrame": 235, "endFrame": 335, "rows": []}]
+    tc = [{"headline": "We work 3-4 months in advance", "x": 60, "y": 1170, "width": 960,
+           "mountFrame": 120, "endFrame": 282, "sub": "x"}]
+    _resolve_same_slot_overlaps(dc, [], [], [], [], [], [], tc)
+    e2_overlap = dc[0]["mountFrame"] < tc[0]["endFrame"] and tc[0]["mountFrame"] < dc[0]["endFrame"]
+    check("E2: 同坑位(x,y)且时间重叠的 dataCard/topicCard 被拆开——"
+          "dataCard 顺延到 topicCard 退场之后，不再被完全盖住",
+          not e2_overlap and dc[0]["mountFrame"] > tc[0]["endFrame"], (dc, tc))
+    check("E2: dataCard 自己的展示时长(100 帧)顺延后保持不变，只是平移，不是被压缩",
+          dc[0]["endFrame"] - dc[0]["mountFrame"] == 100, dc)
 
     # 12. Fix E：关键词校准入场+收尾（不只是数字）。合成一段跟真实场景同形状
     # 的转写："if your policy lapses...which could affect both your coverage

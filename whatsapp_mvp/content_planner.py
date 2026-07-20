@@ -79,9 +79,13 @@ GAUGE_ANIMATION_FRAMES = 20 + 50  # fillDelayFrames + fillDurationFrames 默认�
 COUNTDOWN_ANIMATION_FRAMES = 40  # revealFrames 默认值
 CALENDAR_DISPLAY_FRAMES = 150  # 日历没有"动画完成"节点，给一个固定停留时长
 BEFORE_AFTER_ANIMATION_FRAMES = 40  # BudgetRevealSection 数值动画时长（组件默认值）
-# TimelineSection 每个节点之间至少留这么多帧，避免相邻阶段的点动画/文字入场叠在一起
-# （组件自身的 GROW_WINDOW 是 25 帧）。
-TIMELINE_NODE_MIN_GAP_FRAMES = 30
+# Fix E1（2026-07-16）：之前是 30 帧——组件自己的入场动画(GROW_WINDOW)就要
+# 25 帧，30 帧的间隔等于每个阶段刚长完线就立刻开始长下一段，观众几乎没有
+# "线已经停住、数字定住"的可读时刻，真实生产反馈确认过这个问题（"appears
+# and disappears too fast"，job_73e873e4f7e1 真实成片：3 个阶段每 30 帧
+# (1s)揭示一个，动画根本来不及沉淀）。改成 60 帧(2s)，25 帧动画结束后留
+# ~35 帧真正的静止阅读时间。
+TIMELINE_NODE_MIN_GAP_FRAMES = 60
 # 全画布接管至少要有这么多帧才值得放一个多阶段 timeline 图形（给动画+停留留出空间）。
 TIMELINE_MIN_SECTION_FRAMES = 90
 # Fix D1：接管（说话人被隐藏、全画布展示）的强制上限——不管章节本身多长，
@@ -676,6 +680,39 @@ def _ground_data_point_seconds(raw: dict, word_timestamps: Optional[list[dict]])
             continue
 
 
+def _resolve_same_slot_overlaps(*element_groups: list[dict]) -> None:
+    """Fix E2：见调用处的完整案例说明。对每一对(x,y)完全相同、mount/end 时间
+    区间又重叠的元素，把后 mount 的那个顺延到前一个的 endFrame(+缓冲)之后，
+    同时保持它自己原来的展示时长不变（只平移，不压缩）——mutates in place。
+    只处理"完全同坑位"（精确同 x,y），不是任意矩形相交（那类更宽的重叠交给
+    下游 props_lint 的 element_overlap 诊断，这里只处理"确定会被完全盖住"
+    这一种最坏情况，可以无脑确定性修，不需要判断到底该谁让谁）。
+    """
+    elements = [
+        e for group in element_groups for e in group
+        if isinstance(e, dict) and "x" in e and "y" in e
+        and "mountFrame" in e and "endFrame" in e
+    ]
+    elements.sort(key=lambda e: e["mountFrame"])
+    for i, a in enumerate(elements):
+        for b in elements[i + 1:]:
+            if (a["x"], a["y"]) != (b["x"], b["y"]):
+                continue
+            if not (a["mountFrame"] < b["endFrame"] and b["mountFrame"] < a["endFrame"]):
+                continue
+            # a mounts no later than b (elements sorted by mountFrame) — b is
+            # the one that would render on top and hide a, so b is the one
+            # that yields.
+            delay = (a["endFrame"] + _STACK_EXIT_BUFFER_FRAMES) - b["mountFrame"]
+            if delay <= 0:
+                continue
+            duration_frames = b["endFrame"] - b["mountFrame"]
+            b["mountFrame"] += delay
+            b["endFrame"] = b["mountFrame"] + duration_frames
+            if "secondRevealFrame" in b:
+                b["secondRevealFrame"] += delay
+
+
 def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
     chapters = []
     for c in raw.get("chapters") or []:
@@ -1037,7 +1074,16 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
             # Timeline 图形本身就是这个接管唯一、贯穿全程的可视内容——保持
             # 章节原有跨度，不额外裁剪（_plan_process_timeline 自己已经是
             # atFrame -> next atFrame 锚定，跟这里裁剪的目的一致）。
-            end = natural_end
+            #
+            # Fix E1（2026-07-16）：但"保持原有跨度"只是下限，不是上限——如果
+            # 章节本身的自然跨度比"最后一个阶段揭示完 + 停留时间"还短，最后
+            # 一个节点会在还没来得及被看清楚就被整个接管收走（真实反馈："if
+            # you don't have time to put[the content in], then don't put and
+            # just extend the previous section"）。改成够长就用自然跨度，
+            # 不够长就顺延到最后一个节点有完整停留时间为止——只会往后延，
+            # 从不往前砍，不影响本来就够长的正常情况。
+            last_reveal = max((n["revealFrame"] for n in timeline_plan["nodes"]), default=start)
+            end = max(natural_end, last_reveal + _TAKEOVER_CONTENT_HOLD_FRAMES)
         else:
             # Fix D1：确认过的真实生产 bug——WARNING 接管从 771 帧一路延伸到
             # 片尾(1526)，说话人被隐藏 25.2s 且再也没有恢复，而接管里唯一的
@@ -1300,6 +1346,26 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
                  "footerLabel": str(ro.get("footer_label", ""))[:40]}
         if ro.get("headline_accent"):
             outro["headlineAccent"] = str(ro["headline_accent"])[:30]
+
+    # Fix E2（2026-07-16）：确定性的"同坑位撞车"兜底——真实生产 bug
+    # (job_73e873e4f7e1)：一张 dataCard("Total Duration: 5 months") 跟一张
+    # topicCard 的 x/y 完全相同、存活区间也重叠，而 topicCard 在组件渲染顺序
+    # 里排在 dataCard 后面（画在上面），dataCard 整个存活期间完全不可见——
+    # 不是"挤在一起看着乱"，是这张卡的内容观众从头到尾一次都没看到过。
+    # 堆叠系统（上面的 _flush_stack 逻辑）理论上不该让这种情况发生，但真实
+    # 数据证明它确实发生了——不去继续深挖堆叠系统内部为什么在这个具体案例
+    # 里失手，而是加一道谁都绕不过去的最终兜底：扫一遍所有内容区元素，
+    # 精确同一个 (x,y) 坐标、时间又重叠的两个，一定是后来者完全盖住前者，
+    # 把后来者顺延到前者退场之后——用户的原话就是这个原则："if you don't
+    # have time to put[content in], then don't put and just extend the
+    # previous section"，这里反过来说：宁可把新内容往后推，也不要让旧内容
+    # 被悄无声息地盖住。这是最后一道保险，跟 props_lint 的 element_overlap
+    # 诊断互补：那边发现问题喂回 LLM 重规划（可能好也可能不好），这里直接
+    # 确定性地修好，不依赖任何一轮重规划恰好避开这个坑。
+    _resolve_same_slot_overlaps(
+        data_cards, gauges, countdowns, calendar_events, before_afters,
+        pills, step_lists, topic_cards,
+    )
 
     return {
         "chapters": chapters, "data_cards": data_cards, "gauges": gauges,
