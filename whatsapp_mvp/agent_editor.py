@@ -39,6 +39,7 @@ OP_TOOLS = {
     "reframe": ["auto_reframe"],
     "color_grade": ["color_grade"],
     "insert_broll": ["video_compose"],
+    "add_music": ["audio_mixer"],  # manifest 的 compose 阶段已声明此工具（"audio layering + segmented music"）
     "add_subtitles": ["transcriber", "remotion_caption_burn"],
     "remove_filler": ["transcriber", "video_trimmer"],
     "apply_style": ["transcriber", "remotion_caption_burn"],
@@ -79,17 +80,33 @@ ALL_TOOL_SCHEMAS = {
                     {"profile": {"type": "string", "enum": ["cinematic_warm", "cinematic_cool",
                      "moody_dark", "bright_clean", "vintage_film", "high_contrast", "neutral"]},
                      "intensity": {"type": "number"}}, []),
-    "insert_broll": ("把用户上传的 b-roll 素材叠进成片（默认 b-roll 铺满、人物缩右下小窗，保留原声）。"
-                     "**仅当 source_facts 里列出了可用 b-roll 素材时才用**。items 每项："
-                     "asset_ref=素材编号（见事实里的 [b<编号>]），start_seconds/end_seconds=放置时间窗，"
+    "insert_broll": ("把 b-roll 叠进成片（默认 b-roll 铺满、人物缩右下小窗，保留原声）。b-roll 两种来源："
+                     "①用户上传的素材（source_facts 里列出了 [b<编号>]）→ 该 items 项给 asset_ref；"
+                     "②用户明确要求 AI 生成 b-roll、或用户对某一处点名要生成（哪怕别处有上传素材） → 该 items 项给 gen_prompt（英文画面描述）。"
+                     "同一 items 项 asset_ref 与 gen_prompt 二选一，不要同时给。items 每项："
+                     "asset_ref=素材编号（见事实里的 [b<编号>]），gen_prompt=AI 生成 b-roll 的英文画面描述，"
+                     "gen_provider=生成 provider（默认 omni），start_seconds/end_seconds=放置时间窗，"
                      "mode=broll_main(默认,b-roll主+人物小窗)|cutaway(b-roll全屏无人物)|pip(人物主+b-roll小窗)。"
                      "orientation=auto(默认,方向跟随素材)|portrait|landscape（用户明说竖屏/横屏时才设）",
                      {"items": {"type": "array", "items": {"type": "object", "properties": {
                         "asset_ref": {"type": "integer"},
+                        "gen_prompt": {"type": "string"},
+                        "gen_provider": {"type": "string", "enum": ["omni"]},
+                        "gen_force": {"type": "boolean"},
                         "start_seconds": {"type": "number"}, "end_seconds": {"type": "number"},
                         "mode": {"type": "string", "enum": ["broll_main", "cutaway", "pip"]}}}},
                       "orientation": {"type": "string", "enum": ["auto", "portrait", "landscape"]}},
                      ["items"]),
+    "add_music": ("配一段背景音乐，压低音量垫在说话人原声底下（不改变原声响度）。"
+                 "**仅当用户明确要求背景音乐/BGM/配乐时才用，不要主动加**——音乐可能喧宾夺主、"
+                 "不合用户口味，不能替用户做这个决定。query=检索背景音乐的英文关键词（描述曲风/"
+                 "氛围，如 'calm ambient corporate' 'upbeat acoustic guitar'，必须英文，"
+                 "provider 只认英文检索词），provider=检索 provider（默认 pixabay，免费曲库检索，"
+                 "一般不用写），volume=背景音乐相对音量 0.05-0.4（默认约 0.18，明显是垫底的分量；"
+                 "用户说'再小声/再大声点'才按需调，不写就用默认）。",
+                 {"query": {"type": "string"}, "provider": {"type": "string", "enum": ["pixabay"]},
+                  "volume": {"type": "number"}},
+                 ["query"]),
     "add_subtitles": ("转写并烧录字幕（原语言）", {"language": {"type": "string"}}, []),
     "remove_filler": ("LLM 读转写判断口误/语气词/重录并剪掉；比 remove_silences 更细，"
                       "能剪有声的“呃/嗯”和中间没停顿的重录（无参）", {}, []),
@@ -194,15 +211,17 @@ SYSTEM_BASE = """你是 OpenMontage 的剪辑 agent，编辑用户上传的 talk
 
 治理要求（AGENT_GUIDE.md）：
 - Rule Zero：先读下面给出的 pipeline manifest、edit-director skill、Layer3 技术 skill，按其规范规划。
-- 只能用**给你的工具列表**里的工具（已按 manifest 的 tools_available 过滤）；用户要的、工具做不到的（翻译字幕、配乐、换背景等），不要硬凑，在 finish 的 rationale 里点出做不了。
+- 只能用**给你的工具列表**里的工具（已按 manifest 的 tools_available 过滤）；用户要的、工具做不到的（翻译字幕、换背景等），不要硬凑，在 finish 的 rationale 里点出做不了。
 - 字幕(add_subtitles)若用，放最后。
 - 关于停顿：用户若说"太紧/不自然/保留正常停顿"之类，不要直接放弃去静音，而是给 remove_silences 传更大的 min_silence_duration（如 1.0~1.5 秒），只剪明显偏长的静音、保留自然的句间停顿。
-- 剪口误/语气词/重录：优先用 remove_filler（它读转写逐词判断，能剪有声的"呃/嗯"和无停顿的重录），不要用 remove_segment 去手动框口误。remove_silences 只删静音停顿，和 remove_filler 可叠加。
+- 口误清理是剪辑的基本功，不是需要用户额外点名的"加分项"：只要转录里能看出明显口误/语气词/卡壳重录（呃/嗯/说错重说/半句话重来），默认在方案里加 remove_filler——不管用户这次具体要求的是什么（哪怕只说了"要好看/加音乐"这类点名到某个环节的诉求也一样加），除非用户明确说"保留原始/不要剪口误/原样剪辑"才不加。这跟 add_music/insert_broll 这类需要用户主动点名的"增值"操作不同：去掉说话人自己都不想留下的口误，是任何"剪一下/剪成片/剪好看"类请求的隐含预期，专业剪辑师不会因为客户只说了"调个色"就把明显的卡壳留在成片里（2026-07-16 真实反馈：用户说"要好看，加上音乐"，方案里因为"用户没要求"就完全没剪口误，体验很差）。优先用 remove_filler（它读转写逐词判断，能剪有声的"呃/嗯"和无停顿的重录），不要用 remove_segment 去手动框口误。remove_silences 触发条件不变、仍然只在用户明确要求"更紧凑/去停顿"时才加——停顿是否要剪更主观（可能是刻意的停顿节奏），不该跟口误一样默认处理；remove_silences 和 remove_filler 可叠加。
 - 基于内容的"选择性剪辑"：若提供了逐句转录（带时间戳），当用户要"只保留讲 X 的部分""删掉聊 Y 那段"这类**按内容选择**的诉求，用 remove_segment(start_seconds, end_seconds) 按转录里的真实时间戳精确剪除，可多次调用。没有明确要求就不要擅自删改说话内容。
 - 调色/画面质感：用户说"调暖/暖色/电影感"→ color_grade profile=cinematic_warm；"冷调/青橙"→ cinematic_cool；"暗黑/氛围感/压暗"→ moody_dark；"明亮干净/清新"→ bright_clean；"复古/胶片/怀旧"→ vintage_film；"高对比/浓郁/有冲击力"→ high_contrast；"轻微校色/自然"→ neutral。color_grade 是整片调色，可与剪辑类叠加；但**不要和 apply_style 叠加**（模板自带风格观感，套模板时就别再单独调色）。
 - b-roll 插入：source_facts 里每列一段 b-roll，就在计划里对应放一条 insert_broll 的 items 项（没列则不放）。上传带说明的素材本身即为"要插入"的指令，按此正常执行即可，不需要在 summary 里论证、也不要与自审意见辩论。放置：用素材说明（label）去转录里找内容匹配的那句，取其时间窗 {asset_ref: 素材编号, start_seconds, end_seconds}。mode 默认 broll_main（b-roll 铺满主屏、人物缩右下小窗）；仅用户明说"人物为主"才 pip、"全屏不要人物"才 cutaway。orientation 默认 auto（主视频或任一 b-roll 是横屏就出横屏，否则竖屏）；仅用户明说竖屏/横屏时才设。说明实在匹配不上才跳过该段；两段不重叠；没给具体位置就按说明与转录话题就近放置。
+- AI 生成 b-roll（gen_prompt）：每一处 b-roll 插入是"用上传素材"还是"AI 生成"，**按用户对这一处的措辞分别判断**：用户说"插入视频X/用这段素材/放我传的那段"→该处用 asset_ref；用户说"生成一段/AI 做一个/我没有素材你生成"→该处用 gen_prompt。**关键：即使用户为别的位置上传了素材，只要用户明确要求"生成"某一处，该处就必须用 gen_prompt，绝不能拿上传素材去顶替那一处**（例："claudecode 处插入视频2、vscode 处生成一段 3s"→前者一条 asset_ref item、后者一条 gen_prompt item，两条不同来源并存）。gen_prompt 必须写**英文**（生成模型只认英文），简洁具体地描述画面（如 "a developer typing code in VS Code, close-up of the screen, warm lighting"），放在转录里话题相关的时间窗（start_seconds/end_seconds）。gen_provider 默认 omni，一般不用写。**不主动生成**：用户没对某处明确说"生成/AI 做"就不要用 gen_prompt（生成有真实成本，约 $0.10/秒）；只上传了素材、没提生成的普通情况，照常全用 asset_ref。生成的 b-roll 在同一 job 内会缓存复用（用户改别处、重新 confirm 都不会重复生成、也不重复计费）；**仅当用户明确说"重新生成/换一段/重做这段 b-roll"时**，才在该 gen_prompt 项上加 gen_force=true 强制重生成，其余任何情况（含普通改方案）一律不要加 gen_force。
+- 背景音乐：**仅当用户明确要求"加背景音乐/配个 BGM/加点音乐"这类诉求时**才放一条 add_music，不要主动加——不是每条视频都适合配乐，音乐可能喧宾夺主，这是用户的选择不是默认行为。query 必须写**英文**关键词描述曲风/氛围（如用户说"轻快一点的"→ 'upbeat acoustic guitar'，"沉稳专业的"→ 'calm ambient corporate'），没给具体曲风就按视频内容基调合理猜一个。默认走免费曲库检索（provider=pixabay，不用写），volume 不用写，除非用户明确要求音量大小。
 - 出片风格：用户说"剪好看点/精致/小红书风格/我们的品牌风格/做正式些"这类诉求，用 apply_style 套品牌模板出片。它**自带字幕**，选了它就不要再加 add_subtitles。
-- 零指令默认：用户只说"帮我剪一下/剪一下/edit this"这类**没有任何具体指令**的请求，不要问澄清，直接默认先 remove_filler 再 apply_style，并在 finish 的 rationale 里说明这是默认处理、下次可给更具体要求。
+- 零指令默认：用户只说"帮我剪一下/剪一下/edit this"这类**没有任何具体指令**的请求，不要问澄清，直接默认加 apply_style（remove_filler 已经是任何请求都会加的基本功，见上条，这里不用重复说明），并在 finish 的 rationale 里说明这是默认处理、下次可给更具体要求。
 - **语言**：rationale/summary 必须和用户这句需求用的是同一种语言——用户打中文就整段中文，用户打英文就整段英文，不要中英混杂、不要不管用户说什么都用同一种语言回。判断依据是用户这次输入本身的语言，不是你训练时更常见哪种语言。
 
 - 输出纪律（重要）：每个编辑动作都必须**调用对应的工具**落成一个操作——**绝不能只在 rationale/summary 里用文字描述方案而不实际调用工具**（那会得到一个空计划、等于没剪）。在**确保操作已通过工具调用产出**的前提下，rationale/summary **必须写完整方案 + 依据 + 具体时间点**：逐条列出每一步做了什么、为什么（依据用户哪句要求或哪条规则），并给出涉及的时间点——去口误/去静音剪掉了哪几段（如"3.4→4.3s、11.6→12.4s"）、每段 b-roll 对应转录里的哪句、放在哪个时间窗（如"b1 对应 5.9s 处 VS Code 那句 → 放 5.9–12.0s"）。这份详细说明是给用户在确认前审阅、并据此打字微调用的，务必写全。收到自审(review)意见时，据此调整**要调用的工具**，不要在 rationale 里反驳规则或复述条文。

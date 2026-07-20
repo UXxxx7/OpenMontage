@@ -59,23 +59,37 @@ def run_talking_head_pipeline(job: Job) -> dict[str, Any]:
     # apply_style 是重量级 Remotion 渲染（失败面多：模板/字体/依赖/props）；零指令默认
     # 是 [remove_filler, apply_style]，渲染挂了也必须把剪好的视频还给用户，而不是整单报错。
     # 后续 compose 段算子（color_grade / audio_enhance 等）落地时按需加进来。
+    # add_music 不在这个集合里——它被摘出 ordered_ops 单独在最后执行（见下方
+    # music_op 分支），有自己手写的一份对称重试+降级逻辑，不走这里的通用循环。
     _DEGRADABLE_OPS = {"apply_style", "insert_broll"}
 
     # 执行顺序：多个 remove_segment 按 start 降序“从后往前”切（转录给的是原始时间轴
     # 坐标；从后往前切，前面的刀就不会移动后面那刀之前的坐标）。其余视频操作保持原序，
-    # 字幕永远最后（要对剪过的时间轴转写）。
+    # 字幕永远最后（要对剪过的时间轴转写）。背景音乐更要放最后一步单独混——apply_style
+    # 内部有 audio_enhance（清人声降噪）子步骤，字幕烧录也要转写音频，音乐这时候要是
+    # 已经混进去了，会被降噪链路误伤、也会干扰转写准确度，必须晚于两者。
     subtitle_ops = [op for op in operations if op.get("type") == "add_subtitles"]
-    video_ops = [op for op in operations if op.get("type") != "add_subtitles"]
+    music_ops = [op for op in operations if op.get("type") == "add_music"]
+    video_ops = [op for op in operations if op.get("type") not in ("add_subtitles", "add_music")]
     removes = sorted(
         [op for op in video_ops if op.get("type") == "remove_segment"],
         key=lambda o: _num(o.get("start_seconds")) or 0.0, reverse=True,
     )
     others = [op for op in video_ops if op.get("type") != "remove_segment"]
     ordered_ops = removes + others
+    # presenter 模式：同一方案里 insert_broll 与 apply_style 并存时，让 b-roll 用
+    # cutaway 铺满卡片、人物交给模板在下方渲染（见 _op_insert_broll / _op_apply_style）。
+    # 先清掉上一轮残留的 _presenter.json，避免改方案后放出"幽灵人物小窗"。
+    (job_dir / "_presenter.json").unlink(missing_ok=True)
+    if any(o.get("type") == "apply_style" for o in ordered_ops):
+        for _o in ordered_ops:
+            if _o.get("type") == "insert_broll":
+                _o["_presenter"] = True
     if len(removes) > 1:
         logger.info(f"  {len(removes)} 段 remove_segment 将按起点降序执行（防时间轴错位）")
 
     subtitle_op: Optional[dict] = subtitle_ops[0] if subtitle_ops else None
+    music_op: Optional[dict] = music_ops[0] if music_ops else None
 
     for op in ordered_ops:
         op_type = op.get("type", "")
@@ -88,13 +102,21 @@ def run_talking_head_pipeline(job: Job) -> dict[str, Any]:
         try:
             new_src = handler(src, op, job_dir)
         except Exception as e:
-            if op_type in _DEGRADABLE_OPS:
-                logger.warning(
-                    f"    {op_type}: 执行失败，优雅降级——保留上一步结果继续交付。原因: {e}"
-                )
-                degraded.append(op_type)
-                continue
-            raise
+            # 先自动重试一次再谈降级：渲染类失败里有一部分是瞬时的（资源争抢、
+            # 子进程偶发），一次重试能白捡回来；确定性失败则重试也快（在同一
+            # 个错误上再挂一次），代价可控。
+            logger.warning(f"    {op_type}: 执行失败，自动重试一次。原因: {e}")
+            try:
+                new_src = handler(src, op, job_dir)
+            except Exception as e2:
+                if op_type in _DEGRADABLE_OPS:
+                    logger.warning(
+                        f"    {op_type}: 重试仍失败，降级——保留上一步结果继续交付"
+                        f"（会显性告知用户，非静默）。原因: {e2}"
+                    )
+                    degraded.append(op_type)
+                    continue
+                raise
         if new_src and Path(new_src).exists() and str(Path(new_src).resolve()) != str(Path(src).resolve()):
             after = _probe_duration(Path(new_src))
             logger.info(f"    {op_type}: 时长 {before:.1f}s → {after:.1f}s"
@@ -111,6 +133,25 @@ def run_talking_head_pipeline(job: Job) -> dict[str, Any]:
             src = str(new_src)
             applied.append("add_subtitles")
 
+    if music_op is not None:
+        logger.info("  执行操作: add_music")
+        try:
+            new_src = _op_add_music(src, music_op, job_dir)
+        except Exception as e:
+            logger.warning(f"    add_music: 执行失败，自动重试一次。原因: {e}")
+            try:
+                new_src = _op_add_music(src, music_op, job_dir)
+            except Exception as e2:
+                logger.warning(
+                    f"    add_music: 重试仍失败，降级——保留无背景音乐的版本继续交付"
+                    f"（会显性告知用户，非静默）。原因: {e2}"
+                )
+                new_src = None
+                degraded.append("add_music")
+        if new_src and Path(new_src).exists():
+            src = str(new_src)
+            applied.append("add_music")
+
     # 定稿为 preview.mp4
     if Path(src).resolve() != preview_path.resolve():
         shutil.copyfile(src, preview_path)
@@ -118,12 +159,14 @@ def run_talking_head_pipeline(job: Job) -> dict[str, Any]:
     duration = _probe_duration(preview_path)
     if degraded:
         logger.warning(f"=== 降级交付: {job.id} 跳过失败的 {degraded}，交付上一步结果 ===")
+    generation_cost = _read_generation_cost(job_dir)
     logger.info(f"=== 管线完成: {job.id} → {preview_path} ({duration:.1f}s), 应用: {applied} ===")
     return {
         "preview_path": str(preview_path),
         "duration": duration,
         "applied_operations": applied,
         "degraded_operations": degraded,
+        "generation_cost_usd": generation_cost,
     }
 
 
@@ -761,11 +804,40 @@ def _op_insert_broll(src: str, op: dict, workdir: Path) -> Optional[str]:
         ref = it.get("asset_ref")
         start = _num(it.get("start_seconds"))
         end = _num(it.get("end_seconds"))
-        if ref is None or start is None or end is None or end <= start:
+        has_gen = bool(it.get("gen_prompt"))
+        if start is None or end is None or end <= start:
             continue
-        matches = sorted(assets_dir.glob(f"broll_{ref}.*"))
+        if ref is None and not has_gen:
+            continue
+        ref_key = ref if ref is not None else f"gen{int(round(start))}s"
+        # gen_force：用户明确要重新生成时，先删掉本 job 已缓存的生成片再重生成。
+        # 仅对纯生成项（ref is None）生效——绝不删用户上传的素材；并按真值语义判断，
+        # 避免字符串 "false" 被当成真而误触发重生成。
+        _fv = it.get("gen_force")
+        _force = (_fv.strip().lower() in ("true", "1", "yes")) if isinstance(_fv, str) else bool(_fv)
+        if has_gen and ref is None and _force:
+            for _stale in assets_dir.glob(f"broll_{ref_key}.*"):
+                try:
+                    _stale.unlink()
+                except OSError:
+                    pass
+        matches = sorted(assets_dir.glob(f"broll_{ref_key}.*"))
+        if matches and has_gen:
+            logger.info(f"  insert_broll: 复用已生成的 b-roll {matches[0].name}（同一 job 不重复生成，省成本）")
+        # gen_prompt: 没上传素材但给了文字 prompt 且无缓存 → 用所选 provider 生成一段再合成
+        if not matches and has_gen:
+            from .broll_providers import generate_broll_via
+            assets_dir.mkdir(parents=True, exist_ok=True)
+            _gen_out = assets_dir / f"broll_{ref_key}.mp4"
+            _gen_result = generate_broll_via(it.get("gen_provider", "omni"), it["gen_prompt"], _gen_out,
+                                             aspect=("9:16" if base_h >= base_w else "16:9"))
+            if _gen_result:
+                matches = [_gen_out]
+                _record_generation_cost(workdir, f"insert_broll[{ref_key}]", _gen_result.get("cost_usd") or 0.0)
+            else:
+                logger.warning(f"  insert_broll: gen_prompt 生成失败（provider={it.get('gen_provider','omni')}），跳过该段")
         if not matches:
-            logger.warning(f"  insert_broll: 找不到资产 broll_{ref}.*，跳过")
+            logger.warning(f"  insert_broll: 找不到资产 broll_{ref_key}.*，跳过")
             continue
         asset = matches[0]
         is_image = asset.suffix.lower() in _BROLL_IMG_EXTS
@@ -785,6 +857,19 @@ def _op_insert_broll(src: str, op: dict, workdir: Path) -> Optional[str]:
     if not resolved:
         return None
 
+    # presenter 模式：把 broll_main 项转成 cutaway（卡片只放 b-roll、不烧人物），
+    # 并记下人物视频与各 b-roll 时间窗，交给 apply_style 在模板下方渲染人物小窗。
+    if op.get("_presenter"):
+        _pwins = []
+        for _r in resolved:
+            if _r["mode"] == "broll_main":
+                _r["mode"] = "cutaway"
+                _pwins.append({"start": _r["start"], "end": _r["end"]})
+        if _pwins:
+            (workdir / "_presenter.json").write_text(
+                json.dumps({"person_src": Path(src).name, "windows": _pwins}, ensure_ascii=False),
+                encoding="utf-8")
+
     orientation = str(op.get("orientation") or "auto").lower()
     if orientation not in ("portrait", "landscape"):
         orientation = "landscape" if any_landscape else "portrait"
@@ -793,6 +878,83 @@ def _op_insert_broll(src: str, op: dict, workdir: Path) -> Optional[str]:
     out = workdir / "_op_insert_broll.mp4"
     _composite_broll(src, resolved, out, out_w, out_h,
                      ins_h=round(out_h * 0.28), margin=round(out_w * 0.03))
+    return str(out)
+
+
+def _has_audio_stream(path: str) -> bool:
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries",
+             "stream=index", "-of", "csv=p=0", path],
+            capture_output=True, text=True,
+        )
+        return bool((r.stdout or "").strip())
+    except Exception:
+        return False
+
+
+def _op_add_music(src: str, op: dict, workdir: Path) -> Optional[str]:
+    """配一段背景音乐，压低音量混进原声底下（保留说话人原声不变响）。
+
+    **仅当用户明确要求背景音乐/BGM/配乐时才会被规划器放进方案**（见
+    agent_editor.py 的触发说明）——不是默认行为，音乐会喧宾夺主也可能不合
+    用户口味，不能替用户做这个决定。
+
+    失败（provider 找不到匹配曲目、ffmpeg 混音出错）一律 raise，交给上面
+    已有的 _DEGRADABLE_OPS 降级交付逻辑处理——不静默丢失这一步，用户会
+    在预览消息里被明确告知"背景音乐没配成，可回复 retry 重试"。
+    """
+    query = (op.get("query") or "").strip()
+    if not query:
+        return None
+
+    from .music_providers import fetch_music_via
+    music_path = workdir / "_bgm_source.mp3"
+    result = fetch_music_via(op.get("provider", "pixabay"), query, music_path)
+    if not result:
+        raise RuntimeError(f"add_music: 没找到匹配「{query}」的背景音乐")
+
+    duration = _probe_duration(Path(src))
+    if duration <= 0:
+        raise RuntimeError("add_music: 无法读取主视频时长")
+
+    # 音量：默认压到约 -15dB，明显是"底下垫着"的分量，不盖过说话人原声。
+    # 用户如果具体说了"再小声点/再大声点"，规划器可以给 op.volume 覆盖，
+    # 夹在合理区间内防止误设成 0（听不见）或 1（跟原声一样响、糊成一团）。
+    vol = _num(op.get("volume"))
+    vol = min(max(vol, 0.05), 0.4) if vol else 0.18
+
+    fade_in = min(1.5, duration / 6)
+    fade_out = min(2.0, duration / 4)
+    fade_out_start = max(0.0, duration - fade_out)
+
+    out = workdir / "_op_add_music.mp4"
+    music_chain = (
+        f"[1:a]volume={vol}[mv];"
+        f"[mv]atrim=0:{duration:.3f}[mt];"
+        f"[mt]afade=t=in:st=0:d={fade_in:.2f}[mfi];"
+        f"[mfi]afade=t=out:st={fade_out_start:.2f}:d={fade_out:.2f}[bgm]"
+    )
+    if _has_audio_stream(src):
+        filter_complex = f"{music_chain};[0:a][bgm]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]"
+        audio_map = "[aout]"
+    else:
+        # 主视频没有音轨（罕见，防御性分支）：背景音乐就是唯一音轨，不用混音
+        filter_complex = music_chain
+        audio_map = "[bgm]"
+
+    cmd = [
+        "ffmpeg", "-y", "-i", src, "-stream_loop", "-1", "-i", str(music_path),
+        "-filter_complex", filter_complex,
+        "-map", "0:v", "-map", audio_map,
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+        "-shortest", str(out),
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if r.returncode != 0 or not out.exists():
+        raise RuntimeError(f"add_music: ffmpeg 混音失败: {(r.stderr or '')[-300:]}")
+
+    _record_generation_cost(workdir, "add_music", result.get("cost_usd") or 0.0)
     return str(out)
 
 
@@ -839,7 +1001,7 @@ def _composite_broll(src: str, resolved: list, out: Path,
             fc.append(f"[{cur}][bro{i}]overlay=0:0:enable='between(t,{s},{e})'[c{i}]")
         else:  # broll_main：先铺满，再叠人物小窗
             fc.append(f"[{cur}][bro{i}]overlay=0:0:enable='between(t,{s},{e})'[m{i}]")
-            fc.append(f"[m{i}][insv{i}]overlay=W-w-{margin}:H-h-{margin}:enable='between(t,{s},{e})'[c{i}]")
+            fc.append(f"[m{i}][insv{i}]overlay=W-w-{margin}:H*0.70-h:enable='between(t,{s},{e})'[c{i}]")
         cur = f"c{i}"
     fc.append(f"[{cur}]null[outv]")
     # 输出时长钉在主视频长度：b-roll 用 setpts 偏移后其流可能比主视频长（overlay 默认跟
@@ -1359,14 +1521,40 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
 
     remotion_dir = Path(config.openmontage_root) / "remotion-composer"
     job_slug = workdir.name
-    public_video_rel = f"jobs/{job_slug}/source.mp4"
-    public_video_abs = remotion_dir / "public" / "jobs" / job_slug / "source.mp4"
-    public_video_abs.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(src, public_video_abs)
+    # 素材不再拷进 remotion public/：预打包 bundle 是 public/ 的打包时快照，
+    # 打包后 staged 的素材看不见（整类 404 事故的根源，含 7-10 那次）。改走
+    # 本机 API 的 /files 路由（SpeakerCard 对 http 开头的 src 直接透传），
+    # bundle 从此纯只读共享——没有素材同步问题，也没有 public/jobs 无限膨胀。
+    video_src_url = f"{config.local_api_base}/files/{job_slug}/{Path(src).name}"
 
     # 人脸裁剪校准是确定性的（同一段视频每次算出来的结果一样），跟内容规划反馈
     # 无关，只需要在下面的重试闭包外面算一次——重试它只会得到一模一样的值。
     speaker_object_position = op.get("speaker_object_position") or calibrate_speaker_object_position(src, workdir)
+
+    # presenter：insert_broll 以 presenter 模式跑过时留下的人物视频+时间窗，
+    # 渲染成模板下方的人物小窗（卡片此时只放 b-roll，人脸不再烧进画面被裁）。
+    presenter_prop = None
+    _presenter_meta = workdir / "_presenter.json"
+    if _presenter_meta.exists():
+        try:
+            _pm = json.loads(_presenter_meta.read_text(encoding="utf-8"))
+            _psrc = _pm.get("person_src")
+            _pwins = [
+                {"fromFrame": max(0, round(float(w["start"]) * 30)),
+                 "toFrame": max(0, round(float(w["end"]) * 30))}
+                for w in (_pm.get("windows") or [])
+                if w.get("start") is not None and w.get("end") is not None
+            ]
+            if _psrc and _pwins:
+                presenter_prop = {
+                    "src": f"{config.local_api_base}/files/{job_slug}/{_psrc}",
+                    "windows": _pwins,
+                    "x": 604, "y": 1270, "w": 400, "h": 440, "radius": 28,
+                    "objectPosition": speaker_object_position,
+                }
+        except Exception as _e:
+            logger.warning(f"  apply_style: presenter 元数据解析失败，跳过下方人物小窗: {_e}")
+
     props_path = workdir / "_op_apply_style_props.json"
 
     def _build(feedback: Optional[str] = None) -> dict[str, Any]:
@@ -1423,7 +1611,7 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         scenes, speaker_opacity = _mode_schedule_to_scenes(mode_schedule)
 
         props: dict[str, Any] = {
-            "videoSrc": public_video_rel,
+            "videoSrc": video_src_url,
             "durationSeconds": duration,
             "colorMode": op.get("colorMode", "warm"),
             "speakerObjectPosition": speaker_object_position,
@@ -1434,6 +1622,8 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         }
         if speaker_opacity:
             props["opacityKeyframes"] = speaker_opacity
+        if presenter_prop:
+            props["presenter"] = presenter_prop
         if plan_sections:
             props["sections"] = plan_sections
         if plan_quotes:
@@ -1579,8 +1769,8 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         qr_input = op.get("qr_contact") or {}
         if qr_input.get("contact_url"):
             from .qr_gen import generate_qr
-            qr_rel = f"jobs/{job_slug}/qr.png"
-            qr_abs = remotion_dir / "public" / qr_rel
+            # 同 videoSrc：生成进任务目录、走 /files 伺服，不进 remotion public/
+            qr_abs = workdir / "qr.png"
             if generate_qr(qr_input["contact_url"], qr_abs):
                 # Priority 1 (root fix): content_planner detected the actual
                 # moment the speaker says "WhatsApp me"/"scan the QR code"/etc
@@ -1621,7 +1811,7 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
                         default_mount = max(0, round(duration * 30) - 200)
                         default_x, default_y, default_w = 80, 780, 920
                 qr_contact: dict[str, Any] = {
-                    "qrSrc": qr_rel,
+                    "qrSrc": f"{config.local_api_base}/files/{job_slug}/qr.png",
                     "contactName": qr_input.get("contact_name", ""),
                     "ctaLabel": qr_input.get("cta_label", "WhatsApp Now"),
                     "mountFrame": qr_input.get("mount_frame", default_mount),
@@ -1771,7 +1961,7 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
     out = workdir / "_op_styled.mp4"
     npx_bin = shutil.which("npx") or "npx"  # Windows: subprocess needs the resolved npx.cmd, plain "npx" raises WinError 2
     from .remotion_bundle import ensure_remotion_bundle
-    bundle = ensure_remotion_bundle(remotion_dir, job_slug=job_slug)
+    bundle = ensure_remotion_bundle(remotion_dir)
     # props_path/out must be absolute — this subprocess runs with cwd=remotion_dir,
     # so a relative path (e.g. "storage/jobs/<id>/_op_apply_style_props.json")
     # resolves against remotion-composer/ instead of the repo root, and Remotion
@@ -1824,6 +2014,8 @@ _OP_HANDLERS: dict[str, Callable[[str, dict, Path], Optional[str]]] = {
     "reframe": _op_reframe,
     "color_grade": _op_color_grade,
     "insert_broll": _op_insert_broll,
+    # add_music 不在这里注册——和 add_subtitles 一样被摘出主循环单独在最后执行
+    # （见 run_talking_head_pipeline 里的 music_op 分支），不走通用 handler 派发。
     "apply_style": _op_apply_style,
     # add_subtitles 在主流程末尾单独处理（需要先转写）；apply_style 已经自带
     # 转写+字幕烧录，跟 add_subtitles 同时出现时 planner 应该只选一个。
@@ -1833,6 +2025,37 @@ _OP_HANDLERS: dict[str, Callable[[str, dict, Path], Optional[str]]] = {
 # ============================================================================
 # 辅助
 # ============================================================================
+
+# AI 生成花的真金白银（b-roll/背景音乐等）落一个 job 内共享的账本文件，而不是
+# 用模块级变量——op handler 之间没有别的共享状态通道，模块级变量在多个任务
+# 并发跑（WA_WORKER_CONCURRENCY>1）时会互相污染，文件按 job_dir 天然隔离。
+_COST_LEDGER_NAME = "_generation_costs.json"
+
+
+def _record_generation_cost(workdir: Path, source: str, cost_usd: float) -> None:
+    if not cost_usd:
+        return
+    ledger_path = workdir / _COST_LEDGER_NAME
+    entries = []
+    if ledger_path.exists():
+        try:
+            entries = json.loads(ledger_path.read_text(encoding="utf-8"))
+        except Exception:
+            entries = []
+    entries.append({"source": source, "cost_usd": round(cost_usd, 4)})
+    ledger_path.write_text(json.dumps(entries, ensure_ascii=False), encoding="utf-8")
+
+
+def _read_generation_cost(workdir: Path) -> float:
+    ledger_path = workdir / _COST_LEDGER_NAME
+    if not ledger_path.exists():
+        return 0.0
+    try:
+        entries = json.loads(ledger_path.read_text(encoding="utf-8"))
+        return round(sum(e.get("cost_usd", 0) for e in entries), 4)
+    except Exception:
+        return 0.0
+
 
 def _probe_duration(path: Path) -> float:
     try:

@@ -11,6 +11,7 @@ from sqlalchemy import (
     Column,
     DateTime,
     Enum as SAEnum,
+    Float,
     ForeignKey,
     Integer,
     String,
@@ -110,6 +111,17 @@ class Job(Base):
 
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
+    # 非致命失败被跳过的操作（JSON list，如 ["apply_style"]）。Node 网关靠它
+    # 在预览消息里如实告知用户"哪步没成、当前版本缺什么、可回复 retry"——
+    # 此前这信息只活在管线返回值里，Python 侧的提醒又走的是死代码发送路径，
+    # 用户从头到尾被蒙在鼓里。
+    degraded_operations: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # AI 生成花的真金白银累计（b-roll/背景音乐等，来自 pipeline_runner 的
+    # 成本账本）。Node 网关靠它在预览消息里如实告知花费，防止用户/团队
+    # 完全看不到生成类操作的真实成本。
+    generation_cost_usd: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime, default=datetime.datetime.utcnow
     )
@@ -181,6 +193,12 @@ def _migrate_schema(engine) -> None:
     if "assets" not in cols:
         with engine.begin() as conn:
             conn.execute(_text("ALTER TABLE jobs ADD COLUMN assets TEXT"))
+    if "degraded_operations" not in cols:
+        with engine.begin() as conn:
+            conn.execute(_text("ALTER TABLE jobs ADD COLUMN degraded_operations TEXT"))
+    if "generation_cost_usd" not in cols:
+        with engine.begin() as conn:
+            conn.execute(_text("ALTER TABLE jobs ADD COLUMN generation_cost_usd FLOAT"))
 
 
 def _init_engine() -> None:

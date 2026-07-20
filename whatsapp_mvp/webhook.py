@@ -581,9 +581,39 @@ async def get_job_endpoint(job_id: str):
         # edit_request 是用户自己敲的原话，是最可靠的语言信号——之前没往外
         # 暴露，Node 只能瞎猜或者写死一种语言。
         "edit_request": job.edit_request,
+        # 非致命失败被跳过的操作（如 ["apply_style"]）。Node 侧预览消息靠它
+        # 如实告知"哪步没成 + 可回复 retry"，不再静默交付半成品。
+        "degraded_operations": json.loads(job.degraded_operations) if job.degraded_operations else [],
+        # AI 生成累计花费（b-roll/背景音乐等）。Node 侧预览消息靠它如实告知
+        # 用户/团队这单实际花了多少钱，不再是"哪儿都看不见"的隐性支出。
+        "generation_cost_usd": job.generation_cost_usd or 0.0,
         "created_at": job.created_at.isoformat() if job.created_at else None,
         "updated_at": job.updated_at.isoformat() if job.updated_at else None,
     }
+
+
+@app.post("/jobs/{job_id}/retry")
+async def retry_job_endpoint(job_id: str):
+    """按原方案整单重跑管线。给两类场景用：预览里有降级步骤（用户回复 retry
+    要完整效果），或整单 ERROR 后想再试一次。与 /revise 的区别：不改方案，
+    只重执行。"""
+    job = get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    # 幂等：正在跑就直接返回，避免 Node 队列重试触发双跑
+    if job.status in (JobStatus.RUNNING_PIPELINE, JobStatus.RENDERING):
+        return {"job_id": job_id, "status": job.status.value}
+    if job.status not in (JobStatus.PREVIEW_READY, JobStatus.ERROR, JobStatus.DONE):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Job is in {job.status.value}, cannot retry",
+        )
+    if not job.planned_edit:
+        raise HTTPException(status_code=400, detail="Job has no edit plan to retry")
+    update_job_fields(job_id, status=JobStatus.RUNNING_PIPELINE,
+                      error_message=None, degraded_operations=None, generation_cost_usd=None)
+    _run_in_background(_enqueue_pipeline, job_id)
+    return {"job_id": job_id, "status": "RUNNING_PIPELINE"}
 
 
 @app.post("/jobs/{job_id}/confirm")

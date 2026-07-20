@@ -98,6 +98,11 @@ app.post(["/webhook", "/webhook/whatsapp"], async (req, res) => {
     return res.sendStatus(401);
   }
   const messages = extractMessages(req.body);
+  // 先回 200 再处理（Meta 官方要求快速 ACK）：此前是处理完才返回，处理链里
+  // 有 Graph API 直发回执等慢操作，一旦超过 Meta 的等待窗口，这次投递会被
+  // 记为失败进重试队列——之后带着延迟补投回来，变成"幽灵消息"（2026-07-14
+  // 实测事故：换隧道空窗期滞留的旧视频事件在 4 分钟后补投，开出了并行重复任务）。
+  res.sendStatus(200);
   for (const message of messages) {
     try {
       await handleMessage(message);
@@ -105,7 +110,6 @@ app.post(["/webhook", "/webhook/whatsapp"], async (req, res) => {
       console.error("[webhook] handleMessage error:", err.message);
     }
   }
-  return res.sendStatus(200);
 });
 
 async function handleMessage(message) {
@@ -124,6 +128,21 @@ async function handleMessage(message) {
   if (!seen) {
     console.log(`[webhook] duplicate or timeout: ${msgId}`);
     return;
+  }
+
+  // 陈旧消息过滤：Meta 对投递失败的事件会排队重试（可长达数天），且补投
+  // 不保证沿用原消息 ID——仅靠 msgId 去重挡不住。隧道换址/服务重启的空窗
+  // 期滞留的旧消息，会在恢复后成批补投进来：几小时前的"发视频"现在才到，
+  // 用户视角就是机器人无缘无故自己开新单（2026-07-14 实测事故）。消息自带
+  // 用户发送时刻的 timestamp（epoch 秒），超龄直接丢弃。
+  const sentAt = Number(message.timestamp || 0);
+  const maxAgeS = Number(env("WA_MAX_MESSAGE_AGE_S", "600"));
+  if (sentAt && maxAgeS > 0) {
+    const ageS = Math.round(Date.now() / 1000 - sentAt);
+    if (ageS > maxAgeS) {
+      console.log(`[webhook] stale message dropped: ${msgId} age=${ageS}s type=${msgType}`);
+      return;
+    }
   }
 
   console.log(`[webhook] from=${waNumber} type=${msgType}`);
@@ -188,9 +207,19 @@ async function handleMessage(message) {
     if (awaitingChoice || pendingCount > 0) {
       // 任何阶段都允许取消（含“选主视频”阶段 —— 修 #5）
       if (cancelWords.includes(normalized)) {
+        // "cancel" 本身是裸指令词，不带语言信息（resolveLang 设计上会正确
+        // 跳过它）——真正的信号在已收集素材的配文里，但 collectKey 这行
+        // 删完 worker 那边就再也读不到了，必须在删除前把配文取出来一起
+        // 传过去，不然只能退回默认语言（2026-07-15 实测：英文配文传视频后
+        // 回 cancel，收到的是中文回执）。
+        let captionSignal;
+        try {
+          const items = (await redis.lrange(collectKey(waNumber), 0, -1)).map((s) => JSON.parse(s));
+          captionSignal = items.map((i) => i.caption).find((c) => c);
+        } catch {}
         await redis.del(collectKey(waNumber));
         await redis.del(awaitChoiceKey(waNumber));
-        await videoQueue.add("collect-cancel", { waNumber, text, msgId }, queueOptions(msgId));
+        await videoQueue.add("collect-cancel", { waNumber, text, captionSignal, msgId }, queueOptions(msgId));
         return;
       }
       // 选主视频阶段：期待一个编号，交给 worker 校验并建任务
@@ -217,6 +246,11 @@ async function handleMessage(message) {
     }
     if (activeJobId && ["export", "final", "render"].includes(normalized)) {
       await videoQueue.add("render-job", { waNumber, jobId: activeJobId, msgId }, queueOptions(msgId));
+      return;
+    }
+    // 按原方案整单重跑——预览有降级步骤（消息里已提示可 retry）或想再试一次
+    if (activeJobId && ["retry", "重试"].includes(normalized)) {
+      await videoQueue.add("retry-job", { waNumber, jobId: activeJobId, text, msgId }, queueOptions(msgId));
       return;
     }
     if (activeJobId && ["cancel", "no", "stop"].includes(normalized)) {

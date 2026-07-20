@@ -20,6 +20,33 @@
       "type": "string",
       "description": "Path relative to remotion-composer/public/, e.g. jobs/<slug>/source.mp4"
     },
+    "presenter": {
+      "type": "object",
+      "description": "[presenter mode] speaker inset shown in the lower zone during b-roll windows; the card shows b-roll full-bleed. Written by the pipeline when insert_broll + apply_style co-occur.",
+      "required": ["src", "windows"],
+      "additionalProperties": false,
+      "properties": {
+        "src": { "type": "string" },
+        "windows": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["fromFrame", "toFrame"],
+            "additionalProperties": false,
+            "properties": {
+              "fromFrame": { "type": "integer", "minimum": 0 },
+              "toFrame": { "type": "integer", "minimum": 0 }
+            }
+          }
+        },
+        "x": { "type": "number" },
+        "y": { "type": "number" },
+        "w": { "type": "number" },
+        "h": { "type": "number" },
+        "radius": { "type": "number" },
+        "objectPosition": { "type": "string" }
+      }
+    },
     "durationSeconds": {
       "type": "number",
       "exclusiveMinimum": 0,

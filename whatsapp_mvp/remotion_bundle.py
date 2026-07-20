@@ -2,12 +2,21 @@
 #
 # `npx remotion still/render` 每次调用都会现场 bundle 整个工程（实测 20-40s）。
 # 一个任务的 QA stills（5-6 张，视觉重试后 8-12 张）+ 整片渲染 = 同一份代码
-# 被反复打包十来次，占掉任务总时长的一大块；两任务并发时这些打包还要过
-# RENDER_SLOTS 闸门排队，互相放大等待。
+# 被反复打包十来次，占掉任务总时长的一大块。预打包到 build/ 后所有 still/
+# render 直接吃 bundle 目录，跳过打包；src/ 有改动（mtime 更新）时自动重建。
 #
-# 解法：`npx remotion bundle` 预打包到 build/，之后所有 still/render 直接吃
-# bundle 目录，跳过打包。src/ 有改动（mtime 更新）时自动重新打包。打包失败
-# 返回 None，调用方回退到原始的按次打包路径——这只是加速器，不是新依赖。
+# 2026-07-10 事故（真实发生，非假设）：旧版本 `--out-dir build` 直接往正在
+# 被别的调用读取的同一个目录里现场重写文件——一次开发环境下的手动 bundle
+# 测试撞上了一个正在跑的真实任务，QA stills 六张全部渲染失败（不是画质问题，
+# 是执行失败），apply_style 整体失败，优雅降级把没套模板的半成品当成品发给
+# 了用户，且没有任何报错——降级机制把这个真实 bug 悄悄兜住了。
+#
+# 现在的做法：build/ 是一个符号链接，从不就地重写；每次重建都产出全新的
+# 不可变目录（.bundle-cache/<generation>/），成功后原子性地把符号链接切过
+# 去。正在读旧目录的调用完全不受影响（inode 还在，直到没人可能还在用了才
+# 清理，保留最近两代）；新调用总是拿到一个完整一致的目录，不存在"读到一半"
+# 的中间状态。重建本身还过一把跨进程文件锁（fcntl.flock）——威胁模型不止
+# "我自己手动测试"，还包括多个 worker 进程、队友在另一台机器上开发。
 
 from __future__ import annotations
 
@@ -16,13 +25,16 @@ import shutil
 import subprocess
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-_BUNDLE_LOCK = threading.Lock()
 _BUNDLE_TIMEOUT_S = 300
+_CACHE_DIRNAME = ".bundle-cache"
+_KEEP_GENERATIONS = 2  # 当前 + 上一代，保证切换瞬间仍在读上一代的调用不会被清理坑掉
+_PROC_LOCK = threading.Lock()  # 同进程内的双重检查锁；跨进程保护见 _cross_process_lock
 
 
 def _clean_stale_build_artifacts(remotion_dir: Path, build: Path) -> None:
@@ -32,15 +44,13 @@ def _clean_stale_build_artifacts(remotion_dir: Path, build: Path) -> None:
     中途被打断——例如进程被杀、机器休眠、渲染超时——没跑到改名那一步就留下的
     半成品）或被外部进程（杀毒软件扫描/资源管理器/编辑器）占着句柄时，Windows
     会拒绝这次改名，报 `[WinError 5] 拒绝访问`；Linux/macOS 不受影响。
-    `_BUNDLE_LOCK` 只挡得住同一个 Python 进程内的并发重建，挡不住上一次进程
+    `_PROC_LOCK`/`_cross_process_lock` 只挡得住并发重建，挡不住上一次进程
     崩溃/被杀留下的残留目录——这正是本会话里我自己 `taskkill` 一个卡住的
-    验证脚本时会造成的那种残留，如果它当时恰好在重建 bundle。
-
-    这里只处理"最常见、最能靠代码解决"的一种：主动清掉上一次遗留的
-    `.build.tmp-*` 临时目录，重建前给改名腾出干净的落点——不清 `build` 本身，
-    因为 `build` 存在且够新的时候是合法的缓存复用路径（见调用方的 marker
-    检查），乱删会把有效缓存也删掉。外部进程持有的持续性文件锁没法在代码里
-    解决（原文档已经写明，删了要重启程序才能清句柄），仍需要人工按文档处理。
+    验证脚本时会造成的那种残留，如果它当时恰好在重建 bundle。新架构下每次
+    重建都用带随机后缀的 `tmp_link` 名字（见 ensure_remotion_bundle），单次
+    重建不会撞上自己的残留，但历史崩溃留下的 `.build.tmp-*` 目录不会自己
+    消失，会在 remotion_dir 里一直堆着——这里在每次重建前顺手清一遍，避免
+    无限堆积。
     """
     for stale in remotion_dir.glob(".build.tmp-*"):
         try:
@@ -64,78 +74,163 @@ def _src_mtime(remotion_dir: Path) -> float:
     return newest
 
 
-def _sync_job_public_assets(remotion_dir: Path, build: Path, job_slug: str) -> None:
-    """`npx remotion bundle` snapshots public/ into build/public/ once, at
-    bundle time — it has no idea a new job's video/qr/etc. landed in
-    public/jobs/<job_slug>/ afterward. Every job after the one that happened
-    to be running during the last bundle rebuild would 404 fetching its own
-    source.mp4 from the stale snapshot (confirmed real production bug: this
-    silently degraded apply_style to the bare unstyled cut on most jobs, not
-    just some — a source-code-triggered rebuild only ever refreshes the
-    snapshot for whichever single job is running at that exact moment).
-    Cheap to always re-sync (one job's few-MB folder, not the whole public
-    dir) rather than trying to detect staleness.
-    """
-    src = remotion_dir / "public" / "jobs" / job_slug
-    if not src.exists():
-        return
-    dest = build / "public" / "jobs" / job_slug
-    dest.mkdir(parents=True, exist_ok=True)
-    for f in src.iterdir():
-        if f.is_file():
-            shutil.copy2(f, dest / f.name)
+def _resolve_current(build_link: Path, src_time: float) -> Optional[Path]:
+    """build 当前指向的目录，若存在且够新则返回其真实路径，否则 None。"""
+    if not build_link.is_symlink() and not build_link.exists():
+        return None
+    try:
+        target = build_link.resolve()
+    except OSError:
+        return None
+    marker = target / "index.html"
+    if target.is_dir() and marker.exists() and marker.stat().st_mtime >= src_time:
+        return target
+    return None
 
 
-def ensure_remotion_bundle(remotion_dir: Path, job_slug: Optional[str] = None) -> Optional[str]:
-    """返回可直接喂给 still/render 的 bundle 目录；不可用时返回 None。
+def _cross_process_lock(lock_path: Path):
+    """跨进程互斥：多个 RQ worker 进程、或开发者手动执行的重建命令，都可能
+    与正在运行的服务同时触碰 bundle。Windows 没有 fcntl——明确降级为只在
+    本进程内互斥，写清楚而不是假装覆盖了（队友在 Windows 上部署多进程前
+    需要补 msvcrt 版本的锁）。"""
+    try:
+        import fcntl
+    except ImportError:
+        logger.warning(
+            "  remotion: 本机无 fcntl（Windows），bundle 重建只在本进程内互斥，"
+            "跨进程仍可能竞争"
+        )
 
-    job_slug: 若指定，确保这个任务的 public/jobs/<job_slug> 资源在 bundle 里
-    是最新的（见 _sync_job_public_assets）——跟是否需要整体重新打包无关。
-    """
+        class _NoopLock:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        return _NoopLock()
+
+    class _FlockLock:
+        def __enter__(self):
+            self._f = open(lock_path, "w")
+            fcntl.flock(self._f, fcntl.LOCK_EX)
+            return self
+
+        def __exit__(self, *a):
+            fcntl.flock(self._f, fcntl.LOCK_UN)
+            self._f.close()
+            return False
+
+    return _FlockLock()
+
+
+def _cleanup_old_generations(cache_dir: Path, keep: set[str]) -> None:
+    gens = sorted(
+        (p for p in cache_dir.iterdir() if p.is_dir() and p.name not in keep),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for stale in gens:
+        shutil.rmtree(stale, ignore_errors=True)
+
+
+# 注：曾有一个 sync_public_asset() 把每单素材补写进 bundle 的 public/ 快照
+# （修"打包后 staged 的素材 404"）。现已被更彻底的方案取代：素材根本不进
+# public/，videoSrc/qrSrc 直接走本机 API 的 /files 路由（SpeakerCard 等组件
+# 对 http 开头的 src 透传），bundle 从此纯只读共享。
+
+
+def ensure_remotion_bundle(remotion_dir: Path) -> Optional[str]:
+    """返回可直接喂给 still/render 的 bundle 目录（真实路径）；不可用时返回
+    None（调用方回退到按次打包）。"""
     remotion_dir = Path(remotion_dir).resolve()  # 相对路径+cwd 组合会把 out-dir 解析进嵌套目录（实测）
-    build = remotion_dir / "build"
-    marker = build / "index.html"
+    cache_dir = remotion_dir / _CACHE_DIRNAME
+    build_link = remotion_dir / "build"
     src_time = _src_mtime(remotion_dir)
 
-    if marker.exists() and marker.stat().st_mtime >= src_time:
-        if job_slug:
-            _sync_job_public_assets(remotion_dir, build, job_slug)
-        return str(build)
+    current = _resolve_current(build_link, src_time)
+    if current:
+        return str(current)
 
-    with _BUNDLE_LOCK:
-        if marker.exists() and marker.stat().st_mtime >= src_time:
-            if job_slug:
-                _sync_job_public_assets(remotion_dir, build, job_slug)
-            return str(build)
+    with _PROC_LOCK, _cross_process_lock(remotion_dir / ".bundle.lock"):
+        # 双重检查：等锁的这段时间，可能已经有别的调用（同进程或跨进程）重建好了
+        current = _resolve_current(build_link, src_time)
+        if current:
+            return str(current)
+
+        # 迁移：老代码把 build/ 当真实目录直接写，这台机器上可能还留着旧的。
+        # 符号链接没法 replace 一个非空真实目录（EISDIR），先挪开。挪开后
+        # build_link 这个路径本身就不存在了（见下面 previous 的记录逻辑，
+        # 必须靠 legacy 变量记住它，不能再指望 build_link.is_symlink()）。
+        legacy = None
+        if build_link.exists() and not build_link.is_symlink():
+            legacy = cache_dir / f"legacy-{uuid.uuid4().hex[:8]}"
+            cache_dir.mkdir(exist_ok=True)
+            build_link.rename(legacy)
+            logger.info(f"  remotion: 迁移旧版 build/ 目录 -> {legacy.name}")
+
         npx = shutil.which("npx") or "npx"
-        _clean_stale_build_artifacts(remotion_dir, build)
+        cache_dir.mkdir(exist_ok=True)
+        _clean_stale_build_artifacts(remotion_dir, build_link)
+        new_dir = cache_dir / f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
         logger.info("  remotion: 预打包 bundle（src 有更新或首次）...")
-        r = None
-        for attempt in range(2):  # 一次原始尝试 + 一次 WinError 5 专用重试，见 Fix C17
-            try:
-                r = subprocess.run(
-                    [npx, "remotion", "bundle", "--out-dir", str(build)],
-                    cwd=remotion_dir, capture_output=True, text=True,
-                    timeout=_BUNDLE_TIMEOUT_S,
-                )
-            except Exception as e:
-                logger.warning(f"  remotion: bundle 失败（回退按次打包）: {e}")
-                return None
-            if r.returncode == 0 and marker.exists():
-                break
-            # WinError 5 多半是瞬时的外部句柄占用（例如杀毒软件短暂扫描新写入
-            # 的文件）——原文档验证过持续性占用重试没用，但瞬时占用等一下再
-            # 清一次残留、重试一次经常就过了，不需要每次都动用文档里的手动步骤。
-            if attempt == 0 and "WinError 5" in (r.stderr or ""):
-                logger.warning("  remotion: bundle 遇到 WinError 5（可能是瞬时占用），1s 后重试一次")
-                time.sleep(1)
-                _clean_stale_build_artifacts(remotion_dir, build)
-                continue
-            break
-        if r is None or r.returncode != 0 or not marker.exists():
-            logger.warning(f"  remotion: bundle 失败（回退按次打包）: {(r.stderr or '')[-300:] if r else ''}")
+        try:
+            r = subprocess.run(
+                [npx, "remotion", "bundle", "--out-dir", str(new_dir)],
+                cwd=remotion_dir, capture_output=True, text=True,
+                timeout=_BUNDLE_TIMEOUT_S,
+            )
+        except Exception as e:
+            logger.warning(f"  remotion: bundle 失败（回退按次打包）: {e}")
+            shutil.rmtree(new_dir, ignore_errors=True)
             return None
-        logger.info("  remotion: bundle 就绪")
-        if job_slug:
-            _sync_job_public_assets(remotion_dir, build, job_slug)
-        return str(build)
+        if r.returncode != 0 or not (new_dir / "index.html").exists():
+            logger.warning(f"  remotion: bundle 失败（回退按次打包）: {(r.stderr or '')[-300:]}")
+            shutil.rmtree(new_dir, ignore_errors=True)
+            return None
+
+        # 切换前先记住上一代（在 replace 之前取，之后 build_link 就指向新的了），
+        # 保留它一段时间，避免正在读旧目录的调用被过早清理坑了。刚迁移挪开的
+        # legacy 目录同样适用——它此刻还可能正被"迁移前就已经拿到 build/ 这个
+        # 字面路径"的调用读取，不能让它在这次 cleanup 里被立刻删掉（原 bug：
+        # 迁移分支跑完后 build_link 已不是符号链接，下面这个判断永远是
+        # False，legacy 从未进 keep，首次迁移当场就把它删了——正是这个 PR
+        # 本该修的那种"重建时删掉正在读的目录"事故，只是换成在迁移路径复现）。
+        previous = legacy
+        if build_link.is_symlink():
+            try:
+                previous = build_link.resolve()
+            except OSError:
+                previous = None
+
+        # 原子切换：先建临时符号链接再 rename——rename 单个符号链接是原子操作，
+        # 不存在"旧链接已删、新链接未建"的窗口；任何时刻 build 要么是完整的
+        # 旧目录，要么是完整的新目录，绝不会是"正在写一半"的状态。
+        tmp_link = remotion_dir / f".build.tmp-{uuid.uuid4().hex[:8]}"
+        if tmp_link.exists() or tmp_link.is_symlink():
+            tmp_link.unlink()
+        tmp_link.symlink_to(new_dir, target_is_directory=True)
+        # Windows：os.replace 无法覆盖"真实目录"（WinError 5 拒绝访问）。build 若是
+        # 残留的真实目录（非符号链接）就先删掉再切；对短暂占用（杀软/索引持句柄）重试几次。
+        for _swap_attempt in range(5):
+            try:
+                if build_link.exists() and not build_link.is_symlink():
+                    shutil.rmtree(build_link, ignore_errors=True)
+                tmp_link.replace(build_link)
+                break
+            except OSError:
+                if _swap_attempt == 4:
+                    try:
+                        tmp_link.unlink()
+                    except OSError:
+                        pass
+                    raise
+                time.sleep(0.5)
+
+        keep = {new_dir.name}
+        if previous and previous.parent == cache_dir:
+            keep.add(previous.name)
+        _cleanup_old_generations(cache_dir, keep)
+
+        logger.info(f"  remotion: bundle 就绪 -> {new_dir.name}")
+        return str(new_dir)

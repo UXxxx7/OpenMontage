@@ -71,6 +71,7 @@ import { SpeakerCard, SpeakerCardOpacityKeyframe, SpeakerCardScene } from "./com
 import { StepList, StepListProps } from "./components/xiaojin/StepList";
 import { TopicCard, TopicCardProps } from "./components/xiaojin/TopicCard";
 import { ZoneHeader, ZoneHeaderProps } from "./components/xiaojin/ZoneHeader";
+import { Presenter, PresenterProps } from "./components/xiaojin/Presenter";
 import { ColorMode } from "./components/xiaojin/theme";
 
 export interface ComplianceInfo {
@@ -180,6 +181,8 @@ export interface XiaojinEditorialProps extends Record<string, unknown> {
    */
   compliance?: ComplianceInfo;
   brand?: BrandInfo;
+  /** presenter mode: speaker inset in the lower zone during b-roll windows. */
+  presenter?: PresenterProps;
   headingFont?: string;
   labelFont?: string;
 }
@@ -246,6 +249,7 @@ export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = ({
   outro,
   compliance,
   brand,
+  presenter,
   headingFont = _defaultHeadingFont,
   labelFont = _defaultLabelFont,
 }) => {
@@ -421,6 +425,7 @@ export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = ({
           labelFont={labelFont}
         />
       ) : null}
+      {presenter ? <Presenter {...presenter} colorMode={colorMode} /> : null}
       <ChapterNav
         chapters={chapters}
         introOutFrame={introOutFrame}
