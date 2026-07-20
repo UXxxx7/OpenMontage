@@ -303,7 +303,7 @@ def run_props_qa(props: dict, props_path: Path, remotion_dir: Path, out_dir: Pat
     # 把 stills 交给视觉子模型（VISION_LLM_*，如 GLM-4V）对照清单挑毛病。
     # DeepSeek 主通道是纯文本模型看不了图，所以这一步走独立的视觉通道；
     # 未配置或调用失败都只是"没有眼睛"，绝不影响渲染。
-    vision = _vision_review([s["path"] for s in result["stills"]])
+    vision = _vision_review_confirmed([s["path"] for s in result["stills"]])
     if vision:
         result["vision_review"] = vision
         for f in vision.get("findings", []):
@@ -362,3 +362,58 @@ def _vision_review(still_paths: list) -> Optional[dict]:
     except Exception as e:
         logger.warning(f"  qa_stills: 视觉复审异常（跳过）: {e}")
         return None
+
+
+def _vision_review_confirmed(still_paths: list) -> Optional[dict]:
+    """Fix C23（2026-07-20，真实复现 job_452ef6c48100，用户反馈"自从接了视觉
+    LLM 之后一直这样"促成的排查）：VISION_LLM_MODEL=glm-4v-flash 对同一帧的
+    判断不是确定性的——这不是新发现，Rule 14 已经记录过它对同一张帧在不同
+    job 里分别判成"无内容/low"和"空画布/high"。这次直接打开被标记为 high
+    的实际截图核实：frame_index 0 被报"'POLICY RENEWAL REMINDER' 被截断"和
+    "'David from Pacific Life' 被截断"——两段文字在图上都完整可读，根本没有
+    截断；"脸部被裁切"是否属实还存疑（取景确实偏紧）但另外两条是纯粹的
+    模型幻觉。单次 high 判断就直接喂回重规划、重试后仍 high 就整段降级交付
+    给用户——一次不可靠模型调用的噪音，被这条链路放大成用户能看到的失败。
+
+    这里不改变"发现了就重规划、重规划完还不行就降级"的既有流程（那套本身
+    是对的），只是在把某条 finding 当作"真的存在"之前加一道确认：对同一批
+    已经渲染好的 stills（不需要重新渲染，只多一次纯视觉 LLM 调用）再问一遍，
+    只有两次调用都判定同一 frame_index 是 high 严重度问题时才采信——真实存在
+    的缺陷（取景/重叠/空画布这类客观视觉事实）大概率会在第二次调用里复现，
+    单次模型噪音大概率不会精确复现在同一帧上。low 严重度发现仅供参考、不
+    驱动任何重试/降级决策，不需要确认。
+
+    只在第一次调用真的出现 high 发现时才多花这一次确认调用——没有发现的
+    "干净"路径（多数情况）成本不变。
+    """
+    first = _vision_review(still_paths)
+    if not first:
+        return first
+    first_high = {f["frame_index"] for f in first.get("findings", [])
+                  if f.get("severity") == "high" and "frame_index" in f}
+    if not first_high:
+        return first
+
+    second = _vision_review(still_paths)
+    if not second:
+        # 二次确认调用本身失败（网络/未配置）——宁可保守地当作未确认，不让
+        # 一条从没被复核过的 high 发现单独触发重规划/降级。
+        logger.warning("  qa_stills: 二次视觉复核调用失败，无法确认高严重度发现，按未发现处理")
+        kept = [f for f in first.get("findings", []) if f.get("severity") != "high"]
+        return {"findings": kept, "overall": first.get("overall", "")}
+
+    second_high = {f["frame_index"] for f in second.get("findings", [])
+                   if f.get("severity") == "high" and "frame_index" in f}
+    reproduced = first_high & second_high
+    dropped = first_high - reproduced
+    if dropped:
+        logger.info(
+            f"  qa_stills: 高严重度发现二次复核未复现，判定为模型噪音丢弃"
+            f"（frame_index: {sorted(dropped)}）"
+        )
+
+    kept = [
+        f for f in first.get("findings", [])
+        if f.get("severity") != "high" or f.get("frame_index") in reproduced
+    ]
+    return {"findings": kept, "overall": first.get("overall", "")}
