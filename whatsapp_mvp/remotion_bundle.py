@@ -37,6 +37,29 @@ _KEEP_GENERATIONS = 2  # 当前 + 上一代，保证切换瞬间仍在读上一�
 _PROC_LOCK = threading.Lock()  # 同进程内的双重检查锁；跨进程保护见 _cross_process_lock
 
 
+def _clean_stale_build_artifacts(remotion_dir: Path, build: Path) -> None:
+    """Fix C17（2026-07-17，来自友人提供的 WINDOWS_REMOTION_WINERROR5.md，一份
+    独立记录过的 Windows 专属排查文档）：Remotion 重建 bundle 的最后一步是把
+    临时目录 `.build.tmp-xxxx` 改名成 `build`；`build` 已存在（上一次构建
+    中途被打断——例如进程被杀、机器休眠、渲染超时——没跑到改名那一步就留下的
+    半成品）或被外部进程（杀毒软件扫描/资源管理器/编辑器）占着句柄时，Windows
+    会拒绝这次改名，报 `[WinError 5] 拒绝访问`；Linux/macOS 不受影响。
+    `_PROC_LOCK`/`_cross_process_lock` 只挡得住并发重建，挡不住上一次进程
+    崩溃/被杀留下的残留目录——这正是本会话里我自己 `taskkill` 一个卡住的
+    验证脚本时会造成的那种残留，如果它当时恰好在重建 bundle。新架构下每次
+    重建都用带随机后缀的 `tmp_link` 名字（见 ensure_remotion_bundle），单次
+    重建不会撞上自己的残留，但历史崩溃留下的 `.build.tmp-*` 目录不会自己
+    消失，会在 remotion_dir 里一直堆着——这里在每次重建前顺手清一遍，避免
+    无限堆积。
+    """
+    for stale in remotion_dir.glob(".build.tmp-*"):
+        try:
+            shutil.rmtree(stale, ignore_errors=True)
+            logger.info(f"  remotion: 清理上次遗留的临时打包目录 {stale.name}")
+        except Exception as e:
+            logger.warning(f"  remotion: 清理 {stale.name} 失败（忽略，继续）: {e}")
+
+
 def _src_mtime(remotion_dir: Path) -> float:
     newest = 0.0
     for sub in ("src", "contracts"):
@@ -148,6 +171,7 @@ def ensure_remotion_bundle(remotion_dir: Path) -> Optional[str]:
 
         npx = shutil.which("npx") or "npx"
         cache_dir.mkdir(exist_ok=True)
+        _clean_stale_build_artifacts(remotion_dir, build_link)
         new_dir = cache_dir / f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
         logger.info("  remotion: 预打包 bundle（src 有更新或首次）...")
         try:

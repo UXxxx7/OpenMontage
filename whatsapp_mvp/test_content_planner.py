@@ -5,7 +5,12 @@
 
 from __future__ import annotations
 
-from whatsapp_mvp.content_planner import FPS, MOUNT_LEAD_FRAMES, MIN_GAP_AFTER_PREVIOUS_FRAMES, _to_frame_plan
+from whatsapp_mvp.content_planner import (
+    FPS, MOUNT_LEAD_FRAMES, MIN_GAP_AFTER_PREVIOUS_FRAMES, _to_frame_plan, _zero_value_titles,
+    _ground_data_point_seconds, _number_candidates, _find_grounded_seconds, _workflow_mode_schedule,
+    _find_grounded_word, _keyword_matches, _KEYWORD_EXIT_HOLD_FRAMES, _COUNT_UP_ROW_ANIM_FRAMES,
+    _STACK_EXIT_BUFFER_FRAMES, _TAKEOVER_HARD_CAP_FRAMES, _resolve_same_slot_overlaps,
+)
 
 FAILED = []
 
@@ -54,6 +59,10 @@ def main():
     # 结束就上场——两者结合后，前者的 endFrame 到后者的 mountFrame 之间应该
     # 有至少 MIN_GAP_AFTER_PREVIOUS_FRAMES 的间隔，而不是像只有钳制时那样
     # 严格相等（严格相等会让两者的 15 帧淡出/上场动画紧贴甚至重叠）。
+    # 时间上挨得近的两个图形现在 STACK（不同 y 车道共存，同一时刻整组退场），
+    # 而不是旧的"前一个消失后下一个才上场"串行——那正是"一次只有一张孤零零
+    # 卡片、画面大片留白"的系统性根因（确认过的用户反馈；参考成片
+    # CoverageSection 一个章节内 3-4 个元素积累共存）。
     plan = _to_frame_plan({"chapters": [], "data_points": [
         {"visual": "count_up", "title": "A",
          "rows": [{"label": "X", "seconds": 5.0, "value": 1}]},
@@ -61,20 +70,159 @@ def main():
          "rows": [{"label": "Y", "seconds": 7.0, "value": 2}]},
     ]}, duration=60.0)
     a, b = sorted(plan["data_cards"], key=lambda c: c["mountFrame"])
-    check("被接替的卡不与后一张重叠，且留有最小间隔",
-          a["endFrame"] <= b["mountFrame"] - MIN_GAP_AFTER_PREVIOUS_FRAMES,
-          {"a_end": a["endFrame"], "b_mount": b["mountFrame"]})
+    check("时间相近的两张卡堆叠共存（不同 y 车道），不再串行",
+          b["y"] > a["y"] and b["mountFrame"] < a["endFrame"],
+          {"a": (a["mountFrame"], a["endFrame"], a["y"]), "b": (b["mountFrame"], b["endFrame"], b["y"])})
+    check("同一堆叠的元素整组退场（endFrame 一致）",
+          a["endFrame"] == b["endFrame"], {"a_end": a["endFrame"], "b_end": b["endFrame"]})
     check("最后一张卡保留自己的停留窗口 endFrame", b.get("endFrame", 0) > b["mountFrame"], b.get("endFrame"))
 
-    # 5c. 跨类型同坑位也钳制（count_up 后接 gauge）
+    # 5c. 跨类型也一样堆叠（count_up 后接 gauge）
     plan = _to_frame_plan({"chapters": [], "data_points": [
         {"visual": "count_up", "title": "A", "rows": [{"label": "X", "seconds": 5.0, "value": 1}]},
         {"visual": "gauge", "seconds": 7.0, "title": "R", "leftLabel": "L", "rightLabel": "R", "value": 0.5},
     ]}, duration=60.0)
     card = plan["data_cards"][0]; gauge = plan["gauges"][0]
-    check("跨类型接力: 卡不与仪表盘重叠，且留有最小间隔",
-          card["endFrame"] <= gauge["mountFrame"] - MIN_GAP_AFTER_PREVIOUS_FRAMES,
-          {"card_end": card["endFrame"], "gauge_mount": gauge["mountFrame"]})
+    check("跨类型堆叠: 仪表盘在卡片下方车道共存",
+          gauge["y"] > card["y"] and card["endFrame"] == gauge["endFrame"],
+          {"card": (card["mountFrame"], card["endFrame"], card["y"]),
+           "gauge": (gauge["mountFrame"], gauge["endFrame"], gauge["y"])})
+
+    # 5b-2. 带 "pill" 的数据点在同一堆叠里生成伴随主图形的强调 pill
+    # （参考成片 CoverageSection 的 terracotta 收尾 pill），随堆叠整组退场。
+    plan = _to_frame_plan({"chapters": [], "data_points": [
+        {"visual": "count_up", "title": "A", "pill": "Policy Active — Renew in 30 Days",
+         "rows": [{"label": "X", "seconds": 5.0, "value": 1}]},
+    ]}, duration=60.0)
+    card = plan["data_cards"][0]
+    check("pill 生成且堆叠在主图形下方、随堆叠退场",
+          len(plan["pills"]) == 1
+          and plan["pills"][0]["y"] > card["y"]
+          and plan["pills"][0]["mountFrame"] > card["mountFrame"]
+          and plan["pills"][0]["endFrame"] == card["endFrame"],
+          {"card": (card["mountFrame"], card["endFrame"], card["y"]), "pills": plan["pills"]})
+
+    # 5b-2b. 回归测试——真实生产 bug（job_9923d959512d，props_lint 抓到）：pill
+    # 的 y 计算漏加了 stack_header_offset（跟"fits"分支里 entry_y 的算法不
+    # 一致），导致 pill 少偏移了一整个 ZoneHeader 高度(130px)，直接落在主图形
+    # 自己的矩形范围内，而不是完全在它下方——日历/数据卡的配套文案条在真实
+    # 渲染里会跟自己的主图形重叠。非 takeover/非 solo 的普通章节（有
+    # ZoneHeader，stack_header_offset=130）必须验证 pill 完全在主图形的估算
+    # 高度之下，不能只满足"数值上更大"这种弱检查。
+    from whatsapp_mvp.content_planner import _est_height, _STACK_GAP, _ZONE_HEADER_HEIGHT
+    plan_hdr = _to_frame_plan({"chapters": [{"at_seconds": 0, "label": "DETAILS"}], "data_points": [
+        {"visual": "count_up", "title": "A", "pill": "Policy Active — Renew in 30 Days",
+         "rows": [{"label": "X", "seconds": 5.0, "value": 1}]},
+    ]}, duration=60.0)
+    card_hdr = plan_hdr["data_cards"][0]
+    pill_hdr = plan_hdr["pills"][0]
+    card_height = _est_height("count_up", card_hdr)
+    check("普通章节(带 ZoneHeader)下，pill 完全在主图形估算高度之下，不落进它自己的矩形里",
+          pill_hdr["y"] == card_hdr["y"] + card_height + _STACK_GAP,
+          {"card": card_hdr, "pill": pill_hdr, "card_height": card_height, "zone_header_height": _ZONE_HEADER_HEIGHT})
+
+    # 5b-3. 确认过的真实生产 bug（David 视频真实渲染）：日历图形带 pill，紧接
+    # 着来了一张数据卡（间隔只有 63 帧），_STACK_EXIT_BUFFER_FRAMES 把共享
+    # endFrame 逼得比 pill 自己的 mountFrame（主图形 mountFrame+45）还早——
+    # 产出一条 endFrame(269) < mountFrame(271) 的倒挂条目，渲染层这张 pill
+    # 会立刻判定"已过期"直接不显示（不是崩溃，是静默的时长为负）。用真实数字
+    # 复现，验证防御性清理已经把这类条目挡住，不会有任何 endFrame<=mountFrame
+    # 的图形流出到 props 里。
+    plan = _to_frame_plan({"chapters": [], "data_points": [
+        {"visual": "calendar", "seconds": 9.2, "year": 2026, "month": 7, "targetDay": 28,
+         "eventLabel": "Policy Renewal", "pill": "Policy Renews July 28, 2026"},
+        {"visual": "count_up", "title": "B", "rows": [{"label": "Y", "seconds": 11.3, "value": 2}]},
+    ]}, duration=60.0)
+    all_entries = (plan["calendar_events"] + plan["data_cards"] + plan["pills"]
+                   + plan["gauges"] + plan["countdowns"] + plan["quotes"])
+    check("紧邻图形挤压 pill 时序时，不会产出 endFrame<=mountFrame 的倒挂条目",
+          all(e["endFrame"] > e["mountFrame"] for e in all_entries),
+          [(e.get("title") or e.get("text") or "calendar", e["mountFrame"], e["endFrame"]) for e in all_entries])
+
+    # 5c-2. 时间隔得远（超过 join window）的两个图形仍然各归各的段落，
+    # 前者必须在后者上场前完全退场（同 y 车道不重叠）。
+    plan = _to_frame_plan({"chapters": [], "data_points": [
+        {"visual": "count_up", "title": "A", "rows": [{"label": "X", "seconds": 5.0, "value": 1}]},
+        {"visual": "count_up", "title": "B", "rows": [{"label": "Y", "seconds": 40.0, "value": 2}]},
+    ]}, duration=60.0)
+    a, b = sorted(plan["data_cards"], key=lambda c: c["mountFrame"])
+    check("隔得远的图形不堆叠：前者在后者上场前退场",
+          a["y"] == b["y"] and a["endFrame"] < b["mountFrame"],
+          {"a": (a["mountFrame"], a["endFrame"], a["y"]), "b": (b["mountFrame"], b["endFrame"], b["y"])})
+
+    # 5c-3. 章节边界：即使时间上挨得很近本会堆叠，跨章节也必须各归各的段落
+    # ("跟着说话内容走"的机制化——章节变了=新段落，哪怕时间/高度都够堆)。
+    plan = _to_frame_plan({
+        "chapters": [{"at_seconds": 0, "label": "A"}, {"at_seconds": 10, "label": "B"}],
+        "data_points": [
+            {"visual": "count_up", "title": "A1", "rows": [{"label": "X", "seconds": 8.0, "value": 1}]},
+            {"visual": "count_up", "title": "B1", "rows": [{"label": "Y", "seconds": 11.0, "value": 2}]},
+        ],
+    }, duration=30.0)
+    a, b = sorted(plan["data_cards"], key=lambda c: c["mountFrame"])
+    # Both start a fresh stack at the same base y (correct — matches the
+    # "far apart in time" case above); the actual proof of NOT stacking is
+    # that they never coexist on screen, unlike the same-chapter stacking
+    # tests above where b's mountFrame lands strictly before a's endFrame.
+    check("跨章节不堆叠（哪怕时间挨得很近）：两者不同屏共存",
+          a["endFrame"] <= b["mountFrame"],
+          {"a": (a["mountFrame"], a["endFrame"], a["y"]), "b": (b["mountFrame"], b["endFrame"], b["y"])})
+
+    # 5c-4. 图形的固定时长若会拖过所在章节的边界，必须被截断在章节结束帧——
+    # 泛化 _plan_process_timeline 已经在用的 atFrame->next atFrame 锚定，
+    # 让"卡片时长跟转写脱节"对每种图形都失效，不只是 timeline 这一种。
+    plan = _to_frame_plan({
+        "chapters": [{"at_seconds": 0, "label": "A"}, {"at_seconds": 3, "label": "B"}],
+        "data_points": [
+            {"visual": "count_up", "title": "A1", "rows": [{"label": "X", "seconds": 1.0, "value": 1}]},
+        ],
+    }, duration=30.0)
+    card = plan["data_cards"][0]
+    chapter_b_at_frame = round(3.0 * FPS)
+    check("固定时长图形的退场帧被裁在自己所在章节结束处，不拖到下一章",
+          card["endFrame"] <= chapter_b_at_frame,
+          {"endFrame": card["endFrame"], "chapter_b_atFrame": chapter_b_at_frame})
+
+    # 5c-5. Quote 是全画布字卡：必须让 SpeakerCard 在这段时间隐藏
+    # （mode_schedule 里对应帧段的 contentWidth 达到 SECTION_PIP_SENTINEL），
+    # 不能像之前那样让字幕/引言文字直接叠在还显示着的说话人脸上
+    # (确认过的真实 bug, job_24450b1eacfd / "preview(6)")。
+    from whatsapp_mvp.content_planner import SECTION_PIP_SENTINEL
+    plan = _to_frame_plan({"chapters": [], "data_points": [
+        {"visual": "quote", "seconds": 5.0, "text": "a quote worth showing full canvas"},
+    ]}, duration=30.0)
+    quote = plan["quotes"][0]
+    hides_card = any(
+        m.get("mode") == "workflow" and m.get("contentWidth", 0) >= SECTION_PIP_SENTINEL
+        and m["frame"] <= quote["mountFrame"] < (
+            next((n["frame"] for n in plan["mode_schedule"] if n["frame"] > m["frame"]), quote["endFrame"] + 1)
+        )
+        for m in plan["mode_schedule"]
+    )
+    check("quote 期间 SpeakerCard 被隐藏（不再叠在脸上）", hides_card, plan["mode_schedule"])
+
+    # 5c-6. 确认过的真实生产 bug（David 视频真实渲染）：一句 quote 恰好落在
+    # 一个已经在全画布接管的章节（"takeover":true）里，会跟 SectionLayer 自己
+    # 的标题+图标同屏叠在一起——两套"独占整个画布"的处理互相打架。接管章节
+    # 本身就是这个时刻的视觉呈现（字幕已经带着同样的话），quote 不需要再单独
+    # 渲染一份，应该被跳过而不是产出一张会叠加的卡片。
+    plan = _to_frame_plan({
+        "chapters": [{"at_seconds": 0, "label": "A", "takeover": True, "dark": True}],
+        "data_points": [
+            {"visual": "quote", "seconds": 5.0, "text": "this lands inside the takeover chapter"},
+        ],
+    }, duration=30.0)
+    check("接管章节内的 quote 被跳过，不与 SectionLayer 自己的标题/图标叠加",
+          len(plan["quotes"]) == 0, plan["quotes"])
+
+    # 非接管章节里的 quote 不受影响，照常产出。
+    plan = _to_frame_plan({
+        "chapters": [{"at_seconds": 0, "label": "A", "takeover": False}],
+        "data_points": [
+            {"visual": "quote", "seconds": 5.0, "text": "this lands in a normal chapter"},
+        ],
+    }, duration=30.0)
+    check("非接管章节内的 quote 照常产出", len(plan["quotes"]) == 1, plan["quotes"])
 
     # 6. intro/outro/双语章节映射（对齐 VeLL 参考成片的可自动化元素）
     plan = _to_frame_plan({
@@ -84,10 +232,34 @@ def main():
                   "subtext": "有問題請聯絡我", "cta_label": "立即續保"},
     }, duration=60.0)
     check("chapter 带 labelEn", plan["chapters"][0].get("labelEn") == "RENEWAL", plan["chapters"][0])
-    check("intro 映射 + eyebrow 大写", plan["intro"] == {
-        "eyebrow": "POLICY RENEWAL REMINDER", "title": "保單續期提醒", "subtitle": "Pacific Life"}, plan["intro"])
+    # Fix F1：没指定 variant 时默认落到 "title_card"（4 个 intro 变体里唯一
+    # 原本就有的那个，行为不变），显式写进输出而不是留空——跟其它字段的默认
+    # 值处理方式一致。
+    check("intro 映射 + eyebrow 大写 + variant 默认 title_card", plan["intro"] == {
+        "eyebrow": "POLICY RENEWAL REMINDER", "title": "保單續期提醒", "subtitle": "Pacific Life",
+        "variant": "title_card"}, plan["intro"])
     check("outro 映射(cta_label->ctaLabel, accent 保留)", plan["outro"]["ctaLabel"] == "立即續保"
           and plan["outro"]["headlineAccent"] == "保障不中斷", plan["outro"])
+
+    # 6b. Fix F1：intro 的 4 种视觉变体——之前只有 title_card(Pattern 2)被
+    # 移植过来，2026-07-16 补齐另外 3 种（stats_hook/title_impact/chips）。
+    for variant in ("stats_hook", "title_impact", "chips"):
+        p = _to_frame_plan({
+            "chapters": [{"at_seconds": 0, "label": "A"}],
+            "intro": {"eyebrow": "E", "title": "T", "subtitle": "S", "variant": variant,
+                      "brand_label": "ACME"},
+        }, duration=30.0)
+        check(f"intro variant '{variant}' 原样透传", p["intro"]["variant"] == variant, p["intro"])
+        if variant == "title_impact":
+            check("title_impact 带 brandLabel", p["intro"].get("brandLabel") == "ACME", p["intro"])
+        else:
+            check(f"{variant} 不带 brandLabel（只有 title_impact 用）", "brandLabel" not in p["intro"], p["intro"])
+    p_bad = _to_frame_plan({
+        "chapters": [{"at_seconds": 0, "label": "A"}],
+        "intro": {"eyebrow": "E", "title": "T", "subtitle": "S", "variant": "not_a_real_variant"},
+    }, duration=30.0)
+    check("不认识的 variant 值退回默认 title_card，不让整条 plan 崩掉",
+          p_bad["intro"]["variant"] == "title_card", p_bad["intro"])
 
     plan = _to_frame_plan({"chapters": [], "intro": {"eyebrow": "X"}, "outro": {"kicker": "Y"}}, duration=30.0)
     check("intro 无 title / outro 无 headline -> 不产出(None)", plan["intro"] is None and plan["outro"] is None)
@@ -117,20 +289,79 @@ def main():
           _mode_at(modes, card_mount) == "workflow",
           {"mode_schedule": modes, "card_mount": card_mount})
 
-    # 7. quote 类型：无数据视频的画布动画来源；进 workflow 窗口；关键词透传
+    # 7. quote 类型：无数据视频的画布动画来源；进 workflow 窗口
     plan = _to_frame_plan({"chapters": [], "data_points": [
         {"visual": "quote", "seconds": 8.0, "text": "this changed everything", "attribution": "David"},
-    ], "atmosphere_keywords": ["renewal", "保障", "coverage"]}, duration=30.0)
+    ]}, duration=30.0)
     check("quote 映射 + 触发 workflow", len(plan["quotes"]) == 1
           and plan["quotes"][0]["text"] == "this changed everything"
           and any(m["mode"] == "workflow" for m in plan["mode_schedule"]),
           {"quotes": plan["quotes"], "modes": plan["mode_schedule"]})
-    check("atmosphere 关键词透传", plan["atmosphere_keywords"] == ["renewal", "保障", "coverage"])
 
-    # 8. 密度下限：空档检测 / 确定性兜底 / 短片豁免
-    from whatsapp_mvp.content_planner import (
-        _apply_richness_floor, _sparse_gaps, RICHNESS_WINDOW_FRAMES,
-    )
+    # 7b. contact_cue：确认过的真实用户反馈——QR/联系方式卡之前固定钉在片尾
+    # 附近，跟视频里实际说"WhatsApp 我"的那一刻完全脱节。这里验证 mountFrame
+    # 锚定在该数据点自己的 seconds（减 lead），而不是任何 duration 相关的值。
+    plan = _to_frame_plan({"chapters": [], "data_points": [
+        {"visual": "contact_cue", "seconds": 34.0},
+    ]}, duration=44.0)
+    check("contact_cue 映射到实际说话的那一刻，不是片尾偏移",
+          plan["contact_cue"] is not None
+          and plan["contact_cue"]["mountFrame"] == round(34.0 * FPS) - MOUNT_LEAD_FRAMES,
+          plan["contact_cue"])
+
+    # 无 contact_cue 数据点时该字段应为 None（下游会退回 outro/duration 兜底）
+    plan_no_cue = _to_frame_plan({"chapters": [], "data_points": []}, duration=44.0)
+    check("无 contact_cue 时字段为 None", plan_no_cue["contact_cue"] is None)
+
+    # 7c. 确认过的真实生产 bug（David 视频真实渲染，frame 350，"Your Policy
+    # Summary" 卡片显示 "Coverage: $0.0M"）：LLM 提取的 value 已经是"以百万为
+    # 单位"的 1.5，但同时按 prompt 里"原始美元数值配 divideBy"的格式指引又带上
+    # 了 divideBy=1000000，实际显示 1.5/1,000,000 保留 1 位小数 = "0.0"——原始
+    # value 本身不是 0，旧的"只查 value==0"检查完全漏掉这种双重除法。
+    raw_double_divided = {"data_points": [
+        {"visual": "count_up", "title": "Your Policy Summary", "rows": [
+            {"label": "Coverage", "seconds": 5.0, "value": 1.5,
+             "prefix": "$", "divideBy": 1000000, "decimals": 1, "unit": "M"},
+        ]},
+    ]}
+    check("双重除法导致显示为 0 的卡片被识别为坏值",
+          _zero_value_titles(raw_double_divided) == ["Your Policy Summary"],
+          _zero_value_titles(raw_double_divided))
+
+    # 对照组：同样的 divideBy/decimals，但 value 是原始美元数值（1,500,000），
+    # 显示为 "1.5" —— 不应被误判为坏值。
+    raw_correct = {"data_points": [
+        {"visual": "count_up", "title": "Your Policy Summary", "rows": [
+            {"label": "Coverage", "seconds": 5.0, "value": 1500000,
+             "prefix": "$", "divideBy": 1000000, "decimals": 1, "unit": "M"},
+        ]},
+    ]}
+    check("正确的原始数值（除法后非 0）不被误判", _zero_value_titles(raw_correct) == [], raw_correct)
+
+    # 7d. 确认过的真实生产 bug（David 视频真实渲染，job_f0c3412a1694）：一个
+    # 完全没有可用 seconds 的脏数据点（count_up 的 rows 全部缺 seconds）让
+    # _dp_seconds 按其自身设计返回 float("inf") 用于排序兜底；本次改动之前，
+    # 章节归属查找会直接 round(inf * FPS)，OverflowError 不在下面 try/except
+    # 捕获的 (KeyError, TypeError, ValueError) 之列，导致整条 apply_style 崩溃、
+    # 降级成只有 remove_filler（零字幕/零图形）。这里断言这种脏数据点被安静
+    # 跳过，plan_content 不再因此整体炸掉。
+    plan = _to_frame_plan({"chapters": [{"at_seconds": 0, "label": "A"}], "data_points": [
+        {"visual": "count_up", "title": "Broken", "rows": [{"label": "X", "value": 1}]},  # 缺 seconds
+        {"visual": "count_up", "title": "Good", "rows": [{"label": "Y", "seconds": 5.0, "value": 2}]},
+    ]}, duration=30.0)
+    check("缺时间戳的脏数据点被跳过而不是让整个规划抛异常",
+          len(plan["data_cards"]) == 1 and plan["data_cards"][0]["title"] == "Good", plan["data_cards"])
+
+    # 8. 密度下限：空档检测 / 补规划 / 短片豁免
+    #
+    # 曾经这里还有一层机械兜底：补规划(REPLAN LLM)之后仍有空档就从转写原文
+    # 硬切一段塞进 topic_card。用户明确反馈：这种卡片的内容就是原话，跟屏幕
+    # 下方本来就在滚动的字幕一字不差，"为了有画面而有画面"，没有任何附加
+    # 信息量——已删除(_fallback_topic_cards_for_gaps 连同 _slice_text_for_
+    # window/_truncate_at_word_boundary 一并移除)。现在：LLM 补规划仍是
+    # 第一选择(真正有信息量的图形)，补规划后仍有空档就接受现状(只有说话人
+    # +字幕)，不再机械垫字幕卡片。
+    from whatsapp_mvp.content_planner import _apply_richness_floor, _sparse_gaps
     # 60s 视频、无任何画布事件 -> 中段应报告空档
     bare = _to_frame_plan({"chapters": []}, duration=60.0)
     gaps = _sparse_gaps(bare, 60.0)
@@ -139,17 +370,17 @@ def main():
     # 短片(12s)豁免：intro+outro 已覆盖，不该报空档
     check("短视频豁免密度检查", _sparse_gaps(_to_frame_plan({"chapters": []}, 12.0), 12.0) == [])
 
-    # 确定性兜底(禁用重规划)：从空档内最长转写句合成金句
+    # 禁用补规划(allow_replan=False)时，仍有空档就原样接受——不再机械垫字幕
+    # 卡片。plan 应该原样返回(除了空 chapters 是同一个空列表这种无害差异，
+    # 关键断言是没有任何新的 topic_card/quote 被塞进去，空档依旧被如实报告)。
     segs = [
-        {"start": 10.0, "end": 13.0, "text": "this is the single most important thing to remember"},
-        {"start": 24.0, "end": 27.0, "text": "another decently long spoken line right here"},
-        {"start": 40.0, "end": 43.0, "text": "and one more full sentence near the end of it"},
+        {"start": 4.0, "end": 7.0, "text": "this is the single most important thing to remember"},
     ]
     fixed = _apply_richness_floor({"chapters": []}, bare, segs, 60.0, allow_replan=False)
-    check("兜底金句用了空档内的原话", len(fixed["quotes"]) >= 2
-          and fixed["quotes"][0]["text"].startswith("this is the single"), fixed["quotes"])
-    check("兜底后无残余空档（有转写句可用的时段）", _sparse_gaps(fixed, 60.0) == [],
-          {"before": gaps, "after": _sparse_gaps(fixed, 60.0)})
+    check("禁用补规划时不再机械垫字幕卡片——没有凭空多出 topic_card",
+          fixed["topic_cards"] == [], fixed["topic_cards"])
+    check("空档如实保留(接受现状，而不是硬塞一张读起来跟字幕一样的卡片)",
+          _sparse_gaps(fixed, 60.0) == gaps, {"before": gaps, "after": _sparse_gaps(fixed, 60.0)})
 
     # 已有覆盖的计划不触发下限（原计划原样返回）
     covered_raw = {"chapters": [], "data_points": [
@@ -164,6 +395,633 @@ def main():
                            "data_points": ["not a dict", {"visual": "gauge"}]}, duration=30.0)
     check("畸形 chapter/data_points 跳过不炸",
           plan["chapters"] == [] and not plan["gauges"] and not plan["data_cards"])
+
+    # 6. Phase 2 (arsenal expansion): step_list / topic_card / corner_card / zone_headers
+
+    # step_list: 每一步的 activateOffset 相对卡片自己的 mountFrame，按各自 seconds 计算
+    plan = _to_frame_plan({"chapters": [{"at_seconds": 0, "label": "STEPS"}], "data_points": [
+        {"visual": "step_list", "title": "T", "steps": [
+            {"label": "one", "seconds": 5.0},
+            {"label": "two", "seconds": 7.0},
+            {"label": "three", "seconds": 9.0},
+        ]},
+    ]}, duration=30.0)
+    check("step_list 映射出 3 步", len(plan["step_lists"]) == 1 and len(plan["step_lists"][0]["steps"]) == 3,
+          plan["step_lists"])
+    sl = plan["step_lists"][0]
+    check("step_list 首步 activateOffset == MOUNT_LEAD_FRAMES（卡片提前 lead 帧上场，首步在自己被说到的那一刻激活）",
+          sl["steps"][0]["activateOffset"] == MOUNT_LEAD_FRAMES, sl)
+    check("step_list 后续步骤的 activateOffset 随各自 seconds 递增",
+          sl["steps"][1]["activateOffset"] > sl["steps"][0]["activateOffset"]
+          and sl["steps"][2]["activateOffset"] > sl["steps"][1]["activateOffset"], sl)
+
+    # step_list: 少于 2 步不产出
+    plan = _to_frame_plan({"chapters": [], "data_points": [
+        {"visual": "step_list", "steps": [{"label": "only one", "seconds": 5.0}]},
+    ]}, duration=30.0)
+    check("step_list 少于 2 步不产出", plan["step_lists"] == [], plan["step_lists"])
+
+    # topic_card: 无 headline 不产出；有 headline 正常映射
+    plan = _to_frame_plan({"chapters": [], "data_points": [
+        {"visual": "topic_card", "headline": "A good tip", "sub": "detail", "icon": "lightbulb", "seconds": 10.0},
+    ]}, duration=30.0)
+    check("topic_card 正常映射", len(plan["topic_cards"]) == 1
+          and plan["topic_cards"][0]["headline"] == "A good tip"
+          and plan["topic_cards"][0]["icon"] == "lightbulb", plan["topic_cards"])
+    plan = _to_frame_plan({"chapters": [], "data_points": [
+        {"visual": "topic_card", "sub": "detail only, no headline", "seconds": 10.0},
+    ]}, duration=30.0)
+    check("topic_card 无 headline 不产出", plan["topic_cards"] == [], plan["topic_cards"])
+
+    # corner_card: chat/progress 两种变体映射；不进入内容区堆叠系统（无 y 字段）
+    plan = _to_frame_plan({"chapters": [], "data_points": [
+        {"visual": "corner_card", "variant": "chat", "appName": "WhatsApp", "message": "hi there", "seconds": 8.0},
+        {"visual": "corner_card", "variant": "progress", "label": "Uploading", "percent": 60, "seconds": 20.0},
+    ]}, duration=30.0)
+    check("corner_card 两种变体都映射且不占用内容区（无 y 字段）",
+          len(plan["corner_cards"]) == 2 and all("y" not in c for c in plan["corner_cards"]),
+          plan["corner_cards"])
+    check("corner_card chat 变体字段正确",
+          plan["corner_cards"][0]["variant"] == "chat" and plan["corner_cards"][0]["message"] == "hi there",
+          plan["corner_cards"][0])
+    check("corner_card progress 变体字段正确",
+          plan["corner_cards"][1]["variant"] == "progress" and plan["corner_cards"][1]["percent"] == 60,
+          plan["corner_cards"][1])
+
+    # corner_card: 落在接管章节内时被跳过（SpeakerCard 此时被隐藏，锚不上）
+    plan = _to_frame_plan({
+        "chapters": [{"at_seconds": 0, "label": "A", "takeover": True, "dark": True}],
+        "data_points": [
+            {"visual": "corner_card", "variant": "progress", "label": "X", "percent": 50, "seconds": 5.0},
+        ],
+    }, duration=30.0)
+    check("接管章节内的 corner_card 被跳过（SpeakerCard 此时不可见）", plan["corner_cards"] == [], plan["corner_cards"])
+
+    # zone_headers: 非接管章节里有数据点 -> 产出一个跟章节同跨度的 header；
+    # 接管章节里有数据点 -> 不产出（SectionLayer 自己已经有大标题）
+    plan = _to_frame_plan({
+        "chapters": [
+            {"at_seconds": 0, "label": "NORMAL", "label_en": "NORMAL EN"},
+            {"at_seconds": 10, "label": "TAKEOVER", "takeover": True, "dark": True},
+        ],
+        "data_points": [
+            {"visual": "count_up", "title": "T", "rows": [{"label": "X", "seconds": 2.0, "value": 1}]},
+            {"visual": "gauge", "seconds": 12.0, "title": "G", "leftLabel": "A", "rightLabel": "B", "value": 0.5},
+        ],
+    }, duration=30.0)
+    # fromFrame anchors to the first stack's own mount frame (when the card
+    # actually finishes shrinking), NOT the chapter's raw atFrame=0 — a
+    # header at atFrame would render on top of the still-Dominant-sized card
+    # if the chapter starts before its first data point mounts (confirmed
+    # real bug via stills, job_4c36cb17acb2-style synthetic test).
+    #
+    # toFrame is the STACK's own exit frame (Fix C1), NOT the chapter span —
+    # confirmed real bug (job_e44166eb8c38): a header spanning the whole
+    # chapter stayed on screen long after its own card had exited, including
+    # through a later stretch where the SpeakerCard had regrown to Dominant
+    # size, painting the header directly on top of the now-large facecam.
+    # This count_up's own stack exits at mount+HOLD_AFTER_LAST_ROW_FRAMES(90),
+    # well before the next chapter at 300 — the header must match that,
+    # not stretch to 300.
+    count_up_mount = round(2.0 * FPS) - MOUNT_LEAD_FRAMES
+    count_up_exit = round(2.0 * FPS) + 90  # HOLD_AFTER_LAST_ROW_FRAMES
+    check("非接管章节产出 zone_header，起点=首个堆叠的 mountFrame，止于该堆叠自己的退场帧（不是章节跨度）",
+          len(plan["zone_headers"]) == 1 and plan["zone_headers"][0]["title"] == "NORMAL"
+          and plan["zone_headers"][0]["fromFrame"] == count_up_mount
+          and plan["zone_headers"][0]["toFrame"] == count_up_exit,
+          plan["zone_headers"])
+    check("zone_header 带上 titleEn", plan["zone_headers"][0].get("titleEn") == "NORMAL EN", plan["zone_headers"][0])
+
+    # C1 核心回归：同一个非接管章节里有两段相隔很远的内容（中间有大段没有
+    # 图形的间隙，SpeakerCard 会在间隙里回到 Dominant），必须产出两个独立的
+    # header 窗口，中间的间隙没有 header——而不是一个跨越整个章节、盖住间隙里
+    # 重新变大的卡片的 header。
+    plan_gap = _to_frame_plan({
+        "chapters": [{"at_seconds": 0, "label": "TIPS"}],
+        "data_points": [
+            {"visual": "topic_card", "headline": "first tip", "seconds": 5.0},
+            {"visual": "topic_card", "headline": "second tip, far later", "seconds": 30.0},
+        ],
+    }, duration=60.0)
+    check("同一章节两段相隔很远的内容 -> 两个独立 header 窗口",
+          len(plan_gap["zone_headers"]) == 2, plan_gap["zone_headers"])
+    if len(plan_gap["zone_headers"]) == 2:
+        h0, h1 = plan_gap["zone_headers"]
+        check("两个 header 窗口之间有间隙（第一个先结束，第二个后开始，不重叠也不相连）",
+              h0["toFrame"] < h1["fromFrame"], plan_gap["zone_headers"])
+
+    # 确认过的真实 bug（Phase 2 stills 验证发现）：章节起点 atFrame 明显早于
+    # 该章节第一个数据点实际上场的时刻时，header 如果锚在 atFrame 上会画在
+    # 还没收起的大卡片上面（SpeakerCard 直到第一个内容堆叠触发 workflow_range
+    # 才真正缩小）。这里用一个起点相隔较远的例子直接锁定修复。
+    plan = _to_frame_plan({
+        "chapters": [{"at_seconds": 0, "label": "LATE"}],
+        "data_points": [
+            {"visual": "topic_card", "headline": "first content arrives late", "seconds": 8.0},
+        ],
+    }, duration=30.0)
+    expected_mount = round(8.0 * FPS) - MOUNT_LEAD_FRAMES
+    check("章节起点远早于首个数据点时，zone_header 不提前画在未收起的卡片上",
+          plan["zone_headers"][0]["fromFrame"] == expected_mount
+          and plan["zone_headers"][0]["fromFrame"] > 0,
+          plan["zone_headers"])
+
+    # 确认过的真实生产 bug（David 真实渲染，job_55689b544652）：CONTACT 章节
+    # 紧跟在一个 takeover 章节（RISK）后面，CONTACT 自己第一个数据点的原始
+    # 说话帧离章节边界很近，减去 MOUNT_LEAD_FRAMES 之后算出来的 mountFrame
+    # 落回了 RISK 的地盘——"CONTACT" 标题在 RISK 自己的全画布图标还没淡出
+    # 之前就先冒出来了。header 起点必须钳在本章 atFrame，不能早于它。
+    plan = _to_frame_plan({
+        "chapters": [
+            {"at_seconds": 693 / FPS, "label": "RISK", "takeover": True, "dark": True, "warn": True},
+            {"at_seconds": 1002 / FPS, "label": "CONTACT"},
+        ],
+        "data_points": [
+            {"visual": "gauge", "seconds": 730 / FPS, "title": "G", "leftLabel": "A", "rightLabel": "B", "value": 0.4},
+            {"visual": "contact_cue", "seconds": 1010 / FPS},
+        ],
+    }, duration=1331 / FPS)
+    contact_header = next((h for h in plan["zone_headers"] if h["title"] == "CONTACT"), None)
+    check("CONTACT 紧跟 takeover 章节时，header 起点被钳在本章 atFrame（不早于 1002）",
+          contact_header is not None and contact_header["fromFrame"] == 1002, plan["zone_headers"])
+
+    # 纯接管章节（无 label 意外情况除外）不产出 zone_header
+    plan = _to_frame_plan({
+        "chapters": [{"at_seconds": 0, "label": "ONLY TAKEOVER", "takeover": True, "dark": True}],
+        "data_points": [
+            {"visual": "gauge", "seconds": 5.0, "title": "G", "leftLabel": "A", "rightLabel": "B", "value": 0.5},
+        ],
+    }, duration=30.0)
+    check("纯接管章节不产出 zone_header", plan["zone_headers"] == [], plan["zone_headers"])
+
+    # 8. Fix B：timing FROM the dialogue —— 数据点的 seconds 校准到词级时间戳。
+    # 确认过的真实生产 bug（David 视频真实渲染）：countdown 说的是"30 days"，
+    # LLM 给的 seconds 是 4.7，但转写里"30"这个词真正的时间戳是 7.5s——校准后
+    # mountFrame 应该基于 7.5s，不是 4.7s。
+    real_word_timestamps = [
+        {"word": "Quick", "start": 3.4, "end": 3.7},
+        {"word": "reminder:", "start": 3.7, "end": 4.1},
+        {"word": "Your", "start": 4.1, "end": 4.3},
+        {"word": "policy", "start": 4.3, "end": 4.7},
+        {"word": "is", "start": 4.7, "end": 4.8},
+        {"word": "coming", "start": 4.8, "end": 5.1},
+        {"word": "up", "start": 5.1, "end": 5.2},
+        {"word": "for", "start": 6.4, "end": 6.6},
+        {"word": "renewal", "start": 6.6, "end": 7.0},
+        {"word": "in", "start": 7.0, "end": 7.1},
+        {"word": "30", "start": 7.5, "end": 7.7},
+        {"word": "days,", "start": 7.7, "end": 8.4},
+    ]
+    raw_countdown = {"data_points": [
+        {"visual": "countdown", "seconds": 4.7, "value": 30, "unitLabel": "DAYS",
+         "label": "RENEWAL", "headline": "Renewal in 30 days"},
+    ]}
+    _ground_data_point_seconds(raw_countdown, real_word_timestamps)
+    check("countdown 的 seconds 校准到真正说\"30\"这个词的时间戳(7.5s)，不是 LLM 估计的 4.7s",
+          raw_countdown["data_points"][0]["seconds"] == 7.5, raw_countdown["data_points"][0])
+
+    grounded_plan = _to_frame_plan(raw_countdown, duration=30.0)
+    expected_mount = round(7.5 * FPS) - MOUNT_LEAD_FRAMES
+    check("校准后 mountFrame 基于 7.5s（175），不是基于 4.7s 的旧值（91）",
+          grounded_plan["countdowns"][0]["mountFrame"] == expected_mount, grounded_plan["countdowns"])
+
+    # 找不到匹配的词时保持原样，不校准（不是报错、也不是随便挪到最近的数字）
+    raw_no_match = {"data_points": [
+        {"visual": "countdown", "seconds": 4.7, "value": 99, "unitLabel": "DAYS",
+         "label": "X", "headline": "Y"},
+    ]}
+    _ground_data_point_seconds(raw_no_match, real_word_timestamps)
+    check("转写里没有匹配的数字时，seconds 保持原样",
+          raw_no_match["data_points"][0]["seconds"] == 4.7, raw_no_match["data_points"][0])
+
+    # count_up 的每一行独立校准：divideBy/decimals 格式化后的显示值也要能匹配
+    # （真实场景："$1.5 million" 格式化成 value=1500000, divideBy=1000000,
+    # decimals=1 -> 转写里 ASR 识别出的词是"1.5"）。
+    count_up_words = [
+        {"word": "covers", "start": 11.0, "end": 11.3},
+        {"word": "you", "start": 11.3, "end": 11.4},
+        {"word": "for", "start": 11.4, "end": 11.5},
+        {"word": "1.5", "start": 11.6, "end": 12.0},
+        {"word": "million,", "start": 12.0, "end": 12.5},
+    ]
+    raw_count_up = {"data_points": [
+        {"visual": "count_up", "title": "Coverage", "rows": [
+            {"label": "Coverage", "seconds": 8.0, "value": 1500000, "divideBy": 1000000, "decimals": 1},
+        ]},
+    ]}
+    _ground_data_point_seconds(raw_count_up, count_up_words)
+    check("count_up 行的 seconds 校准到格式化后的显示值('1.5')对应的词",
+          raw_count_up["data_points"][0]["rows"][0]["seconds"] == 11.6, raw_count_up["data_points"][0])
+
+    # 8x 秒的窗口之外的匹配不算数——不能把风马牛不相及的同名数字乱配对
+    far_words = [{"word": "30", "start": 200.0, "end": 200.3}]
+    grounded_far = _find_grounded_seconds(4.7, _number_candidates(30), far_words)
+    check("超出 8 秒匹配窗口的候选词不会被采用", grounded_far is None, grounded_far)
+
+    # 9. Fix C3：合并短暂的 dominant 抖动。两段 workflow 之间只隔了 10 帧
+    # （确认过的真实场景：scenes 里 206->216 的鼓包），卡片不该长回 Dominant
+    # 又立刻缩回去——应该桥接成一段连续的 workflow。
+    jitter_schedule = _workflow_mode_schedule(
+        [(50, 200, 960), (220, 400, 960)], duration_frames=500,
+    )
+    check("短间隙(10 帧 < 45 帧)被桥接：schedule 里没有 200/210 附近的 dominant 条目",
+          not any(e["mode"] == "dominant" and 190 <= e["frame"] <= 220 for e in jitter_schedule),
+          jitter_schedule)
+    check("桥接后卡片从 40 帧连续 workflow 到 400 帧（只有开头/结尾两次真正的模式切换）",
+          [e["mode"] for e in jitter_schedule] == ["dominant", "workflow", "dominant"], jitter_schedule)
+
+    # 对照组：间隙足够长（超过 45 帧）时不桥接，这是真实的、需要卡片长回来的空档。
+    no_jitter_schedule = _workflow_mode_schedule(
+        [(50, 200, 960), (260, 400, 960)], duration_frames=500,
+    )
+    check("间隙足够长(>=45 帧)时正常长回 Dominant，不桥接",
+          any(e["mode"] == "dominant" and e["frame"] == 200 for e in no_jitter_schedule),
+          no_jitter_schedule)
+
+    # 10. Fix D1：接管时长上限（8s 硬上限 + 内容结束后 2s 停留，取更早者）。
+    # 确认过的真实生产 bug（job_e44166eb8c38）：WARNING 接管从 771 帧一路
+    # 延伸到片尾(1526)，说话人被隐藏 25.2s 且再也没有恢复；接管里唯一的
+    # 图形(gauge)早就结束了，后面 12.3s 是纯黑背景配一个静止图标。这里用
+    # 同样形状的真实数值复现：章节起点 700 帧、gauge 在 27.0s(frame810)
+    # 说出、总时长 50s(1500 帧，章节是最后一章，natural_end=1500)。
+    plan_d1 = _to_frame_plan({
+        "chapters": [{"at_seconds": 700 / FPS, "label": "WARNING", "takeover": True, "dark": True, "warn": True}],
+        "data_points": [
+            {"visual": "gauge", "seconds": 27.0, "title": "G", "leftLabel": "A", "rightLabel": "B", "value": 0.8},
+        ],
+    }, duration=50.0)
+    check("接管跨度被裁到 8s 硬上限(700+240=940)，不是章节自然结束(1500)",
+          len(plan_d1["sections"]) == 1 and plan_d1["sections"][0]["toFrame"] == 940,
+          plan_d1["sections"])
+
+    # 11. Fix D2：全片隐藏时长预算(30%)——两个接管都被 D1 裁过之后，加起来
+    # 仍然超过 30%，摘除时长更长的那个（金句从不摘除）。
+    plan_d2 = _to_frame_plan({
+        "chapters": [
+            {"at_seconds": 0, "label": "A", "takeover": True, "dark": True},
+            {"at_seconds": 500 / FPS, "label": "B", "takeover": True, "dark": True},
+        ],
+        "data_points": [
+            {"visual": "gauge", "seconds": 10.0, "title": "GA", "leftLabel": "X", "rightLabel": "Y", "value": 0.5},
+            {"visual": "gauge", "seconds": 18.5, "title": "GB", "leftLabel": "X", "rightLabel": "Y", "value": 0.5},
+        ],
+    }, duration=1400 / FPS)
+    check("总隐藏时长超预算时，摘除时长更长的接管('A', 240 帧)，只剩'B'(225 帧)",
+          len(plan_d2["sections"]) == 1 and plan_d2["sections"][0]["title"] == "B"
+          and plan_d2["sections"][0]["fromFrame"] == 500 and plan_d2["sections"][0]["toFrame"] == 725,
+          plan_d2["sections"])
+    check("摘除接管后，对应的 sentinel workflow_range 也一并移除（mode_schedule 里章节 A 的时间段不再隐藏卡片）",
+          not any(m["mode"] == "workflow" and m.get("contentWidth", 0) >= 10_000_000 and m["frame"] < 250
+                  for m in plan_d2["mode_schedule"]),
+          plan_d2["mode_schedule"])
+
+    # 11b. 回归测试——真实用户反馈("what happened to the timeline animation
+    # we had?")：真实一跑(job_88b957f807b9/job_0aaef74e8865，MrBeast 视频)
+    # 里，一段多阶段时间线("从立项到上线要五个月")占了全片 77% 的时长，超过
+    # 30% 隐藏预算后被 D2 整段摘除——时间线的可视内容(sec["timeline"])是
+    # 焊死在这个 section 对象本身上的，不像 gauge/data_card 那样活在独立
+    # 列表里"删了接管、图形还在别处正常显示"，整段摘除等于这 18 秒里除了
+    # 字幕什么都不剩。用 30s 的视频复现同样形状(时间线占比 77%)，验证时间线
+    # 被裁短保留、不是被摘除。
+    #
+    # Fix D5（2026-07-16）：这条测试原本断言裁到固定的 8s 硬上限
+    # （_TAKEOVER_HARD_CAP_FRAMES）——但真实生产复测（MrBeast backtest，
+    # job_95e1e08b0995，23.6s 视频）发现固定 8s 本身就已经超过 26.7s 以内
+    # 任何视频总时长的 30%，导致"先裁 8s、再检查预算、仍然超预算、直接整段
+    # 摘除"——时间线在那条真实视频的全部 4 次规划里都被摘除，从未播出过。
+    # 现在改成裁到预算实际允许的长度（这条测试的 900 帧/30% 预算 = 270 帧，
+    # 比固定 8s(240 帧)更宽松，因为这条视频的总时长本身就比 8s 富余不少）。
+    plan_timeline_budget = _to_frame_plan({
+        "chapters": [
+            {"at_seconds": 0, "label": "PROCESS", "takeover": True, "dark": True},
+            {"at_seconds": 540 / FPS, "label": "COST"},
+        ],
+        "process_timeline": {
+            "chapter_label": "PROCESS", "heading": "FROM IDEA TO UPLOAD",
+            "stages": [
+                {"label": "IDEATION", "seconds": 3.0, "prefix": "", "target": 2, "unit": "MONTHS"},
+                {"label": "PRODUCTION", "seconds": 10.0, "prefix": "", "target": 4, "unit": "MONTHS"},
+            ],
+        },
+        "data_points": [],
+    }, duration=900 / FPS)
+    check("超预算的时间线接管被裁到预算允许的实际长度(270 帧 = 30% of 900)，不是整段摘除——"
+          "section 仍然存在且带着 timeline 数据，裁得比固定 8s 硬上限更宽松",
+          len(plan_timeline_budget["sections"]) == 1
+          and "timeline" in plan_timeline_budget["sections"][0]
+          and plan_timeline_budget["sections"][0]["fromFrame"] == 0
+          and plan_timeline_budget["sections"][0]["toFrame"] == 270
+          and plan_timeline_budget["sections"][0]["toFrame"] > _TAKEOVER_HARD_CAP_FRAMES,
+          plan_timeline_budget["sections"])
+    check("裁短对应的 sentinel workflow_range 也跟着收窄到实际裁短的长度，说话人在裁掉的那部分不再被挡住",
+          not any(m["mode"] == "workflow" and m.get("contentWidth", 0) >= 10_000_000
+                  and m["frame"] >= 270 + 30
+                  for m in plan_timeline_budget["mode_schedule"]),
+          plan_timeline_budget["mode_schedule"])
+
+    # 11c. Fix D5 专项回归——真实 job_95e1e08b0995（MrBeast backtest，23.6s
+    # 视频，710 帧）复现：固定 8s 硬上限(240 帧)本身就是 710 帧的 33.8%，
+    # 已经超过 30% 预算，"裁到 8s、再检查预算"这条路在这个时长上永远走不通
+    # ——不管重规划多少轮，第二轮都会因为"裁无可裁"直接整段摘除。用真实
+    # 视频完全一样的时长复现，断言时间线现在被裁到预算实际允许的 213 帧
+    # (30% of 710，向下取整)，而不是被摘除；同时确认这个长度比固定 8s 硬
+    # 上限更短——证明是"按预算算出来的"，不是巧合等于某个别的常量。
+    plan_short_video_timeline = _to_frame_plan({
+        "chapters": [
+            {"at_seconds": 0, "label": "TIMELINE", "takeover": True, "dark": True},
+            {"at_seconds": 591 / FPS, "label": "COST"},
+        ],
+        "process_timeline": {
+            "chapter_label": "TIMELINE", "heading": "FROM IDEA TO UPLOAD",
+            "stages": [
+                {"label": "IDEA", "seconds": 6.0, "prefix": "", "target": 2, "unit": "MO"},
+                {"label": "PRODUCTION", "seconds": 12.0, "prefix": "", "target": 3, "unit": "MO"},
+            ],
+        },
+        "data_points": [],
+    }, duration=710 / FPS)
+    check("MrBeast 真实视频时长(23.6s/710 帧)复现：时间线接管不再被整段摘除，"
+          "裁到预算允许的 213 帧(30% of 710)，比固定 8s 硬上限(240 帧)更短",
+          len(plan_short_video_timeline["sections"]) == 1
+          and "timeline" in plan_short_video_timeline["sections"][0]
+          and plan_short_video_timeline["sections"][0]["toFrame"] == 213
+          and plan_short_video_timeline["sections"][0]["toFrame"] < _TAKEOVER_HARD_CAP_FRAMES,
+          plan_short_video_timeline["sections"])
+
+    # 11d. Fix E1/E2 回归——真实 job_73e873e4f7e1（用户下载 preview(11).mp4 后
+    # 逐帧检查抓到的两个问题）：
+    #   E1: process_timeline 节点间隔从 30 帧收紧变成"还没长完线就开始长下
+    #       一段"，用户原话"everything just appears and disappears too fast"。
+    #   E2: 一张 dataCard 跟一张 topicCard 完全同坑位(x,y)、时间又重叠，
+    #       topicCard 画在后面(盖住 dataCard)，"Total Duration: 5 months"这
+    #       张卡整个存活期间从没被看到过——不是视觉上乱，是内容彻底不可见。
+    plan_e1 = _to_frame_plan({
+        "chapters": [
+            {"at_seconds": 0, "label": "PLAN"},
+            {"at_seconds": 5.4, "label": "STEPS", "takeover": True},
+            {"at_seconds": 9.5, "label": "TOTAL"},
+        ],
+        "process_timeline": {
+            "chapter_label": "STEPS", "heading": "PIPELINE",
+            "stages": [
+                {"label": "IDEA", "seconds": 6.4, "target": 4, "unit": "WEEKS", "prefix": "~"},
+                {"label": "FILMING", "seconds": 6.8, "target": 2, "unit": "WEEKS", "prefix": ""},
+                {"label": "EDITING", "seconds": 7.2, "target": 3, "unit": "WEEKS", "prefix": ""},
+            ],
+        },
+    }, duration=17.0)
+    e1_nodes = plan_e1["sections"][0]["timeline"]["nodes"]
+    e1_gaps = [e1_nodes[i]["revealFrame"] - e1_nodes[i - 1]["revealFrame"] for i in range(1, len(e1_nodes))]
+    check("E1: 时间线相邻节点间隔 >= 60 帧(2s)，不是被压缩到 30 帧",
+          all(g >= 60 for g in e1_gaps), e1_gaps)
+
+    dc = [{"title": "From Start to Finish", "x": 60, "y": 1170, "width": 960,
+           "mountFrame": 235, "endFrame": 335, "rows": []}]
+    tc = [{"headline": "We work 3-4 months in advance", "x": 60, "y": 1170, "width": 960,
+           "mountFrame": 120, "endFrame": 282, "sub": "x"}]
+    _resolve_same_slot_overlaps(dc, [], [], [], [], [], [], tc)
+    e2_overlap = dc[0]["mountFrame"] < tc[0]["endFrame"] and tc[0]["mountFrame"] < dc[0]["endFrame"]
+    check("E2: 同坑位(x,y)且时间重叠的 dataCard/topicCard 被拆开——"
+          "dataCard 顺延到 topicCard 退场之后，不再被完全盖住",
+          not e2_overlap and dc[0]["mountFrame"] > tc[0]["endFrame"], (dc, tc))
+    check("E2: dataCard 自己的展示时长(100 帧)顺延后保持不变，只是平移，不是被压缩",
+          dc[0]["endFrame"] - dc[0]["mountFrame"] == 100, dc)
+
+    # 12. Fix E：关键词校准入场+收尾（不只是数字）。合成一段跟真实场景同形状
+    # 的转写："if your policy lapses...which could affect both your coverage
+    # and your rate."——LLM 自己估的 seconds 落在句子中间，用 keyword/
+    # end_keyword 校准到真正的触发词/收尾词。
+    risk_words = [
+        {"word": "if", "start": 25.3, "end": 25.5},
+        {"word": "your", "start": 25.5, "end": 25.7},
+        {"word": "policy", "start": 25.7, "end": 26.0},
+        {"word": "lapses,", "start": 26.0, "end": 26.4},
+        {"word": "you'd", "start": 26.6, "end": 26.8},
+        {"word": "have", "start": 26.8, "end": 27.0},
+        {"word": "to", "start": 27.0, "end": 27.1},
+        {"word": "go", "start": 27.1, "end": 27.3},
+        {"word": "through", "start": 27.3, "end": 27.6},
+        {"word": "underwriting", "start": 27.6, "end": 28.2},
+        {"word": "again", "start": 28.2, "end": 28.5},
+        {"word": "which", "start": 28.8, "end": 29.0},
+        {"word": "could", "start": 29.0, "end": 29.2},
+        {"word": "affect", "start": 29.2, "end": 29.5},
+        {"word": "both", "start": 29.5, "end": 29.7},
+        {"word": "your", "start": 29.7, "end": 29.9},
+        {"word": "coverage", "start": 29.9, "end": 30.3},
+        {"word": "and", "start": 30.3, "end": 30.4},
+        {"word": "your", "start": 30.4, "end": 30.5},
+        {"word": "rate.", "start": 30.5, "end": 30.9},
+    ]
+
+    # 12a. _find_grounded_word 直接测试：数字谓词和关键词谓词都返回完整的
+    # 词 dict（含 start/end），不只是起始时间。
+    num_match = _find_grounded_word(4.7, lambda w: w.strip(",.") == "30", [{"word": "30", "start": 7.5, "end": 7.7}])
+    check("_find_grounded_word 数字谓词返回完整词 dict",
+          num_match is not None and num_match["start"] == 7.5 and num_match["end"] == 7.7, num_match)
+    kw_match = _find_grounded_word(29.0, _keyword_matches("policy", take="first"), risk_words)
+    check("_find_grounded_word 关键词谓词命中 'policy'，返回完整词 dict",
+          kw_match is not None and kw_match["word"] == "policy" and kw_match["start"] == 25.7, kw_match)
+
+    # 12b. gauge：keyword 校准入场（不是 LLM 自己估的句中位置），end_keyword
+    # 校准收尾（不是固定 160 帧动画时长）。
+    raw_gauge = {"data_points": [
+        {"visual": "gauge", "seconds": 29.0, "title": "Lapse Risk", "leftLabel": "SAFE", "rightLabel": "AT RISK",
+         "value": 0.9, "keyword": "policy", "end_keyword": "rate"},
+    ]}
+    _ground_data_point_seconds(raw_gauge, risk_words)
+    check("gauge 的 seconds 校准到 'policy' 的起始时间(25.7s)，不是 LLM 猜的句中位置(29.0s)",
+          raw_gauge["data_points"][0]["seconds"] == 25.7, raw_gauge["data_points"][0])
+    gauge_plan = _to_frame_plan(raw_gauge, duration=40.0)
+    expected_gauge_mount = round(25.7 * FPS) - MOUNT_LEAD_FRAMES
+    expected_gauge_end = round(30.9 * FPS) + _KEYWORD_EXIT_HOLD_FRAMES
+    check("gauge mountFrame 基于 'policy' 的起始时间，不是句中猜测的位置",
+          gauge_plan["gauges"][0]["mountFrame"] == expected_gauge_mount, gauge_plan["gauges"])
+    check("gauge endFrame 基于 'rate' 的结束时间 + 收尾缓冲，不是固定的 160 帧动画时长",
+          gauge_plan["gauges"][0]["endFrame"] == expected_gauge_end, gauge_plan["gauges"])
+
+    # 12c. count_up 行：end_keyword 校准卡片的自然退场，而不是"最后一行说完
+    # 再固定停留 90 帧"。
+    premium_words = [
+        {"word": "premium", "start": 14.7, "end": 15.0},
+        {"word": "is", "start": 15.0, "end": 15.1},
+        {"word": "$8,400.00.", "start": 15.1, "end": 15.6},
+    ]
+    raw_count_up_ek = {"data_points": [
+        {"visual": "count_up", "title": "Plan", "rows": [
+            {"label": "Premium", "seconds": 12.0, "value": 8400, "prefix": "$", "decimals": 0,
+             "end_keyword": "8,400"},
+        ]},
+    ]}
+    _ground_data_point_seconds(raw_count_up_ek, premium_words)
+    plan_ek = _to_frame_plan(raw_count_up_ek, duration=30.0)
+    card = plan_ek["data_cards"][0]
+    expected_card_end = round(15.6 * FPS) + _KEYWORD_EXIT_HOLD_FRAMES
+    check("count_up 卡片的 endFrame 基于 '$8,400.00.' 的结束时间 + 收尾缓冲，不是固定 90 帧停留",
+          card["endFrame"] == expected_card_end, card)
+
+    # 12d. quote：不需要新的 LLM 字段——直接用 text 自己的第一个词/最后一个词
+    # 校准入场/收尾。
+    quote_words = [
+        {"word": "Renewing", "start": 23.2, "end": 23.5},
+        {"word": "on", "start": 23.5, "end": 23.6},
+        {"word": "time", "start": 23.6, "end": 23.8},
+        {"word": "really", "start": 23.8, "end": 24.1},
+        {"word": "matters.", "start": 24.1, "end": 24.6},
+    ]
+    raw_quote = {"data_points": [
+        {"visual": "quote", "seconds": 20.0, "text": "Renewing on time really matters."},
+    ]}
+    _ground_data_point_seconds(raw_quote, quote_words)
+    check("quote 的 seconds 校准到自己文本第一个词'Renewing'的起始时间(23.2s)，不是 LLM 猜的 20.0s",
+          raw_quote["data_points"][0]["seconds"] == 23.2, raw_quote["data_points"][0])
+    quote_plan = _to_frame_plan(raw_quote, duration=30.0)
+    expected_quote_mount = round(23.2 * FPS) - MOUNT_LEAD_FRAMES
+    expected_quote_end = round(24.6 * FPS) + _KEYWORD_EXIT_HOLD_FRAMES
+    check("quote mountFrame 基于文本自己第一个词的起始时间",
+          quote_plan["quotes"][0]["mountFrame"] == expected_quote_mount, quote_plan["quotes"])
+    check("quote endFrame 基于文本自己最后一个词'matters.'的结束时间 + 收尾缓冲，不是固定 140 帧",
+          quote_plan["quotes"][0]["endFrame"] == expected_quote_end, quote_plan["quotes"])
+
+    # 12e. 向后兼容：没有 keyword/end_keyword 时行为跟 Fix E 之前完全一样
+    # （回退到固定时长），不会因为新字段缺失而报错或改变既有输出。
+    raw_no_keyword = {"data_points": [
+        {"visual": "gauge", "seconds": 5.0, "title": "G", "leftLabel": "A", "rightLabel": "B", "value": 0.5},
+    ]}
+    _ground_data_point_seconds(raw_no_keyword, risk_words)  # should be a no-op for this dp (no keyword field)
+    plan_no_kw = _to_frame_plan(raw_no_keyword, duration=20.0)
+    fallback_mount = round(5.0 * FPS) - MOUNT_LEAD_FRAMES
+    check("无 keyword/end_keyword 时，gauge 完全回退到 Fix E 之前的固定时长行为",
+          plan_no_kw["gauges"][0]["mountFrame"] == fallback_mount
+          and plan_no_kw["gauges"][0]["endFrame"] == fallback_mount + 70 + 90,  # GAUGE_ANIMATION_FRAMES+HOLD
+          plan_no_kw["gauges"])
+
+    # 12f. 回归测试——真实一跑(job_b943ce1d3606)抓到的 bug：count_up 卡片
+    # 如果只有*一行*拿到 end_keyword 校准（且校准得比另一行自己的出场时间更
+    # 早），旧逻辑会直接拿这一行的收尾时间当作整张卡片的 endFrame，结果卡片
+    # 在另一行（没校准、出场更晚）自己的数字还没滚动之前就已经被判定该收起
+    # 了。Premium 行（无 end_keyword，自己在 16.0s 才出场)不能被 Coverage 行
+    # （有 end_keyword，收尾校准到 11.5s）的早收尾顶掉。
+    starvation_words = [{"word": "million", "start": 11.3, "end": 11.5}]
+    raw_starvation = {"data_points": [
+        {"visual": "count_up", "title": "Plan", "rows": [
+            {"label": "Coverage", "seconds": 11.0, "value": 1.5, "prefix": "$", "decimals": 1,
+             "end_keyword": "million"},
+            {"label": "Premium", "seconds": 16.0, "value": 8400, "prefix": "$", "decimals": 0},
+        ]},
+    ]}
+    _ground_data_point_seconds(raw_starvation, starvation_words)
+    plan_starvation = _to_frame_plan(raw_starvation, duration=30.0)
+    card_s = plan_starvation["data_cards"][0]
+    premium_row = next(r for r in card_s["rows"] if r["label"] == "Premium")
+    premium_reveal_frame = card_s["mountFrame"] + premium_row["mountOffset"]
+    check("没校准的 Premium 行不会被 Coverage 行更早的校准收尾顶掉——卡片"
+          "endFrame 必须晚于 Premium 自己的出场帧",
+          card_s["endFrame"] > premium_reveal_frame, card_s)
+    check("Premium 行出场之后卡片至少停留完整的滚动动画+收尾缓冲(40+30帧)",
+          card_s["endFrame"] >= premium_reveal_frame + _COUNT_UP_ROW_ANIM_FRAMES + _KEYWORD_EXIT_HOLD_FRAMES,
+          card_s)
+
+    # 13. 回归测试——真实用户反馈("appeared it nicely, but disappearing too
+    # fast")：countdown/calendar 这类紧挨着的两段内容，前一段(countdown)自己
+    # 关键词校准过的收尾时间已经是跟着台词走的真实值了，但堆叠系统一直是
+    # 无脑地用"下一段(calendar)想上场的时间 - 缓冲"去砍前一段，完全不管前一段
+    # 本来想播到什么时候。两边现在都是台词校准来的真实时间，冲突时应该优先
+    # 让前一段播完，代价是让下一段稍微晚一点上场。
+    countdown_dp = {"visual": "countdown", "seconds": 6.0, "value": 30, "unitLabel": "DAYS", "label": "RENEWAL"}
+    countdown_dp["_grounded_end_seconds"] = 8.0  # 模拟 end_keyword="days" 校准到的收尾词结束时间
+    calendar_dp = {"visual": "calendar", "seconds": 7.0, "year": 2026, "month": 7, "targetDay": 28,
+                   "eventLabel": "Renewal"}
+    handoff_plan = _to_frame_plan({"chapters": [], "data_points": [countdown_dp, calendar_dp]}, duration=30.0)
+    cd = handoff_plan["countdowns"][0]
+    cal = handoff_plan["calendar_events"][0]
+    expected_cd_end = round(8.0 * FPS) + _KEYWORD_EXIT_HOLD_FRAMES
+    check("countdown 播完自己校准过的收尾时间，不被 calendar 的上场时间砍短",
+          cd["endFrame"] == expected_cd_end, cd)
+    check("calendar 改为晚一点上场（等 countdown 播完 + 退场缓冲），而不是把 countdown 砍短",
+          cal["mountFrame"] == cd["endFrame"] + _STACK_EXIT_BUFFER_FRAMES, {"countdown": cd, "calendar": cal})
+    check("calendar 自己的展示时长没有因为被推迟而被压缩",
+          cal["endFrame"] - cal["mountFrame"] >= 100, cal)
+
+    # 冲突太大(超过 _STACK_HANDOFF_MAX_DELAY_FRAMES)时放弃推迟，退回旧的砍短
+    # 行为——不能让一次异常的校准结果把下一段拖很久很久都不上场。
+    from whatsapp_mvp.content_planner import _STACK_HANDOFF_MAX_DELAY_FRAMES
+    countdown_far = {"visual": "countdown", "seconds": 6.0, "value": 30, "unitLabel": "DAYS", "label": "RENEWAL"}
+    countdown_far["_grounded_end_seconds"] = 6.0 + (_STACK_HANDOFF_MAX_DELAY_FRAMES + 60) / FPS
+    calendar_soon = {"visual": "calendar", "seconds": 7.0, "year": 2026, "month": 7, "targetDay": 28,
+                     "eventLabel": "Renewal"}
+    far_plan = _to_frame_plan({"chapters": [], "data_points": [countdown_far, calendar_soon]}, duration=60.0)
+    cd_far = far_plan["countdowns"][0]
+    cal_soon = far_plan["calendar_events"][0]
+    grounded_target_frame = round(countdown_far["_grounded_end_seconds"] * FPS)
+    check("冲突超过上限时不推迟下一段太久——calendar 没有被拖到接近 countdown 完整校准目标那么晚",
+          cal_soon["mountFrame"] < grounded_target_frame - _STACK_HANDOFF_MAX_DELAY_FRAMES,
+          {"countdown": cd_far, "calendar": cal_soon, "grounded_target_frame": grounded_target_frame})
+    check("这种情况下 countdown 被砍短（回退到旧行为），而不是播完整个校准目标",
+          cd_far["endFrame"] < grounded_target_frame - _STACK_HANDOFF_MAX_DELAY_FRAMES, cd_far)
+
+    # 14. 回归测试——真实用户反馈("what happened to the calendar, what
+    # happened to the numbers")：真实一跑(job_1237c9c59bc0)里 LLM 没规划出
+    # 日历/数据卡，密度下限补规划(REPLAN，产出标记 _gap_fill 的数据点)在 11s
+    # 后才出现，此时按旧逻辑它跟已经孤零零晾在那的 countdown 属于同一堆叠
+    # (同章节、在 8s 的 JOIN WINDOW 内、高度也够)——两者被绑定共享同一个退场
+    # 时间，倒计时活活多播了 12 秒，观众看到的是一张过时的"30 DAYS"卡片陪着
+    # 一条毫不相关的"$8,400 保费"文字同时挂在画面上。补规划产出的内容必须
+    # 强制开新的一段，让 countdown 在自己该退场的时候就退场。
+    countdown_alone = {"visual": "countdown", "seconds": 6.0, "value": 30, "unitLabel": "DAYS", "label": "RENEWAL"}
+    gap_fill_card = {"visual": "topic_card", "seconds": 10.0, "headline": "the premium is $8,400", "icon": "sparkle",
+                      "_gap_fill": True}
+    isolation_plan = _to_frame_plan({"chapters": [], "data_points": [countdown_alone, gap_fill_card]}, duration=30.0)
+    cd_alone = isolation_plan["countdowns"][0]
+    gap_card = isolation_plan["topic_cards"][0]
+    check("孤零零的 countdown 在自己的自然收尾时间退场，不会被后面才出现的补规划内容拖住",
+          cd_alone["endFrame"] < round(10.0 * FPS), cd_alone)
+    check("_gap_fill 标记的 topic_card 强制开一段新的堆叠(跟 countdown 同一条车道 y，不是拼在它下面)，"
+          "而不是悄悄拼进 countdown 还开着的那一段",
+          gap_card["y"] == cd_alone["y"] and gap_card["mountFrame"] >= cd_alone["endFrame"],
+          {"countdown": cd_alone, "gap_card": gap_card})
+
+    # 16. 规划质量标准循环的标准函数（_plan_quality_failures）——纯函数、
+    # 确定性，criterion loop 每轮规划后跑，全部通过才提前退出。真实用户
+    # 要求："ALL VIDEOS SENT WILL HAVE A PLANNING TOWARDS HOW THE ANIMATIONS
+    # WILL GO... HAVE A CRITERION ON THE FEATURE SO THAT THE BOT WOULD GO
+    # THROUGH IT EVERYTIME"。
+    from whatsapp_mvp.content_planner import _plan_quality_failures, _MIN_DURATION_FOR_VISUALS_S
+
+    # 16a. 确认过的真实生产失败（job_1dd6e4748b31，Dickson 视频）：35s 口播
+    # 规划出 0 个图形——必须被标准 1（零图形）+ 标准 2（长空档）双双抓住。
+    empty_plan_35s = _to_frame_plan({"chapters": [{"at_seconds": 0, "label": "A"}]}, duration=35.0)
+    f_empty = _plan_quality_failures({"data_points": []}, empty_plan_35s, 35.0)
+    check("35s 视频规划出 0 个图形被质量标准抓住（零图形 + 长空档）",
+          len(f_empty) >= 2 and any("ZERO visual" in f for f in f_empty)
+          and any("No visual event" in f for f in f_empty), f_empty)
+
+    # 16b. 覆盖良好的计划全部通过（20s 视频 + 一张 5s 处的 topic_card，
+    # 头尾豁免区之外的中段全被盖住）。
+    good_raw = {"data_points": [{"visual": "topic_card", "seconds": 5.0, "headline": "a real point", "icon": "check"}]}
+    good_plan = _to_frame_plan({"chapters": [], **good_raw}, duration=20.0)
+    check("覆盖良好的计划质量标准全部通过（返回空失败列表）",
+          _plan_quality_failures(good_raw, good_plan, 20.0) == [],
+          _plan_quality_failures(good_raw, good_plan, 20.0))
+
+    # 16c. 0 值卡被标准 3 抓住（value=1.5 又配 divideBy=1000000 → 显示 $0.0M，
+    # 真实生产 bug 的复现形状）。
+    zero_raw = {"data_points": [
+        {"visual": "topic_card", "seconds": 5.0, "headline": "x", "icon": "check"},
+        {"visual": "count_up", "title": "Coverage", "rows": [
+            {"label": "C", "seconds": 6.0, "value": 1.5, "divideBy": 1000000, "decimals": 1}]},
+    ]}
+    zero_plan = _to_frame_plan({"chapters": [], **zero_raw}, duration=20.0)
+    f_zero = _plan_quality_failures(zero_raw, zero_plan, 20.0)
+    check("显示为 0 的数字卡被质量标准抓住", any("ZERO after" in f for f in f_zero), f_zero)
+
+    # 16d. 短视频（<15s）豁免零图形标准（intro/outro 已够撑画面），空档检查
+    # 也因为短视频豁免不触发——空计划应该整体通过。
+    short_plan = _to_frame_plan({"chapters": []}, duration=12.0)
+    check("短视频(<15s)空计划豁免质量标准",
+          _plan_quality_failures({"data_points": []}, short_plan, 12.0) == []
+          and 12.0 < _MIN_DURATION_FOR_VISUALS_S,
+          _plan_quality_failures({"data_points": []}, short_plan, 12.0))
 
     print()
     if FAILED:
