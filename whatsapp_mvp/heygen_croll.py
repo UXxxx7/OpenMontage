@@ -145,6 +145,28 @@ def _download(url: str, out_path: Path) -> bool:
         return False
 
 
+def delete_talking_photo(talking_photo_id: str) -> bool:
+    """用完即删，释放 HeyGen 账号的 photo avatar 配额（标准档只给 3 个，见
+    2026-07-17 实测：`DELETE /v1/talking_photo/{id}` 返回 200 但不释放配额，
+    配额单位其实是 avatar group——同一张照片上传后 group id 就等于
+    talking_photo_id，删 group 才是真删除。失败只记警告不抛异常：清理失败不该
+    把一次已经成功的生成变成失败任务。"""
+    key = _api_key()
+    if not key:
+        return False
+    try:
+        r = requests.delete(
+            f"https://api.heygen.com/v2/avatar_group/{talking_photo_id}",
+            headers={"x-api-key": key}, timeout=15,
+        )
+        r.raise_for_status()
+        logger.info(f"heygen_croll: 已清理 talking photo {talking_photo_id}，释放配额")
+        return True
+    except Exception as e:
+        logger.warning(f"heygen_croll: 清理 talking photo {talking_photo_id} 失败（不影响本次任务）: {e}")
+        return False
+
+
 def probe_duration_seconds(path: Path) -> float:
     """成本按实际生成时长算，不信请求参数。"""
     import subprocess

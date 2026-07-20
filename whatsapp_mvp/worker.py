@@ -223,8 +223,14 @@ def generate_croll(job_id: str, photo_path: str, lang: str = "zh", hint: str = "
     if job is None:
         return
 
+    from . import heygen_croll
+
+    # 标准档账号只给 3 个 photo avatar 名额，用完必须清理——2026-07-17 实测撞过：
+    # 连续测 3 次直接把配额堵死，第 4 次上传直接 400。放 finally 里保证无论后面
+    # 生成成功/超时/异常都会清理，因为上传这一步本身就已经占了名额，不清理的话
+    # 即使后续步骤失败，这个名额也白白浪费掉。
+    talking_photo_id: Optional[str] = None
     try:
-        from . import heygen_croll
         from .croll_script import write_script
 
         if not heygen_croll.is_available():
@@ -274,6 +280,9 @@ def generate_croll(job_id: str, photo_path: str, lang: str = "zh", hint: str = "
     except Exception as e:
         logger.exception(f"C-roll 生成出错 {job_id}: {e}")
         update_job_status(job_id, JobStatus.ERROR, str(e))
+    finally:
+        if talking_photo_id:
+            heygen_croll.delete_talking_photo(talking_photo_id)
 
 
 # ---------------------------------------------------------------------------
