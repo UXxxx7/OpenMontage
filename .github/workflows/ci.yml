@@ -82,6 +82,10 @@ jobs:
       # 单元测试。若你有需要联网/花钱的用例（调 wolfai/omni 等），
       # 给它们打上 @pytest.mark.network，再用下面的 -m 'not network' 在 CI 里跳过，
       # 避免 CI 花钱/因外部服务抖动而误红。
+      # 用 --with pytest 临时把 pytest 带进运行环境（pytest 不是项目主依赖，
+      # uv sync 不会装它，直接 uv run pytest 会报 "Failed to spawn: pytest"）。
+      # 若你有需要联网/花钱的用例，给它们打 @pytest.mark.network，再把下面
+      # 换成带 -m "not network" 的那行，CI 里跳过它们。
       - name: Unit tests
-        run: uv run pytest -q
-        # run: uv run pytest -q -m "not network"
+        run: uv run --with pytest pytest -q
+        # run: uv run --with pytest pytest -q -m "not network"
