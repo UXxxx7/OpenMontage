@@ -1023,6 +1023,48 @@ def main():
           and 12.0 < _MIN_DURATION_FOR_VISUALS_S,
           _plan_quality_failures({"data_points": []}, short_plan, 12.0))
 
+    # 17. Fix C26 回归测试——真实生产复现 job_452ef6c48100，用户截图抓到
+    # "$8,400"这一行数字滚动到一半就被卡片收起切掉：一张卡片里两行数字，
+    # 一行(Coverage)校准过、说得慢；另一行(Premium)也校准过，但"$8,400"这个
+    # 短语说得很快，校准出的"说完这个词"时间点离它自己的出场帧很近——旧逻辑
+    # 只用"说完 + 停留缓冲"决定卡片收起时间，完全不管这一行自己的滚动动画
+    # (_COUNT_UP_ROW_ANIM_FRAMES=40 帧)有没有时间播完。
+    from whatsapp_mvp.content_planner import _MIN_VISUAL_HOLD_FRAMES
+    coverage_row = {"label": "COVERAGE", "seconds": 18.0, "value": 1500000, "prefix": "$",
+                     "divideBy": 1000000, "decimals": 1, "unit": "M"}
+    coverage_row["_grounded_end_seconds"] = 18.6
+    premium_row = {"label": "PREMIUM", "seconds": 24.2, "value": 8400, "prefix": "$", "decimals": 0}
+    premium_row["_grounded_end_seconds"] = 24.4  # "$8,400" 说得很快——校准收尾离出场只差 0.2s(6 帧)
+    count_up_dp = {"visual": "count_up", "title": "Your Coverage", "rows": [coverage_row, premium_row]}
+    cutoff_plan = _to_frame_plan({"chapters": [], "data_points": [count_up_dp]}, duration=45.0)
+    cutoff_card = cutoff_plan["data_cards"][0]
+    premium_out = next(r for r in cutoff_card["rows"] if r["label"] == "PREMIUM")
+    premium_row_frame = cutoff_card["mountFrame"] + premium_out["mountOffset"]
+    check("说得很快的行(校准收尾离出场很近)，卡片仍然等它自己的滚动动画播完才收起",
+          cutoff_card["endFrame"] >= premium_row_frame + _COUNT_UP_ROW_ANIM_FRAMES,
+          {"card": cutoff_card, "premium_row_frame": premium_row_frame})
+
+    # 18. Fix C27 回归测试——真实生产复现 job_452ef6c48100，用户反馈"日历
+    # 消失得太快"：一个数据点被关键词校准到自己章节快结束时才挂载(这条日历
+    # 的"28th of July"是 DEADLINE 章节最后一句话)，章节边界裁剪(_flush_stack
+    # 的"不能播到下一个话题里"保护)把它砍到只剩十几帧——比这份代码自己认定
+    # 的最短可读时长(_MIN_VISUAL_HOLD_FRAMES=45 帧/1.5s)还短得多。
+    tight_chapter_plan = _to_frame_plan({
+        "chapters": [{"at_seconds": 0, "label": "DEADLINE"}, {"at_seconds": 11.2, "label": "COVERAGE"}],
+        "data_points": [{
+            "visual": "calendar", "seconds": 10.6, "year": 2026, "month": 7, "targetDay": 28,
+            "eventLabel": "Renewal",
+        }],
+    }, duration=45.0)
+    tight_cal = tight_chapter_plan["calendar_events"][0]
+    check("章节边界快到卡死的元素，展示时长仍不低于 _MIN_VISUAL_HOLD_FRAMES 这个下限"
+          "（或者卡在下一段真的紧跟着要用的地盘之前，两者取较严格的那个）",
+          tight_cal["endFrame"] - tight_cal["mountFrame"] >= _MIN_VISUAL_HOLD_FRAMES
+          or tight_cal["endFrame"] == round(11.2 * FPS),
+          tight_cal)
+    check("展示时长比修复前的 18 帧(旧行为，无下限保护)有实质性改善",
+          tight_cal["endFrame"] - tight_cal["mountFrame"] > 18, tight_cal)
+
     print()
     if FAILED:
         print(f"{len(FAILED)} FAILED: {FAILED}")

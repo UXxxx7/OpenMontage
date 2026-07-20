@@ -844,6 +844,19 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
         end = min(stack_last_end, stack_chapter_end)
         if next_mount is not None:
             end = min(end, next_mount - _STACK_EXIT_BUFFER_FRAMES)
+        # Fix C27（2026-07-20，真实生产复现——job_452ef6c48100，用户反馈"日历
+        # 消失得太快"）：一个数据点如果恰好在自己章节快结束时才被关键词校准
+        # 挂载（这条 calendar 的"28th of July"就是 DEADLINE 章节最后一句话），
+        # 上面的章节边界裁剪会把它砍到只剩十几帧——比这份代码自己在别处认定
+        # 的"最短可读时长"(_MIN_VISUAL_HOLD_FRAMES，45 帧/1.5s) 还短得多，观众
+        # 根本来不及看清。章节边界裁剪本身是对的（不能让图形播到下一个话题
+        # 里），这里只是补一条下限：裁剪结果绝不能比 _MIN_VISUAL_HOLD_FRAMES
+        # 还短——真的没有 45 帧空间时（下一段紧跟着立刻要用这块地盘）才会
+        # 无可奈何地保持原样，不会反过来抢占下一段本该有的地盘。
+        floor = min(stack[0]["mountFrame"] + _MIN_VISUAL_HOLD_FRAMES, stack_last_end)
+        if next_mount is not None:
+            floor = min(floor, next_mount - _STACK_EXIT_BUFFER_FRAMES)
+        end = max(end, floor)
         end = max(end, stack[0]["mountFrame"] + 1)  # never a non-positive/inverted duration
         for e in stack:
             e["endFrame"] = end
@@ -1545,7 +1558,19 @@ def _plan_count_up(dp: dict, min_mount_frame: int) -> Optional[dict]:
         # 准的行也要用"它自己的出场帧 + 动画时长 + 停留"参与同一个 max，防
         # 止被更早收尾的另一行顶掉。
         if isinstance(r, dict) and r.get("_grounded_end_seconds") is not None:
-            grounded_ends.append(round(r["_grounded_end_seconds"] * FPS) + _KEYWORD_EXIT_HOLD_FRAMES)
+            # Fix C26（2026-07-20，真实生产复现——job_452ef6c48100，用户截图
+            # 抓到 $8,400 这一行数字滚动到一半、还没滚完就被卡片收起切掉）：
+            # 校准过的收尾时间只反映"这个词说完的那一帧"+ 停留缓冲，跟这一行
+            # 自己的动画有没有播完是两回事——"$8,400"这种短语音说得很快，
+            # 说完 + 停留缓冲常常比它自己从 mountOffset 起跳需要的
+            # _COUNT_UP_ROW_ANIM_FRAMES(40 帧) 更早。未校准的行已经用
+            # `row_frame + _COUNT_UP_ROW_ANIM_FRAMES` 兜底过这一点（见下面
+            # ungrounded 分支），但校准过的行反而没有这层保护，白白让"说得快"
+            # 的行提前把整张卡片收走。这里两个下限都算，取较大值。
+            grounded_ends.append(max(
+                round(r["_grounded_end_seconds"] * FPS) + _KEYWORD_EXIT_HOLD_FRAMES,
+                row_frame + _COUNT_UP_ROW_ANIM_FRAMES,
+            ))
         else:
             ungrounded_row_frames.append(row_frame)
     if not rows:
