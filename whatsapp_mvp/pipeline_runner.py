@@ -1111,6 +1111,164 @@ _RICHNESS_FIELDS = (
 )
 
 
+def _fill_intro_lead_dead_space(props: dict, findings: list[dict], captions: list[dict]) -> dict:
+    """Fix C13（2026-07-17，真实生产复现——同一支 backtest 视频连续 3 轮重规划
+    都没修掉 intro_lead_dead_space，最终交付版本仍是长达 5.2s 的纯说话人+字幕
+    空白，用户直接在渲染出的截图里抓到）。
+
+    这条 finding 的检测（Rule 9/props_lint.py）从没失手过——三次独立 backtest
+    都精准报出同一类缺口；但把它当反馈文字喂给 LLM 重规划，三轮下来没有一次
+    真正补上过。跟 D3-D6/E2 是同一类教训：LLM 对某条 finding 反复失败，就不该
+    继续指望"这次会听话"，该换成确定性保证。这里不追加一次 LLM 调用，直接在
+    最终交付的 props 上机械地插入一个轻量 topicCard 盖住缺口——内容取这段时间
+    实际讲的字幕原文（掐头去尾，不超过 _MAX_HEADLINE_CHARS），不是编造的品牌语
+    ——跟"_fallback_topic_cards_for_gaps 被删掉"不是同一类问题：那个是对*所有*
+    稀疏 gap 无差别地机械填充、多次重复才显得像"为了有而有的弹窗"；这里只在
+    "LLM 已经真实尝试过 3 轮、专门针对 intro 这一个位置仍然失败"之后才触发一次，
+    是保底，不是默认行为。
+    """
+    from .content_planner import FPS, _CONTENT_ZONE_X, _CONTENT_ZONE_Y
+    from .props_lint import lint_props, _transition_windows
+
+    gap = next((f for f in findings if f.get("check") == "intro_lead_dead_space"), None)
+    if gap is None:
+        return props
+
+    gap_start, gap_end = gap["gap_start"], gap["gap_end"]
+    # gap_start 就是 introOutFrame（props_lint.py 里这条 check 的定义）——但卡片
+    # 实际收到 workflow 尺寸的时间点不一定等于 introOutFrame+20：Fix C14 把它
+    # 的上限设在 introOutFrame+100，真实收缩点可能落在 20-100 之间任何地方。
+    # 用真实的 scenes 过渡窗口而不是猜一个固定偏移——固定 +20 在 C14 落地前
+    # 曾经把这张卡直接放进了仍在变形的过渡区间，反而多产生一条
+    # element_mounts_during_card_transition（验证时抓到的真实回归）。
+    mount = gap_start + 20
+    for win_start, win_end in _transition_windows(props.get("scenes") or []):
+        if win_start < mount < win_end:
+            mount = win_end
+    # Fix C13b（2026-07-17，真实生产复现——job_b7e1b7f96481，用户 WhatsApp 上
+    # 真实收到降级交付后发现）：这里原来是 max(mount+20, gap_end-10)，两个候选
+    # 取较大值——但 gap_end 是"第一个真实内容元素挂载的那一帧"，取较大值在
+    # mount 本身已经很晚（贴着 gap_end）时会让 end 反而超出 gap_end，把卡片
+    # 的尾巴伸进下一个真实元素的地盘，制造一条新的 element_overlap，安全阀
+    # 因此拒绝插入——保底本身失效，intro_lead_dead_space 原样交付给用户，
+    # 最终触发 vision QA 的"空画布"判定和整段降级。改成夹在 gap_end 这个硬
+    # 上限以内：还是尽量给够 20 帧的最小展示时长，但绝不越界侵入下一个元素
+    # 的时间窗——真的挤不下（mount 本身已经 >= gap_end）就老实放弃插入，
+    # 好过插入一个会引发新重叠的版本。
+    end = min(max(mount + 20, gap_end - 10), gap_end)
+    if end <= mount:
+        return props
+
+    gap_start_ms, gap_end_ms = gap_start / FPS * 1000, gap_end / FPS * 1000
+    overlapping = [c for c in captions if c["startMs"] < gap_end_ms and c["endMs"] > gap_start_ms]
+    _MAX_HEADLINE_CHARS = 16
+    if overlapping:
+        text = overlapping[0]["text"].strip()
+        headline = text if len(text) <= _MAX_HEADLINE_CHARS else text[:_MAX_HEADLINE_CHARS] + "…"
+    else:
+        headline = "AI EDIT"  # 这段时间没有任何字幕可用时的最后兜底，不编造具体内容
+
+    filler_card = {
+        "headline": headline, "icon": "sparkle",
+        "x": _CONTENT_ZONE_X, "y": _CONTENT_ZONE_Y, "width": 960,
+        "mountFrame": mount, "endFrame": end,
+    }
+    candidate = dict(props)
+    candidate["topicCards"] = [*(props.get("topicCards") or []), filler_card]
+
+    # 保底本身不能制造新问题——插入前后都跑一次 lint。光比总数不够：验证时
+    # 真实抓到过一次总数持平(5->5)但内容换了的回归——intro_lead_dead_space
+    # 和 low_visual_richness 消失，换成了一条新的 element_over_card 重复项
+    # 和一条新的 element_mounts_during_card_transition，总数假装没变化，实际
+    # 是拿一个已知问题换了两个新问题。改成比较 check 类型集合：新版本不能
+    # 出现插入前完全没有过的 check 类型，哪怕总数打平或更少。
+    before_findings = lint_props(props)
+    after_findings = lint_props(candidate)
+    before_checks = {f["check"] for f in before_findings}
+    after_checks = {f["check"] for f in after_findings}
+    new_check_types = after_checks - before_checks
+    if new_check_types or len(after_findings) > len(before_findings):
+        logger.warning(
+            f"  apply_style: intro_lead_dead_space 确定性兜底会引入新问题"
+            f"({len(before_findings)}->{len(after_findings)} findings, 新增类型: "
+            f"{new_check_types or '无，但总数变多'})，放弃插入，保留原版本（Fix C13 安全阀）"
+        )
+        return props
+
+    logger.info(
+        f"  apply_style: intro_lead_dead_space 3 轮重规划仍未解决，确定性兜底插入"
+        f"轻量 topicCard('{headline}') 覆盖第 {mount}-{end} 帧（Fix C13）"
+    )
+    return candidate
+
+
+def _demote_content_free_takeovers(props: dict, findings: list[dict]) -> dict:
+    """Fix C15（2026-07-17，真实生产复现——同一支 dajaai-walking backtest 视频，
+    用户截图直接抓到）：'流程/PROCESS' 接管区间(417-657)既没有 timeline 也没有
+    icon，SectionLayer 只能画标题+一个纯装饰性的模糊光斑——跟 Rule 4 记录的
+    bug 视觉上一模一样，但根因不同：Rule 4 那次是 TimelineSection 被写死只在
+    dark 模式渲染，这次是 content_planner 这一轮的方案压根没给这个接管章节挂
+    timeline/icon 中的任何一个。
+
+    跟 intro_lead_dead_space（Fix C13）同一类教训：LLM 三轮重规划都没修好，
+    该换成确定性保证，不再赌"这次会听话"。这里选 props_lint 自己给的第三个
+    选项——"这段内容其实不值得全画布接管，改回普通 workflow 模式"——而不是
+    硬造一个 timeline：这个章节自己的 stepList（DIGITAL HUMAN PROCESS，
+    mountFrame 367-978）已经完整覆盖了 417-657 这整个接管区间，说话人被藏起来
+    换来的只有一个空气泡，内容一点没多。直接去掉这个 section（不再全画布接管）
+    + 去掉对应的说话人隐藏关键帧，说话人正常留在画面上，stepList 该怎么显示
+    还怎么显示，不需要凭空造内容。
+
+    只删 sections 列表本身不够——真正驱动说话人可见度的是 opacityKeyframes，
+    是渲染时读的独立字段，不是从 sections 派生的；只删 sections 会留下"说话人
+    仍不可见，但连装饰性光斑都没了"的更差状态（纯空气泡）。两个字段必须一起改。
+    """
+    bad = [f for f in findings if f.get("check") == "section_takeover_lacks_content"]
+    if not bad:
+        return props
+    bad_spans = [(f["fromFrame"], f["toFrame"]) for f in bad]
+
+    candidate = dict(props)
+    candidate["sections"] = [
+        s for s in (props.get("sections") or [])
+        if (s.get("fromFrame"), s.get("toFrame")) not in bad_spans
+    ]
+    # 淡出/淡回的关键帧紧贴 fromFrame/toFrame 但不完全等于（_workflow_mode_schedule
+    # 的事件扫描 + _TAKEOVER_FADE_FRAMES 淡入淡出会有几帧偏移），用缓冲区间匹配
+    # 而不是精确相等。
+    _BUFFER = 20
+    old_opacity = props.get("opacityKeyframes") or []
+    new_opacity = [
+        k for k in old_opacity
+        if not any(fr - _BUFFER <= k["frame"] <= to + _BUFFER for fr, to in bad_spans)
+    ]
+    if new_opacity:
+        candidate["opacityKeyframes"] = new_opacity
+    else:
+        candidate.pop("opacityKeyframes", None)
+
+    from .props_lint import lint_props
+    before_findings = lint_props(props)
+    after_findings = lint_props(candidate)
+    before_checks = {f["check"] for f in before_findings}
+    after_checks = {f["check"] for f in after_findings}
+    new_check_types = after_checks - before_checks
+    if new_check_types or len(after_findings) > len(before_findings):
+        logger.warning(
+            f"  apply_style: section_takeover_lacks_content 确定性兜底会引入新问题"
+            f"({len(before_findings)}->{len(after_findings)} findings, 新增类型: "
+            f"{new_check_types or '无，但总数变多'})，放弃降级，保留原版本（Fix C15 安全阀）"
+        )
+        return props
+
+    logger.info(
+        f"  apply_style: section_takeover_lacks_content 3 轮重规划仍未解决，"
+        f"确定性降级为普通 workflow 模式（去掉 {len(bad_spans)} 个空内容接管，"
+        f"说话人保持可见）（Fix C15）"
+    )
+    return candidate
+
+
 def _visual_richness(props: dict) -> int:
     """Fix C6（2026-07-16）：确认过的真实生产 bug——MrBeast backtest
     (job_95e1e08b0995)第一轮规划出了完整的 TIMELINE 时间线图形 + 数据卡 +
@@ -1303,11 +1461,33 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
             # intro 期间卡片必须保持 Dominant(近全屏)——标题是压在大卡上的
             # (VeLL 参考)。把 introOutFrame 之前开始的 workflow 段推迟到 intro
             # 结束后 20 帧，避免标题叠在停靠小卡+背景上。
+            #
+            # Fix C14（2026-07-17，真实生产复现，dajaai-walking backtest）：上面
+            # 这条只管"太早"（workflow 提前到 intro 还没播完就开始）——完全没管
+            # "太晚"的反方向。第一段 workflow 的起始帧来自 _flush_stack 里的
+            # stack_start，直接等于第一个内容点自己的 mountFrame（content_planner.py
+            # 行 997），跟 introOutFrame 毫无关系。真实撞上的案例：第一个内容点
+            # 直到第 236 帧才 mount，intro 在第 80 帧就已经结束，卡片就这么继续
+            # 保持全尺寸又空占了 150 帧(5s)——props_lint 的 intro_lead_dead_space
+            # 抓到的正是这段。这里补对称的上限：第一段 workflow 最迟从
+            # intro_out + _MAX_DOMINANT_HOLD_FRAMES 开始，卡片按时收起，即使这时候
+            # 还没有真实内容能填满收起后的位置也一样——腾出来的空当交给 props_lint
+            # 的 intro_lead_dead_space + pipeline_runner._fill_intro_lead_dead_space
+            # （Fix C13）兜底填一张轻量卡，好过卡片顶着全尺寸空转。只夹住*第一段*
+            # workflow（第一个 mode=="workflow" 的项）——后面的 workflow/dominant
+            # 交替是内容本身决定的真实时间点，不该跟着挪。
+            _MAX_DOMINANT_HOLD_FRAMES = 100  # intro 结束后最多再保持满打满算 ~3.3s 全尺寸
+            first_workflow_seen = False
             clamped = []
             for m in mode_schedule:
                 m = dict(m)
                 if m.get("mode") == "workflow" and m["frame"] < intro_out + 20:
                     m["frame"] = intro_out + 20
+                elif (not first_workflow_seen and m.get("mode") == "workflow"
+                        and m["frame"] > intro_out + _MAX_DOMINANT_HOLD_FRAMES):
+                    m["frame"] = intro_out + _MAX_DOMINANT_HOLD_FRAMES
+                if m.get("mode") == "workflow":
+                    first_workflow_seen = True
                 clamped.append(m)
             # 保持严格递增（推迟后可能与后续项撞帧）
             mode_schedule = []
@@ -1517,7 +1697,31 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         )
     elif attempt > 1:
         logger.info(f"  apply_style: props_lint 全部通过（第 {attempt - 1}/{_PROPS_LINT_MAX_ATTEMPTS} 轮重试后）")
-    props = best_props
+    def _apply_deterministic_guarantees(p: dict) -> dict:
+        """Fix C16（2026-07-17，真实生产复现——同一支 backtest 视频，用户截图
+        直接抓到的"截图4"問題重规划 3 轮后仍在，一路查下去发现 C13/C15 从没被
+        真正应用过）：这两个确定性保底只挂在 props_lint 重试循环*后面*一次，
+        但 qa_stills 视觉复审如果抓到 high 严重度问题，下面会整段调用
+        `props = _build(feedback=...)` 重新规划——这是全新一次内容规划，产出
+        的新 props 从没经过 props_lint 循环、更没经过 C13/C15，直接原样送去
+        渲染。C13/C15 的保底逻辑因此形同虚设：只要视觉复审恰好在第一轮就抓到
+        问题（这条 backtest 真实发生的情况——C13 自己的安全阀又刚好拒绝了
+        插入，intro_lead_dead_space 缺口原样留着，被 vision QA 判成"空画布"
+        high severity），保底代码从头到尾没有执行的机会。抽成一个函数，在
+        主循环后、以及 qa_stills 触发的每一次重规划后都调用，不管 props 是
+        从哪条路径产出的，最终送去渲染的版本都保证经过同一套确定性检查。
+        """
+        findings = _run_props_lint(p)
+        if findings:
+            p = _fill_intro_lead_dead_space(p, findings, captions)
+            findings = _run_props_lint(p)
+        if findings:
+            p = _demote_content_free_takeovers(p, findings)
+            findings = _run_props_lint(p)
+        return p
+
+    props = _apply_deterministic_guarantees(best_props)
+    best_findings = _run_props_lint(props)
     # Fix C9（2026-07-16）：确认过的真实生产 bug——_build() 每次调用都会无条件
     # 把自己产出的 props 写到 props_path（见 _build 最后一行），循环跑完之后
     # 磁盘上留的是*最后一次*调用的内容，不一定是 best_props（只有当赢家恰好
@@ -1551,7 +1755,13 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         if major:
             feedback = "; ".join(f"still #{f.get('frame_index')}: {f.get('issue', '')}" for f in major)[:500]
             logger.warning(f"  apply_style: 视觉复审发现问题，重新规划一次: {feedback}")
-            props = _build(feedback=feedback)
+            props = _apply_deterministic_guarantees(_build(feedback=feedback))
+            # _build() 自己已经无条件写过一次 props_path（未经确定性保底的版本，
+            # 见 Fix C9 的注释）——这里必须用保底之后的版本覆盖写回去，否则
+            # run_props_qa/最终渲染读到的还是磁盘上那份没经过 C13/C15 的旧内容
+            # （跟 C9 是同一类"内存和磁盘不同步"教训，只是这次是 Fix C16 引入的
+            # 新调用点）。
+            props_path.write_text(json.dumps(props, ensure_ascii=False), encoding="utf-8")
             qa_result = run_props_qa(props, props_path, remotion_dir, workdir / "qa_stills")
             vision_findings = (qa_result.get("vision_review") or {}).get("findings") or []
             major = [f for f in vision_findings if f.get("severity") == "high"]
