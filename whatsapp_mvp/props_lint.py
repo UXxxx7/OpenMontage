@@ -19,6 +19,7 @@ FPS = 30
 _MAX_CONTINUOUS_HIDDEN_FRAMES = 8 * FPS
 _MAX_HIDDEN_FRACTION = 0.30
 _DEAD_SPACE_FRAMES = 60  # 接管区间里超过这么多帧没有任何图形元素 = 死空间
+_TRANSITION_DURATION_FRAMES = 20  # 卡片一次真实变形动画的时长上限，见 _transition_windows
 
 # Fix C6（2026-07-16）：每这么多秒视频至少要有 1 项真正的图形/动画内容——
 # 用户明确要求过"加一条标准检查动画到不到位，不要只返回说话人配字幕"。
@@ -148,6 +149,16 @@ def _transition_windows(scenes: list[dict]) -> list[tuple[int, int]]:
     """SpeakerCard 正在两个 scene 关键帧之间变形(w/h 改变)的帧区间——用跟
     _scene_value_at 一样保守的近似（整个关键帧间隔都算过渡区间）。宽高都
     没变的相邻关键帧（例如只是把同一个 mode 的 scene 拆成两段）不算过渡。
+
+    2026-07-17：曾短暂改成只标记每次几何变化后的固定 20 帧（Fix C20），
+    动机是修一个真实撞上的 (180,592)/412 帧超长"过渡区间"误判——但那次
+    改动会把已经验证过的 C13b/C19（intro 过渡窗口 0-180，真实需要整段
+    都算过渡，不能只算前 20 帧）连带破坏（test_props_lint.py 三个已验证
+    的用例当场回归），且没有足够时间在生产时限内验证清楚"什么时候该用
+    整段、什么时候该用固定时长"这两种情况的边界。原地回滚保留整段近似
+    这个已验证正确的版本；C20 想解决的"中段 workflow 小节之间隔很远的
+    真正问题仍未修——留给下一次有余裕单独验证的时候处理，不要在还没
+    完全想清楚的情况下再动这个被多处依赖的公共函数。
     """
     windows: list[tuple[int, int]] = []
     for i in range(len(scenes) - 1):
@@ -298,6 +309,46 @@ def lint_props(props: dict) -> list[dict]:
                 "detail": f"隐藏区间 [{start},{end}] 里，第 {cursor}-{end} 帧"
                           f"（{(end - cursor) / FPS:.1f}s）没有任何图形元素",
                 "gap_start": cursor, "gap_end": end,
+            })
+
+    # 5a) Fix C10（2026-07-16，真实生产 bug job_dc6a22198c6d）：intro 结束到
+    # 第一个内容区元素挂载之间的死空间——takeover_dead_space 只查 hidden_spans
+    # (说话人被隐藏/接管的区间)，卡片仍然可见但内容区依旧空着的开场空档完全
+    # 没查过。这条视频 introOutFrame=80，第一个内容元素(倒计时)190 帧才挂载，
+    # 中间 110 帧(3.7s)画面上只有说话人+字幕；vision QA 正确抓到"空画布"（高
+    # 严重度），但 props_lint 的 3 轮重规划循环从没见过这个 finding，只能白白
+    # 烧一次渲染+vision 调用才发现，还常常来不及在 vision 重试预算内修好就被
+    # 降级交付。content_planner 自己的 _sparse_gaps 用的是 8s 阈值（专门为了
+    # 容忍纯口播不需要图形的正常段落），跟这里 2s 的画面级"看起来空"阈值是
+    # 两回事，两条规则都要留着，服务不同目的。
+    # Fix C19（2026-07-17，真实生产复现——job_b7e1b7f96481，用户 WhatsApp 上
+    # 真实收到的降级交付）：gap_start 原来直接用 introOutFrame，但卡片从
+    # intro 收到 workflow 尺寸的过渡本身可能一路持续到 introOutFrame+100
+    # （Fix C14 的上限）——过渡期间画面上确实只有说话人，但那不是"可避免的
+    # 空白"，是卡片本身还在变形，任何东西都不该在这段时间挂载（跟
+    # element_mounts_during_card_transition 是同一个约束）。用真实的
+    # scenes 过渡窗口把 gap_start 顶到过渡结束那一帧，这条 finding 才真正
+    # 只测"过渡已经结束、卡片已经稳定、但内容区还是没人来填"这段——原本量出
+    # 的 80-190（110帧）其实大半段是过渡期，pipeline_runner.py 的确定性保底
+    # （Fix C13/C13b）拿这条 finding 的 gap_start/gap_end 去算安全插入位置时
+    # 也会因此对齐到真正可用的窗口，不会再算出一个只有几帧、几乎不可能有
+    # 意义的候选。
+    intro_out = props.get("introOutFrame", 0)
+    for win_start, win_end in _transition_windows(scenes):
+        if win_start <= intro_out < win_end:
+            intro_out = win_end
+    if elements:
+        first_mount = min((e["mount"] for e in elements if e["mount"] >= intro_out), default=None)
+        if first_mount is not None and first_mount - intro_out > _DEAD_SPACE_FRAMES:
+            findings.append({
+                "check": "intro_lead_dead_space",
+                "detail": f"卡片过渡结束(第 {intro_out} 帧)到第一个内容区元素挂载(第 {first_mount} 帧)"
+                          f"之间有 {first_mount - intro_out} 帧（{(first_mount - intro_out) / FPS:.1f}s）"
+                          "画面上只有说话人和字幕，内容区完全空着。如果这段时间说的是纯问候/自我"
+                          "介绍（没有数字/工具名可以提前挂上去），补一个轻量元素覆盖这段时间（例如"
+                          "topic_card/corner_card 展示品牌名或说话人身份），不要让内容区空着等第一个"
+                          "数字/关键词出现。",
+                "gap_start": intro_out, "gap_end": first_mount,
             })
 
     # 5b) Fix D6（2026-07-16）：全画布接管(sections)本身既没有 timeline

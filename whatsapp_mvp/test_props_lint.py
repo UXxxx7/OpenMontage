@@ -92,15 +92,21 @@ def test_real_buggy_props_flags_all_three_known_bugs():
 
 def test_clean_props_no_findings():
     """健康的 props（卡片始终可见、图形只在卡片已经收起后才出现、没有互相
-    重叠）不应该产生任何 finding。"""
+    重叠、intro 结束后很快就有内容、密度达标）不应该产生任何 finding。
+    这个 fixture 需要在每次新增 props_lint 检查时重新核对——Fix C10 加了
+    intro_lead_dead_space 检查后，这里补上 introOutFrame（原来没设，默认值
+    0 会被当成"intro 结束到 150 帧全空"误判）和第二项内容（凑够 C6 的密度
+    下限，20s 需要至少 2 项）。"""
     clean_props = {
         "durationSeconds": 20.0,
+        "introOutFrame": 100,
         "scenes": [
             {"frame": 0, "x": 60, "y": 104, "w": 960, "h": 1100},
             {"frame": 100, "x": 60, "y": 104, "w": 960, "h": 900},
         ],
         "dataCards": [{"title": "T", "x": 60, "y": 1170, "width": 960, "mountFrame": 150, "endFrame": 400,
                        "rows": [{"label": "X", "value": 1, "mountOffset": 0}]}],
+        "topicCards": [{"headline": "Y", "x": 60, "y": 1400, "width": 960, "mountFrame": 200, "endFrame": 350}],
     }
     findings = lint_props(clean_props)
     check("干净的 props 不产生任何 finding", findings == [], findings)
@@ -218,6 +224,79 @@ def test_section_takeover_lacks_content():
           with_icon)
 
 
+def test_intro_lead_dead_space():
+    """Fix C10 回归测试——真实生产 bug job_dc6a22198c6d：intro 在第 80 帧结束，
+    第一个内容区元素（倒计时）190 帧才挂载，中间 110 帧(3.7s)画面上只有说话
+    人和字幕。vision QA 正确抓到"空画布"（高严重度）导致这条视频最终整个
+    apply_style 降级交付（用户只收到裸剪的视频，没有任何品牌样式）——props_lint
+    当时完全没查过这个模式（takeover_dead_space 只查 hidden_spans），白白
+    多烧一轮渲染+vision 调用才发现，且没能在 vision 重试预算内修好。"""
+    # Fix C19（2026-07-17，同一 job_dc6a22198c6d 形状在真实生产里复现——
+    # job_b7e1b7f96481，用户 WhatsApp 上真实收到的降级交付）：这个 fixture
+    # 原本断言 [80,190] 整段(110 帧)都算死空间，但 scenes 里过渡在第 180 帧
+    # 才结束——80-180 这一段卡片本身还在变形，190 帧的内容紧跟着过渡结束
+    # 只隔 10 帧就挂载，是"过渡+立刻有内容"的正常情况，不是可避免的空白。
+    # gap_start 现在会顶到过渡结束的那一帧（180），10 帧的间隔在 60 帧阈值
+    # 之内，不应该再报——这条 finding 曾经因为把过渡期也算进"空白"，导致
+    # pipeline_runner.py 的确定性保底（Fix C13/C13b）算出的候选卡片位置也
+    # 跟着算错、频繁跟旁边的真实内容撞车，安全阀拒绝插入，intro_lead_dead_space
+    # 原样交付给用户，最终触发 vision QA 的"空画布"判定——降级交付原样重演。
+    no_longer_flagged_props = {
+        "durationSeconds": 43.233,
+        "introOutFrame": 80,
+        "scenes": [
+            {"frame": 0, "x": 60, "y": 104, "w": 960, "h": 1100},
+            {"frame": 180, "x": 60, "y": 104, "w": 960, "h": 900},
+        ],
+        "countdowns": [{"value": 30.0, "unitLabel": "DAYS", "label": "RENEWAL", "x": 60, "y": 1170,
+                         "width": 960, "mountFrame": 190, "endFrame": 367}],
+        "dataCards": [{"title": "YOUR COVERAGE", "x": 60, "y": 1170, "width": 960,
+                        "mountFrame": 557, "endFrame": 602,
+                        "rows": [{"label": "Coverage", "value": 1.5, "mountOffset": 0}]}],
+    }
+    check("过渡结束(180)到内容挂载(190)只差10帧——不再误报为死空间",
+          not any(f["check"] == "intro_lead_dead_space" for f in lint_props(no_longer_flagged_props)),
+          lint_props(no_longer_flagged_props))
+
+    # 真正的死空间：过渡在第 180 帧就结束了，但第一个内容一直到第 400 帧
+    # 才挂载——过渡结束后还有 220 帧(7.3s)是真的什么都没有，这条必须继续抓到。
+    real_gap_props = {
+        "durationSeconds": 43.233,
+        "introOutFrame": 80,
+        "scenes": [
+            {"frame": 0, "x": 60, "y": 104, "w": 960, "h": 1100},
+            {"frame": 180, "x": 60, "y": 104, "w": 960, "h": 900},
+        ],
+        "countdowns": [{"value": 30.0, "unitLabel": "DAYS", "label": "RENEWAL", "x": 60, "y": 1170,
+                         "width": 960, "mountFrame": 400, "endFrame": 567}],
+        "dataCards": [{"title": "YOUR COVERAGE", "x": 60, "y": 1170, "width": 960,
+                        "mountFrame": 557, "endFrame": 602,
+                        "rows": [{"label": "Coverage", "value": 1.5, "mountOffset": 0}]}],
+    }
+    findings = lint_props(real_gap_props)
+    gap_finding = next((f for f in findings if f["check"] == "intro_lead_dead_space"), None)
+    check("过渡结束后仍有真正的死空间时照常抓到", gap_finding is not None, findings)
+    if gap_finding:
+        check("死空间区间是过渡结束到内容挂载 [180, 400]（220 帧/7.3s），不是 [80,400]",
+              gap_finding["gap_start"] == 180 and gap_finding["gap_end"] == 400, gap_finding)
+
+    tight_props = {
+        "durationSeconds": 20.0,
+        "introOutFrame": 80,
+        "topicCards": [{"headline": "A", "x": 60, "y": 1400, "width": 960, "mountFrame": 110, "endFrame": 250}],
+        "dataCards": [{"title": "T", "x": 60, "y": 1170, "width": 960, "mountFrame": 300, "endFrame": 450,
+                       "rows": [{"label": "X", "value": 1, "mountOffset": 0}]}],
+    }
+    check("intro 结束后 30 帧(1s)内就有内容——不到 60 帧阈值，不误报",
+          not any(f["check"] == "intro_lead_dead_space" for f in lint_props(tight_props)),
+          lint_props(tight_props))
+
+    no_elements_props = {"durationSeconds": 10.0, "introOutFrame": 80}
+    check("整片没有任何内容区元素时不因为这条检查额外报错(交给 richness/zero-visual 检查处理)",
+          not any(f["check"] == "intro_lead_dead_space" for f in lint_props(no_elements_props)),
+          lint_props(no_elements_props))
+
+
 def main():
     test_real_buggy_props_flags_all_three_known_bugs()
     test_clean_props_no_findings()
@@ -225,6 +304,7 @@ def main():
     test_element_mounts_during_card_transition()
     test_low_visual_richness()
     test_section_takeover_lacks_content()
+    test_intro_lead_dead_space()
 
     print()
     if FAILED:
