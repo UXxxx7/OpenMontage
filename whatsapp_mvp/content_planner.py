@@ -2083,8 +2083,21 @@ def _coverage_spans(plan: dict) -> list[tuple[int, int]]:
     # topic_cards 必须算进覆盖范围——LLM 自己规划的、或密度下限补规划产出的
     # 都可能是 topic_card，漏掉它会让密度检查始终觉得这段"还是空的"，导致
     # 同一段时间被重复补规划、堆出用户明确反对的"互相盖住"的多张卡片。
+    #
+    # Fix C30（2026-07-20，真实生产复现——job_f7b171f8d952/Dixon 视频）：这个
+    # 列表漏了 step_lists 和 corner_cards 整整两种图形类型——SYSTEM_PROMPT 第
+    # 2(b)/3 条明确把这两个列为"非数字内容"（命名工具/应用、进行中的动作、
+    # 说出来的分步流程）的正确选择，LLM 也确实按提示词的引导规划出了真实、
+    # 有信息量的 step_list("發送內容→AI製作數字人→自動剪接→收回上傳"四步)
+    # 和 corner_card(WhatsApp 聊天气泡)——但因为这两类从没进过覆盖范围统计，
+    # _sparse_gaps 死活觉得这段时间"还是空的"，criterion loop 三轮重规划全部
+    # 判定失败，C28 的确定性兜底也跟着白白尝试、白白放弃。不是 LLM 没听
+    # 提示词的话，是负责"检查画面是否已经有内容"的这个函数自己没跟上
+    # SYSTEM_PROMPT 早就支持的完整图形词汇表——这个漏洞影响的是*所有*用
+    # step_list/corner_card 覆盖非数字内容的视频，不只是这一支。
     for g in (plan["data_cards"] + plan["gauges"] + plan["countdowns"]
-              + plan["calendar_events"] + plan["quotes"] + plan["topic_cards"]):
+              + plan["calendar_events"] + plan["quotes"] + plan["topic_cards"]
+              + plan["step_lists"] + plan["corner_cards"]):
         spans.append((g["mountFrame"], g.get("endFrame", g["mountFrame"] + 90)))
     for sec in plan["sections"]:
         spans.append((sec["fromFrame"], sec["toFrame"]))

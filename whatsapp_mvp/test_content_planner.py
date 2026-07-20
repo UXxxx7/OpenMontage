@@ -1123,6 +1123,45 @@ def main():
         check("兜底插入的 quote 内容确实来自转写原文，不是编造的",
               "end to end" in e2e_plan["quotes"][0]["text"], e2e_plan["quotes"][0])
 
+    # 20. Fix C30 回归测试——真实生产复现 job_f7b171f8d952(Dixon 视频)：
+    # content_planner 已经正确规划出 step_list + corner_card 覆盖某段时间，
+    # 但 _coverage_spans 从没把这两种图形类型算进"已覆盖"范围——criterion loop
+    # 因此死活觉得这段时间"还是空的"，三轮重规划全部误判失败，即使 LLM 一直
+    # 严格照着 SYSTEM_PROMPT 的指引在做正确的事。
+    from whatsapp_mvp.content_planner import _coverage_spans, _sparse_gaps
+
+    plan_with_step_list_only = _to_frame_plan({
+        "chapters": [{"at_seconds": 0, "label": "A"}],
+        "data_points": [{
+            "visual": "step_list", "title": "steps",
+            "steps": [
+                {"label": "一", "seconds": 12.0},
+                {"label": "二", "seconds": 16.0},
+                {"label": "三", "seconds": 20.0},
+            ],
+        }],
+    }, duration=30.0)
+    check("step_list 本身被规划出来了", len(plan_with_step_list_only["step_lists"]) == 1,
+          plan_with_step_list_only["step_lists"])
+    spans = _coverage_spans(plan_with_step_list_only)
+    step_list_entry = plan_with_step_list_only["step_lists"][0]
+    check("step_list 的挂载区间出现在覆盖范围里，不再被当成空档",
+          (step_list_entry["mountFrame"], step_list_entry["endFrame"]) in spans, spans)
+
+    plan_with_corner_card_only = _to_frame_plan({
+        "chapters": [{"at_seconds": 0, "label": "A"}],
+        "data_points": [{
+            "visual": "corner_card", "variant": "chat", "seconds": 12.0,
+            "appName": "WhatsApp", "message": "test",
+        }],
+    }, duration=30.0)
+    check("corner_card 本身被规划出来了", len(plan_with_corner_card_only["corner_cards"]) == 1,
+          plan_with_corner_card_only["corner_cards"])
+    cc_spans = _coverage_spans(plan_with_corner_card_only)
+    cc_entry = plan_with_corner_card_only["corner_cards"][0]
+    check("corner_card 的挂载区间出现在覆盖范围里，不再被当成空档",
+          (cc_entry["mountFrame"], cc_entry["endFrame"]) in cc_spans, cc_spans)
+
     print()
     if FAILED:
         print(f"{len(FAILED)} FAILED: {FAILED}")
