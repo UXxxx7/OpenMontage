@@ -1065,6 +1065,64 @@ def main():
     check("展示时长比修复前的 18 帧(旧行为，无下限保护)有实质性改善",
           tight_cal["endFrame"] - tight_cal["mountFrame"] > 18, tight_cal)
 
+    # 19. Fix C28 回归测试——真实生产复现 job_f7b171f8d952(Dixon 视频)：全片
+    # 没有一个数字/日期/风险值，_sparse_gaps 连续 3 轮重规划都没被修好。
+    from whatsapp_mvp.content_planner import _sparse_gap_quote_candidates
+
+    gaps = [(90, 360), (600, 930)]  # 两段空档(3s-12s, 20s-31s @30fps)
+    segments = [
+        {"text": "um", "start": 0.0, "end": 1.0},  # 太短的过渡词，不该被选中
+        {"text": "yeah so basically", "start": 4.0, "end": 5.5},  # 空档1里较短的一句
+        {"text": "I can help you build a digital human avatar from scratch",
+         "start": 6.0, "end": 9.0},  # 空档1里更长、更实质的一句——应该被选中
+        {"text": "this line sits between the two gaps and should never be picked",
+         "start": 15.0, "end": 18.0},  # 落在两段空档之间，不该被选中
+        {"text": "once it's done you can use it for marketing videos",
+         "start": 22.0, "end": 25.0},  # 空档2里的一句——应该被选中
+    ]
+    candidates = _sparse_gap_quote_candidates(gaps, segments)
+    check("两段空档各选出一条候选", len(candidates) == 2, candidates)
+    check("空档1选中的是更长、更实质的那句，不是过渡词", "digital human avatar" in candidates[0]["text"], candidates)
+    check("空档2选中的是落在它自己范围内的那句", "marketing videos" in candidates[1]["text"], candidates)
+    check("落在两段空档之间的句子没有被任何一个空档选中",
+          all("between the two gaps" not in c["text"] for c in candidates), candidates)
+
+    no_fit_candidates = _sparse_gap_quote_candidates(
+        [(90, 360)],
+        [{"text": "x" * 200, "start": 5.0, "end": 8.0}],  # 超过 80 字符上限
+    )
+    check("空档里唯一的句子塞不进 80 字符上限时，宁可不选，不腰斩",
+          no_fit_candidates == [], no_fit_candidates)
+
+    empty_gap_candidates = _sparse_gap_quote_candidates([(90, 360)], [])
+    check("完全没有转写数据时不报错、返回空列表", empty_gap_candidates == [], empty_gap_candidates)
+
+    # 19b. Fix C28 端到端接线测试——mock 掉 LLM 调用，模拟"纯叙事内容，LLM
+    # 三轮都正确地规划不出任何数字/日期"这个真实场景(job_f7b171f8d952)，
+    # 验证 plan_content 自己真的会触发这条确定性兜底，而不是只在独立的
+    # helper 单测里工作。
+    import whatsapp_mvp.content_planner as cp_module
+    from whatsapp_mvp.content_planner import plan_content
+
+    def _fake_llm_always_empty(label, system_prompt, user_message, *, temperature, model=None):
+        return {"chapters": [{"at_seconds": 0, "label": "TALK"}], "data_points": []}
+
+    long_narrative_segments = [
+        {"text": "let me walk you through how this whole system actually works end to end",
+         "start": 5.0, "end": 9.0},
+    ]
+    original_call_llm_json = cp_module._call_llm_json
+    cp_module._call_llm_json = _fake_llm_always_empty
+    try:
+        e2e_plan = plan_content(long_narrative_segments, duration=45.0)
+    finally:
+        cp_module._call_llm_json = original_call_llm_json
+    check("LLM 三轮都规划不出任何东西时，plan_content 自己触发确定性兜底插入 quote",
+          len(e2e_plan.get("quotes") or []) >= 1, e2e_plan.get("quotes"))
+    if e2e_plan.get("quotes"):
+        check("兜底插入的 quote 内容确实来自转写原文，不是编造的",
+              "end to end" in e2e_plan["quotes"][0]["text"], e2e_plan["quotes"][0])
+
     print()
     if FAILED:
         print(f"{len(FAILED)} FAILED: {FAILED}")

@@ -387,6 +387,30 @@ def plan_content(segments: list[dict], duration: float, *, feedback: Optional[st
         f"content_planner: {_PLAN_MAX_ATTEMPTS} 轮后仍未全部达标，交付失败项最少的一轮"
         f"（剩余 {len(best_failures or [])} 项）: " + " | ".join(best_failures or [])
     )
+
+    # Fix C28：criterion 2（稀疏空档）如果还留着，试一次确定性兜底——见
+    # _sparse_gap_quote_candidates 的完整说明。只在这里触发一次，不追加任何
+    # LLM 调用；候选为空或没能真的减少失败项就原样放弃，不强行插入。
+    gaps = _sparse_gaps(best_plan, duration)
+    if gaps:
+        quote_candidates = _sparse_gap_quote_candidates(gaps, segments)
+        if quote_candidates:
+            candidate_raw = dict(best_raw)
+            candidate_raw["data_points"] = [*(best_raw.get("data_points") or []), *quote_candidates]
+            _ground_data_point_seconds(candidate_raw, word_timestamps)
+            candidate_plan = _to_frame_plan(candidate_raw, duration)
+            candidate_failures = _plan_quality_failures(candidate_raw, candidate_plan, duration)
+            if len(candidate_failures) < len(best_failures or []):
+                logger.info(
+                    f"content_planner: 稀疏空档确定性兜底插入 {len(quote_candidates)} 条 quote"
+                    f"（失败项 {len(best_failures or [])} -> {len(candidate_failures)}）（Fix C28）"
+                )
+                best_plan = candidate_plan
+            else:
+                logger.info("content_planner: 稀疏空档兜底候选未能减少失败项，放弃插入（Fix C28）")
+        else:
+            logger.info("content_planner: 稀疏空档里没有任何一句转写塞得进 QuoteCard 字数上限，放弃兜底（Fix C28）")
+
     return best_plan
 
 
@@ -2082,6 +2106,55 @@ def _sparse_gaps(plan: dict, duration: float) -> list[tuple[int, int]]:
     if end_limit - cursor > RICHNESS_WINDOW_FRAMES:
         gaps.append((cursor, end_limit))
     return gaps
+
+
+def _sparse_gap_quote_candidates(gaps: list[tuple[int, int]], segments: list[dict]) -> list[dict]:
+    """Fix C28（2026-07-20，真实生产复现——job_f7b171f8d952，纯叙事内容全片
+    0 个数据卡/仪表盘/倒计时/日历，_sparse_gaps 连续 3 轮重规划都没修好）：
+    criterion 2 是四条规划质量标准里唯一一条至今没有确定性兜底的——
+    intro_lead_dead_space（Fix C13）、section_takeover_lacks_content（Fix C15）
+    都已经从"指望 LLM 这次会听话"换成了机械兜底，这条一直没有，Rule 13 的
+    教训在这里同样成立。
+
+    直接机械插入一张复读字幕原文的 topic_card 会重蹈 `_fallback_topic_cards_
+    for_gaps` 的覆辙——那正是被用户明确否决、专门删掉的做法（"popups for the
+    sake of having them"）。这里改用已经验证过、专门为"数据稀薄的视频"设计的
+    quotes 机制（f60731c "Data-less videos get canvas motion"提交）：QuoteCard
+    是一次真正的排版时刻（强调引号、逐字揭示、下划线扫过），不是简单复读——
+    跟被删掉的那个 fallback 不是同一类东西，REPLAN_SYSTEM_PROMPT 自己也把
+    quote 列为可用选项之一。
+
+    唯一的问题是它要求"genuinely striking"——对纯叙事、没有任何数字/日期
+    可讲的内容，LLM 卡在"没资格用 quote"和"没资格用 topic_card"之间，三轮
+    都在正确地拒绝硬造内容，而不是真的偷懒。这里退一步：不再要求"striking"，
+    机械选这段空档时间里最长的一整句转写原文（越长的句子越可能是实质性
+    表达，不是语气词/过渡句）。找不到任何一句能塞进 QuoteCard 80 字符上限
+    的完整句时，这个空档直接跳过——宁可保持"只有说话人+字幕"，也不要插入
+    一句被腰斩、读不完整的话。
+    """
+    candidates = []
+    for gap_start, gap_end in gaps:
+        gap_start_s, gap_end_s = gap_start / FPS, gap_end / FPS
+        best_seg = None
+        for seg in segments:
+            text = str(seg.get("text", "")).strip()
+            if not text or len(text) > 80:
+                continue
+            try:
+                start_s = float(seg.get("start", 0))
+                end_s = float(seg.get("end", start_s))
+            except (TypeError, ValueError):
+                continue
+            mid_s = (start_s + end_s) / 2
+            if not (gap_start_s <= mid_s <= gap_end_s):
+                continue
+            if best_seg is None or len(text) > len(str(best_seg.get("text", ""))):
+                best_seg = {"text": text, "start_seconds": start_s}
+        if best_seg is not None:
+            candidates.append({
+                "visual": "quote", "seconds": best_seg["start_seconds"], "text": best_seg["text"],
+            })
+    return candidates
 
 
 def _apply_richness_floor(raw: dict, plan: dict, segments: list[dict],
