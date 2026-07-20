@@ -417,10 +417,57 @@ def _safe_transcribe(src: str, workdir: Path, model_size: str):
     """
     import os as _os
 
+    from tools.base_tool import ToolResult
+
+    # Fix C18（2026-07-17，video-use 的 SKILL.md 明确写过这条教训——"Cache
+    # transcripts per source. Never re-transcribe unless the source file
+    # itself changed"——whatsapp_mvp 一直没有这层缓存）：同一个 job 里
+    # _safe_transcribe 最多被调用 4 次（remove_filler / add_subtitles /
+    # apply_style / transcribe_segments），每次的 src 是流水线上不同阶段的
+    # 产物（原始输入 / 剪过口误的 / 过完 face+color+audio 增强的……），字节
+    # 内容互不相同，天真按文件内容/路径做缓存 key 完全不会命中。但只要
+    # remove_filler 没有真的剪任何东西（没有口误/复述需要去掉——真实视频里
+    # 相当常见），从它到 apply_style 之间讲的话、每个词的时间戳全都没变，
+    # 中间的增强步骤全部用 -fps_mode cfr（Rule 11 已经确认过）保时长不变，
+    # 只是重新编码了画质/音质——这种情况下重新转写一次纯粹是浪费配额。
+    # 用时长做安全的等价判断：只有当前 src 的时长跟缓存里记录的时长几乎
+    # 相等（<0.05s 误差）才命中——这基本等价于"帧数完全一致"，比路径/mtime
+    # 更能反映"内容真的没变"，且一旦剪过东西时长必然不同，缓存不会被误用
+    # 到那种情况（那种情况本来就应该、也确实会重新转写）。缓存范围只到
+    # workdir（即单个 job），不跨 job，不会有内容混淆的风险。
+    cache_path = workdir / "_transcript_cache.json"
+    try:
+        src_duration = _probe_duration(Path(src))
+    except Exception:
+        src_duration = -1.0
+    if cache_path.exists() and src_duration > 0:
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if abs(cached.get("duration_seconds", -999) - src_duration) < 0.05:
+                logger.info(
+                    f"  转写命中缓存（时长 {src_duration:.2f}s 与缓存一致，"
+                    "视为同一段语音内容的另一次重新编码，跳过重新转写）"
+                )
+                return ToolResult(success=True, data=cached["data"])
+        except (json.JSONDecodeError, OSError, KeyError):
+            pass  # 缓存损坏/格式不对就当没有，走下面正常转写，不阻断流程
+
+    def _save_cache(data: dict) -> None:
+        if src_duration <= 0:
+            return
+        try:
+            cache_path.write_text(
+                json.dumps({"duration_seconds": src_duration, "data": data}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass  # 写缓存失败不影响本次转写结果，只是下次少一次命中机会
+
     config = get_config()
     if config.transcribe_provider == "elevenlabs" and config.elevenlabs_api_key:
         t = _transcribe_elevenlabs(src, config.elevenlabs_api_key)
         if t.success:
+            _save_cache(t.data)
             return t
         # 确认过的真实生产 bug：ElevenLabs 密钥"配了但被拒绝"(401/过期/限流/
         # 网络异常)时，以前直接在这里 return None——调用方把这当成"完全没有
@@ -454,6 +501,7 @@ def _safe_transcribe(src: str, workdir: Path, model_size: str):
     if not t.success:
         logger.warning(f"  转写失败: {t.error}")
         return None
+    _save_cache(t.data)
     return t
 
 
