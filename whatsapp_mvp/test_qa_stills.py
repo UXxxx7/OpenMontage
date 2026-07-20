@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import whatsapp_mvp.qa_stills as qa_stills
 from whatsapp_mvp.qa_stills import pick_qa_frames
 
 FAILED = []
@@ -112,10 +113,124 @@ def test_full_frames_midpoint_does_not_resolve_to_frame_zero():
           28 in frames, frames)
 
 
+# Fix C23 回归测试——真实生产复现 job_452ef6c48100：VISION_LLM_MODEL=
+# glm-4v-flash 对 frame_index 0 报了三条 high severity 问题（脸部裁切、两处
+# 文字截断），但打开实际渲染的 f28.png 核实，两处"文字截断"完全不存在——
+# 两段文字在图上都清晰完整。这套单测用假的 _vision_review 模拟"模型在两次
+# 独立调用里给出不同答案"，验证只有两次都判定同一 frame_index 为 high 的
+# 发现才会被采信。
+
+
+def _fake_vision_review(responses):
+    """按调用顺序依次返回 responses 里的字典，用于替换 qa_stills._vision_review。"""
+    calls = {"n": 0}
+
+    def _fake(still_paths):
+        i = calls["n"]
+        calls["n"] += 1
+        return responses[i] if i < len(responses) else responses[-1]
+
+    return _fake, calls
+
+
+def test_unconfirmed_high_finding_is_dropped():
+    """第一次调用报 frame_index 0 是 high；第二次独立调用完全没提这条
+    （模型噪音，不可复现）——不应该被采信为真实问题。"""
+    fake, calls = _fake_vision_review([
+        {"findings": [{"frame_index": 0, "issue": "文字被截断", "severity": "high"}], "overall": "x"},
+        {"findings": [], "overall": "looks fine"},
+    ])
+    original = qa_stills._vision_review
+    qa_stills._vision_review = fake
+    try:
+        result = qa_stills._vision_review_confirmed(["f0.png"])
+    finally:
+        qa_stills._vision_review = original
+    check("二次复核未复现的 high 发现被丢弃", result["findings"] == [], result)
+    check("调用了两次视觉复审（第一次有 high 发现才需要确认）", calls["n"] == 2, calls)
+
+
+def test_confirmed_high_finding_is_kept():
+    """两次独立调用都判定同一 frame_index 是 high——判定为真实问题，保留。"""
+    fake, calls = _fake_vision_review([
+        {"findings": [{"frame_index": 0, "issue": "说话人取景偏紧", "severity": "high"}], "overall": "x"},
+        {"findings": [{"frame_index": 0, "issue": "脸部太靠近卡片边缘", "severity": "high"}], "overall": "y"},
+    ])
+    original = qa_stills._vision_review
+    qa_stills._vision_review = fake
+    try:
+        result = qa_stills._vision_review_confirmed(["f0.png"])
+    finally:
+        qa_stills._vision_review = original
+    check("两次都复现的 high 发现被保留", len(result["findings"]) == 1, result)
+    check("保留的是第一次调用的原始描述", result["findings"][0]["issue"] == "说话人取景偏紧", result)
+
+
+def test_low_severity_findings_never_need_confirmation():
+    """low 严重度发现不驱动任何重试/降级决策，不需要二次确认——但如果同一次
+    调用里还有 high 发现，仍然会触发确认调用（这里验证 low 本身在这种情况下
+    也原样保留，不会被第二次调用意外过滤掉）。"""
+    fake, calls = _fake_vision_review([
+        {"findings": [
+            {"frame_index": 0, "issue": "对比度略低", "severity": "low"},
+            {"frame_index": 1, "issue": "脸部被裁切", "severity": "high"},
+        ], "overall": "x"},
+        {"findings": [], "overall": "looks fine on second look"},
+    ])
+    original = qa_stills._vision_review
+    qa_stills._vision_review = fake
+    try:
+        result = qa_stills._vision_review_confirmed(["f0.png", "f1.png"])
+    finally:
+        qa_stills._vision_review = original
+    check("low 严重度发现始终保留，不受二次确认影响",
+          any(f["severity"] == "low" for f in result["findings"]), result)
+    check("未复现的 high 发现被丢弃，只剩 low",
+          all(f["severity"] == "low" for f in result["findings"]), result)
+
+
+def test_no_high_findings_skips_confirmation_call():
+    """第一次调用完全没有 high 发现时，不需要多花一次确认调用——干净路径
+    成本不变。"""
+    fake, calls = _fake_vision_review([
+        {"findings": [{"frame_index": 0, "issue": "对比度略低", "severity": "low"}], "overall": "clean"},
+    ])
+    original = qa_stills._vision_review
+    qa_stills._vision_review = fake
+    try:
+        result = qa_stills._vision_review_confirmed(["f0.png"])
+    finally:
+        qa_stills._vision_review = original
+    check("没有 high 发现时只调用一次，不做二次确认", calls["n"] == 1, calls)
+    check("原始 low 发现原样返回", result["findings"][0]["severity"] == "low", result)
+
+
+def test_second_call_failure_drops_all_high_findings():
+    """确认调用本身失败（网络异常/未配置，_vision_review 返回 None）时，宁可
+    保守地丢弃所有未经确认的 high 发现，不能让它们在没有二次确认的情况下
+    仍然触发重规划/降级。"""
+    fake, calls = _fake_vision_review([
+        {"findings": [{"frame_index": 0, "issue": "脸部被裁切", "severity": "high"}], "overall": "x"},
+        None,
+    ])
+    original = qa_stills._vision_review
+    qa_stills._vision_review = fake
+    try:
+        result = qa_stills._vision_review_confirmed(["f0.png"])
+    finally:
+        qa_stills._vision_review = original
+    check("确认调用失败时未经确认的 high 发现被丢弃", result["findings"] == [], result)
+
+
 def main():
     test_frame_zero_not_sampled_as_pre_transition_check()
     test_transition_starting_at_frame_zero_without_other_frames()
     test_full_frames_midpoint_does_not_resolve_to_frame_zero()
+    test_unconfirmed_high_finding_is_dropped()
+    test_confirmed_high_finding_is_kept()
+    test_low_severity_findings_never_need_confirmation()
+    test_no_high_findings_skips_confirmation_call()
+    test_second_call_failure_drops_all_high_findings()
 
     print()
     if FAILED:
