@@ -161,7 +161,7 @@ class ColorGrade(BaseTool):
             "-i", str(input_path),
             "-vf", vf,
             "-c:v", codec, "-crf", str(crf),
-            "-fps_mode", "cfr", "-r", str(fps),
+            "-fps_mode", "cfr", "-r", str(fps), "-g", str(int(fps)),
             "-c:a", "copy",
             str(output_path),
         ]

@@ -159,13 +159,22 @@ class FaceEnhance(BaseTool):
         # (content_planner.py's FPS=30, video_trimmer's own CFR fix), so pin
         # to that fixed, known-correct value instead of trusting a live probe
         # of a file that may already be the thing that's wrong.
+        #
+        # -g <fps> (Fix C12, 2026-07-17): same "No frame found at position N"
+        # symptom as above, but a DIFFERENT trigger — CFR alone doesn't set
+        # keyframe interval, so libx264 fell back to its own default (250
+        # frames, confirmed via ffprobe on a real failing render: only 4
+        # keyframes in 1119 frames, none at frame 0). Remotion's random-access
+        # seeking can't reliably decode frames that far from the nearest
+        # keyframe. See tools/video/video_trimmer.py's matching fix for the
+        # full writeup.
         fps = inputs.get("fps", 30)
         cmd = [
             "ffmpeg", "-y",
             "-i", str(input_path),
             "-vf", vf,
             "-c:v", codec, "-crf", str(crf),
-            "-fps_mode", "cfr", "-r", str(fps),
+            "-fps_mode", "cfr", "-r", str(fps), "-g", str(int(fps)),
             "-c:a", "copy",
             str(output_path),
         ]

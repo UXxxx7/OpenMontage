@@ -280,12 +280,21 @@ class VideoTrimmer(BaseTool):
             # own _probe_fps() read 120fps off a 30fps source. The whole
             # pipeline assumes 30fps throughout (content_planner.py's FPS=30),
             # so there is nothing to gain by probing and real risk in doing so.
+            # Fix C12（2026-07-17，真实生产复现）：GOP/关键帧间隔从没显式设过，
+            # libx264 在没给 -g 时用自己的默认值（实测 250），37s/1119 帧的视频
+            # 只有 4 个关键帧（帧 250/500/725/975），且帧 0 前面完全没有关键帧——
+            # Remotion 的 Rust compositor 按帧随机 seek 时对着这种稀疏 GOP 直接
+            # 报 "No frame found at position N"（独立复现：同一份 props 在
+            # qa_stills 之后单独重跑照样炸，只是每次炸在不同帧——不是网上一直
+            # 以为的"qa_stills 和整片渲染交接时的瞬时状态"，是 GOP 结构问题，
+            # 换个随机 seek 目标自然换个炸点）。-g 30（30fps 下每秒一个关键帧）
+            # 直接对齐 content_planner.py 的 FPS=30 假设。
             fps = 30.0
             cmd = [
                 "ffmpeg", "-y",
                 "-f", "concat", "-safe", "0",
                 "-i", str(list_path),
-                "-fps_mode", "cfr", "-r", str(fps),
+                "-fps_mode", "cfr", "-r", str(fps), "-g", str(int(fps)),
                 "-c:v", "libx264", "-preset", "fast", "-c:a", "aac",
                 str(output_path),
             ]
