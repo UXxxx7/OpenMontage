@@ -161,10 +161,7 @@ def render_still(remotion_dir: Path, props_path: Path, frame: int, out_png: Path
     # on any Windows deployment).
     npx_bin = shutil.which("npx") or "npx"
     from .remotion_bundle import ensure_remotion_bundle
-    # job_slug so the bundle's stale public/ snapshot gets this job's video
-    # synced in — see remotion_bundle._sync_job_public_assets' docstring for
-    # the real bug this fixes (every still 404ing on source.mp4).
-    bundle = ensure_remotion_bundle(Path(remotion_dir), job_slug=props_path.parent.name)
+    bundle = ensure_remotion_bundle(Path(remotion_dir))
     # props_path/out_png must be absolute — this subprocess runs with
     # cwd=remotion_dir, so a relative path (e.g. "storage/jobs/<id>/...json")
     # resolves against remotion-composer/ instead of the repo root, and
@@ -204,7 +201,7 @@ def render_stills_batch(
         return None
     node_bin = shutil.which("node") or "node"  # same WinError 2 guard as npx elsewhere in this module
     from .remotion_bundle import ensure_remotion_bundle
-    bundle = ensure_remotion_bundle(Path(remotion_dir), job_slug=props_path.parent.name)
+    bundle = ensure_remotion_bundle(Path(remotion_dir))
     out_dir.mkdir(parents=True, exist_ok=True)
     frames_arg = ",".join(str(f) for f in frames)
     cmd = [node_bin, str(script.resolve()), "XiaojinEditorial", str(out_dir.resolve()),
