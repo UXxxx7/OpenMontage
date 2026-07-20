@@ -244,7 +244,8 @@ def generate_croll(job_id: str, photo_path: str, lang: str = "zh", hint: str = "
             raise RuntimeError("HeyGen 视频生成提交失败")
 
         input_path = job.job_dir / "input.mp4"
-        ok = heygen_croll.poll_and_download(video_id, input_path, timeout_s=300)
+        # 60 秒成片的渲染明显比 20 秒的慢，300s 不够用；给到 15 分钟。
+        ok = heygen_croll.poll_and_download(video_id, input_path, timeout_s=900)
         if not ok:
             raise RuntimeError("HeyGen 视频生成超时或失败")
 
