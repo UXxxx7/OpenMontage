@@ -82,10 +82,19 @@ jobs:
       # 单元测试。若你有需要联网/花钱的用例（调 wolfai/omni 等），
       # 给它们打上 @pytest.mark.network，再用下面的 -m 'not network' 在 CI 里跳过，
       # 避免 CI 花钱/因外部服务抖动而误红。
+      # tests/qa/ 里的视频集成测试会 spawn ffmpeg；CI 的 Linux 机器默认没装，
+      # 会在收集阶段报 FileNotFoundError: 'ffmpeg'。装上它们就能真跑。
+      - name: Install ffmpeg (qa integration tests spawn it)
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
       # 用 --with pytest 临时把 pytest 带进运行环境（pytest 不是项目主依赖，
       # uv sync 不会装它，直接 uv run pytest 会报 "Failed to spawn: pytest"）。
-      # 若你有需要联网/花钱的用例，给它们打 @pytest.mark.network，再把下面
-      # 换成带 -m "not network" 的那行，CI 里跳过它们。
+      #
+      # 方案 A（当前）：装了 ffmpeg，跑全部测试（含 tests/qa 视频集成）。
+      # 方案 B（备选，最快绿）：只跑快速单元测试、跳过重的视频集成——
+      #   把上面的 Install ffmpeg 步骤删掉，并改用下面这行：
+      #     run: uv run --with pytest pytest -q --ignore=tests/qa
+      # 若某个用例需要联网/花钱（如 end_to_end 调 LLM），给它打
+      # @pytest.mark.network，再加 -m "not network" 跳过。
       - name: Unit tests
         run: uv run --with pytest pytest -q
-        # run: uv run --with pytest pytest -q -m "not network"
