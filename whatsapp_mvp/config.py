@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 
 # Project root is two levels up from this file
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(_PROJECT_ROOT / ".env")
+load_dotenv(_PROJECT_ROOT / ".env", override=True)
 
 
 @dataclass
