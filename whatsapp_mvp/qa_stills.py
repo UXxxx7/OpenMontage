@@ -123,7 +123,34 @@ def pick_qa_frames(props: dict) -> list[int]:
     for win_start, win_end in _transition_windows(scenes):
         frames.add(max(0, min(win_start - 8, duration_frames - 1)))
         frames.add(max(0, min(win_end + 8, duration_frames - 1)))
-    return sorted(f for f in frames if 0 <= f < duration_frames)
+    # Fix C22（2026-07-19，真实生产复现 job_ac00838adea9/job_1b7254abcd66，
+    # both times reproduced again on a live re-run after the first attempt at
+    # this fix only patched the transition-window path above）: frame 0 is the
+    # instant before the SpeakerCard's entrance animation has rendered
+    # anything — a genuinely blank canvas, confirmed by opening f0.png
+    # directly. It gets sampled through *multiple* independent rules, not just
+    # one: scenes[0] is always {"frame": 0, ...}, so the transition-window
+    # loop above always samples max(0, 0-8)=0; separately, whenever the
+    # opening Dominant/full-size hold is brief enough that frame 0 is the only
+    # (or a low-index) entry in `full_frames`, the "full-screen interval
+    # midpoint" rule two blocks up *also* resolves to 0 (confirmed live: a
+    # re-run of job_ac00838adea9 with a regenerated 20-frame-long intro hold
+    # produced full_frames == [0], reintroducing frame 0 through this
+    # completely different rule after the transition-window path alone had
+    # already been patched). Content_planner has zero control over the
+    # SpeakerCard's own entrance timing, so no amount of replanning can ever
+    # change what this frame looks like — every retry regenerates the same
+    # emptiness, and vision QA's severity call on it is not deterministic
+    # (`job_localdemowalk` scored the same essential frame "无内容/low" and
+    # shipped fine; both jobs above scored it "空画布/high" and degraded).
+    # Rather than special-case every individual rule that might independently
+    # land on 0 (proven fragile — that's exactly how the first attempt at this
+    # fix missed the full_frames path), enforce the invariant once, here, at
+    # the only point that actually matters: no rule above needs frame 0
+    # specifically (the "intro landed" check already samples
+    # introOutFrame+15, well after the entrance), so it is never a frame worth
+    # sending to vision QA regardless of which rule produced it.
+    return sorted(f for f in frames if 0 < f < duration_frames)
 
 
 def render_still(remotion_dir: Path, props_path: Path, frame: int, out_png: Path) -> bool:
