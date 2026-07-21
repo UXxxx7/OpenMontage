@@ -352,7 +352,7 @@ def plan_content(segments: list[dict], duration: float, *, feedback: Optional[st
 
         _ground_data_point_seconds(raw, word_timestamps)
         plan = _to_frame_plan(raw, duration)
-        failures = _plan_quality_failures(raw, plan, duration)
+        failures = _plan_quality_failures(raw, plan, duration, segments)
         if not failures:
             logger.info(f"content_planner: 规划质量标准全部通过（第 {attempt}/{_PLAN_MAX_ATTEMPTS} 轮）")
             return plan
@@ -399,7 +399,7 @@ def plan_content(segments: list[dict], duration: float, *, feedback: Optional[st
             candidate_raw["data_points"] = [*(best_raw.get("data_points") or []), *quote_candidates]
             _ground_data_point_seconds(candidate_raw, word_timestamps)
             candidate_plan = _to_frame_plan(candidate_raw, duration)
-            candidate_failures = _plan_quality_failures(candidate_raw, candidate_plan, duration)
+            candidate_failures = _plan_quality_failures(candidate_raw, candidate_plan, duration, segments)
             if len(candidate_failures) < len(best_failures or []):
                 logger.info(
                     f"content_planner: 稀疏空档确定性兜底插入 {len(quote_candidates)} 条 quote"
@@ -2039,7 +2039,23 @@ _PLAN_MAX_ATTEMPTS = 3
 _MIN_DURATION_FOR_VISUALS_S = 15.0
 
 
-def _plan_quality_failures(raw: dict, plan: dict, duration: float) -> list[str]:
+def _spoken_dollar_amounts(segments: list[dict]) -> list[str]:
+    """Every distinct '$<amount>' substring actually spoken in the transcript
+    (verbatim, as ASR rendered it — no unit parsing, just presence)."""
+    seen: list[str] = []
+    for seg in segments or []:
+        for m in _DOLLAR_AMOUNT_RE.finditer(str(seg.get("text", ""))):
+            text = m.group(0).strip()
+            if text not in seen:
+                seen.append(text)
+    return seen
+
+
+_DOLLAR_AMOUNT_RE = re.compile(r"\$\s*[\d,]+(?:\.\d+)?\s*(?:million|thousand|k|m)?", re.IGNORECASE)
+_NUMERIC_VISUAL_TYPES = {"count_up", "gauge", "countdown", "before_after"}
+
+
+def _plan_quality_failures(raw: dict, plan: dict, duration: float, segments: Optional[list[dict]] = None) -> list[str]:
     """规划质量标准——纯函数、确定性、不依赖 LLM 自评。plan_content 的
     criterion loop 每轮规划后跑一遍：返回空列表 = 全部达标（提前退出循环）；
     非空 = 每一条都是喂给下一轮 LLM 的具体失败描述（英文，因为 SYSTEM_PROMPT
@@ -2054,6 +2070,17 @@ def _plan_quality_failures(raw: dict, plan: dict, duration: float) -> list[str]:
        也是不达标（_sparse_gaps 的既有标准，此前只补救一次就放弃）。
     3. 0 值卡——job_acefec8b1c82 等多次复现的 "$0.0M"：格式化后显示为 0 的
        数字卡是提取错误，必须修正或删除。
+    4. 说了具体金额却一张数字卡都没有——job_452ef6c48100（真实用户反馈）：
+       同一支视频、同样的转写，某几轮重规划把 "one and a half million"/
+       "$8,400" 正确变成 count_up/gauge 卡，另几轮却完全没有任何数字卡，
+       只剩几张泛泛的 topic_card——SYSTEM_PROMPT 的分类指引本身没问题（已经
+       写明"任何数字都该是 count_up/gauge/countdown/before_after，不要默认
+       套 topic_card"），是 LLM 每轮的执行不稳定，属于"reprompt 不可靠"的
+       那一类，该加确定性标准而不是继续加提示词字数。这里只查最容易、最不
+       会误判的信号——转写里出现过 "$" 金额，但整份计划里一张
+       count_up/gauge/countdown/before_after 都没有——出现这种情况几乎总是
+       该数字被漏掉了，不是"这条视频真的没有数字"（那种情况下一开始就不会
+       在转写里出现 "$"）。
     """
     failures: list[str] = []
     if duration >= _MIN_DURATION_FOR_VISUALS_S:
@@ -2086,6 +2113,20 @@ def _plan_quality_failures(raw: dict, plan: dict, duration: float) -> list[str]:
             "the transcript for the actual spoken figure (and only apply divideBy to RAW dollar "
             "amounts, not values already spoken in millions)."
         )
+    dollar_amounts = _spoken_dollar_amounts(segments or [])
+    if dollar_amounts:
+        has_numeric_card = any(
+            isinstance(dp, dict) and dp.get("visual", "count_up") in _NUMERIC_VISUAL_TYPES
+            for dp in (raw.get("data_points") or [])
+        )
+        if not has_numeric_card:
+            failures.append(
+                f"The transcript explicitly says {', '.join(dollar_amounts)} but the plan has "
+                "ZERO count_up/gauge/countdown/before_after cards — a spoken dollar amount "
+                "almost always deserves its own numeric card, not just a generic topic_card. "
+                "Add a count_up (or gauge/before_after if it fits that shape better) for each "
+                "amount actually spoken."
+            )
     return failures
 
 REPLAN_SYSTEM_PROMPT = """You previously produced a content plan for this talking-head video, but the listed time spans have NO visual event at all (no data graphic, no quote, no section takeover) — on screen it's just the speaker and captions for too long.

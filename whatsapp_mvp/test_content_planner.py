@@ -1036,6 +1036,39 @@ def main():
           and 12.0 < _MIN_DURATION_FOR_VISUALS_S,
           _plan_quality_failures({"data_points": []}, short_plan, 12.0))
 
+    # 16e. Fix C41 —— job_452ef6c48100 真实用户反馈：转写里明说了具体金额
+    # （"one and a half million"/"$8,400"），但某一轮重规划的输出只有
+    # topic_card，一张数字卡都没有——标准 4 必须抓住这种情况。
+    dollar_segments = [
+        {"start": 4.6, "end": 11.2, "text": "Your policy is coming up for renewal in 30 days"},
+        {"start": 11.2, "end": 17.4, "text": "Your current plan covers you for one and a half million"
+                                              " and your annual premium is"},
+        {"start": 17.4, "end": 23.5, "text": "$8,400. I've put the full breakdown in this video."},
+    ]
+    topic_card_only_raw = {"data_points": [
+        {"visual": "topic_card", "seconds": 5.0, "headline": "Quick policy reminder", "icon": "check"},
+        {"visual": "topic_card", "seconds": 18.0, "headline": "Full breakdown in this video", "icon": "sparkle"},
+    ]}
+    topic_card_only_plan = _to_frame_plan({"chapters": [], **topic_card_only_raw}, duration=30.0)
+    f_dollar = _plan_quality_failures(topic_card_only_raw, topic_card_only_plan, 30.0, dollar_segments)
+    check("转写里说了具体金额但计划里一张数字卡都没有时被标准 4 抓住",
+          any("$8,400" in f or "explicitly says" in f for f in f_dollar), f_dollar)
+
+    with_count_up_raw = {"data_points": [
+        {"visual": "count_up", "title": "Your Plan", "rows": [
+            {"label": "Coverage", "seconds": 12.0, "value": 1500000, "divideBy": 1000000, "decimals": 1,
+             "prefix": "$", "unit": "M"},
+        ]},
+    ]}
+    with_count_up_plan = _to_frame_plan({"chapters": [], **with_count_up_raw}, duration=30.0)
+    f_with_card = _plan_quality_failures(with_count_up_raw, with_count_up_plan, 30.0, dollar_segments)
+    check("转写里说了金额、计划里确实有对应数字卡时不误报标准 4",
+          not any("explicitly says" in f for f in f_with_card), f_with_card)
+
+    f_no_segments = _plan_quality_failures(topic_card_only_raw, topic_card_only_plan, 30.0)
+    check("不传 segments 时标准 4 完全不触发（向后兼容，不影响没有转写上下文的既有调用）",
+          not any("explicitly says" in f for f in f_no_segments), f_no_segments)
+
     # 17. Fix C26 回归测试——真实生产复现 job_452ef6c48100，用户截图抓到
     # "$8,400"这一行数字滚动到一半就被卡片收起切掉：一张卡片里两行数字，
     # 一行(Coverage)校准过、说得慢；另一行(Premium)也校准过，但"$8,400"这个
