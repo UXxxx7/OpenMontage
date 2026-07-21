@@ -1928,6 +1928,41 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         elif op.get("compliance"):
             props["compliance"] = op["compliance"]
 
+        # Fix C33（2026-07-20，真实生产复现——job_51f154a80f9b 交付版本的 vision
+        # QA 直接抓到：一张 stepList 自己的存活区间(349-954)中途撞上一段从 551
+        # 帧开始的 Dominant(满尺寸卡片)窗口，说话人卡片长回全尺寸，直接压在还在
+        # 显示的步骤 1/2 上面）：跟 content_planner.py 的 Fix C31 是同一类桥——
+        # props["scenes"]/opacityKeyframes 在上面(~1705 行，有 intro 时 ~1782 行
+        # 还会重算一次)就已经从 mode_schedule 定型了，但 data_cards/gauges/
+        # countdowns/calendarEvents/beforeAfter/quotes/pills/stepLists/
+        # topicCards 在那之后还会被 _floor_shift_graphics、_shift_off_dominant_
+        # windows、outro 避让、quote 的开场地板线等好几处逻辑继续挪动——
+        # mode_schedule 冻结的时间点跟这些图形最终真正落地的时间点不再是同一份
+        # 真相。在这个闭包真正要写盘之前，用每个内容区图形*此刻*(所有挪动都
+        # 结束后)的 mountFrame/endFrame 重新扫一遍、跟 sections/quote 的隐藏
+        # (SECTION_PIP_SENTINEL)区间取并集再重算一次 mode_schedule ->
+        # scenes/opacityKeyframes——不管是哪一步挪动造成的错位，这里都能补上，
+        # 跟 Fix C31 同一个"最后统一给一次保证，不信任中途的增量记账"原则。
+        from .content_planner import FPS, SECTION_PIP_SENTINEL, _workflow_mode_schedule
+
+        _final_ranges: list[tuple[int, int, int]] = []
+        for _items in (data_cards, gauges, countdowns, calendar_events, before_after,
+                       plan_pills, plan_step_lists, plan_topic_cards):
+            for _it in _items or []:
+                if "mountFrame" in _it and "endFrame" in _it:
+                    _final_ranges.append((_it["mountFrame"], _it["endFrame"], _CONTENT_ZONE_WIDTH))
+        for _q in plan_quotes or []:
+            if "mountFrame" in _q and "endFrame" in _q:
+                _final_ranges.append((_q["mountFrame"], _q["endFrame"], SECTION_PIP_SENTINEL))
+        for _sec in props.get("sections") or []:
+            _final_ranges.append((_sec["fromFrame"], _sec["toFrame"], SECTION_PIP_SENTINEL))
+        final_mode_schedule = _workflow_mode_schedule(_final_ranges, round(duration * FPS))
+        props["scenes"], speaker_opacity = _mode_schedule_to_scenes(final_mode_schedule)
+        if speaker_opacity:
+            props["opacityKeyframes"] = speaker_opacity
+        else:
+            props.pop("opacityKeyframes", None)
+
         props_path.write_text(json.dumps(props, ensure_ascii=False), encoding="utf-8")
         return props
 
