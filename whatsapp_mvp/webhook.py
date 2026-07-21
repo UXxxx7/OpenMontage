@@ -464,6 +464,39 @@ async def qa_endpoint(text: str = Form(...)):
     return {"answer": answer}
 
 
+@app.post("/croll")
+async def create_croll_endpoint(
+    photo: UploadFile = File(...),
+    hint: str = Form(""),
+    lang: str = Form("zh"),
+    pipeline: str = Form("talking-head"),
+):
+    """C-roll：一张照片 -> AI 看图写文案 -> HeyGen 数字人说话视频 -> 接入常规
+    剪辑管线（后续 confirm/export/retry 跟普通视频任务完全一样）。
+
+    跟 POST /jobs 的形状故意保持一致（同样的 job 生命周期），区别只在于
+    input.mp4 的来源——那边是用户直接传视频，这边是后台生成出来的。生成
+    这几步（看图写文案 + HeyGen 上传/生成/轮询）合起来能到 1-2 分钟，全部
+    放进后台线程，立即返回 job_id，Node 侧照旧轮询 GET /jobs/{id}。
+    """
+    user = get_or_create_user("api_user")
+    job = create_job(user_id=user.id, pipeline=pipeline, input_caption=hint)
+
+    job_dir = job.job_dir
+    job_dir.mkdir(parents=True, exist_ok=True)
+    photo_data = await photo.read()
+    ext = (os.path.splitext(photo.filename or "")[1].lstrip(".") or "jpg").lower()
+    photo_path = job_dir / f"source_photo.{ext}"
+    photo_path.write_bytes(photo_data)
+
+    update_job_status(job.id, JobStatus.DOWNLOADING_MEDIA)
+
+    from .worker import generate_croll
+    _run_in_background(generate_croll, job.id, str(photo_path), lang, hint)
+
+    return {"job_id": job.id, "status": job.status.value}
+
+
 @app.post("/jobs")
 async def create_job_endpoint(
     video: UploadFile = File(...),

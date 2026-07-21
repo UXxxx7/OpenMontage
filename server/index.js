@@ -147,6 +147,34 @@ async function handleMessage(message) {
 
   console.log(`[webhook] from=${waNumber} type=${msgType}`);
 
+  // C-roll：一张照片 + 触发词 caption → AI 看图写文案 + HeyGen 生成数字人
+  // 说话视频，再自动接入常规剪辑管线。必须显式触发词才认（不能让所有
+  // 图片上传都被当成 C-roll 请求）——不然会跟下面正常的 b-roll 图片收集
+  // 撞车。且只在完全没有素材收集在途时才认，收集途中发的图（哪怕碰巧
+  // 带了这几个词）一律走原来的"当作素材"逻辑，避免打断用户正在做的事。
+  const CROLL_TRIGGER_RE = /\b(c[\s-]?roll|croll)\b|数字人|生成视频|ai\s*视频|口播视频|说话视频/i;
+  if (msgType === "image") {
+    const media = message.image || {};
+    const mediaId = media.id;
+    const caption = media.caption || "";
+    if (mediaId && CROLL_TRIGGER_RE.test(caption)) {
+      const pendingCount = await withTimeout(
+        redis.llen(collectKey(waNumber)), Number(env("WA_REDIS_OP_TIMEOUT_MS", "2000")), 0
+      );
+      const awaitingChoice = await withTimeout(
+        redis.get(awaitChoiceKey(waNumber)), Number(env("WA_REDIS_OP_TIMEOUT_MS", "2000")), null
+      );
+      if (!pendingCount && !awaitingChoice) {
+        const lang = resolveLang(env("WA_DEFAULT_LANG", "zh"), caption);
+        await gatewaySendText(waNumber, t(lang,
+          "收到图片，正在生成数字人说话视频（AI 看图写文案 + 生成口型动画），这一步通常要 1-2 分钟…",
+          "Got the photo — generating your talking-photo video (AI writing the script + animating it), usually takes 1-2 minutes…"));
+        await videoQueue.add("croll-generate", { waNumber, mediaId, caption, msgId }, queueOptions(msgId));
+        return;
+      }
+    }
+  }
+
   // 视频/图片 → 收集态：每条素材攒进 Redis，等用户回 'go' 再统一建任务
   // （支持“主视频 + 多段 b-roll”）。每收一条回一句引导，告诉用户何时结束。
   if (msgType === "video" || msgType === "image") {
@@ -240,7 +268,7 @@ async function handleMessage(message) {
       return;
     }
 
-    if (activeJobId && ["confirm", "continue", "yes", "ok"].includes(normalized)) {
+    if (activeJobId && ["confirm", "continue", "yes", "ok", "go", "start", "done", "开始", "完成", "好了", "继续"].includes(normalized)) {
       await videoQueue.add("confirm-job", { waNumber, jobId: activeJobId, msgId }, queueOptions(msgId));
       return;
     }
