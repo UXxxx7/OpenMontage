@@ -674,7 +674,18 @@ async def revise_job_endpoint(job_id: str, text: str = Form("")):
 # ---------------------------------------------------------------------------
 
 @app.get("/files/{job_id}/{filename}")
-async def serve_file(job_id: str, filename: str):
+def serve_file(job_id: str, filename: str):
+    # Deliberately a plain `def`, not `async def`: get_job() is a blocking
+    # SQLAlchemy query (a JOIN across user+messages), and this route is the
+    # one Remotion's renderer hits repeatedly and CONCURRENTLY (6-way tab
+    # concurrency) while seeking through the source video during a render.
+    # As `async def` it shared FastAPI's single event-loop thread, so one
+    # blocking DB call froze every concurrent fetch behind it — confirmed
+    # live as the actual cause of Remotion's repeated "server sent no data
+    # for 20 seconds" / proxy 500 failures across multiple real jobs, at many
+    # different timestamps (not tied to any one frame). A plain `def` makes
+    # FastAPI run each call in its own threadpool thread automatically, so
+    # concurrent requests no longer serialize on one blocked thread.
     job = get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
