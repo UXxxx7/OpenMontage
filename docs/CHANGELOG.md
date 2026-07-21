@@ -15,6 +15,107 @@
 
 ---
 
+## 2026-07-21 (4) — count_up values weren't checked against the transcript at all (C45)
+- **Who**: Claude (same session, next day's live re-run of the C43/C44 fix —
+  user's reaction: "you're saying it's error again???? wtf i thought we
+  fixed it". Root-caused from real transcript evidence, per standing
+  instruction not to guess, before writing any code.)
+- **Branch/commit**: whatsapp-studio (uncommitted at time of writing)
+- **What changed**: `content_planner.py` — new 5th `_plan_quality_failures`
+  criterion, `_ungrounded_count_up_rows`: flags any count_up row whose value
+  matches none of the numbers actually spoken in the transcript (digit-form
+  via existing `_spoken_dollar_amounts`, plus new `_spoken_word_numbers` for
+  word-form amounts like "one and a half million"/"one point five million").
+  Tolerance check accounts for the value/divideBy convention ambiguity
+  already documented (Rule 15 note, `_zero_value_titles`) — compares against
+  each spoken candidate at raw scale and at /1,000 and /1,000,000.
+- **Why / impact**: a fresh `run_full_fixed_pipeline.py` re-run against
+  `job_452ef6c48100` (the same job Rule 16's C43/C44 writeup investigated
+  yesterday and concluded had no reproducible delivered-content bug) hit
+  the exact `$6,300`/`$8,400` mismatch again, then a second one
+  (`$1.1M`/"one and a half million"), and this time the vision-QA retry did
+  NOT self-correct — it degraded to a hard failure with no video delivered
+  at all. Confirmed via both the raw and filler-removed transcripts that
+  `$6,300`/`$1.1M` never appear anywhere in the source: the LLM is
+  inventing plausible-looking wrong figures on some replan rounds, not
+  reading a stray retake. The existing C41 criterion only checks that *a*
+  numeric card exists for a spoken amount — never that its value is the
+  value that was actually spoken — so a hallucinated card sailed through it
+  every time. See `whatsapp_mvp/CLAUDE.md` Rule 17 for the full writeup and
+  the correction to Rule 16's now-disproven conclusion.
+- **Status**: 🧪 to verify. Unit-level verified (reproduces catching both
+  hallucinated values against the real job transcript; passes clean on the
+  real correct values). Full `test_content_planner.py` /
+  `test_golden_extraction.py` / `test_filler_review.py` suites re-run clean
+  — including a false positive this change itself introduced and then fixed
+  (word-number parser initially mis-split "one point five million" into an
+  unrelated "five million"; fixed by handling spoken decimal points). Not
+  yet verified via a full live `apply_style` re-render of this job — that's
+  the next step before calling this actually fixed, not just detected.
+
+---
+
+## 2026-07-21 (3) — Self-intro-repeat identity bug (C43) + dead deterministic dup-cut backstop (C44)
+- **Who**: Claude (same session — user's most urgent pushback yet: "it's david...
+  is back?!?!?" and "you didn't cut the if you have any questions just
+  whatsapped me", both flagged as regressions of things already believed fixed.
+  Root-caused both from real transcript/render evidence before writing any
+  code, per the user's standing instruction not to guess.)
+- **Branch/commit**: whatsapp-studio (uncommitted at time of writing)
+- **What changed**:
+  - `pipeline_runner.py` (C43): `_fill_intro_lead_dead_space`'s self-intro-repeat
+    guard (the original fix behind "it's David from...") compared caption
+    **object identity** (`overlapping[0] is captions[0]`) to decide whether a
+    detected gap was the speaker's own opening line repeating on-screen. Real
+    transcript evidence (job_452ef6c48100): the self-intro is ONE spoken
+    segment (0.21–4.61s) but gets split into MULTIPLE phrase-level captions —
+    so the gap's first overlapping caption is never literally the *same object*
+    as `captions[0]`, even though it's still time-contained within the first
+    spoken segment. Fixed by comparing against `segments[0]`'s end time
+    (+200ms slack) instead of caption identity — a fix that generalizes to any
+    number of caption chunks the first sentence gets split into.
+  - `content_planner.py` (C44): `plan_filler_removal`'s deterministic
+    dup-phrase backstop (`_cut_duplicate_phrases` — the "no matter what the
+    LLM concluded, re-scan with pure rules" guarantee described in its own
+    docstring) was only ever reached via the branch taken after **every**
+    verify retry is exhausted. The loop returns immediately the moment
+    `verify_filler_removal` reports `{"clean": true}` **or** returns `None`
+    (the documented "assume passed" fallback for when the verify LLM call
+    itself fails/errors) — so if the LLM's own retake-review was wrong on
+    attempt 0, or unavailable (plausible: the exact same job's ASR calls were
+    hitting real ElevenLabs quota errors in this session), the deterministic
+    backstop was dead code for that run. Real instance: job_452ef6c48100's
+    "If you have any questions, just WhatsApp me directly" retake survived
+    because verify said clean. Fixed by running the backstop on every loop
+    iteration, before the verify call, not just after retries are exhausted.
+- **Why / impact**: both are the same class of bug already named in Rule 13/15
+  (a deterministic guarantee that doesn't actually run on every path is not a
+  guarantee) — C43 is an identity-vs-time-containment mismatch scoped too
+  narrowly for multi-caption sentences; C44 is a guard clause returning before
+  the "always run this" step it was supposed to precede. Neither is a
+  regression of the original fix's logic — both are the original fix's own
+  narrower assumption breaking on a real input it didn't anticipate.
+- **Status**: ✅ C43 covered by a regression test reproducing the exact
+  multi-phrase-caption scenario; C44 covered by two new tests
+  (`test_dup_phrase_backstop_runs_even_when_verify_says_clean_on_first_pass`,
+  `..._returns_none`) plus a new real-data regression test
+  (`test_cut_duplicate_phrases_preserves_dollar_figure_between_two_retakes`,
+  from job_452ef6c48100's actual transcript) locking in that the fix doesn't
+  over-cut the `$8,400` figure that sits directly between two genuine retakes
+  in this video. Full suite passes. C44 re-verified against this job's real
+  cached transcript end-to-end (fresh `_op_remove_filler` re-run): output
+  duration matches the clean/deduped keep_ranges exactly, `$8,400` preserved,
+  no duplicate. Separately investigated the user's "you keep cutting the
+  8400 dollars" claim directly: scanned all 40 historical "David"-video job
+  runs' final delivered props — `$8,400` present and correct in 100% of them;
+  the one observed `$6,300`/`$8,400` mismatch was a transient mid-replan state
+  that the existing vision-QA retry loop already caught and corrected before
+  delivery, not a delivered defect. No separate fix made for that claim beyond
+  C44 and the new regression test, since no reproducible delivered-content bug
+  was found.
+
+---
+
 ## 2026-07-21 (2) — Content-planning quality/consistency fixes from real user feedback (C40-C42)
 - **Who**: Claude (same session — user reviewed the actual delivered videos from
   the day's harness runs and gave specific, concrete feedback: missing data

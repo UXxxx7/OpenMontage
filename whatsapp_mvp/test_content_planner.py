@@ -1069,6 +1069,37 @@ def main():
     check("不传 segments 时标准 4 完全不触发（向后兼容，不影响没有转写上下文的既有调用）",
           not any("explicitly says" in f for f in f_no_segments), f_no_segments)
 
+    # 16f2. 标准 5（新增，2026-07-21 真实复现）——同一支 job_452ef6c48100，
+    # 同一份转写只说过 "$8,400"/"one and a half million"，但某几轮重规划把
+    # count_up 行编造成了 "$6,300"/"$1.1M"（两个数字转写里都不存在，不是
+    # retake 残留）。标准 4 对这种情况完全没有覆盖，因为它只查"有没有数字
+    # 卡"，卡确实有，只是数字是编的。
+    hallucinated_raw = {"data_points": [
+        {"visual": "count_up", "title": "Coverage", "rows": [
+            {"label": "Coverage", "seconds": 12.0, "value": 1100000, "divideBy": 1000000,
+             "decimals": 1, "prefix": "$", "unit": "M"}]},
+        {"visual": "count_up", "title": "Premium", "rows": [
+            {"label": "Premium", "seconds": 18.0, "value": 6300, "divideBy": 1, "decimals": 0,
+             "prefix": "$"}]},
+    ]}
+    hallucinated_plan = _to_frame_plan({"chapters": [], **hallucinated_raw}, duration=30.0)
+    f_hallucinated = _plan_quality_failures(hallucinated_raw, hallucinated_plan, 30.0, dollar_segments)
+    check("编造出转写里不存在的数字（$6,300/$1.1M）被标准 5 抓住",
+          any("do not match ANY number" in f for f in f_hallucinated), f_hallucinated)
+
+    correct_raw = {"data_points": [
+        {"visual": "count_up", "title": "Coverage", "rows": [
+            {"label": "Coverage", "seconds": 12.0, "value": 1500000, "divideBy": 1000000,
+             "decimals": 1, "prefix": "$", "unit": "M"}]},
+        {"visual": "count_up", "title": "Premium", "rows": [
+            {"label": "Premium", "seconds": 18.0, "value": 8400, "divideBy": 1, "decimals": 0,
+             "prefix": "$"}]},
+    ]}
+    correct_plan = _to_frame_plan({"chapters": [], **correct_raw}, duration=30.0)
+    f_correct = _plan_quality_failures(correct_raw, correct_plan, 30.0, dollar_segments)
+    check("转写里实际说的数字（$8,400/$1.5M，含词面大数）不被标准 5 误报",
+          not any("do not match ANY number" in f for f in f_correct), f_correct)
+
     # 16f. Fix C42 —— process_timeline.chapter_label 跟 chapters[].label 精确
     # 匹配失败时，退回到唯一被标记 takeover 的章节，而不是整段丢弃。
     timeline_chapters = [

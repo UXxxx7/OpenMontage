@@ -669,6 +669,17 @@ sampling bug, not a content bug, and no amount of replanning will ever change it
   try to fix it with more prompt wording; add a deterministic criterion to
   `_plan_quality_failures` instead (Fix C41's dollar-amount check is the template:
   coarse, hard-to-false-positive signal, not exact-value grounding).
+- **A single spoken sentence can be split across multiple phrase-level captions** —
+  don't compare against `captions[0]` by object identity to detect "is this the
+  opening line repeating on screen"; compare against the first *spoken segment's*
+  end time instead (Fix C43). Identity checks silently stop matching the moment a
+  sentence gets chunked into more caption pieces than the code originally assumed.
+- **A deterministic backstop described as "runs no matter what the LLM decided"
+  must actually execute on every code path that returns early**, not just the one
+  taken when retries are exhausted (Fix C44). A guard clause (`if verify says
+  clean or is None: return`) placed before the backstop makes it dead code for
+  every run where the LLM's own judgment happens to be wrong-but-confident, or
+  the verify call itself fails — which, given real LLM APIs, will happen.
 
 ## Rule 15 — a "final recompute" guarantee is only final if it runs after every step that can still touch the thing it's guaranteeing
 
@@ -731,6 +742,147 @@ rendered geometry for an assumption that only holds in one direction. A
 correct scheduler feeding a broken converter still produces broken output,
 and the converter can look validated forever if nobody happens to test the
 direction it's wrong in.
+
+## Rule 16 — "regardless of what the LLM decided" backstops need every return path audited, not just the happy path
+
+Confirmed real bug (2026-07-21, user's most urgent complaint of the session: a
+retake ("If you have any questions, just WhatsApp me directly") surviving into
+a delivered video, right after being told "it's David from..." — a previously
+fixed self-intro-repeat bug — had also come back).
+
+**Two separate bugs, both in this same "the guarantee wasn't actually
+unconditional" shape, found by reading real transcript/render evidence before
+writing any code (per the user's explicit instruction not to guess):**
+
+1. **Fix C43** — `_fill_intro_lead_dead_space`'s guard against re-inserting a
+   card over the speaker's own opening line compared `overlapping[0] is
+   captions[0]` (object identity). The real transcript showed the opening
+   line is ONE spoken segment but gets split across several phrase-level
+   captions — so the gap's first overlapping caption is never the literal
+   `captions[0]` object once the sentence spans more than one caption chunk,
+   even though it's still entirely inside the first segment's time range.
+   Fixed by comparing elapsed time against `segments[0]["end"]` (+200ms
+   slack) instead of object identity.
+
+2. **Fix C44** — `plan_filler_removal`'s own docstring says its deterministic
+   `_cut_duplicate_phrases` backstop runs "不管 LLM 判断结果如何" (no matter
+   what the LLM concluded). The code didn't. It only ran after the verify
+   retry loop was fully exhausted — every other return path (`verify_filler_
+   removal` says `{"clean": true}`, or returns `None` because the call itself
+   failed) returned immediately, before the backstop ever executed. Given
+   real LLM APIs *will* occasionally be wrong-but-confident or fail outright
+   (this exact job was hitting real ElevenLabs quota errors in the same run),
+   the "unconditional" backstop was, in practice, conditional on the LLM's
+   own judgment already being unreliable in the *opposite* direction (never
+   passing clean) — the one case it's least likely to hit. Fixed by moving the
+   backstop call to the top of every loop iteration, before the verify call
+   that can short-circuit the function.
+
+**General principle**: when you write "this deterministic check runs
+regardless of what the LLM/upstream step decided," that claim is only true if
+you can point to the single call site executed on *every* return path of the
+function — not just the path your test happened to exercise. A backstop that's
+reachable from only one of several `return` statements is not a guarantee, it's
+a fallback for a fallback. Grep for every `return` in the function and check
+which ones the backstop precedes; if any early return skips it, the guarantee
+is fiction until proven otherwise by a test that forces that specific return
+path (`test_dup_phrase_backstop_runs_even_when_verify_says_clean_on_first_pass`
+and `..._returns_none` in `test_filler_review.py` are the template — one test
+per skippable return path, not just one happy-path test).
+
+**On "you keep cutting the $8400 dollars" (same complaint message, investigated
+alongside C43/C44):** no reproducible delivered-content bug found. Scanned all
+40 historical "David"-video job runs' final `_op_apply_style_props.json` —
+`$8,400` present and correct in every one that reached delivery. The one
+observed intermediate `$6,300`/`$8,400` mismatch was mid-replan, inside a
+vision-QA retry round that already caught and corrected it before delivery —
+not something the user could have actually seen. Locked in with a real-data
+regression test anyway (`test_cut_duplicate_phrases_preserves_dollar_figure_
+between_two_retakes`) because `$8,400` sits, in this video's real transcript,
+directly between two genuine speaker retakes — the exact adjacency that would
+make an over-eager cut span risk swallowing it, even though it doesn't today.
+
+**This conclusion was wrong — see Rule 17.** It reproduced for real the very
+next day, delivery failed (not silently shipped), and the actual bug was never
+what the note above investigated.
+
+## Rule 17 — "the retry loop already catches it" is not the same as "the value is correct"; presence-only criteria don't check content
+
+Confirmed real bug (2026-07-21, the day after Rule 16 was written — same job,
+`job_452ef6c48100`, a full live `apply_style` re-run via
+`run_full_fixed_pipeline.py`): the user reported "you keep cutting the $8400"
+again, was told (correctly, per Rule 16's own investigation) that this wasn't
+a delivered-content bug — then a fresh end-to-end run delivered nothing at
+all. `qa_stills`' vision review found the data card showing "$6,300" against
+narration saying "$8,400" (the same mismatch Rule 16 dismissed as
+"already caught and corrected before delivery"), triggered exactly one
+content_planner replan (the existing mechanism), and on the replanned attempt
+the vision review found the SAME mismatch again, plus a new one ("$1.1M" card
+vs. "one and a half million" narration) and an unrelated caption/button
+overlap. Three high-severity findings surviving the one retry tripped
+`_op_apply_style`'s degrade-to-RuntimeError path — no video was rendered at
+all, worse than the silent-wrong-number case Rule 16 was worried about.
+
+**Root cause, found by reading the actual transcripts before writing any
+code (checked both `_op_nofiller_transcript.json` and the pre-filler-removal
+`input_transcript.json`):** `$6,300` and `$1.1M` do not appear anywhere in
+either transcript, in any form. This rules out Rule 16's implicit theory (a
+stray retake or dedup leftover bleeding through) — the LLM is flatly
+inventing a plausible-looking wrong figure on some replan rounds, not
+misreading real alternate text. Rule 16's "already caught and corrected
+before delivery" claim was true of the specific historical runs it sampled,
+but was never a guarantee — it was luck holding across 40 samples, not a
+mechanism. C41 (criterion 4, "a spoken dollar amount but zero numeric
+cards") only checks that *a* count_up/gauge/etc. card exists; it has no
+opinion on whether the number inside it is the number that was actually
+said. A hallucinated-but-present card satisfies it completely.
+
+**The fix (Fix C45):** a fifth `_plan_quality_failures` criterion,
+`_ungrounded_count_up_rows` — for every count_up row, checks whether its raw
+`value` matches ANY number actually spoken in the transcript, combining two
+sources: `_spoken_dollar_amounts` (existing, digit-form `"$8,400"`) and a new
+`_spoken_word_numbers` (word-form amounts like `"one and a half million"` or
+`"one point five million"` — deliberately scoped to the `<number-word>[ and a
+<fraction>| point <digits>] <scale-word>` pattern common in spoken financial
+figures, not a general English number parser). Only fires when at least one
+grounded candidate exists for the transcript, so quantities this function
+can't parse (percentages, small counts) are left alone rather than
+false-flagged. Tolerance check expands each candidate to `{c, c/1_000,
+c/1_000_000}` before comparing, because a row's "value" field is used with
+two different legitimate conventions elsewhere in this codebase (raw dollars
++ divideBy=1e6, per SYSTEM_PROMPT's own instructions, OR already-scaled +
+divideBy=1.0, seen in a real frozen DeepSeek response in
+`test_golden_extraction.py`) — checking only the raw scale produced a false
+positive against that existing regression fixture during verification.
+
+Same as every other criterion in this function (Rule 3): wiring it into
+`_plan_quality_failures` means it automatically covers both the main
+`plan_content` loop AND the vision-QA-triggered `_build()` replan path (Rule
+13/C16's lesson — a guarantee only counts if every path that produces final
+props runs it), with zero special-casing at either call site.
+
+**Verified:** unit-level against the real job's actual transcript text
+(reproduces catching both hallucinated values, passes clean on the real
+correct values); full `test_content_planner.py` / `test_golden_extraction.py`
+/ `test_filler_review.py` suites re-run clean, including a fixed false
+positive found by that same full-suite run (the word-number parser initially
+mis-split `"one point five million"` into an unrelated `"five million"` —
+fixed by handling spoken decimal points, not just `"and a half"`/`"and a
+quarter"`). Not yet verified via a full live `apply_style` re-render of
+`job_452ef6c48100` end-to-end (that is the natural next check, same standard
+Rule 13 sets — a props-level pass is necessary but not sufficient).
+
+**General principle, sharpening Rule 16's own closing line:** "the existing
+retry/QA loop already catches this" is an observation about historical
+samples, not a guarantee, unless something in the code actually forces every
+path to re-check the same thing before it can ship. A presence-only
+criterion (Rule 3's "does at least one card exist") and a value-correctness
+criterion (this rule's "is the number in that card the one actually said")
+are different guarantees — passing the first proves nothing about the
+second. When investigating a user complaint that sounds like "the fix didn't
+work," check whether the existing fix's criterion was ever capable of
+catching the specific failure being reported, not just whether it fires at
+all.
 
 ## Where the rest of the story lives
 

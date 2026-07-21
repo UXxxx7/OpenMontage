@@ -213,6 +213,65 @@ def test_llm_unconfigured():
     check("LLM 不可用: 返回空列表，不炸", result == [], result)
 
 
+def _kept_text(words, result):
+    return " ".join(
+        w["word"] for w in words
+        if any(r["start_seconds"] - 1e-6 <= w["start"] and w["end"] <= r["end_seconds"] + 1e-6 for r in result)
+    )
+
+
+def test_dup_phrase_backstop_runs_even_when_verify_says_clean_on_first_pass():
+    """C44 核心回归测试——真实生产 bug（job_452ef6c48100）：judgment 第 1 轮
+    完全没剪到"If you have any questions..."这处重录（LLM 漏判），复核第 1 轮
+    也判"clean"（复核本身也看漏，跟判断是同一类不可靠）——旧实现在这里直接
+    return，_cut_duplicate_phrases 这道不该依赖 LLM 判断结果的确定性兜底
+    根本没机会跑，重录原样播出。断言修复后，哪怕两次 LLM 调用都判"没问题"，
+    确定性重复短语检测依然会在 verify 判 clean 之前介入，剪掉废弃的第一次
+    出现。"""
+    calls = []
+
+    def fake(system_prompt, user_message, *, temperature=0.1, model=None):
+        calls.append(system_prompt)
+        if _is_filler_call(system_prompt):
+            return json.dumps({"cut_word_indices": []})  # 完全漏判，一个词都没剪
+        if _is_verify_call(system_prompt):
+            return json.dumps({"clean": True})  # 复核也误判为 clean
+        raise AssertionError("unexpected system_prompt")
+
+    content_planner.call_llm_chat = fake
+    result = content_planner.plan_filler_removal(DUP_TAKE_2, duration=44.0)
+    check("C44: 只调用了 2 次 LLM（第 1 轮判断+第 1 轮复核就 return，不该继续重试）",
+          len(calls) == 2, calls)
+    kept_text = _kept_text(DUP_TAKE_2, result)
+    check("C44: 即使 verify 判 clean，确定性兜底依然剪掉了废弃的第一次重录",
+          "directly. If" not in kept_text and kept_text.count("directly") == 1, kept_text)
+    check("C44: 保留了干净的第二次完整版本（含后续未重复的内容）",
+          "scan the QR code" in kept_text, kept_text)
+
+
+def test_dup_phrase_backstop_runs_even_when_verify_returns_none():
+    """同一个 dead-code 路径的另一种触发方式——verify_filler_removal 调用
+    本身失败/不可用时返回 None，约定当作"假定通过"，同样会在旧实现里跳过
+    _cut_duplicate_phrases。真实场景：跟这次同一个 job 里 ElevenLabs 转写
+    quota_exceeded 报的是同一类"外部 LLM 调用可能随时失败"的风险，复核调用
+    没道理免疫。"""
+    calls = []
+
+    def fake(system_prompt, user_message, *, temperature=0.1, model=None):
+        calls.append(system_prompt)
+        if _is_filler_call(system_prompt):
+            return json.dumps({"cut_word_indices": []})
+        if _is_verify_call(system_prompt):
+            return None  # 模拟复核调用失败/解析失败
+        raise AssertionError("unexpected system_prompt")
+
+    content_planner.call_llm_chat = fake
+    result = content_planner.plan_filler_removal(DUP_TAKE_2, duration=44.0)
+    kept_text = _kept_text(DUP_TAKE_2, result)
+    check("C44b: verify 返回 None 时，确定性兜底依然剪掉了废弃的第一次重录",
+          "directly. If" not in kept_text and kept_text.count("directly") == 1, kept_text)
+
+
 # --- _cut_duplicate_phrases 直接测试（确定性兜底，Fix A3）-------------------
 
 def _w(word, start, end):
@@ -242,6 +301,35 @@ DUP_TAKE_2 = [
     _w("QR", 43.0, 43.3), _w("code.", 43.3, 43.9),
 ]
 
+# 真实生产数据复现（job_452ef6c48100，2026-07-21，本地 faster-whisper 转写）——
+# 用户反复追问"你是不是又把 8400 剪掉了"之后专门追查的场景：说话人两次
+# false-start（"...for one point" 和 "I've put...so you can have"），且第一次
+# false start 的干净重录版本里，紧贴着夹了一个真实报价 "$8,400"（分词成
+# "$8" + ",400" 两个 token）——刚好卡在两处该剪的重录中间。断言确定性兜底
+# 只剪掉两处 false start 本身，$8,400 完好保留，不会被相邻重录的裁剪span
+# 误伤扩大范围带走。
+DUP_TAKE_3_WITH_ADJACENT_DOLLAR_FIGURE = [
+    _w("Your", 14.63, 15.69), _w("current", 15.69, 15.99), _w("plan", 15.99, 16.23),
+    _w("covers", 16.23, 16.57), _w("you", 16.57, 16.93), _w("for", 16.93, 17.35),
+    _w("one", 17.35, 17.63), _w("point", 17.63, 17.99),
+    _w("Your", 18.97, 19.49), _w("current", 19.49, 20.05), _w("plan", 20.05, 20.35),
+    _w("covers", 20.35, 20.75), _w("you", 20.75, 21.07), _w("for", 21.07, 21.37),
+    _w("one", 21.37, 21.55), _w("and", 21.55, 21.75), _w("a", 21.75, 21.81),
+    _w("half", 21.81, 22.05), _w("million", 22.05, 22.53), _w("and", 22.53, 23.33),
+    _w("your", 23.33, 23.59), _w("annual", 23.59, 23.97), _w("premium", 23.97, 24.35),
+    _w("is", 24.35, 24.81), _w("$8", 24.81, 25.25), _w(",400", 25.25, 26.01),
+    _w("I've", 26.01, 27.27), _w("put", 27.27, 27.37), _w("the", 27.37, 27.59),
+    _w("full", 27.59, 27.81), _w("breakdown", 27.81, 28.15), _w("in", 28.15, 28.37),
+    _w("this", 28.37, 28.55), _w("video", 28.55, 28.99), _w("so", 28.99, 29.51),
+    _w("you", 29.51, 29.81), _w("can", 29.81, 30.07), _w("have", 30.07, 30.45),
+    _w("I've", 31.63, 32.23), _w("put", 32.23, 32.35), _w("the", 32.35, 32.47),
+    _w("full", 32.47, 32.71), _w("breakdown", 32.71, 33.03), _w("in", 33.03, 33.17),
+    _w("this", 33.17, 33.41), _w("video", 33.41, 33.79), _w("so", 33.79, 33.95),
+    _w("you", 33.95, 34.17), _w("have", 34.17, 34.45), _w("everything", 34.45, 35.11),
+    _w("in", 35.11, 35.67), _w("one", 35.67, 35.95), _w("place.", 35.95, 36.63),
+]
+
+
 NEG_FAR_APART = [
     _w("this", 0.0, 0.3), _w("is", 0.3, 0.5), _w("a", 0.5, 0.6), _w("test", 0.6, 1.0),
     _w("this", 30.0, 30.3), _w("is", 30.3, 30.5), _w("a", 30.5, 30.6), _w("test", 30.6, 31.0),
@@ -265,6 +353,21 @@ def test_cut_duplicate_phrases_negative_far_apart():
     check("dup-phrase: 间隔 30s(超过 15s 窗口)的重复短语不会被剪", cut == set(), sorted(cut))
 
 
+def test_cut_duplicate_phrases_preserves_dollar_figure_between_two_retakes():
+    words = DUP_TAKE_3_WITH_ADJACENT_DOLLAR_FIGURE
+    cut = _cut_duplicate_phrases(words, set())
+    check("dup-phrase(真实数据): 恰好剪掉两处 false start，共 20 个词",
+          cut == set(range(0, 8)) | set(range(26, 38)), sorted(cut))
+    kept_text = " ".join(words[i]["word"] for i in range(len(words)) if i not in cut)
+    check("dup-phrase(真实数据): $8,400 完好保留在剪完后的内容里",
+          "$8 ,400" in kept_text, kept_text)
+    check("dup-phrase(真实数据): 两处 false start 都被剪掉，只留一份干净版本",
+          kept_text == "Your current plan covers you for one and a half million and your "
+                       "annual premium is $8 ,400 I've put the full breakdown in this video "
+                       "so you have everything in one place.",
+          kept_text)
+
+
 def test_cut_duplicate_phrases_too_short_to_check():
     cut = _cut_duplicate_phrases(WORDS, set())  # 只有 5 个词，< _DUP_MIN_NGRAM*2
     check("dup-phrase: 词数太少时直接跳过检测（不误报）", cut == set(), sorted(cut))
@@ -277,9 +380,12 @@ def main():
     test_best_result_delivered_not_last()
     test_flagged_still_flagged_after_all_retries()
     test_llm_unconfigured()
+    test_dup_phrase_backstop_runs_even_when_verify_says_clean_on_first_pass()
+    test_dup_phrase_backstop_runs_even_when_verify_returns_none()
     test_cut_duplicate_phrases_real_bug_1()
     test_cut_duplicate_phrases_real_bug_2()
     test_cut_duplicate_phrases_negative_far_apart()
+    test_cut_duplicate_phrases_preserves_dollar_figure_between_two_retakes()
     test_cut_duplicate_phrases_too_short_to_check()
 
     print()

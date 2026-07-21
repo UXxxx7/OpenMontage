@@ -2075,6 +2075,142 @@ def _spoken_dollar_amounts(segments: list[dict]) -> list[str]:
 _DOLLAR_AMOUNT_RE = re.compile(r"\$\s*[\d,]+(?:\.\d+)?\s*(?:million|thousand|k|m)?", re.IGNORECASE)
 _NUMERIC_VISUAL_TYPES = {"count_up", "gauge", "countdown", "before_after"}
 
+_DOLLAR_SUFFIX_MULTIPLIER = {"k": 1_000, "m": 1_000_000, "million": 1_000_000, "thousand": 1_000}
+
+
+def _dollar_amount_to_float(text: str) -> Optional[float]:
+    """'$8,400' -> 8400.0, '$1.5 million' -> 1_500_000.0, '$500k' -> 500_000.0."""
+    m = re.match(r"\$\s*([\d,]+(?:\.\d+)?)\s*(million|thousand|k|m)?", text.strip(), re.IGNORECASE)
+    if not m:
+        return None
+    base = _num(m.group(1).replace(",", ""))
+    if base is None:
+        return None
+    suffix = (m.group(2) or "").lower()
+    return base * _DOLLAR_SUFFIX_MULTIPLIER.get(suffix, 1)
+
+
+# 口播里 "$8,400" 这类数字形式的金额，_DOLLAR_AMOUNT_RE 已经能抓到——但像
+# "one and a half million" 这种纯词面的大数字（真实案例：job_452ef6c48100
+# 的 coverage 金额，全程转写里从没出现过任何数字形式），原本完全没有任何
+# 检测覆盖。范围刻意收窄：只处理 "<数字词>[ and a <分数词>] <量级词>" 这一
+# 种口语金融叙述里常见的模式，不是通用英语数字解析器。
+_UNIT_WORDS = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+    "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17,
+    "eighteen": 18, "nineteen": 19,
+}
+_TEN_WORDS = {
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60,
+    "seventy": 70, "eighty": 80, "ninety": 90,
+}
+_SCALE_WORDS = {"hundred": 100, "thousand": 1_000, "million": 1_000_000, "billion": 1_000_000_000}
+_FRACTION_WORDS = {"half": 0.5, "quarter": 0.25}
+_WORD_TOKEN_RE = re.compile(r"[a-z]+")
+
+
+def _spoken_word_numbers(segments: list[dict]) -> list[float]:
+    """Best-effort extraction of large numbers spoken purely as words
+    ('one and a half million', 'one point five million', 'two hundred
+    thousand') — see module note above on scope. Returns raw numeric values,
+    same units as a count_up row's "value" field (pre-divideBy)."""
+    found: list[float] = []
+    for seg in segments or []:
+        tokens = _WORD_TOKEN_RE.findall(str(seg.get("text", "")).lower())
+        n = len(tokens)
+        i = 0
+        while i < n:
+            base = _UNIT_WORDS.get(tokens[i], _TEN_WORDS.get(tokens[i]))
+            if base is None:
+                i += 1
+                continue
+            j = i + 1
+            frac = 0.0
+            consumed_extra = False
+            if j + 2 < n and tokens[j] == "and" and tokens[j + 1] == "a" \
+                    and tokens[j + 2] in _FRACTION_WORDS:
+                frac = _FRACTION_WORDS[tokens[j + 2]]
+                j += 3
+                consumed_extra = True
+            elif j < n and tokens[j] == "point":
+                digits = []
+                k = j + 1
+                while k < n and _UNIT_WORDS.get(tokens[k], 10) < 10:
+                    digits.append(str(_UNIT_WORDS[tokens[k]]))
+                    k += 1
+                if digits:
+                    frac = float("0." + "".join(digits))
+                    j = k
+                    consumed_extra = True
+            if j < n and tokens[j] in _SCALE_WORDS:
+                found.append((base + frac) * _SCALE_WORDS[tokens[j]])
+                i = j + 1
+                continue
+            # No scale word followed — this wasn't a big-number phrase (e.g.
+            # "twelve percent", or a bare decimal like "one point five" with
+            # no magnitude word). Skip past whatever was tentatively consumed
+            # so "five" in "one point five" doesn't get re-scanned on its own
+            # and misread as an unrelated standalone number.
+            i = j if consumed_extra else i + 1
+    return found
+
+
+def _grounded_spoken_values(segments: list[dict]) -> list[float]:
+    """Every number actually spoken in the transcript, in the units a count_up
+    row's raw "value" would use — combines digit-form ('$8,400') and
+    word-form ('one and a half million') amounts."""
+    values: list[float] = []
+    for amt in _spoken_dollar_amounts(segments):
+        v = _dollar_amount_to_float(amt)
+        if v is not None:
+            values.append(v)
+    values.extend(_spoken_word_numbers(segments))
+    return values
+
+
+def _ungrounded_count_up_rows(raw: dict, segments: list[dict]) -> list[str]:
+    """count_up rows whose raw value matches NONE of the numbers actually
+    spoken in the transcript — catches the LLM inventing a plausible-looking
+    but wrong figure. Confirmed real bug (job_452ef6c48100): delivered
+    "$6,300"/"$1.1M" count_up rows on some replan rounds when the transcript
+    only ever said "$8,400"/"one and a half million" — not a retake/dedup
+    artifact (verified against both the raw and filler-removed transcripts),
+    a straight hallucination the presence-only C41 check can't catch since
+    *a* numeric card did exist, just with the wrong number in it.
+
+    Only fires when there's at least one grounded candidate for this
+    transcript, so a row this function can't parse against (percentages, small
+    counts, a quantity with no digit or big-word-number form) is left alone
+    rather than false-flagged.
+
+    A row's "value" is supposed to be the RAW spoken figure per SYSTEM_PROMPT
+    (e.g. 1500000, with divideBy=1000000 formatting it to "1.5" for display) —
+    but real recorded LLM responses also legitimately write the already-scaled
+    number directly (value=1.5, divideBy=1.0, unit="M"), the same convention
+    ambiguity `_zero_value_titles` exists to handle on the "displays as zero"
+    side. So each candidate is checked at its raw scale AND divided by 1e3/1e6,
+    not just matched exactly — a hallucinated value has to miss all of those
+    to get flagged."""
+    candidates = _grounded_spoken_values(segments)
+    if not candidates:
+        return []
+    expanded = [scaled for c in candidates for scaled in (c, c / 1_000, c / 1_000_000)]
+    bad: list[str] = []
+    for dp in raw.get("data_points", []) or []:
+        if not isinstance(dp, dict) or dp.get("visual") != "count_up":
+            continue
+        for r in (dp.get("rows") or []):
+            if not isinstance(r, dict):
+                continue
+            value = _num(r.get("value"))
+            if value is None or value == 0:
+                continue
+            if any(abs(value - c) <= max(abs(c), 1.0) * 0.01 for c in expanded):
+                continue
+            bad.append(f"{dp.get('title', '')} row '{r.get('label', '')}' = {value:g}")
+    return bad
+
 
 def _plan_quality_failures(raw: dict, plan: dict, duration: float, segments: Optional[list[dict]] = None) -> list[str]:
     """规划质量标准——纯函数、确定性、不依赖 LLM 自评。plan_content 的
@@ -2102,6 +2238,16 @@ def _plan_quality_failures(raw: dict, plan: dict, duration: float, segments: Opt
        count_up/gauge/countdown/before_after 都没有——出现这种情况几乎总是
        该数字被漏掉了，不是"这条视频真的没有数字"（那种情况下一开始就不会
        在转写里出现 "$"）。
+    5. 数字卡里的值跟转写对不上——同一支 job_452ef6c48100，2026-07-21 真实
+       复现：criterion 4 只查"有没有数字卡"，从没查过卡片里的数字对不对。
+       同一份转写（前后两次检查过，remove_filler 前后都一样）只说过
+       "$8,400" 和 "one and a half million"，但某几轮重规划把 count_up 行
+       写成了 "$6,300"/"$1.1M"——转写里根本没有这两个数字，纯属编造，不是
+       retake/去重漏留的旧片段（Rule 16 那条"未复现"的结论建立在旧证据上，
+       这次真实复现了）。`_ungrounded_count_up_rows` 同时抓数字形式
+       （"$8,400"）和词面大数（"one and a half million"），只在转写里确实
+       能解析出至少一个数字候选时才生效，避免误伤解析不了的行（百分比、
+       小计数等）。
     """
     failures: list[str] = []
     if duration >= _MIN_DURATION_FOR_VISUALS_S:
@@ -2148,6 +2294,16 @@ def _plan_quality_failures(raw: dict, plan: dict, duration: float, segments: Opt
                 "Add a count_up (or gauge/before_after if it fits that shape better) for each "
                 "amount actually spoken."
             )
+    ungrounded = _ungrounded_count_up_rows(raw, segments or [])
+    if ungrounded:
+        spoken = _grounded_spoken_values(segments or [])
+        failures.append(
+            f"These count_up card value(s) do not match ANY number actually spoken in the "
+            f"transcript: {', '.join(ungrounded)}. The transcript only ever states these "
+            f"figures: {', '.join(f'{v:g}' for v in spoken)} — re-read the transcript and use "
+            "the exact spoken figure for this card, do not invent or approximate a nearby "
+            "number."
+        )
     return failures
 
 REPLAN_SYSTEM_PROMPT = """You previously produced a content plan for this talking-head video, but the listed time spans have NO visual event at all (no data graphic, no quote, no section takeover) — on screen it's just the speaker and captions for too long.
@@ -2704,6 +2860,22 @@ def plan_filler_removal(words: list[dict], duration: float) -> list[dict]:
     best_issue_count: Optional[int] = None
 
     for attempt in range(FILLER_VERIFY_MAX_RETRIES + 1):
+        # C44: 这一步必须在每一轮 verify 之前跑，不能只在重试耗尽后当兜底——
+        # 之前的写法只有"重试全部失败"这一条路径才会走到文件末尾的
+        # _cut_duplicate_phrases 调用；只要 LLM 复核在第 1 轮就判"clean"
+        # （复核本身会看漏，跟 remove_filler 漏判是同一类错误），或者复核调用
+        # 失败返回 None（约定当作"假定通过"），下面这行永远执行不到，确定性
+        # 兜底就变成了死代码。真实生产 bug（job_452ef6c48100）：口误复核第
+        # 1 轮就判 clean，"If you have any questions, just WhatsApp me
+        # directly" 的重录整段原样播出。
+        dup_cut = _cut_duplicate_phrases(words, cut_indices)
+        if dup_cut:
+            logger.warning(
+                f"content_planner: 确定性重复短语检测追加剪掉 {len(dup_cut)} 个词"
+                "（LLM 判断还没来得及/没抓到）"
+            )
+            cut_indices = cut_indices | dup_cut
+
         keep_ranges = _finalize(cut_indices)
         review = verify_filler_removal(words, keep_ranges)
         if review is None or review.get("clean", True):
@@ -2735,9 +2907,6 @@ def plan_filler_removal(words: list[dict], duration: float) -> list[dict]:
         new_cut_in_kept = _plan_filler_removal_once(kept_words, feedback=feedback)
         cut_indices = cut_indices | {kept_orig_indices[i] for i in new_cut_in_kept}
 
-    dup_cut = _cut_duplicate_phrases(words, cut_indices)
-    if dup_cut:
-        logger.warning(f"content_planner: 确定性重复短语检测追加剪掉 {len(dup_cut)} 个词（LLM 判断+复核都没抓到）")
-        cut_indices = cut_indices | dup_cut
-
+    # 循环内每一轮都已经跑过 _cut_duplicate_phrases（见上方 C44 注释），
+    # best_cut_indices 取的就是那时已经去重过的状态，这里不用再跑一遍。
     return _finalize(cut_indices)

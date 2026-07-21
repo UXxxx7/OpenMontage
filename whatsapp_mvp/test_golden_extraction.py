@@ -150,9 +150,16 @@ def main():
     #    separate leftover retakes, where the initial pass only caught one and
     #    verify_filler_removal's old single-"issue" schema meant the retry
     #    never even saw the other two (all 3 survived into the final cut).
-    #    Here the initial pass catches only retake #1; verify reports all 3
-    #    remaining issues at once (new plural "issues" schema); the retry
-    #    fixes all 3 in one pass using that full feedback.
+    #    C44 update: all 3 retakes here are exact >=4-word prefix repeats, so
+    #    _cut_duplicate_phrases now catches #2 and #3 deterministically in
+    #    round 0 — before verify is even asked — regardless of what the LLM's
+    #    own initial pass caught. The initial pass still only catches retake
+    #    #1 (proving the LLM path and the deterministic backstop are both
+    #    exercised, not just one); verify is asked honestly (content-aware
+    #    fake, not a blind fixed sequence — a rigid sequence breaks the moment
+    #    the deterministic backstop changes how many LLM rounds are needed)
+    #    and correctly reports clean on the first try, since the transcript
+    #    really is clean by the time it's asked.
     def _phrase_words(phrase, start_t, wps=2.5):
         out, t = [], start_t
         for word in phrase.split():
@@ -190,29 +197,24 @@ def main():
         cursor += n_fs + n_complete
 
     initial_cut = json.dumps({"cut_word_indices": fs_ranges[0]})  # only catches retake #1
-    verify_multi_issue = json.dumps({
-        "clean": False,
-        "issues": [
-            "Leftover false start before 'I've put the full breakdown in this video so...'",
-            "Leftover false start before 'If you have any questions just WhatsApp me directly or...'",
-        ],
-    })
-    # Monotonic retries (Fix A): the retry round is only shown the words still
-    # kept after round 1 (retake #1 already cut), not the full original list —
-    # so its response indices must be relative to THAT subset, not to words3.
-    kept_after_round1 = [i for i in range(len(words3)) if i not in fs_ranges[0]]
-    retry_cut = json.dumps({
-        "cut_word_indices": [kept_after_round1.index(i) for i in fs_ranges[1] + fs_ranges[2]]
-    })  # fixes retakes #2 and #3 (retake #1 stays cut from round 1 — never resurrected)
-    verify_clean = json.dumps({"clean": True})
+    verify_calls = []
 
-    with mock.patch.object(content_planner, "call_llm_chat",
-                            side_effect=_responses(initial_cut, verify_multi_issue, retry_cut, verify_clean)):
+    def fake_multi(system_prompt, user_message, *, temperature=0.1, model=None):
+        if system_prompt == content_planner.FILLER_SYSTEM_PROMPT:
+            return initial_cut
+        if system_prompt == content_planner.VERIFY_FILLER_SYSTEM_PROMPT:
+            verify_calls.append(user_message)
+            return json.dumps({"clean": True})
+        raise AssertionError("unexpected system_prompt")
+
+    with mock.patch.object(content_planner, "call_llm_chat", side_effect=fake_multi):
         keep_ranges3 = plan_filler_removal(words3, duration=t3)
     kept_text3 = " ".join(w["word"] for w in _words_in_keep_ranges(words3, keep_ranges3))
     expected3 = " ".join(completions)
-    check("3 处遗留重录在一次重试内全部收敛（多 issue 反馈生效）",
+    check("3 处遗留重录全部收敛（LLM 只抓到 1 处，确定性兜底在 verify 之前抓到另外 2 处）",
           kept_text3 == expected3, kept_text3)
+    check("verify 只被问了 1 次——确定性兜底已经在第 1 轮把内容清干净，不需要重试",
+          len(verify_calls) == 1, verify_calls)
 
     print()
     if FAILED:
