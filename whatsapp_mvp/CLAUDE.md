@@ -652,6 +652,23 @@ sampling bug, not a content bug, and no amount of replanning will ever change it
 - **Quote is the only "solo" (full-canvas) visual type** and cannot mount within the
   first `_QUOTE_MIN_START_FRAMES` (7s) of the video regardless of whether an intro
   title card exists — this floor is unconditional, not gated behind `if intro:`.
+- **A required text field on a visual type must be checked for non-empty, or the
+  card ships half-blank.** `_plan_topic_card`/`_plan_corner_card`/`_plan_quote` all
+  skip the card if their required text is empty; `_plan_gauge` didn't (Fix C40) —
+  caught from a real delivered video with a blank gauge title bar. When adding a
+  new visual type, check every "required per SYSTEM_PROMPT" text field the same way.
+- **Two fields the LLM emits in the same response aren't guaranteed to agree with
+  each other**, even when one is supposed to reference the other verbatim
+  (`process_timeline.chapter_label` vs. `chapters[].label`, Fix C42). An exact-match
+  lookup between them is one typo away from silently discarding real data. Prefer a
+  narrow, well-reasoned fallback (e.g. "there's only one plausible candidate anyway")
+  over either a strict match that fails silently or a fuzzy match that guesses wrong.
+- **LLM classification/judgment inconsistency (same input, different visual-type
+  choice across replans) is a different failure class from missing/wrong data** —
+  the SYSTEM_PROMPT guidance can be completely correct and this still happens. Don't
+  try to fix it with more prompt wording; add a deterministic criterion to
+  `_plan_quality_failures` instead (Fix C41's dollar-amount check is the template:
+  coarse, hard-to-false-positive signal, not exact-value grounding).
 
 ## Rule 15 — a "final recompute" guarantee is only final if it runs after every step that can still touch the thing it's guaranteeing
 

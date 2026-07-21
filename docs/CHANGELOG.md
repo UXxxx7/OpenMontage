@@ -15,6 +15,49 @@
 
 ---
 
+## 2026-07-21 (2) — Content-planning quality/consistency fixes from real user feedback (C40-C42)
+- **Who**: Claude (same session — user reviewed the actual delivered videos from
+  the day's harness runs and gave specific, concrete feedback: missing data
+  cards/calendar for clearly-spoken numbers, popup cards dominating over a
+  timeline they'd previously liked)
+- **Branch/commit**: whatsapp-studio (`62ba5fd`, `0747454`, `7f5ced5`)
+- **What changed**:
+  - `content_planner.py` (C40): `_plan_gauge` now skips the card entirely if
+    `title` is empty, matching every other visual type (`_plan_topic_card`/
+    `_plan_corner_card`/`_plan_quote` already do this). Caught directly in a
+    delivered video — a gauge with a blank title bar.
+  - `content_planner.py` (C41): new 4th criterion in `_plan_quality_failures` —
+    if the transcript has an explicit "$" amount and the plan has zero
+    count_up/gauge/countdown/before_after cards at all, fail with the specific
+    amount named. Root cause: SYSTEM_PROMPT's classification guidance was
+    already correct, but LLM compliance was inconsistent run-to-run on the
+    exact same transcript (same video, some replans produced a proper data
+    card, others produced only generic topic_cards). Deliberately coarse
+    (presence + total absence, not exact value matching) to stay low-risk.
+  - `content_planner.py` (C42): `_plan_process_timeline` required an exact
+    string match between `chapters[].label` and `process_timeline.
+    chapter_label` — two independently-generated fields in the same LLM
+    response with no structural guarantee they agree. Any mismatch silently
+    discarded the *entire* timeline, and the orphaned takeover chapter then
+    got fully evicted by the hidden-budget cap (which already knows to
+    cap-not-remove a *real* timeline section) instead of showing it. Now
+    falls back to the sole `takeover:true` chapter when exact match fails and
+    there's exactly one candidate; stays honest (returns None) when 0 or 2+
+    candidates make the fallback ambiguous.
+- **Why / impact**: none of C31-C39 (the facecam-timing/render-reliability
+  fixes from earlier the same day) touch content-planning *judgment* at all —
+  these three are a separate axis (which visual type gets chosen, and whether
+  a chapter's real intended graphic survives to delivery) that was still
+  producing exactly the symptoms the user originally complained about
+  ("brand style failed"-adjacent quality issues), just not literal degradation.
+- **Status**: ✅ all 3 covered by regression tests (including explicit
+  "don't guess when ambiguous" cases for C42), full suite passes. Not yet
+  re-verified via a fresh harness run on the same real jobs (content-planning
+  is non-deterministic, so confirming requires multiple runs) — next step
+  before calling this fully closed.
+
+---
+
 ## 2026-07-21 — Reconciled with origin + replica harness + 6 confirmed apply_style bugs (C34-C39)
 - **Who**: Claude (session continuation — user asked to fetch latest origin, resolve
   conflicts, then root-cause "brand style rendering failed" for real using a
