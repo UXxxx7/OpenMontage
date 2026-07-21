@@ -10,7 +10,7 @@ from whatsapp_mvp.content_planner import (
     _ground_data_point_seconds, _number_candidates, _find_grounded_seconds, _workflow_mode_schedule,
     _find_grounded_word, _keyword_matches, _KEYWORD_EXIT_HOLD_FRAMES, _COUNT_UP_ROW_ANIM_FRAMES,
     _STACK_EXIT_BUFFER_FRAMES, _TAKEOVER_HARD_CAP_FRAMES, _resolve_same_slot_overlaps,
-    _plan_gauge,
+    _plan_gauge, _plan_process_timeline,
 )
 
 FAILED = []
@@ -1068,6 +1068,40 @@ def main():
     f_no_segments = _plan_quality_failures(topic_card_only_raw, topic_card_only_plan, 30.0)
     check("不传 segments 时标准 4 完全不触发（向后兼容，不影响没有转写上下文的既有调用）",
           not any("explicitly says" in f for f in f_no_segments), f_no_segments)
+
+    # 16f. Fix C42 —— process_timeline.chapter_label 跟 chapters[].label 精确
+    # 匹配失败时，退回到唯一被标记 takeover 的章节，而不是整段丢弃。
+    timeline_chapters = [
+        {"label": "Intro", "atFrame": 0, "_takeover": False},
+        {"label": "Production Timeline", "atFrame": 300, "_takeover": True},
+        {"label": "Outro", "atFrame": 900, "_takeover": False},
+    ]
+    raw_pt_mismatched_label = {
+        "chapter_label": "TIMELINE",  # 跟章节真实的 "Production Timeline" 对不上
+        "heading": "FROM IDEA TO UPLOAD",
+        "stages": [
+            {"label": "IDEA", "seconds": 12.0, "target": 2, "unit": "MONTHS"},
+            {"label": "FILMING", "seconds": 20.0, "target": 3, "unit": "WEEKS"},
+        ],
+    }
+    tl = _plan_process_timeline(raw_pt_mismatched_label, timeline_chapters, duration_frames=1200)
+    check("chapter_label 精确匹配失败但只有一个 takeover 章节时，退回用它而不是整段丢弃",
+          tl is not None and tl["chapter_index"] == 1, tl)
+    check("退回匹配后，对应章节确实被标记为 takeover 且无 icon",
+          timeline_chapters[1]["_takeover"] is True and timeline_chapters[1]["_icon"] is None,
+          timeline_chapters[1])
+
+    # 有 0 个或 >=2 个 takeover 章节时，退回匹配没有唯一目标——保持原有行为，
+    # 老实返回 None，不瞎猜。
+    no_takeover_chapters = [{"label": "Intro", "atFrame": 0, "_takeover": False}]
+    check("没有任何 takeover 章节时，精确匹配失败就老实返回 None（不瞎猜）",
+          _plan_process_timeline(raw_pt_mismatched_label, no_takeover_chapters, 1200) is None)
+    two_takeover_chapters = [
+        {"label": "A", "atFrame": 0, "_takeover": True},
+        {"label": "B", "atFrame": 300, "_takeover": True},
+    ]
+    check("有多个 takeover 章节时无法唯一确定退回目标，老实返回 None（不瞎猜）",
+          _plan_process_timeline(raw_pt_mismatched_label, two_takeover_chapters, 1200) is None)
 
     # 17. Fix C26 回归测试——真实生产复现 job_452ef6c48100，用户截图抓到
     # "$8,400"这一行数字滚动到一半就被卡片收起切掉：一张卡片里两行数字，

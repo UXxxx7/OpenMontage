@@ -1921,7 +1921,28 @@ def _plan_process_timeline(raw_pt: Any, chapters: list[dict], duration_frames: i
         None,
     )
     if match_idx is None:
-        return None
+        # Fix C42（2026-07-21，怀疑真实生产复现——job_73e873e4f7e1，MrBeast
+        # 视频，用户反馈"很喜欢 timeline 但看到的是弹窗卡"）：chapters[].label
+        # 和 process_timeline.chapter_label 是同一次 LLM 响应里两个独立的
+        # JSON 字段，结构上完全没有"两边写的字一定一模一样"的保证——哪怕只是
+        # 多了个空格、大小写、标点，精确匹配就直接失手，整段 timeline 数据
+        # 被静默丢弃，返回 None。丢了 timeline 之后，这个本来该是 process_
+        # timeline 载体的章节，D2 的预算检查（见下面 `"timeline" in longest`）
+        # 会把它当成普通接管处理，超预算时整段摘除而不是裁剪保留——观众该看到
+        # 的多阶段动画一次都没播出来过，只剩泛泛的弹窗卡填空。SYSTEM_PROMPT
+        # 明确说 process_timeline "必须对应恰好一个标了 takeover:true 的章节"
+        # ——如果精确匹配失败但全部章节里*恰好只有一个*被标了 takeover，几乎
+        # 可以确定就是这个，用它兜底，而不是直接放弃整段数据。
+        takeover_chapters = [i for i, c in enumerate(chapters) if c.get("_takeover")]
+        if len(takeover_chapters) == 1:
+            match_idx = takeover_chapters[0]
+            logger.info(
+                f"content_planner: process_timeline 的 chapter_label('{chapter_label}') "
+                f"没有精确匹配到任何章节标题，退回到唯一被标记 takeover 的章节"
+                f"（Fix C42，避免整段 timeline 数据被白白丢弃）"
+            )
+        else:
+            return None
 
     ch = chapters[match_idx]
     start = ch["atFrame"]
