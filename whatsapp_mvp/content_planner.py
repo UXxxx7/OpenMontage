@@ -1355,8 +1355,6 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
                 nxt.get("x", _CONTENT_ZONE_X), nxt.get("y", _CONTENT_ZONE_Y)):
             cur["endFrame"] = min(cur.get("endFrame", nxt["mountFrame"]), nxt["mountFrame"])
 
-    dedup = _workflow_mode_schedule(workflow_ranges, round(duration * FPS))
-
     intro = None
     ri = raw.get("intro")
     if isinstance(ri, dict) and ri.get("title"):
@@ -1403,6 +1401,26 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
         data_cards, gauges, countdowns, calendar_events, before_afters,
         pills, step_lists, topic_cards,
     )
+
+    # Fix C31（2026-07-20，真实生产复现——用户直接从交付的成片里抓到：WORKFLOW
+    # 分区标题和一张 WhatsApp corner_card 都被一个长回 Dominant 尺寸的
+    # SpeakerCard 压在下面/背后）：mode_schedule 本该在这里用 workflow_ranges
+    # 算一次，但 _resolve_same_slot_overlaps 会顺延 topic_card/step_list 的
+    # mountFrame（E2 的"后来者让路"规则）——如果在这一步之前就把 mode_schedule
+    # 冻结住，被顺延卡片真正上屏的窗口会比 workflow_ranges 当初算的更晚开始，
+    # 中间空出一段"内容其实已经在画面上，但 mode_schedule 还以为没有"的间隙，
+    # SpeakerCard 就在这段间隙里长回满尺寸，正好压在标题/卡片下面。在这里
+    # （所有顺延都结束之后）用每个内容区图形*当前*（最终）的 mountFrame/
+    # endFrame 重新扫一遍，跟原始 workflow_ranges（保留 sections/quote 的
+    # 隐藏语义，那部分不是从这些 list 来的）取并集再重算——不管是哪一步顺延
+    # 导致的错位，这里都能补上，跟 Fix C24/C30 同一个"给保证，不只是查"的原则。
+    final_workflow_ranges = list(workflow_ranges)
+    for _items in (data_cards, gauges, countdowns, calendar_events, before_afters,
+                   pills, step_lists, topic_cards):
+        for _it in _items:
+            if "mountFrame" in _it and "endFrame" in _it:
+                final_workflow_ranges.append((_it["mountFrame"], _it["endFrame"], _CONTENT_ZONE_WIDTH))
+    dedup = _workflow_mode_schedule(final_workflow_ranges, round(duration * FPS))
 
     return {
         "chapters": chapters, "data_cards": data_cards, "gauges": gauges,
