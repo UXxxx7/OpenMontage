@@ -1120,6 +1120,20 @@ def _insert_transition_holds(scenes: list[dict]) -> list[dict]:
     在这个新关键帧之前是真过渡（跟原来一样，短且合理），之后到下一个真实
     关键帧因为两端尺寸相同、不再被判定为过渡——不用改 _transition_windows
     这个已经验证过、被多处依赖的检测函数一个字，只是让它看到的数据更准确。
+
+    Fix C39（2026-07-21，通过 replica harness 在 job_452ef6c48100 上反复复现，
+    root-caused 后发现这才是 C31/C33/C38 追的那个"内容区图形撞上 Dominant"
+    问题真正的最初来源）：上面这段插入逻辑对"缩小"（Dominant->Workflow）和
+    "长大"（Workflow->Dominant）一视同仁，永远在 prev 之后 _TRANSITION_HOLD_
+    FRAMES 帧提前到达 cur 的尺寸——这对缩小方向是对的（卡片碍事就该尽快让开），
+    但对长大方向恰恰相反：workflow 状态之所以在 mode_schedule 里出现，就是
+    因为这段时间*确实*有内容要占那块地方，长大回 Dominant 只应该发生在 cur
+    自己的帧（内容真正结束的时刻），提前 20 帧就长回满屏，等于卡片在内容还
+    显示着的时候就已经压上去了——这正是 element_over_card 反复抓到的那个 bug，
+    而不是巧合。改成按方向区分：缩小方向保持原逻辑（提前到达+尽快让开）；
+    长大方向反过来——插入的提前到达关键帧用 prev 的（更小的）尺寸，落在 cur
+    帧*之前* _TRANSITION_HOLD_FRAMES 帧的位置，让卡片在小尺寸多停留到接近
+    cur 自己的时刻才真正长大，而不是一进 workflow 没多久就被拉回满屏。
     """
     if not scenes:
         return scenes
@@ -1129,8 +1143,19 @@ def _insert_transition_holds(scenes: list[dict]) -> list[dict]:
         box_changed = prev.get("w") != cur.get("w") or prev.get("h") != cur.get("h")
         gap = cur["frame"] - prev["frame"]
         if box_changed and gap > _TRANSITION_HOLD_FRAMES:
-            hold_frame = prev["frame"] + _TRANSITION_HOLD_FRAMES
-            out.append({"frame": hold_frame, "x": cur["x"], "y": cur["y"], "w": cur["w"], "h": cur["h"]})
+            shrinking = cur["h"] < prev["h"]
+            if shrinking:
+                # 卡片变小：尽快让开，提前到达 cur 的（更小）尺寸并一直停在那，
+                # 跟原逻辑一致。
+                hold_frame = prev["frame"] + _TRANSITION_HOLD_FRAMES
+                out.append({"frame": hold_frame, "x": cur["x"], "y": cur["y"], "w": cur["w"], "h": cur["h"]})
+            else:
+                # 卡片变大：workflow 期间内容还在占用这块地方，尽量保持 prev
+                # 的（更小）尺寸，只在紧贴 cur 自己那一刻之前才真正长大——
+                # 不能提前，提前就是直接压在还在显示的内容上面。
+                hold_frame = cur["frame"] - _TRANSITION_HOLD_FRAMES
+                if hold_frame > prev["frame"]:
+                    out.append({"frame": hold_frame, "x": prev["x"], "y": prev["y"], "w": prev["w"], "h": prev["h"]})
         out.append(cur)
     return out
 
@@ -1169,6 +1194,61 @@ def _mode_schedule_to_scenes(mode_schedule: list[dict]) -> tuple[list[dict], lis
             continue
         monotonic.append(k)
     return scenes, monotonic
+
+
+# props 字段名 -> _CONTENT_ZONE_WIDTH 的普通内容区图形类型（quotes/sections 单独
+# 处理，它们是 SECTION_PIP_SENTINEL 隐藏语义，不是普通 workflow 内容）。
+_WORKFLOW_CONTENT_PROP_KEYS = (
+    "dataCards", "gauges", "countdowns", "calendarEvents", "beforeAfter",
+    "pills", "stepLists", "topicCards",
+)
+
+
+def _recompute_scenes_from_content(props: dict, duration_frames: int) -> dict:
+    """Fix C33（2026-07-20，真实生产复现——job_51f154a80f9b 交付版本的 vision QA
+    直接抓到：一张 stepList 自己的存活区间(349-954)中途撞上一段从 551 帧开始的
+    Dominant(满尺寸卡片)窗口，说话人卡片长回全尺寸，直接压在还在显示的步骤 1/2
+    上面）；跟 content_planner.py 的 Fix C31 是同一类桥——props["scenes"]/
+    opacityKeyframes 一旦从 mode_schedule 定型，后面任何再挪动/插入内容区图形
+    的代码都必须重新调用这个函数，否则冻结的时间点跟图形最终真正落地的时间点
+    不再是同一份真相。
+
+    Fix C38（2026-07-21，通过 replica harness 在 job_452ef6c48100 上反复复现——
+    C33 当初只在 `_build()` 内部调用一次，但 `_apply_deterministic_guarantees`
+    调用的 C13(`_fill_intro_lead_dead_space`)/C15/C37 全部发生在 `_build()`
+    *之后*：C13 插入的新 topicCard 用真实数据验证过会直接落在一段 Dominant
+    窗口的开头——因为它插入时 scenes 早就是 C33 recompute 过的旧版本，而这张
+    新卡片当然不在那次 recompute 的输入里。跟 C33 同一个教训，只是这次连
+    "只调用一次"这个假设本身都是错的：任何插入/挪动内容区图形的步骤之后都要
+    重算，不是只在 `_build()` 收尾时算一次就一劳永逸。
+
+    从 props 的公开字段（dataCards/gauges/.../topicCards/quotes/sections，
+    JSON key 名而非 Python 局部变量名，好让 `_build()` 内部和
+    `_apply_deterministic_guarantees` 都能调用同一份实现）重新扫一遍
+    workflow_ranges，跟 sections/quote 的隐藏(SECTION_PIP_SENTINEL)区间取并集
+    再重算一次 mode_schedule -> scenes/opacityKeyframes。
+    """
+    from .content_planner import SECTION_PIP_SENTINEL, _workflow_mode_schedule
+
+    ranges: list[tuple[int, int, int]] = []
+    for key in _WORKFLOW_CONTENT_PROP_KEYS:
+        for it in props.get(key) or []:
+            if "mountFrame" in it and "endFrame" in it:
+                ranges.append((it["mountFrame"], it["endFrame"], _CONTENT_ZONE_WIDTH))
+    for q in props.get("quotes") or []:
+        if "mountFrame" in q and "endFrame" in q:
+            ranges.append((q["mountFrame"], q["endFrame"], SECTION_PIP_SENTINEL))
+    for sec in props.get("sections") or []:
+        ranges.append((sec["fromFrame"], sec["toFrame"], SECTION_PIP_SENTINEL))
+
+    mode_schedule = _workflow_mode_schedule(ranges, duration_frames)
+    props = dict(props)
+    props["scenes"], opacity = _mode_schedule_to_scenes(mode_schedule)
+    if opacity:
+        props["opacityKeyframes"] = opacity
+    else:
+        props.pop("opacityKeyframes", None)
+    return props
 
 
 # QuoteCard 是唯一"solo"(占满整个画布)的图形类型——用户明确反馈过：不能
@@ -1566,25 +1646,7 @@ def _restore_facecam_before_end(props: dict, findings: list[dict], duration_fram
     if not capped_any:
         return props
     candidate["sections"] = candidate_sections
-
-    from .content_planner import FPS, SECTION_PIP_SENTINEL, _workflow_mode_schedule
-    ranges: list[tuple[int, int, int]] = []
-    for sec in candidate_sections:
-        ranges.append((sec["fromFrame"], sec["toFrame"], SECTION_PIP_SENTINEL))
-    for key in ("dataCards", "gauges", "countdowns", "calendarEvents", "beforeAfter",
-                "pills", "stepLists", "topicCards"):
-        for it in candidate.get(key) or []:
-            if "mountFrame" in it and "endFrame" in it:
-                ranges.append((it["mountFrame"], it["endFrame"], _CONTENT_ZONE_WIDTH))
-    for q in candidate.get("quotes") or []:
-        if "mountFrame" in q and "endFrame" in q:
-            ranges.append((q["mountFrame"], q["endFrame"], SECTION_PIP_SENTINEL))
-    mode_schedule = _workflow_mode_schedule(ranges, duration_frames)
-    candidate["scenes"], opacity = _mode_schedule_to_scenes(mode_schedule)
-    if opacity:
-        candidate["opacityKeyframes"] = opacity
-    else:
-        candidate.pop("opacityKeyframes", None)
+    candidate = _recompute_scenes_from_content(candidate, duration_frames)
 
     from .props_lint import lint_props
     before_findings = lint_props(props)
@@ -2011,41 +2073,7 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         elif op.get("compliance"):
             props["compliance"] = op["compliance"]
 
-        # Fix C33（2026-07-20，真实生产复现——job_51f154a80f9b 交付版本的 vision
-        # QA 直接抓到：一张 stepList 自己的存活区间(349-954)中途撞上一段从 551
-        # 帧开始的 Dominant(满尺寸卡片)窗口，说话人卡片长回全尺寸，直接压在还在
-        # 显示的步骤 1/2 上面）：跟 content_planner.py 的 Fix C31 是同一类桥——
-        # props["scenes"]/opacityKeyframes 在上面(~1705 行，有 intro 时 ~1782 行
-        # 还会重算一次)就已经从 mode_schedule 定型了，但 data_cards/gauges/
-        # countdowns/calendarEvents/beforeAfter/quotes/pills/stepLists/
-        # topicCards 在那之后还会被 _floor_shift_graphics、_shift_off_dominant_
-        # windows、outro 避让、quote 的开场地板线等好几处逻辑继续挪动——
-        # mode_schedule 冻结的时间点跟这些图形最终真正落地的时间点不再是同一份
-        # 真相。在这个闭包真正要写盘之前，用每个内容区图形*此刻*(所有挪动都
-        # 结束后)的 mountFrame/endFrame 重新扫一遍、跟 sections/quote 的隐藏
-        # (SECTION_PIP_SENTINEL)区间取并集再重算一次 mode_schedule ->
-        # scenes/opacityKeyframes——不管是哪一步挪动造成的错位，这里都能补上，
-        # 跟 Fix C31 同一个"最后统一给一次保证，不信任中途的增量记账"原则。
-        from .content_planner import FPS, SECTION_PIP_SENTINEL, _workflow_mode_schedule
-
-        _final_ranges: list[tuple[int, int, int]] = []
-        for _items in (data_cards, gauges, countdowns, calendar_events, before_after,
-                       plan_pills, plan_step_lists, plan_topic_cards):
-            for _it in _items or []:
-                if "mountFrame" in _it and "endFrame" in _it:
-                    _final_ranges.append((_it["mountFrame"], _it["endFrame"], _CONTENT_ZONE_WIDTH))
-        for _q in plan_quotes or []:
-            if "mountFrame" in _q and "endFrame" in _q:
-                _final_ranges.append((_q["mountFrame"], _q["endFrame"], SECTION_PIP_SENTINEL))
-        for _sec in props.get("sections") or []:
-            _final_ranges.append((_sec["fromFrame"], _sec["toFrame"], SECTION_PIP_SENTINEL))
-        final_mode_schedule = _workflow_mode_schedule(_final_ranges, round(duration * FPS))
-        props["scenes"], speaker_opacity = _mode_schedule_to_scenes(final_mode_schedule)
-        if speaker_opacity:
-            props["opacityKeyframes"] = speaker_opacity
-        else:
-            props.pop("opacityKeyframes", None)
-
+        props = _recompute_scenes_from_content(props, round(duration * 30))
         props_path.write_text(json.dumps(props, ensure_ascii=False), encoding="utf-8")
         return props
 
@@ -2119,6 +2147,15 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         high severity），保底代码从头到尾没有执行的机会。抽成一个函数，在
         主循环后、以及 qa_stills 触发的每一次重规划后都调用，不管 props 是
         从哪条路径产出的，最终送去渲染的版本都保证经过同一套确定性检查。
+
+        Fix C38（2026-07-21，通过 replica harness 在 job_452ef6c48100 上反复
+        复现）：C13 插入的新 topicCard（或 C37 裁剪后的 sections）改的是内容区
+        图形本身，但这几个保底函数都不会重算 scenes——`_build()` 收尾时已经
+        调用过一次 `_recompute_scenes_from_content`（Fix C33），可这里对 p 的
+        任何修改都发生在那次 recompute *之后*，冻结的 scenes 又变成了旧的
+        真相。不管上面 3 个保底最终谁改了、改没改，返回前统一再重算一次——
+        便宜（纯 Python，不用重新渲染），也是唯一能保证"最终送渲染的 scenes
+        跟这里最终的内容区图形互相对得上"的办法。
         """
         findings = _run_props_lint(p)
         if findings:
@@ -2130,6 +2167,7 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         if findings:
             p = _restore_facecam_before_end(p, findings, round(duration * 30))
             findings = _run_props_lint(p)
+        p = _recompute_scenes_from_content(p, round(duration * 30))
         return p
 
     props = _apply_deterministic_guarantees(best_props)

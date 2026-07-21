@@ -10,7 +10,8 @@ from whatsapp_mvp.pipeline_runner import (
     _floor_shift_graphics, _floor_shift_zone_headers, _QUOTE_MIN_START_FRAMES,
     _shift_off_dominant_windows, _shift_off_dominant_windows_headers,
     _fill_intro_lead_dead_space, _restore_facecam_before_end,
-    _FACECAM_RESTORE_BUFFER_FRAMES,
+    _FACECAM_RESTORE_BUFFER_FRAMES, _recompute_scenes_from_content,
+    _mode_schedule_to_scenes, _TRANSITION_HOLD_FRAMES,
 )
 
 FAILED = []
@@ -213,6 +214,66 @@ def test_restore_facecam_no_op_when_no_room_to_cap():
     check("隐藏区间起点离片尾太近、没有裁剪空间时原样返回", result == _FACECAM_NEVER_RESTORED_PROPS)
 
 
+def test_recompute_scenes_from_content_covers_a_late_inserted_card():
+    # Fix C38 real scenario (job_452ef6c48100): scenes already computed once
+    # (only a gauge from 400-700 justified workflow mode), then a topicCard
+    # gets inserted afterward (mimicking what C13 does) at 750-850 -- a
+    # naive/stale scenes array would show the card going Dominant right at
+    # this new card's own mount frame, since nothing recomputed after the
+    # insertion.
+    props = {
+        "durationSeconds": 30.0,
+        "gauges": [{"label": "x", "mountFrame": 400, "endFrame": 700, "x": 60, "y": 1040}],
+        "scenes": [{"frame": 0, "x": 60, "y": 104, "w": 960, "h": 1100},
+                   {"frame": 20, "x": 60, "y": 104, "w": 960, "h": 900},
+                   {"frame": 710, "x": 60, "y": 104, "w": 960, "h": 1100}],  # stale: nothing covers 750-850 yet
+    }
+    props["topicCards"] = [{"headline": "late card", "mountFrame": 750, "endFrame": 850, "x": 60, "y": 1040}]
+    result = _recompute_scenes_from_content(props, 900)
+
+    def mode_at(frame):
+        state = "dominant"
+        for s in result["scenes"]:
+            if s["frame"] <= frame:
+                state = "workflow" if s["h"] < 1000 else "dominant"
+            else:
+                break
+        return state
+
+    check("late-inserted topicCard's own window is now covered by workflow mode (not Dominant)",
+          mode_at(800) == "workflow", result["scenes"])
+
+
+def test_transition_hold_shrinking_arrives_early_and_holds():
+    # Original Fix C21 scenario: card is Dominant for a long time (a takeover
+    # section runs late), then shrinks to Workflow -- should arrive at the
+    # smaller size quickly and hold there, not slowly shrink the whole gap.
+    schedule = [{"frame": 0, "mode": "dominant"}, {"frame": 592, "mode": "workflow", "contentWidth": 960}]
+    scenes, _ = _mode_schedule_to_scenes(schedule)
+    check("缩小方向：提前到达更小尺寸并一直停留（原 C21 行为不受影响）",
+          scenes == [
+              {"frame": 0, "x": 60, "y": 104, "w": 960, "h": 1100},
+              {"frame": 20, "x": 60, "y": 104, "w": 960, "h": 900},
+              {"frame": 592, "x": 60, "y": 104, "w": 960, "h": 900},
+          ], scenes)
+
+
+def test_transition_hold_growing_stays_small_until_the_end():
+    # Fix C39 real scenario (job_452ef6c48100): card is Workflow (docked) for
+    # a long stretch because content covers it, THEN the schedule says
+    # Dominant much later. The card must stay docked for nearly the whole
+    # stretch and only grow right before the Dominant frame -- growing early
+    # means the oversized card lands directly on top of content still on screen.
+    ranges_schedule = [{"frame": 0, "mode": "dominant"},
+                        {"frame": 390, "mode": "workflow", "contentWidth": 960},
+                        {"frame": 850, "mode": "dominant"}]
+    scenes, _ = _mode_schedule_to_scenes(ranges_schedule)
+    check("长大方向：不提前长大，保持小尺寸直到贴近 cur 帧才长大",
+          scenes[-2] == {"frame": 850 - _TRANSITION_HOLD_FRAMES, "x": 60, "y": 104, "w": 960, "h": 900},
+          scenes)
+    check("cur 自己那一帧仍然是长大后的尺寸", scenes[-1]["h"] == 1100, scenes)
+
+
 def main():
     test_shifts_below_floor_preserving_duration()
     test_before_after_second_reveal_frame_shifts_too()
@@ -229,6 +290,9 @@ def main():
     test_restore_facecam_caps_section_with_runway_before_end()
     test_restore_facecam_no_op_without_matching_finding()
     test_restore_facecam_no_op_when_no_room_to_cap()
+    test_recompute_scenes_from_content_covers_a_late_inserted_card()
+    test_transition_hold_shrinking_arrives_early_and_holds()
+    test_transition_hold_growing_stays_small_until_the_end()
 
     print()
     if FAILED:
