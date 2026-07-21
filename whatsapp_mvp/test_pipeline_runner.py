@@ -162,7 +162,8 @@ def test_self_intro_repeat_is_not_inserted():
         {"startMs": 1000, "endMs": 6000, "text": "it's David from Pacific life quick reminder"},
         {"startMs": 6000, "endMs": 9000, "text": "your policy is coming up for renewal"},
     ]
-    result = _fill_intro_lead_dead_space(dict(_MINIMAL_INTRO_GAP_PROPS), _INTRO_GAP_FINDING, captions)
+    segments = [{"start": 1.0, "end": 6.0, "text": "it's David from Pacific life quick reminder"}]
+    result = _fill_intro_lead_dead_space(dict(_MINIMAL_INTRO_GAP_PROPS), _INTRO_GAP_FINDING, captions, segments)
     check("gap 恰好被全片第一句话(自我介绍)覆盖时，不插入重复的兜底卡片",
           not result.get("topicCards"), result.get("topicCards"))
 
@@ -172,9 +173,32 @@ def test_non_first_caption_still_gets_fallback_card():
         {"startMs": -3000, "endMs": -1000, "text": "an earlier line before this gap, not the first caption"},
         {"startMs": 1000, "endMs": 6000, "text": "some genuinely later content overlapping the gap"},
     ]
-    result = _fill_intro_lead_dead_space(dict(_MINIMAL_INTRO_GAP_PROPS), _INTRO_GAP_FINDING, captions)
+    segments = [{"start": -3.0, "end": -1.0, "text": "an earlier line before this gap, not the first caption"}]
+    result = _fill_intro_lead_dead_space(dict(_MINIMAL_INTRO_GAP_PROPS), _INTRO_GAP_FINDING, captions, segments)
     check("gap 被非首句字幕覆盖时，兜底逻辑照常插入卡片（既有行为不受影响）",
           bool(result.get("topicCards")), result.get("topicCards"))
+
+
+def test_self_intro_repeat_across_multiple_phrase_captions_not_inserted():
+    # Fix C43 real regression scenario (job_452ef6c48100): the self-intro
+    # SENTENCE ("Hi there, it's David from Pacific Life, quick reminder") is
+    # one spoken segment, but split into TWO phrase-level captions for
+    # subtitle display. The gap (frames 80-200 = 2667-6667ms, same window
+    # _INTRO_GAP_FINDING uses) starts partway through the sentence, so the
+    # first phrase-caption ("Hi there,") ends BEFORE the gap even starts and
+    # is correctly excluded from `overlapping` -- but overlapping[0] is then
+    # the SECOND phrase-caption ("it's David from..."), not literally
+    # captions[0]. The old identity check (`overlapping[0] is captions[0]`)
+    # missed this entirely and let the repeat card through.
+    captions = [
+        {"startMs": 0, "endMs": 2500, "text": "Hi there,"},
+        {"startMs": 2500, "endMs": 4600, "text": "it's David from Pacific Life, quick reminder"},
+        {"startMs": 4600, "endMs": 9000, "text": "your policy is coming up for renewal"},
+    ]
+    segments = [{"start": 0.0, "end": 4.6, "text": "Hi there, it's David from Pacific Life, quick reminder"}]
+    result = _fill_intro_lead_dead_space(dict(_MINIMAL_INTRO_GAP_PROPS), _INTRO_GAP_FINDING, captions, segments)
+    check("gap 覆盖的是第一句话的后半段(不同的 phrase-caption 对象)时，仍然被识别为自我介绍重复，不插卡",
+          not result.get("topicCards"), result.get("topicCards"))
 
 
 _DURATION_FRAMES = 900  # 30s @ 30fps
@@ -287,6 +311,7 @@ def main():
     test_shift_off_dominant_windows_leaves_unrescuable_item_alone()
     test_self_intro_repeat_is_not_inserted()
     test_non_first_caption_still_gets_fallback_card()
+    test_self_intro_repeat_across_multiple_phrase_captions_not_inserted()
     test_restore_facecam_caps_section_with_runway_before_end()
     test_restore_facecam_no_op_without_matching_finding()
     test_restore_facecam_no_op_when_no_room_to_cap()

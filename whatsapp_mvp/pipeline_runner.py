@@ -1431,7 +1431,7 @@ _RICHNESS_FIELDS = (
 )
 
 
-def _fill_intro_lead_dead_space(props: dict, findings: list[dict], captions: list[dict]) -> dict:
+def _fill_intro_lead_dead_space(props: dict, findings: list[dict], captions: list[dict], segments: list[dict]) -> dict:
     """Fix C13（2026-07-17，真实生产复现——同一支 backtest 视频连续 3 轮重规划
     都没修掉 intro_lead_dead_space，最终交付版本仍是长达 5.2s 的纯说话人+字幕
     空白，用户直接在渲染出的截图里抓到）。
@@ -1494,7 +1494,22 @@ def _fill_intro_lead_dead_space(props: dict, findings: list[dict], captions: lis
     # +字幕"（intro 卡片已经把身份信息交代过了），也不插入一张重复、且大概率
     # 被截断的卡片——跟"_fallback_topic_cards_for_gaps 被删掉"是同一个教训，
     # 这次是把它落实到 C13 自己身上。
-    is_self_intro_repeat = bool(captions) and bool(overlapping) and overlapping[0] is captions[0]
+    # Fix C43（2026-07-21，真实生产复现——job_452ef6c48100，用户直接抓到"it's
+    # david from..."在 Fix C25 上线后又出现了一次）：C25 的判定只在 overlapping
+    # 的第一条恰好是 captions[0] 这个具体的 PHRASE-CAPTION 对象时才成立——但
+    # phrase-level captions 是把一整句话（比如"Hi there, it's David from
+    # Pacific Life, quick reminder"）按词时间戳拆成好几个短字幕块显示，自我
+    # 介绍这一整句话本身横跨好几个 phrase-caption。只要这段 gap 的起点落在
+    # 这句话中间（intro 收起的时刻很常见地卡在句子说到一半），overlapping[0]
+    # 就是这句话后半段的某个 phrase-caption，而不是字面上的 captions[0]——
+    # identity 判定因此漏判，即使内容仍然是纯自我介绍。改成检查真正要拿来
+    # 当标题来源的 overlapping[0] 是否落在第一个真实语音 segment（一整句话，
+    # 不是拆碎的字幕块）的时间范围内——不管它是不是 captions 列表里字面上的
+    # 第一个对象，只要内容还没超出开场这句自我介绍，就仍然算重复。
+    first_segment_end_ms = (segments[0]["end"] * 1000) if segments else -1
+    is_self_intro_repeat = (
+        bool(overlapping) and overlapping[0]["endMs"] <= first_segment_end_ms + 200
+    )
     _MAX_HEADLINE_CHARS = 16
     if is_self_intro_repeat:
         return props
@@ -2159,7 +2174,7 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         """
         findings = _run_props_lint(p)
         if findings:
-            p = _fill_intro_lead_dead_space(p, findings, captions)
+            p = _fill_intro_lead_dead_space(p, findings, captions, segments)
             findings = _run_props_lint(p)
         if findings:
             p = _demote_content_free_takeovers(p, findings)
