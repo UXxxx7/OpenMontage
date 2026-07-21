@@ -653,6 +653,68 @@ sampling bug, not a content bug, and no amount of replanning will ever change it
   first `_QUOTE_MIN_START_FRAMES` (7s) of the video regardless of whether an intro
   title card exists — this floor is unconditional, not gated behind `if intro:`.
 
+## Rule 15 — a "final recompute" guarantee is only final if it runs after every step that can still touch the thing it's guaranteeing
+
+Confirmed real bug (2026-07-21, found via `whatsapp_mvp/simulate_job.py` — a
+replica harness added specifically to stop diagnosing "brand style failed" by
+trial-and-error against the live WhatsApp bot): `props_lint`'s `element_over_card`
+and `facecam_hidden_too_long` kept recurring identically across independent
+`content_planner` replans on the same real job (`job_452ef6c48100`), never
+resolving no matter how many LLM rounds ran.
+
+**Two compounding bugs, found in order:**
+
+1. **Fix C33 (2026-07-20) only recomputed `scenes` once, inside `_build()`.**
+   But `_apply_deterministic_guarantees` runs C13/C15/C37 *after* `_build()`
+   returns, and any of them can add or modify content-zone elements (C13
+   inserts a new `topicCard`) without triggering another recompute. The frozen
+   `scenes` stopped matching reality the moment C13 fired. **Fix C38**:
+   extracted the recompute into a standalone `_recompute_scenes_from_content()`
+   (reads `props["dataCards"]`/`["gauges"]`/etc. — public JSON keys, not
+   `_build()`'s local variables — specifically so it's callable from anywhere),
+   and calls it unconditionally at the true end of the guarantee chain,
+   regardless of which guarantee fired.
+
+2. **The actual root cause, one layer deeper — `_insert_transition_holds`
+   (Fix C21, 2026-07-17) has been wrong since it was written.** It treats
+   card-*shrinking* and card-*growing* transitions identically: given two
+   scenes keyframes far apart with different sizes, it always inserts an
+   early "arrival at the *next* keyframe's size" a fixed `_TRANSITION_HOLD_
+   FRAMES` (20 frames) after the *first* one. That's correct for shrinking
+   (Dominant → Workflow: get the oversized card out of the way as soon as
+   possible). It is backwards for growing (Workflow → Dominant): a `workflow`
+   entry exists in `mode_schedule` *because* real content needs that screen
+   space for a while — arriving early at the bigger (Dominant) size ~20
+   frames after entering `workflow` mode makes the card grow back to full
+   size while the content it's supposed to make room for is still on
+   screen. This is the actual mechanism behind every "content-zone element
+   overlapping an oversized facecam" bug this file has chased (Rule 4's
+   dead-space cases aside) — C31/C33/C38 were all correctly re-deriving
+   `scenes` from `mode_schedule`, but `_insert_transition_holds` was
+   corrupting the *conversion* on the growing side every time. **Fix C39**:
+   direction-aware — shrinking keeps the original behavior (arrive early
+   at the smaller size, hold there); growing now holds at the *smaller*
+   (`prev`) size and only arrives at the bigger size `_TRANSITION_HOLD_
+   FRAMES` *before* the next real transition, not after the previous one.
+
+**Why this took so long to find**: `_workflow_mode_schedule`'s own event-scan
+(Fix C31's dependency) was completely correct — feeding it the real ranges by
+hand always produced the right schedule. The bug only appeared after
+`_mode_schedule_to_scenes` converted that correct schedule into `scenes`,
+inside a helper (`_insert_transition_holds`) three call-frames away that
+nobody suspected because its *own* fix (C21) was already validated and had
+looked correct for years of "shrinking" cases — it was simply never exercised
+on a real "growing after a long workflow hold" case until this specific
+video's content shape hit it.
+
+**General principle, worth restating from Rule 13 in a new form:** when a
+"final guarantee" recompute keeps failing to hold, don't just add more
+guarantees on top — check every function *between* the schedule and the
+rendered geometry for an assumption that only holds in one direction. A
+correct scheduler feeding a broken converter still produces broken output,
+and the converter can look validated forever if nobody happens to test the
+direction it's wrong in.
+
 ## Where the rest of the story lives
 
 - `docs/STATUS.md` — architecture baseline, branch status (predates most of the

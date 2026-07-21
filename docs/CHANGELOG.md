@@ -15,6 +15,76 @@
 
 ---
 
+## 2026-07-21 — Reconciled with origin + replica harness + 6 confirmed apply_style bugs (C34-C39)
+- **Who**: Claude (session continuation — user asked to fetch latest origin, resolve
+  conflicts, then root-cause "brand style rendering failed" for real using a
+  repeatable local harness instead of live-WhatsApp trial and error)
+- **Branch/commit**: whatsapp-studio (local commits `2a6b0e2`..`aa97270`; merged
+  `origin/whatsapp-studio` in cleanly, no real conflicts — local's 24-commit lead
+  turned out patch-identical to what PR #38 already merged upstream)
+- **What changed**:
+  - `main.py` (C34): uvicorn hardcodes `ProactorEventLoop` on Windows whenever
+    `use_subprocess` is false — its accept() doesn't re-arm after a transient
+    OSError (WinError 64), silently killing the server's ability to accept new
+    connections with no crash. Bypasses `Server.run()`/`uvicorn.run()` entirely,
+    drives `server.serve()` on a manually created `SelectorEventLoop`.
+  - `webhook.py` (C35): `serve_file` was `async def` calling a blocking SQLAlchemy
+    query directly — froze every concurrent Remotion video-fetch behind the first
+    one on the single event-loop thread. Made it a plain `def` (FastAPI threadpools
+    it automatically).
+  - `content_planner.py` (C31) / `pipeline_runner.py` (C33, C38): `mode_schedule`
+    → `scenes` gets frozen at various points, but content-zone visuals keep
+    getting shifted/inserted afterward (`_resolve_same_slot_overlaps`,
+    `_shift_off_dominant_windows`, C13's topicCard insertion, C37's section cap).
+    Extracted a single `_recompute_scenes_from_content()` now called after every
+    point that can still touch content-zone elements, not just once.
+  - `pipeline_runner.py` (C39) — **the actual root cause behind C31/C33/C38's
+    symptom**: `_insert_transition_holds` (existing Fix C21) treated card-growing
+    and card-shrinking transitions identically, always arriving early at the
+    *next* keyframe's size. Correct for shrinking (get the oversized card out of
+    the way ASAP); backwards for growing (workflow → dominant) — it made the card
+    jump back to full size ~20 frames after entering docked mode, regardless of
+    how much longer real content needed that space. Now direction-aware: growing
+    holds at the smaller size until just before the next real transition instead
+    of arriving early.
+  - `remotion-composer/.../StepList.tsx` (C32): inactive step rows stacked two
+    independent dimming mechanisms (a muted color + a 0.32 opacity cut), collapsing
+    contrast to near-invisible against the warm palette.
+  - `remotion-composer/.../Captions.tsx` (C36): the karaoke-highlight sweep is a
+    raw linear character count with no word-boundary awareness — splits a word
+    into two colors on nearly every phrase. Snaps to the last fully-covered word.
+  - `pipeline_runner.py` (C37): new deterministic guarantee for
+    `facecam_never_restored` (speaker hidden through the video's own end) —
+    caps the offending section's `toFrame` with runway to reappear, same
+    cap-don't-remove pattern as Rule 4/D2.
+  - New `whatsapp_mvp/simulate_job.py`: a committed replica harness (`retry`
+    mode hits the real `/jobs/{id}/retry` endpoint; `apply-style` mode calls
+    `_op_apply_style` directly for fast iteration) — replaces one-off scratch
+    scripts, reports degraded status / facecam-overlap / props_lint findings
+    directly. Used to find C36-C39 without a single live WhatsApp round-trip.
+  - Discovered (not previously known to this session): `server/index.js` +
+    `server/worker.js` (Node/Express + BullMQ) is the real, intended public
+    front door — fast-ACKs webhooks, drops stale redeliveries, then calls the
+    Python API (which should never be exposed directly). Local dev had been
+    tunneling straight to the Python app all along, bypassing this. Now running
+    Redis + both Node processes, tunnel repointed at the gateway's port 3000.
+- **Why / impact**: closes the actual recurring "brand style rendering failed"
+  WhatsApp message for the content shapes tested (2 different real videos, 24s
+  and 50s, both confirmed clean end-to-end via the harness — see Rule 1). C39 in
+  particular was the deepest root cause: a single wrong assumption in a helper
+  function from 2026-07-17 that has likely been silently causing every
+  "content-zone element overlapping an oversized facecam" report since.
+- **Status**: ✅ all 6 fixes covered by regression tests, full suite passes,
+  verified via 2+ independent live `/retry` runs on 2 different real jobs
+  through the harness. One known minor residual: a brief (~20 frame) partial
+  overlap can still occur right at the tail end of a content-zone element's
+  own display window, during the growing-transition itself, if the element's
+  endFrame runs right up against the transition point — much smaller in scope
+  than the original bug (hundreds of frames), not yet fixed, not blocking
+  delivery.
+
+---
+
 ## 2026-07-19 — Fix C22: QA stills sampled frame 0 (before the SpeakerCard's own entrance renders anything) on every job, non-deterministic vision scoring turned it into recurring apply_style degradation
 - **Who**: Claude (new session — user reported the WhatsApp degradation
   reminder message recurring and asked for a real fix + confirmation, not
