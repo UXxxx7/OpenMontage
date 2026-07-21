@@ -10,6 +10,7 @@ from whatsapp_mvp.content_planner import (
     _ground_data_point_seconds, _number_candidates, _find_grounded_seconds, _workflow_mode_schedule,
     _find_grounded_word, _keyword_matches, _KEYWORD_EXIT_HOLD_FRAMES, _COUNT_UP_ROW_ANIM_FRAMES,
     _STACK_EXIT_BUFFER_FRAMES, _TAKEOVER_HARD_CAP_FRAMES, _resolve_same_slot_overlaps,
+    _plan_gauge,
 )
 
 FAILED = []
@@ -456,6 +457,18 @@ def main():
         ],
     }, duration=30.0)
     check("接管章节内的 corner_card 被跳过（SpeakerCard 此时不可见）", plan["corner_cards"] == [], plan["corner_cards"])
+
+    # gauge: 缺 title 时整卡跳过（Fix C40 —— 真实生产复现，job_452ef6c48100
+    # 交付的 gauge title 是空字符串，标题栏整条留白）
+    gauge_missing_title = _plan_gauge(
+        {"seconds": 10.0, "leftLabel": "SAFE", "rightLabel": "RISK", "value": 0.7}, min_mount_frame=0)
+    check("gauge 缺 title 时不产出（不是留一个标题栏空白的半成品卡）",
+          gauge_missing_title is None, gauge_missing_title)
+    gauge_with_title = _plan_gauge(
+        {"seconds": 10.0, "title": "Lapse Risk", "leftLabel": "SAFE", "rightLabel": "RISK", "value": 0.7},
+        min_mount_frame=0)
+    check("gauge 有 title 时正常产出", gauge_with_title is not None and gauge_with_title["title"] == "Lapse Risk",
+          gauge_with_title)
 
     # zone_headers: 非接管章节里有数据点 -> 产出一个跟章节同跨度的 header；
     # 接管章节里有数据点 -> 不产出（SectionLayer 自己已经有大标题）

@@ -1766,6 +1766,14 @@ def _plan_gauge(dp: dict, min_mount_frame: int) -> Optional[dict]:
     value = _num(dp.get("value"))
     if value is None:
         return None
+    # Fix C40（2026-07-21，真实生产复现——job_452ef6c48100 真实交付的 gauge
+    # title 是空字符串，GaugeCard 顶部标题栏整条留白）：SYSTEM_PROMPT 的 gauge
+    # schema 明确要求 "title"，但 LLM 偶尔就是不给——不像 headline/message 那样
+    # 已有"缺了就整卡跳过"的保护。跟 _plan_topic_card/_plan_corner_card 同一个
+    # 原则：schema 里标了必填的文字字段，缺了就不产出这张卡，不留一个视觉上
+    # 半成品的卡片进最终 props。
+    if not str(dp.get("title", "")).strip():
+        return None
     mount_frame = max(min_mount_frame, round(sec * FPS) - MOUNT_LEAD_FRAMES)
     end_frame = _grounded_or_fallback_end(
         dp, mount_frame, mount_frame + GAUGE_ANIMATION_FRAMES + HOLD_AFTER_LAST_ROW_FRAMES
