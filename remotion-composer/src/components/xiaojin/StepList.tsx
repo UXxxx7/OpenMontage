@@ -84,7 +84,18 @@ export const StepList: React.FC<StepListProps> = ({
               borderRadius: 16,
               padding: "18px 22px",
               marginBottom: 12,
-              opacity: active ? 1 : 0.32,
+              // Fix C32 (2026-07-20, vision QA caught it directly on a real render,
+              // job_51f154a80f9b: "inactive step text barely readable against the
+              // light background"): inactive rows used to stack TWO independent
+              // dimming mechanisms — palette.inkSoft (already a muted color vs.
+              // palette.ink) on the text, AND a 0.32 opacity cut on the whole row.
+              // Multiplied together against the warm palette's light cream bg
+              // (#F2EBE0), inkSoft's own already-modest contrast collapsed to
+              // near-invisible. The border-vs-solid-background and outline-vs-
+              // filled circle already clearly signal "not yet active" — text
+              // legibility shouldn't be sacrificed on top of that for the same
+              // signal. Row opacity now only takes the edge off, not the color.
+              opacity: active ? 1 : 0.88,
               boxShadow: active ? `0 8px 24px ${palette.shadow}` : "none",
               transform: `scale(${active ? 0.97 + 0.03 * pop : 1})`,
             }}
