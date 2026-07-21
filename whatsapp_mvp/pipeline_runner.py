@@ -1525,6 +1525,89 @@ def _demote_content_free_takeovers(props: dict, findings: list[dict]) -> dict:
     return candidate
 
 
+_FACECAM_RESTORE_BUFFER_FRAMES = 60  # 2s @ 30fps -- enough runway for the speaker to visibly reappear before the video ends
+
+
+def _restore_facecam_before_end(props: dict, findings: list[dict], duration_frames: int) -> dict:
+    """Fix C37（2026-07-21，通过 replica harness 在真实 job 上反复确认——
+    job_51f154a80f9b 和 job_73e873e4f7e1 各自的 content_planner 重规划都撞上
+    过）：props_lint 的 facecam_never_restored 在最后一个隐藏(接管)区间一路
+    延伸到片尾时触发——说话人在视频结束前再也没有恢复可见。跟 C13/C15 同一类
+    教训：这条 finding 在多轮真实重规划里反复出现，不该继续赌"这次 LLM 会
+    收窄接管范围"。
+
+    修法跟 Rule 4/D2 的"裁不是删"一致——这个接管区间的内容（timeline/icon/
+    随便什么）可能完全正当，唯一错的是它跑得太靠近片尾、没给说话人留返场
+    的时间。把该 section 的 toFrame 裁到 duration_frames - buffer，而不是
+    整段删掉；裁完之后原有的 opacityKeyframes 淡入淡出时机点已经不对（本来
+    就没排"恢复可见"这一步，因为接管当时判定跑到片尾），所以跟 Fix C33 一样
+    从头对当前（裁剪后）的 sections + 全部内容区图形重新扫一遍 workflow_ranges，
+    重算 scenes/opacityKeyframes，而不是手工去猜该在哪一帧插一个淡入关键帧。
+
+    跟 C15 共用同一张安全阀：裁剪后findings 变多或出现新类型就放弃，保留原版本。
+    """
+    bad = [f for f in findings if f.get("check") == "facecam_never_restored"]
+    if not bad:
+        return props
+    hidden_from = bad[0]["hidden_from_frame"]
+    new_end = duration_frames - _FACECAM_RESTORE_BUFFER_FRAMES
+    if new_end <= hidden_from:
+        return props  # 没有可裁的空间（隐藏区间本身已经短于 buffer），维持原样
+
+    candidate = dict(props)
+    candidate_sections = []
+    capped_any = False
+    for s in (props.get("sections") or []):
+        s = dict(s)
+        if s.get("fromFrame", 0) <= hidden_from < s.get("toFrame", 0) and s["toFrame"] >= duration_frames - 1:
+            s["toFrame"] = new_end
+            capped_any = True
+        candidate_sections.append(s)
+    if not capped_any:
+        return props
+    candidate["sections"] = candidate_sections
+
+    from .content_planner import FPS, SECTION_PIP_SENTINEL, _workflow_mode_schedule
+    ranges: list[tuple[int, int, int]] = []
+    for sec in candidate_sections:
+        ranges.append((sec["fromFrame"], sec["toFrame"], SECTION_PIP_SENTINEL))
+    for key in ("dataCards", "gauges", "countdowns", "calendarEvents", "beforeAfter",
+                "pills", "stepLists", "topicCards"):
+        for it in candidate.get(key) or []:
+            if "mountFrame" in it and "endFrame" in it:
+                ranges.append((it["mountFrame"], it["endFrame"], _CONTENT_ZONE_WIDTH))
+    for q in candidate.get("quotes") or []:
+        if "mountFrame" in q and "endFrame" in q:
+            ranges.append((q["mountFrame"], q["endFrame"], SECTION_PIP_SENTINEL))
+    mode_schedule = _workflow_mode_schedule(ranges, duration_frames)
+    candidate["scenes"], opacity = _mode_schedule_to_scenes(mode_schedule)
+    if opacity:
+        candidate["opacityKeyframes"] = opacity
+    else:
+        candidate.pop("opacityKeyframes", None)
+
+    from .props_lint import lint_props
+    before_findings = lint_props(props)
+    after_findings = lint_props(candidate)
+    before_checks = {f["check"] for f in before_findings}
+    after_checks = {f["check"] for f in after_findings}
+    new_check_types = after_checks - before_checks
+    if new_check_types or len(after_findings) > len(before_findings):
+        logger.warning(
+            f"  apply_style: facecam_never_restored 确定性兜底会引入新问题"
+            f"({len(before_findings)}->{len(after_findings)} findings, 新增类型: "
+            f"{new_check_types or '无，但总数变多'})，放弃裁剪，保留原版本（Fix C37 安全阀）"
+        )
+        return props
+
+    logger.info(
+        f"  apply_style: facecam_never_restored 3 轮重规划仍未解决，"
+        f"确定性裁短接管区间到第 {new_end} 帧（留 {_FACECAM_RESTORE_BUFFER_FRAMES} 帧"
+        f"给说话人在片尾前恢复可见）（Fix C37）"
+    )
+    return candidate
+
+
 def _visual_richness(props: dict) -> int:
     """Fix C6（2026-07-16）：确认过的真实生产 bug——MrBeast backtest
     (job_95e1e08b0995)第一轮规划出了完整的 TIMELINE 时间线图形 + 数据卡 +
@@ -2043,6 +2126,9 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
             findings = _run_props_lint(p)
         if findings:
             p = _demote_content_free_takeovers(p, findings)
+            findings = _run_props_lint(p)
+        if findings:
+            p = _restore_facecam_before_end(p, findings, round(duration * 30))
             findings = _run_props_lint(p)
         return p
 

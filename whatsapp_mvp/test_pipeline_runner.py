@@ -9,7 +9,8 @@ from __future__ import annotations
 from whatsapp_mvp.pipeline_runner import (
     _floor_shift_graphics, _floor_shift_zone_headers, _QUOTE_MIN_START_FRAMES,
     _shift_off_dominant_windows, _shift_off_dominant_windows_headers,
-    _fill_intro_lead_dead_space,
+    _fill_intro_lead_dead_space, _restore_facecam_before_end,
+    _FACECAM_RESTORE_BUFFER_FRAMES,
 )
 
 FAILED = []
@@ -175,6 +176,43 @@ def test_non_first_caption_still_gets_fallback_card():
           bool(result.get("topicCards")), result.get("topicCards"))
 
 
+_DURATION_FRAMES = 900  # 30s @ 30fps
+
+_FACECAM_NEVER_RESTORED_PROPS = {
+    "durationSeconds": 30.0,
+    "scenes": [{"frame": 0, "x": 60, "y": 104, "w": 960, "h": 1100}],
+    "sections": [{"fromFrame": 300, "toFrame": 900, "icon": "clock"}],
+    "opacityKeyframes": [{"frame": 299, "opacity": 1.0}, {"frame": 314, "opacity": 0.0}],
+}
+_FACECAM_NEVER_RESTORED_FINDING = [{"check": "facecam_never_restored", "hidden_from_frame": 300}]
+
+
+def test_restore_facecam_caps_section_with_runway_before_end():
+    result = _restore_facecam_before_end(
+        dict(_FACECAM_NEVER_RESTORED_PROPS), _FACECAM_NEVER_RESTORED_FINDING, _DURATION_FRAMES)
+    new_end = result["sections"][0]["toFrame"]
+    check("接管区间被裁到片尾前留出 buffer，不是继续跑到片尾",
+          new_end == _DURATION_FRAMES - _FACECAM_RESTORE_BUFFER_FRAMES, new_end)
+    # 真正要保证的是"说话人恢复可见"（opacity 淡回 1.0），不是卡片尺寸——
+    # dominant(满尺寸)但可见完全没问题，intro 本来就是这个状态；只有"永远
+    # 透明"才是 facecam_never_restored 要抓的 bug。
+    restore_frames = [k["frame"] for k in result["opacityKeyframes"] if k["opacity"] == 1.0]
+    check("裁剪后 opacityKeyframes 里有一个淡回 opacity=1.0 的关键帧，且落在片尾之前",
+          any(f < _DURATION_FRAMES for f in restore_frames if f >= new_end), result["opacityKeyframes"])
+
+
+def test_restore_facecam_no_op_without_matching_finding():
+    result = _restore_facecam_before_end(dict(_FACECAM_NEVER_RESTORED_PROPS), [], _DURATION_FRAMES)
+    check("没有 facecam_never_restored 发现时原样返回", result == _FACECAM_NEVER_RESTORED_PROPS)
+
+
+def test_restore_facecam_no_op_when_no_room_to_cap():
+    # hidden_from 已经离片尾很近（比 buffer 还短），裁了也没意义——原样返回。
+    tight_finding = [{"check": "facecam_never_restored", "hidden_from_frame": _DURATION_FRAMES - 10}]
+    result = _restore_facecam_before_end(dict(_FACECAM_NEVER_RESTORED_PROPS), tight_finding, _DURATION_FRAMES)
+    check("隐藏区间起点离片尾太近、没有裁剪空间时原样返回", result == _FACECAM_NEVER_RESTORED_PROPS)
+
+
 def main():
     test_shifts_below_floor_preserving_duration()
     test_before_after_second_reveal_frame_shifts_too()
@@ -188,6 +226,9 @@ def main():
     test_shift_off_dominant_windows_leaves_unrescuable_item_alone()
     test_self_intro_repeat_is_not_inserted()
     test_non_first_caption_still_gets_fallback_card()
+    test_restore_facecam_caps_section_with_runway_before_end()
+    test_restore_facecam_no_op_without_matching_finding()
+    test_restore_facecam_no_op_when_no_room_to_cap()
 
     print()
     if FAILED:
