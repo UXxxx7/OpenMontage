@@ -33,7 +33,41 @@ def main():
     """Start the FastAPI webhook server."""
     from whatsapp_mvp.webhook import app
 
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    # Windows' default ProactorEventLoop has a confirmed bug: its one-shot
+    # IOCP accept() doesn't re-arm itself after a transient OSError (seen
+    # live, repeatedly: WinError 64 "The specified network name is no longer
+    # available", triggered by a burst of WhatsApp webhook retries / Remotion
+    # render traffic). The process survives — background pipeline threads
+    # keep running — but the accept loop is dead forever, so the server
+    # silently stops taking any new connection with no crash, no log past
+    # "Accept failed on a socket". SelectorEventLoop's accept is poll-based
+    # and doesn't share this failure mode.
+    #
+    # Setting asyncio.set_event_loop_policy() here does NOT work (tried it,
+    # confirmed live it has zero effect): uvicorn.run()/Server.run() calls
+    # asyncio.run(..., loop_factory=config.get_loop_factory()), and
+    # uvicorn.loops.asyncio.asyncio_loop_factory hardcodes
+    # `return asyncio.ProactorEventLoop` on win32 whenever `use_subprocess`
+    # is false (uvicorn.run()'s default) — it never consults the ambient
+    # event loop policy at all. The only way to actually get Selector is to
+    # bypass Server.run()/uvicorn.run() and drive the server on a loop we
+    # create ourselves.
+    from uvicorn import Config, Server
+
+    config = Config(app, host="0.0.0.0", port=8000, log_level="info")
+    server = Server(config)
+
+    if sys.platform == "win32":
+        import asyncio
+        loop = asyncio.SelectorEventLoop()
+        asyncio.set_event_loop(loop)
+        logging.getLogger(__name__).info(f"event loop: {type(loop).__name__} (forced, not uvicorn default)")
+        try:
+            loop.run_until_complete(server.serve())
+        finally:
+            loop.close()
+    else:
+        server.run()
 
 
 def worker():
