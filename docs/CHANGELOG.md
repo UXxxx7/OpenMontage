@@ -229,6 +229,46 @@
 
 ---
 
+## 2026-07-21 — C-roll: insurance-category script library + hint=None crash fix + retry gap
+- **Who**: Claude (user-directed session; local end-to-end test confirmed
+  passing before this PR was opened)
+- **Branch/commit**: data/insurance-croll-scripts (PR — see docs/CHANGELOG.md
+  entry date for base: whatsapp-studio @ 0a43a04)
+- **What changed**:
+  - `whatsapp_mvp/prompts/insurance_scripts_extended.json` (new): 28
+    human-curated scripts across 8 insurance categories (定期寿险/终身寿险/
+    重疾险/医疗险/意外险/年金险/车险/家财险), 14 zh + 14 en, each tagged with
+    `category`, `lang`, `duration_seconds`.
+  - `whatsapp_mvp/croll_script.py`: when the user's hint names a specific
+    insurance category (e.g. "重疾险" / "term life"), `_match_categories`
+    detects it via an alias table (specific sub-types like 定期寿险/终身寿险
+    checked before the generic 寿险 alias, so "定期寿险" doesn't get swallowed
+    by the broader match) and `_pick_examples` selects few-shot examples from
+    the new category+language-matched library instead of the old
+    keyword-only generic library (`croll_reference_scripts.json`, kept as
+    fallback for unmatched hints). Target duration also becomes automatic
+    when the caller doesn't pass one: it's derived from the matched
+    category's sample average (new library runs 78-102s, longer than the old
+    fixed 60s default) instead of always defaulting to 60s.
+  - Fixed a crash: `write_script` called `.strip()`/`.lower()` on `hint`
+    without guarding `hint=None`; now normalized to `""` at the top of the
+    function.
+  - `whatsapp_mvp/llm_client.py`: `_post_with_retries` now also retries on
+    `requests.exceptions.ChunkedEncodingError` ("Response ended prematurely"),
+    which isn't a subclass of `ConnectionError`/`Timeout` and was previously
+    escaping the retry loop, forcing the caller (`apply_style`) to redo the
+    whole stage over one transport-layer blip.
+- **Why / impact**: previously every C-roll script used the same 8-sample
+  generic library and a fixed 60s target regardless of what insurance
+  product the client actually asked about; scripts now match the requested
+  category's real structure, language, and natural spoken length. The
+  `hint=None` fix removes a crash path that could hit in production whenever
+  a caller passes no hint. No contract change — `write_script`'s signature
+  only relaxed `duration_s` to `int | None = None` (existing callers that
+  pass an explicit value are unaffected).
+- **Status**: 🧪 to verify — tested locally end-to-end by the user before
+  this PR was opened; not yet reviewed/merged.
+
 ## 2026-07-19 — Fix C22: QA stills sampled frame 0 (before the SpeakerCard's own entrance renders anything) on every job, non-deterministic vision scoring turned it into recurring apply_style degradation
 - **Who**: Claude (new session — user reported the WhatsApp degradation
   reminder message recurring and asked for a real fix + confirmation, not
