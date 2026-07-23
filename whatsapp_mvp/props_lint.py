@@ -34,6 +34,7 @@ _RICHNESS_FIELDS = (
     "dataCards", "gauges", "countdowns", "calendarEvents", "beforeAfter",
     "stepLists", "topicCards", "cornerCards", "quotes",
     "comparisons", "rankedLists", "checklists", "locationPins", "testimonials", "iconClusters",
+    "progressBars", "prosCons", "milestoneTracks", "trustBadges", "barCharts", "milestoneUnlocks",
 )
 _SECONDS_PER_RICHNESS_UNIT = 12
 
@@ -44,6 +45,7 @@ _EST_HEIGHT = {
     "gauge": 330, "countdown": 300, "calendar": 560, "beforeAfter": 330,
     "pill": 100, "zoneHeader": 130, "topicCard": 180, "qrContact": 260,
     "locationPin": 190, "testimonial": 220,
+    "progressBar": 190, "milestoneTrack": 210, "barChart": 360, "milestoneUnlock": 240,
 }
 
 
@@ -62,6 +64,11 @@ def _rect_height(kind: str, entry: dict) -> int:
         return 30 + 68 * len(entry.get("items") or [])
     if kind == "iconCluster":
         return 70 + 60 * -(-len(entry.get("items") or []) // 3)
+    if kind == "prosCons":
+        max_items = max(len(entry.get("pros") or []), len(entry.get("cons") or []), 0)
+        return 50 + 34 * max_items
+    if kind == "trustBadge":
+        return 30 + 68 * len(entry.get("badges") or [])
     return _EST_HEIGHT.get(kind, 320)
 
 
@@ -157,6 +164,12 @@ def _collect_elements(props: dict) -> list[dict]:
     add("locationPin", props.get("locationPins"))
     add("testimonial", props.get("testimonials"))
     add("iconCluster", props.get("iconClusters"))
+    add("progressBar", props.get("progressBars"))
+    add("prosCons", props.get("prosCons"))
+    add("milestoneTrack", props.get("milestoneTracks"))
+    add("trustBadge", props.get("trustBadges"))
+    add("barChart", props.get("barCharts"))
+    add("milestoneUnlock", props.get("milestoneUnlocks"))
     qr = props.get("qrContact")
     if qr:
         add("qrContact", [qr])
