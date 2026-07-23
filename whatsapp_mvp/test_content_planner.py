@@ -1178,6 +1178,64 @@ def main():
     check("无关的时长描述句（没有月份名同段共现）不触发标准 7 的误报",
           not any("ZERO countdown cards" in f for f in f_unrelated), f_unrelated)
 
+    # 16f1c. 标准 8（新增，2026-07-23，用户直接反馈"the outro is not there
+    # again"）——真实转写全文（job_452ef6c48100 的 _op_nofiller_transcript.json
+    # 完整片段列表，不是截断片段）：末段明显在做收尾（"Looking forward to
+    # keeping you..."/"Take care."），落在视频最后 1/4 时间段内。
+    full_real_segments = [
+        {"start": 0.21, "end": 7.99, "text": "Hi there, it's David from Pacific life quick "
+                                              "reminder your policy is coming up for renewal in"},
+        {"start": 7.99, "end": 11.23, "text": "30 days on the 28th of July"},
+        {"start": 11.23, "end": 17.43, "text": "Your current plan covers you for one and a half "
+                                                "million and your annual premium is"},
+        {"start": 17.43, "end": 23.54, "text": "$8,400 I've put the full breakdown in this video. "
+                                                "So you have everything in one place"},
+        {"start": 23.54, "end": 29.18, "text": "Renewing on time really matters. If your policy "
+                                                "lapses, you'd have to go"},
+        {"start": 29.18, "end": 33.74, "text": "through underwriting again, which could affect "
+                                                "both your coverage and your rate."},
+        {"start": 34.38, "end": 38.96, "text": "If you have any questions, just WhatsApp me "
+                                                "directly. If you have any"},
+        {"start": 38.96, "end": 44.98, "text": "questions, just WhatsApp me directly or scan the "
+                                                "QR code below. I'll get back"},
+        {"start": 44.98, "end": 49.0, "text": "you right away. Looking forward to keeping you and "
+                                               "your family protected."},
+        {"start": 49.46, "end": 49.84, "text": "Take care."},
+    ]
+    no_outro_raw = {"data_points": [
+        {"visual": "count_up", "title": "Your Coverage & Premium", "rows": [
+            {"label": "Coverage", "seconds": 12.0, "value": 1500000, "divideBy": 1000000,
+             "decimals": 1, "prefix": "$", "unit": "M"},
+            {"label": "Premium", "seconds": 18.0, "value": 8400, "divideBy": 1, "decimals": 0,
+             "prefix": "$"}]},
+    ]}
+    no_outro_plan = _to_frame_plan({"chapters": [], **no_outro_raw}, duration=50.0)
+    f_no_outro = _plan_quality_failures(no_outro_raw, no_outro_plan, 50.0, full_real_segments)
+    check("转写末段明显在收尾但计划没有 outro 时被标准 8 抓住（真实转写数据）",
+          any("NO outro" in f for f in f_no_outro), f_no_outro)
+
+    with_outro_raw = {**no_outro_raw, "outro": {
+        "kicker": "CONTACT", "headline": "Looking forward to keeping you",
+        "subtext": "I'll get back to you right away", "cta_label": "Scan QR",
+    }}
+    with_outro_plan = _to_frame_plan({"chapters": [], **with_outro_raw}, duration=50.0)
+    f_with_outro = _plan_quality_failures(with_outro_raw, with_outro_plan, 50.0, full_real_segments)
+    check("outro 已经有 headline 时标准 8 不误报", not any("NO outro" in f for f in f_with_outro), f_with_outro)
+
+    short_no_outro_plan = _to_frame_plan({"chapters": [], **no_outro_raw}, duration=10.0)
+    f_short = _plan_quality_failures(no_outro_raw, short_no_outro_plan, 10.0,
+                                      [{"start": 0.0, "end": 9.0, "text": "Take care, thanks for watching!"}])
+    check("视频短于 outro 门槛(12s)时标准 8 不强求（呼应 pipeline_runner 自己的 duration_frames>=360 门槛）",
+          not any("NO outro" in f for f in f_short), f_short)
+
+    early_closing_plan = _to_frame_plan({"chapters": [], **no_outro_raw}, duration=50.0)
+    f_early = _plan_quality_failures(
+        no_outro_raw, early_closing_plan, 50.0,
+        [{"start": 2.0, "end": 6.0, "text": "Feel free to contact me or scan the QR code anytime."},
+         {"start": 40.0, "end": 45.0, "text": "So that's the coverage breakdown for this year."}],
+    )
+    check("收尾措辞出现在视频前段（不是最后 1/4）时标准 8 不误报", not any("NO outro" in f for f in f_early), f_early)
+
     # 16f. Fix C42 —— process_timeline.chapter_label 跟 chapters[].label 精确
     # 匹配失败时，退回到唯一被标记 takeover 的章节，而不是整段丢弃。
     timeline_chapters = [

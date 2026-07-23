@@ -2560,6 +2560,41 @@ def _spoken_countdown_and_date_together(segments: list[dict]) -> bool:
     return False
 
 
+# 片尾 CTA 只在视频够长时才有意义（跟 pipeline_runner.py 自己的
+# `duration_frames >= 360` 门槛保持一致——12s 以下的视频 outro 会跟正文内容
+# 抢屏，pipeline_runner 会整段跳过，规划阶段没必要为这种视频强求 outro）。
+_MIN_DURATION_FOR_OUTRO_S = 12.0
+# 收尾/告别/联系方式类措辞——出现在转写末段时，说话人明显在做结束语，这种
+# 情况下"没有 outro"几乎总是规划漏了，不是这条视频真的没有收尾。范围包含
+# "常见告别语" + "联系方式 CTA"（SYSTEM_PROMPT 1c 本来就要求 outro 抓这类内容），
+# 不含泛用词，避免在视频中段的普通句子上误报。
+_CLOSING_LANGUAGE_RE = re.compile(
+    r"\b(take care|talk (?:to you )?soon|thanks? for watching|see you (?:next|soon|again)|"
+    r"looking forward to|reach out|get back to you|contact (?:me|us)|whatsapp me|"
+    r"scan the qr|any questions|take it easy|until next time)\b",
+    re.IGNORECASE,
+)
+
+
+def _transcript_has_closing_language(segments: list[dict], duration: float) -> bool:
+    """True when a segment landing in the last quarter of the video contains
+    closing/farewell/contact-CTA language — the shape of a speaker wrapping
+    up, which is exactly what an outro card is meant to capture (SYSTEM_PROMPT
+    1c). Scoped to the tail of the video specifically so an early-video
+    mention of "contact me" (e.g. inside the main body, unrelated to closing)
+    doesn't trigger this."""
+    if not segments or duration <= 0:
+        return False
+    cutoff = duration * 0.75
+    for seg in segments:
+        start = seg.get("start")
+        if start is None or start < cutoff:
+            continue
+        if _CLOSING_LANGUAGE_RE.search(str(seg.get("text", ""))):
+            return True
+    return False
+
+
 def _plan_quality_failures(raw: dict, plan: dict, duration: float, segments: Optional[list[dict]] = None) -> list[str]:
     """规划质量标准——纯函数、确定性、不依赖 LLM 自评。plan_content 的
     criterion loop 每轮规划后跑一遍：返回空列表 = 全部达标（提前退出循环）；
@@ -2613,6 +2648,12 @@ def _plan_quality_failures(raw: dict, plan: dict, duration: float, segments: Opt
        刻意收窄到"倒计时措辞跟月份名同段共现"，不是"凡是提到天数就该有倒计
        时"，避免在描述时长的无关句子上（"我做这行十年了"、分步流程的"用了
        三天完成"）大量误报。
+    8. 转写末段明显在做收尾/告别/留联系方式，但计划里没有 outro（或 outro
+       的 headline 是空的）——同一次真实复现，用户直接反馈"the outro is not
+       there again"。`_transcript_has_closing_language` 只看视频最后 1/4
+       时间段，避免视频中段一句"欢迎联系我们"被误判成结尾。只在视频长到
+       outro 本来就该有意义时才生效（跟 pipeline_runner.py 自己的
+       `duration_frames >= 360` 门槛对齐），短视频不强求。
     """
     failures: list[str] = []
     if duration >= _MIN_DURATION_FOR_VISUALS_S:
@@ -2688,6 +2729,17 @@ def _plan_quality_failures(raw: dict, plan: dict, duration: float, segments: Opt
             "countdown cards. Add a \"countdown\" data point for the day-count figure IN ADDITION "
             "to the calendar — they are two independently valid visuals for the same moment, not "
             "alternatives."
+        )
+    raw_outro = raw.get("outro")
+    has_outro_headline = isinstance(raw_outro, dict) and str(raw_outro.get("headline", "")).strip()
+    if (duration >= _MIN_DURATION_FOR_OUTRO_S
+            and _transcript_has_closing_language(segments or [], duration)
+            and not has_outro_headline):
+        failures.append(
+            "The end of the transcript has closing/farewell/contact-CTA language but the plan has "
+            "NO outro (or an outro with an empty headline). Write an outro CTA card (kicker/"
+            "headline/subtext/cta_label, grounded in what the speaker actually says at the end) "
+            "per instruction 1c — do not leave the video ending on just the raw speaker footage."
         )
     return failures
 

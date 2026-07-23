@@ -1172,7 +1172,7 @@ with more prompt wording, add a deterministic criterion instead") — not a
 regression from any code change, just a failure shape the existing criteria
 happen not to cover.
 
-**The fix (criteria 6 and 7 in `_plan_quality_failures`):**
+**The fix (criteria 6, 7, and 8 in `_plan_quality_failures`):**
 
 - **Criterion 6**, `_uncovered_spoken_values` — the mirror image of C45's
   `_ungrounded_count_up_rows`. That function checks every count_up row's value
@@ -1191,22 +1191,44 @@ happen not to cover.
   countdown," which would misfire constantly on unrelated duration mentions,
   e.g. "I've done this for ten years" or a step_list's "took three days") —
   scoped to the exact linguistic shape of the observed failure.
+- **Criterion 8**, `_transcript_has_closing_language` — added same day, after
+  the user separately confirmed "the outro is not there again" for the same
+  preview. Fires when a segment landing in the last quarter of the video
+  contains farewell/closing/contact-CTA language ("take care," "looking
+  forward to," "scan the QR," etc.) but the plan has no outro or an outro
+  with an empty headline. Gated at the same `duration >= 12s` threshold
+  `pipeline_runner.py` itself uses before it will even attempt an outro, and
+  scoped to the tail of the video specifically so an early-video "contact me"
+  mention doesn't misfire. Validated against the FULL real segment list for
+  `job_452ef6c48100` (not a truncated excerpt) — confirms the actual closing
+  lines ("Looking forward to keeping you and your family protected." /
+  "Take care.") land in the last quarter and correctly trigger the check.
+  **Left `pipeline_runner.py`'s own outro-placement skip logic (the
+  `duration_frames - outro["fromFrame"] >= 60` gate, added because an earlier
+  bug let outro cover a real before/after reveal near the end) untouched** —
+  no direct access to the job that produced the reported preview to confirm
+  whether that skip, rather than a missing LLM-written outro, was the actual
+  mechanism, and loosening an anti-overlap guard on a guess risks
+  reintroducing the bug it was built to prevent. If criterion 8 alone doesn't
+  resolve a future case, that skip logic is the next place to look — with
+  real props in hand first, not another guess.
 
-Both wired into `_plan_quality_failures` the same way every other criterion
-is (Rule 3): automatically covers the main `plan_content` loop AND the
-vision-QA-triggered `_build()` replan path, zero special-casing needed at
+All three wired into `_plan_quality_failures` the same way every other
+criterion is (Rule 3): automatically covers the main `plan_content` loop AND
+the vision-QA-triggered `_build()` replan path, zero special-casing needed at
 either call site.
 
 **Verified:** unit-level against REAL segment data pulled directly from
 `storage/jobs/job_452ef6c48100/_op_nofiller_transcript.json` (not a simplified
-test fixture) — confirms "30 days" and "on the 28th of July" really do land in
-the same ASR segment despite being split across two captions, and that both
-new criteria fire on the exact real failure shape while staying silent when
-the plan is actually complete or the transcript content is unrelated. Full
-6-suite test run clean. **Not yet verified via a live render** — same standard
-as every rule above; this closes a real gap in the deterministic checks but a
-live re-run against a transcript with this exact shape is the natural next
-confirmation.
+test fixture, and for criterion 8 the FULL segment list through the video's
+actual final line, not a truncated excerpt) — confirms "30 days" and "on the
+28th of July" really do land in the same ASR segment despite being split
+across two captions, and that all three new criteria fire on the exact real
+failure shape while staying silent when the plan is actually complete or the
+transcript content is unrelated. Full 6-suite test run clean. **Not yet
+verified via a live render** — same standard as every rule above; this closes
+a real gap in the deterministic checks but a live re-run against a transcript
+with this exact shape is the natural next confirmation.
 
 **General principle, extending Rule 17's own lesson a third time:** when a bug
 report sounds exactly like a previously-fixed class of bug, resist the urge to

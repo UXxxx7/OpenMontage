@@ -15,6 +15,34 @@
 
 ---
 
+## 2026-07-23 (3) — outro silently missing from a delivered preview is its own criterion, not the same bug as C51/C52 (C53)
+- **Who**: Claude (same session, immediately after C51/C52 — user separately confirmed
+  "the outro is not there again" for the same reported preview)
+- **Branch/commit**: worktree-whatsapp-message-fix (uncommitted at time of writing)
+- **What changed**: a third new `_plan_quality_failures` criterion (8),
+  `_transcript_has_closing_language` — fires when a segment in the last quarter of
+  the video contains farewell/closing/contact-CTA language but the plan has no outro
+  (or an outro with an empty headline). Gated at the same `duration >= 12s` threshold
+  `pipeline_runner.py` already uses before attempting an outro at all.
+- **Why / impact**: closes the third of the three symptoms in the original report
+  (Coverage card, countdown, outro all missing from the same preview). Deliberately
+  did NOT touch `pipeline_runner.py`'s own outro-placement skip logic (the
+  `duration_frames - outro["fromFrame"] >= 60` gate) — that logic exists specifically
+  to stop an outro from covering real content near a video's end, and without direct
+  access to the job that produced the reported preview there's no way to confirm
+  whether that skip (rather than a missing LLM-written outro) is what actually
+  happened. Loosening an anti-overlap guard on a guess risks reintroducing the bug it
+  was built to prevent — flagged as the next place to look if this criterion alone
+  doesn't resolve a future case, not fixed blind. See `whatsapp_mvp/CLAUDE.md` Rule 23.
+- **Status**: 🧪 to verify. Validated against the FULL real segment list for
+  `job_452ef6c48100` (through its actual final "Take care." line, not a truncated
+  excerpt) — confirms the real closing lines land in the last quarter and correctly
+  trigger the check; also confirmed silent on short videos, videos with a real outro
+  already present, and closing-sounding language that appears early (not in the tail).
+  Full 6-suite test run clean. Live render still the natural next confirmation.
+
+---
+
 ## 2026-07-23 (2) — "at least one card" and "no invented numbers" don't guarantee "every spoken number got a card" (C51/C52)
 - **Who**: Claude
 - **Branch/commit**: worktree-whatsapp-message-fix (uncommitted at time of writing)
