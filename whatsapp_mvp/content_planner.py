@@ -148,6 +148,7 @@ _STACK_HANDOFF_MAX_DELAY_FRAMES = 180  # 6s
 _EST_HEIGHT_BY_VISUAL = {
     "gauge": 330, "countdown": 300, "calendar": 560,
     "before_after": 330, "contact_cue": 200, "topic_card": 180,
+    "location_pin": 190, "testimonial": 220,
 }
 _PILL_EST_HEIGHT = 100
 # Calendar.tsx's own default `width` prop — kept in sync manually (component
@@ -166,6 +167,17 @@ _ZONE_HEADER_HEIGHT = 130
 TOPIC_CARD_DISPLAY_FRAMES = 150
 STEP_LIST_STEP_HOLD_FRAMES = 120
 CORNER_CARD_DISPLAY_FRAMES = 130
+# xiaojin "arsenal" round 2 (2026-07-23): 6 new content-zone card types
+# (ComparisonCard/RankedListCard/ChecklistCard/LocationPinCard/TestimonialCard/
+# IconClusterCard) wired into the same generic dispatch/stacking machinery as
+# topic_card/step_list — see the SYSTEM_PROMPT vocabulary entries and the
+# _plan_comparison/_plan_ranked_list/etc. functions below _plan_step_list.
+COMPARISON_DISPLAY_FRAMES = 180
+RANKED_LIST_DISPLAY_FRAMES = 180
+CHECKLIST_ITEM_HOLD_FRAMES = 120
+LOCATION_PIN_DISPLAY_FRAMES = 150
+TESTIMONIAL_DISPLAY_FRAMES = 180
+ICON_CLUSTER_DISPLAY_FRAMES = 150
 
 
 def _est_height(visual: str, entry: dict) -> int:
@@ -173,6 +185,16 @@ def _est_height(visual: str, entry: dict) -> int:
         return 100 + 112 * len(entry.get("rows") or [])
     if visual == "step_list":
         return 40 + 95 * len(entry.get("steps") or [])
+    if visual == "comparison":
+        cols = entry.get("columns") or []
+        max_items = max((len(c.get("items") or []) for c in cols), default=0)
+        return 60 + 40 * max_items
+    if visual == "ranked_list":
+        return 50 + 68 * len(entry.get("items") or [])
+    if visual == "checklist":
+        return 30 + 68 * len(entry.get("items") or [])
+    if visual == "icon_cluster":
+        return 70 + 60 * math.ceil(len(entry.get("items") or []) / 3)
     return _EST_HEIGHT_BY_VISUAL.get(visual, 320)
 
 
@@ -209,6 +231,12 @@ SYSTEM_PROMPT = """You analyze a talking-head video's transcript and produce a c
    - A short supporting statement worth a graphic beat but with no hard data to visualize (a claim, a tip, an observation) -> "topic_card". This is the fallback for a moment that deserves SOME visual but isn't a number/date/risk/quote-worthy line — use it sparingly, only when the sentence is genuinely a distinct point, not for every line of dialogue.
    - A genuine sequential how-to/process with 2-5 distinct steps that ISN'T substantial enough to deserve the full-canvas animated timeline (3b below) — a quick routine, a short setup, an ordered list actually spoken as steps -> "step_list".
    - A moment referencing a specific named app/tool ("open WhatsApp", "in this app") or an in-progress action (uploading, processing, generating) where the speaker should stay visible and dominant rather than the canvas cutting to a full data reveal -> "corner_card".
+   - Several distinct DIFFERENCES listed side by side across 2-3 named options ("old way vs new way", "plan A vs plan B", several attributes compared at once) -> "comparison". Distinct from before_after, which is only ONE metric across two points in time, not several attributes across options.
+   - Several numbers/quantities being compared or ranked against EACH OTHER in the same beat ("top 3", "best X", "Y beats Z by...") -> "ranked_list". If it's just one number on its own with no explicit comparison, that's "count_up" instead.
+   - A short list of items being confirmed/included/met one at a time (requirements met, features included, steps confirmed done) -> "checklist". Distinct from step_list, which reads as an ordered how-to ("first do X, then Y"), not a confirmation.
+   - A specific place/city/country/region being named -> "location_pin".
+   - A THIRD PARTY's words being quoted (a client, a reviewer, a colleague's remark — NOT the main speaker's own words) -> "testimonial". Distinct from "quote", which is reserved for the main speaker's own striking line.
+   - Several related named things mentioned together with no ordering and no hard numbers (works with X/Y/Z, supports A/B/C) -> "icon_cluster". Distinct from step_list (ordered) and topic_card (one single statement).
 3b. Multi-stage process timeline: if (and only if) the transcript describes a genuine multi-step SEQUENTIAL process with 3-5 distinct stages, each with its own duration/quantity ("first we do X for N weeks, then Y for M months, then Z..." — a workflow, a production pipeline, a plan with ordered phases), this deserves a full-canvas timeline graphic instead of a data card. It must correspond to exactly one chapter that you also mark "takeover": true (and "icon": null — the timeline fills that space instead) — set "process_timeline" to describe it, referencing that chapter's exact "label" text. This graphic now renders correctly in BOTH color modes (Fix D6, 2026-07-16) — set "dark" on that chapter based on the content's actual tone (a warning/dramatic process -> dark: true, a normal upbeat/neutral one -> dark: false), not as a requirement for the graphic to work. Most videos have none of this; only use it for a real ordered multi-stage process, not a simple list.
 4. Output shape per visual type (all times in seconds, matching when that number/date is actually spoken):
    - count_up: {"visual":"count_up","title":"...","rows":[{"label":"short label in the video's primary language","label_en":"1-3 word UPPERCASE ENGLISH","seconds":12.3,"value":42,"prefix":"","divideBy":1,"decimals":0,"unit":"","tone":"accent|good|bad|normal","end_keyword":"the exact word/short phrase spoken right where this number's sentence finishes, e.g. \"8,400\" or \"premium\""}]} — group values that belong together into ONE card as multiple rows, not separate cards (but see "before_after" above for a two-point comparison of the SAME metric — that's richer as its own visual, not a two-row count_up card). prefix/divideBy/decimals/unit format the number so it's compact and readable (e.g. divideBy 1000000 + decimals 1 -> "1.5" for 1,500,000) — never a raw unformatted number.
@@ -221,6 +249,12 @@ SYSTEM_PROMPT = """You analyze a talking-head video's transcript and produce a c
    - topic_card: {"visual":"topic_card","icon":"chat|lightbulb|check|sparkle","headline":"short statement in the video's primary language, <=60 chars","sub":"optional one-line supporting detail, <=80 chars","seconds":12.3,"keyword":"the exact trigger word this statement's moment begins on","end_keyword":"the exact word where this statement's sentence finishes"} — icon should loosely match the statement's nature (chat=communication/social, lightbulb=idea/insight, check=confirmation/good practice, sparkle=highlight/standout moment); default to "sparkle" if nothing fits better.
    - step_list: {"visual":"step_list","title":"optional short UPPERCASE label for the whole list","steps":[{"label":"short step name in the video's primary language","label_en":"optional 1-3 word UPPERCASE ENGLISH","seconds":12.3,"keyword":"the exact trigger word this specific step begins on"}, ...]} — 2-5 steps, each "seconds" is when THAT specific step is actually spoken (not all the same timestamp).
    - corner_card: {"visual":"corner_card","variant":"chat","seconds":12.3,"appName":"the actual app named, e.g. \"WhatsApp\"","message":"short mock message matching what's being discussed, <=60 chars"} for an app/messaging reference, OR {"visual":"corner_card","variant":"progress","seconds":12.3,"label":"short label, e.g. \"Uploading\"","percent":0-100} for an in-progress action.
+   - comparison: {"visual":"comparison","seconds":12.3,"title":"optional short UPPERCASE label","columns":[{"label":"short label in the video's primary language","label_en":"1-3 word UPPERCASE ENGLISH","accent":"good|bad|neutral","items":["short item 1","short item 2", ...]}, ...]} — 2-3 columns, 2-4 items each, grounded in what's actually being compared.
+   - ranked_list: {"visual":"ranked_list","seconds":12.3,"title":"...","items":[{"label":"short label in the video's primary language","label_en":"1-3 word UPPERCASE ENGLISH","value":42,"suffix":"%|"}, ...]} — 2-5 items, each a real number actually spoken, ordered largest/best first.
+   - checklist: {"visual":"checklist","title":"optional short UPPERCASE label for the whole list","items":[{"label":"short item name in the video's primary language","label_en":"optional 1-3 word UPPERCASE ENGLISH","seconds":12.3}, ...]} — 2-6 items, each "seconds" is when THAT specific item is actually confirmed/mentioned (not all the same timestamp).
+   - location_pin: {"visual":"location_pin","seconds":12.3,"place":"the place name in the video's primary language","place_en":"optional English form","sub":"optional one-line context, <=60 chars"}
+   - testimonial: {"visual":"testimonial","seconds":12.3,"quote":"the exact quoted words, verbatim, <=100 chars","name":"who said it","role":"optional short role/context, e.g. \"Pacific Life client\""}
+   - icon_cluster: {"visual":"icon_cluster","seconds":12.3,"title":"optional short UPPERCASE label","items":[{"icon":"chat|camera|play|star|bolt|heart","label":"short label in the video's primary language","label_en":"optional 1-3 word UPPERCASE ENGLISH"}, ...]} — 2-6 items; icon should loosely match each item's nature (chat=messaging/social, camera=recording/photo, play=media/video, star=highlight/favorite, bolt=speed/power/automation, heart=care/community) — default to "star" if nothing fits better.
 4a. keyword/end_keyword: wherever a shape above lists them, they are optional but STRONGLY preferred whenever the moment has a clear trigger/conclusion word in the transcript — they anchor the graphic's entrance/exit precisely to the words being spoken (checked against the transcript's own timestamps) instead of relying on your estimated "seconds" being exactly right. Always copy the word exactly as it appears in the transcript (same capitalization/punctuation is fine, just don't paraphrase it). Omit only when there's genuinely no single clear word to point to.
 4b. Accent pill: EVERY data point above (count_up/gauge/countdown/calendar/before_after) may additionally carry "pill": a short punchy takeaway line (<=44 chars, in the video's primary spoken language) shown as a full-width accent pill directly under that graphic — e.g. a coverage card's pill might be "Policy Active — Renew in 30 Days". It must be grounded in that exact sentence's content, never invented. Include it whenever the sentence has a natural takeaway (most do); omit only when nothing fits. These pills are how the canvas stays visually full, so prefer including one.
 5. If the transcript has no genuinely dramatic/comparison-worthy moments AND no quote-worthy lines, return an empty data_points array. Do not invent one to fill the response, and do not force a domain's framing (financial, fitness, etc.) onto content that isn't actually about that.
@@ -308,6 +342,8 @@ def plan_content(segments: list[dict], duration: float, *, feedback: Optional[st
         "mode_schedule": [{"frame": 0, "mode": "dominant"}],
         "intro": None, "outro": None, "sections": [], "quotes": [], "contact_cue": None,
         "pills": [], "zone_headers": [], "step_lists": [], "topic_cards": [], "corner_cards": [],
+        "comparisons": [], "ranked_lists": [], "checklists": [], "location_pins": [],
+        "testimonials": [], "icon_clusters": [],
     }
 
     transcript_text = _build_transcript_text(segments)
@@ -796,6 +832,12 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
     step_lists: list[dict] = []
     topic_cards: list[dict] = []
     corner_cards: list[dict] = []
+    comparisons: list[dict] = []
+    ranked_lists: list[dict] = []
+    checklists: list[dict] = []
+    location_pins: list[dict] = []
+    testimonials: list[dict] = []
+    icon_clusters: list[dict] = []
     # One (chapter_idx, start, end) window per content-zone stack that
     # reserved header space (see _ZONE_HEADER_HEIGHT/stack_header_offset
     # below) — used after the main loop to emit one ZoneHeader PER STACK,
@@ -966,6 +1008,18 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
                 entry, target = _plan_step_list(dp, min_mount), step_lists
             elif visual == "topic_card":
                 entry, target = _plan_topic_card(dp, min_mount), topic_cards
+            elif visual == "comparison":
+                entry, target = _plan_comparison(dp, min_mount), comparisons
+            elif visual == "ranked_list":
+                entry, target = _plan_ranked_list(dp, min_mount), ranked_lists
+            elif visual == "checklist":
+                entry, target = _plan_checklist(dp, min_mount), checklists
+            elif visual == "location_pin":
+                entry, target = _plan_location_pin(dp, min_mount), location_pins
+            elif visual == "testimonial":
+                entry, target = _plan_testimonial(dp, min_mount), testimonials
+            elif visual == "icon_cluster":
+                entry, target = _plan_icon_cluster(dp, min_mount), icon_clusters
             else:
                 entry, target = _plan_count_up(dp, min_mount), data_cards
         except (KeyError, TypeError, ValueError) as e:
@@ -1085,7 +1139,8 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
     # 一张实际上零/负时长、渲染层直接隐形或报错的图形安全。
     for target_list in (data_cards, quotes, gauges, countdowns, calendar_events,
                         before_afters, contact_cues, pills, step_lists, topic_cards,
-                        corner_cards):
+                        corner_cards, comparisons, ranked_lists, checklists,
+                        location_pins, testimonials, icon_clusters):
         target_list[:] = [
             e for e in target_list
             if e.get("endFrame", e.get("mountFrame", 0) + 1) > e.get("mountFrame", 0)
@@ -1132,7 +1187,9 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
             last_content_end = start
             first_content_mount: Optional[int] = None
             for group in (gauges, countdowns, calendar_events, data_cards,
-                          before_afters, pills, step_lists, topic_cards):
+                          before_afters, pills, step_lists, topic_cards,
+                          comparisons, ranked_lists, checklists, location_pins,
+                          testimonials, icon_clusters):
                 for g in group:
                     g_end = g.get("endFrame", g.get("mountFrame", start))
                     if g["mountFrame"] < natural_end and g_end > start:
@@ -1343,7 +1400,8 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
     # 的另一半）。
     slotted = sorted(
         (g for g in (data_cards + gauges + countdowns + calendar_events + quotes + before_afters
-                      + step_lists + topic_cards)),
+                      + step_lists + topic_cards + comparisons + ranked_lists + checklists
+                      + location_pins + testimonials + icon_clusters)),
         key=lambda g: g["mountFrame"],
     )
     for cur, nxt in zip(slotted, slotted[1:]):
@@ -1400,6 +1458,7 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
     _resolve_same_slot_overlaps(
         data_cards, gauges, countdowns, calendar_events, before_afters,
         pills, step_lists, topic_cards,
+        comparisons, ranked_lists, checklists, location_pins, testimonials, icon_clusters,
     )
 
     # Fix C31（2026-07-20，真实生产复现——用户直接从交付的成片里抓到：WORKFLOW
@@ -1416,7 +1475,8 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
     # 导致的错位，这里都能补上，跟 Fix C24/C30 同一个"给保证，不只是查"的原则。
     final_workflow_ranges = list(workflow_ranges)
     for _items in (data_cards, gauges, countdowns, calendar_events, before_afters,
-                   pills, step_lists, topic_cards):
+                   pills, step_lists, topic_cards,
+                   comparisons, ranked_lists, checklists, location_pins, testimonials, icon_clusters):
         for _it in _items:
             if "mountFrame" in _it and "endFrame" in _it:
                 final_workflow_ranges.append((_it["mountFrame"], _it["endFrame"], _CONTENT_ZONE_WIDTH))
@@ -1430,6 +1490,8 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
         "quotes": quotes, "contact_cue": contact_cues[0] if contact_cues else None,
         "pills": pills, "zone_headers": zone_headers, "step_lists": step_lists,
         "topic_cards": topic_cards, "corner_cards": corner_cards,
+        "comparisons": comparisons, "ranked_lists": ranked_lists, "checklists": checklists,
+        "location_pins": location_pins, "testimonials": testimonials, "icon_clusters": icon_clusters,
     }
 
 
@@ -1548,6 +1610,16 @@ def _dp_seconds(dp: dict) -> float:
         for s in dp.get("steps") or []:
             try:
                 secs.append(float(s["seconds"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        return min(secs) if secs else float("inf")
+    if visual == "checklist":
+        # Same shape as step_list — no top-level "seconds", each item ticks
+        # on its own spoken beat (see _plan_checklist).
+        secs: list[float] = []
+        for it in dp.get("items") or []:
+            try:
+                secs.append(float(it["seconds"]))
             except (KeyError, TypeError, ValueError):
                 continue
         return min(secs) if secs else float("inf")
@@ -1717,6 +1789,197 @@ def _plan_step_list(dp: dict, min_mount_frame: int) -> Optional[dict]:
         "steps": steps,
         "x": _CONTENT_ZONE_X, "y": _CONTENT_ZONE_Y, "width": _CONTENT_ZONE_WIDTH,
         "mountFrame": card_mount_frame, "endFrame": end_frame,
+    }
+    if dp.get("title"):
+        entry["title"] = str(dp["title"])[:40]
+    return entry
+
+
+def _plan_comparison(dp: dict, min_mount_frame: int) -> Optional[dict]:
+    """Multi-column side-by-side comparison (ComparisonCard) — several
+    DIFFERENCES listed across 2-3 named options at once. Distinct from
+    before_after (BudgetRevealSection), which is exactly ONE metric across
+    two points in time, not several attributes across options."""
+    cols_in = dp.get("columns") or []
+    columns: list[dict] = []
+    for c in cols_in:
+        if not isinstance(c, dict):
+            continue
+        items = [str(it).strip()[:60] for it in (c.get("items") or []) if str(it).strip()]
+        label = str(c.get("label", "")).strip()
+        if not label or not items:
+            continue
+        col: dict[str, Any] = {"label": label[:24], "items": items[:4]}
+        if c.get("label_en"):
+            col["labelEn"] = str(c["label_en"])[:16]
+        if c.get("accent") in ("good", "bad", "neutral"):
+            col["accent"] = c["accent"]
+        columns.append(col)
+    if len(columns) < 2:
+        return None
+    sec = float(dp["seconds"])
+    mount_frame = max(min_mount_frame, round(sec * FPS) - MOUNT_LEAD_FRAMES)
+    end_frame = _grounded_or_fallback_end(dp, mount_frame, mount_frame + COMPARISON_DISPLAY_FRAMES)
+    entry: dict[str, Any] = {
+        "columns": columns[:3],
+        "x": _CONTENT_ZONE_X, "y": _CONTENT_ZONE_Y, "width": _CONTENT_ZONE_WIDTH,
+        "mountFrame": mount_frame, "endFrame": end_frame,
+    }
+    if dp.get("title"):
+        entry["title"] = str(dp["title"])[:40]
+    return entry
+
+
+def _plan_ranked_list(dp: dict, min_mount_frame: int) -> Optional[dict]:
+    """Several numbers compared/ranked against EACH OTHER in the same beat
+    (RankedListCard) — distinct from count_up (independent rows on one card,
+    not explicitly compared) and before_after (one metric, two points in
+    time)."""
+    items_in = dp.get("items") or []
+    items: list[dict] = []
+    for it in items_in:
+        if not isinstance(it, dict):
+            continue
+        label = str(it.get("label", "")).strip()
+        value = _num(it.get("value"))
+        if not label or value is None:
+            continue
+        item: dict[str, Any] = {"label": label[:24], "value": value}
+        if it.get("label_en"):
+            item["labelEn"] = str(it["label_en"])[:16]
+        if it.get("suffix"):
+            item["suffix"] = str(it["suffix"])[:8]
+        items.append(item)
+    if len(items) < 2:
+        return None
+    sec = float(dp["seconds"])
+    mount_frame = max(min_mount_frame, round(sec * FPS) - MOUNT_LEAD_FRAMES)
+    end_frame = _grounded_or_fallback_end(dp, mount_frame, mount_frame + RANKED_LIST_DISPLAY_FRAMES)
+    entry: dict[str, Any] = {
+        "items": items[:5],
+        "x": _CONTENT_ZONE_X, "y": _CONTENT_ZONE_Y, "width": _CONTENT_ZONE_WIDTH,
+        "mountFrame": mount_frame, "endFrame": end_frame,
+    }
+    if dp.get("title"):
+        entry["title"] = str(dp["title"])[:40]
+    return entry
+
+
+def _plan_checklist(dp: dict, min_mount_frame: int) -> Optional[dict]:
+    """Items ticking on one by one, each on its own spoken beat (ChecklistCard)
+    — a confirmation/requirements-met beat, distinct from step_list's ordered
+    how-to reading (same "each row has its own seconds" shape as step_list,
+    see _plan_step_list)."""
+    items_in = dp.get("items") or []
+    item_seconds: list[float] = []
+    for it in items_in:
+        if not isinstance(it, dict):
+            return None
+        try:
+            item_seconds.append(float(it["seconds"]))
+        except (KeyError, TypeError, ValueError):
+            return None
+    if len(item_seconds) < 2:
+        return None
+    card_mount_frame = max(min_mount_frame, round(min(item_seconds) * FPS) - MOUNT_LEAD_FRAMES)
+    items: list[dict] = []
+    for it, sec in zip(items_in, item_seconds):
+        label = str(it.get("label", "")).strip()
+        if not label:
+            continue
+        item_frame = round(sec * FPS)
+        item: dict[str, Any] = {
+            "label": label[:24],
+            "activateOffset": max(0, item_frame - card_mount_frame),
+        }
+        if it.get("label_en"):
+            item["labelEn"] = str(it["label_en"])[:28]
+        items.append(item)
+    items = items[:6]
+    if len(items) < 2:
+        return None
+    last_item_frame = round(max(item_seconds) * FPS)
+    end_frame = max(last_item_frame, card_mount_frame) + CHECKLIST_ITEM_HOLD_FRAMES
+    entry: dict[str, Any] = {
+        "items": items,
+        "x": _CONTENT_ZONE_X, "y": _CONTENT_ZONE_Y, "width": _CONTENT_ZONE_WIDTH,
+        "mountFrame": card_mount_frame, "endFrame": end_frame,
+    }
+    if dp.get("title"):
+        entry["title"] = str(dp["title"])[:40]
+    return entry
+
+
+def _plan_location_pin(dp: dict, min_mount_frame: int) -> Optional[dict]:
+    """A named place — a map pin drop (LocationPinCard). Nothing else in the
+    library visualizes place; every other card is a number, a claim, or a
+    process step."""
+    place = str(dp.get("place", "")).strip()
+    if not place:
+        return None
+    sec = float(dp["seconds"])
+    mount_frame = max(min_mount_frame, round(sec * FPS) - MOUNT_LEAD_FRAMES)
+    end_frame = _grounded_or_fallback_end(dp, mount_frame, mount_frame + LOCATION_PIN_DISPLAY_FRAMES)
+    entry: dict[str, Any] = {
+        "place": place[:24],
+        "x": _CONTENT_ZONE_X, "y": _CONTENT_ZONE_Y, "width": _CONTENT_ZONE_WIDTH,
+        "mountFrame": mount_frame, "endFrame": end_frame,
+    }
+    if dp.get("place_en"):
+        entry["placeEn"] = str(dp["place_en"])[:20]
+    if dp.get("sub"):
+        entry["sub"] = str(dp["sub"])[:60]
+    return entry
+
+
+def _plan_testimonial(dp: dict, min_mount_frame: int) -> Optional[dict]:
+    """A THIRD PARTY's quoted words (TestimonialCard) — distinct from `quote`
+    (QuoteCard), which is reserved for the main speaker's own line and takes
+    over the full canvas; this stays in the content zone like any other beat."""
+    quote = str(dp.get("quote", "")).strip()
+    name = str(dp.get("name", "")).strip()
+    if not quote or not name:
+        return None
+    sec = float(dp["seconds"])
+    mount_frame = max(min_mount_frame, round(sec * FPS) - MOUNT_LEAD_FRAMES)
+    end_frame = _grounded_or_fallback_end(dp, mount_frame, mount_frame + TESTIMONIAL_DISPLAY_FRAMES)
+    entry: dict[str, Any] = {
+        "quote": quote[:100], "name": name[:32],
+        "x": _CONTENT_ZONE_X, "y": _CONTENT_ZONE_Y, "width": _CONTENT_ZONE_WIDTH,
+        "mountFrame": mount_frame, "endFrame": end_frame,
+    }
+    if dp.get("role"):
+        entry["role"] = str(dp["role"])[:40]
+    return entry
+
+
+def _plan_icon_cluster(dp: dict, min_mount_frame: int) -> Optional[dict]:
+    """An unordered SET of named things mentioned together (IconClusterCard)
+    — distinct from step_list (ordered sequence) and topic_card (one single
+    statement)."""
+    valid_icons = ("chat", "camera", "play", "star", "bolt", "heart")
+    items_in = dp.get("items") or []
+    items: list[dict] = []
+    for it in items_in:
+        if not isinstance(it, dict):
+            continue
+        label = str(it.get("label", "")).strip()
+        if not label:
+            continue
+        icon = it.get("icon") if it.get("icon") in valid_icons else "star"
+        item: dict[str, Any] = {"icon": icon, "label": label[:20]}
+        if it.get("label_en"):
+            item["labelEn"] = str(it["label_en"])[:16]
+        items.append(item)
+    if len(items) < 2:
+        return None
+    sec = float(dp["seconds"])
+    mount_frame = max(min_mount_frame, round(sec * FPS) - MOUNT_LEAD_FRAMES)
+    end_frame = _grounded_or_fallback_end(dp, mount_frame, mount_frame + ICON_CLUSTER_DISPLAY_FRAMES)
+    entry: dict[str, Any] = {
+        "items": items[:6],
+        "x": _CONTENT_ZONE_X, "y": _CONTENT_ZONE_Y, "width": _CONTENT_ZONE_WIDTH,
+        "mountFrame": mount_frame, "endFrame": end_frame,
     }
     if dp.get("title"):
         entry["title"] = str(dp["title"])[:40]
@@ -2256,6 +2519,8 @@ def _plan_quality_failures(raw: dict, plan: dict, duration: float, segments: Opt
             + len(plan["calendar_events"]) + len(plan["before_after"]) + len(plan["quotes"])
             + len(plan["step_lists"]) + len(plan["topic_cards"]) + len(plan["corner_cards"])
             + len(plan["sections"])
+            + len(plan["comparisons"]) + len(plan["ranked_lists"]) + len(plan["checklists"])
+            + len(plan["location_pins"]) + len(plan["testimonials"]) + len(plan["icon_clusters"])
         )
         if total_visuals == 0:
             failures.append(
@@ -2341,7 +2606,9 @@ def _coverage_spans(plan: dict) -> list[tuple[int, int]]:
     # step_list/corner_card 覆盖非数字内容的视频，不只是这一支。
     for g in (plan["data_cards"] + plan["gauges"] + plan["countdowns"]
               + plan["calendar_events"] + plan["quotes"] + plan["topic_cards"]
-              + plan["step_lists"] + plan["corner_cards"]):
+              + plan["step_lists"] + plan["corner_cards"]
+              + plan["comparisons"] + plan["ranked_lists"] + plan["checklists"]
+              + plan["location_pins"] + plan["testimonials"] + plan["icon_clusters"]):
         spans.append((g["mountFrame"], g.get("endFrame", g["mountFrame"] + 90)))
     for sec in plan["sections"]:
         spans.append((sec["fromFrame"], sec["toFrame"]))

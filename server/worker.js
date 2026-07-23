@@ -182,7 +182,7 @@ async function crollGenerate({ waNumber, mediaId, caption }) {
       return;
     }
     if (status.status === "PREVIEW_READY") {
-      await sendText(waNumber, previewReadyMessage(jobLang, jobId, status.degraded_operations, status.generation_cost_usd) + idleHint(jobLang, "export"));
+      await sendText(waNumber, previewReadyMessage(jobLang, jobId, status.animations, status.degraded_operations, status.generation_cost_usd) + idleHint(jobLang, "export"));
       await armIdle(waNumber, jobId, "export", jobLang);
       return;
     }

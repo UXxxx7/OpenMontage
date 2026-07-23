@@ -1273,6 +1273,88 @@ def main():
     check("corner_card 的挂载区间出现在覆盖范围里，不再被当成空档",
           (cc_entry["mountFrame"], cc_entry["endFrame"]) in cc_spans, cc_spans)
 
+    # 21. xiaojin arsenal round 2 (2026-07-23) — 6 new content-zone visual
+    # types (comparison/ranked_list/checklist/location_pin/testimonial/
+    # icon_cluster). Same regression class as test 20 above (Fix C30): each
+    # new type must (a) map correctly, (b) skip cleanly when its required
+    # field is missing, and (c) actually count toward _coverage_spans/
+    # _plan_quality_failures' total_visuals — a type that plans correctly but
+    # never reaches those two functions produces the exact "criterion loop
+    # thinks this span is still empty" bug C30 fixed for step_list/corner_card.
+    new_type_points = {
+        "comparison": {
+            "visual": "comparison", "seconds": 5.0, "title": "OLD VS NEW",
+            "columns": [
+                {"label": "旧方案", "label_en": "BEFORE", "accent": "bad", "items": ["手动剪辑", "耗时长"]},
+                {"label": "新方案", "label_en": "AFTER", "accent": "good", "items": ["AI 自动化", "更快"]},
+            ],
+        },
+        "ranked_list": {
+            "visual": "ranked_list", "seconds": 6.0, "title": "TOP USAGE",
+            "items": [
+                {"label": "字幕", "label_en": "CAPTIONS", "value": 94, "suffix": "%"},
+                {"label": "品牌", "label_en": "BRAND", "value": 81, "suffix": "%"},
+            ],
+        },
+        "checklist": {
+            "visual": "checklist", "title": "READY",
+            "items": [
+                {"label": "字幕已生成", "label_en": "CAPTIONS", "seconds": 7.0},
+                {"label": "样式已渲染", "label_en": "STYLE", "seconds": 9.0},
+            ],
+        },
+        "location_pin": {
+            "visual": "location_pin", "seconds": 8.0, "place": "香港", "place_en": "HONG KONG",
+            "sub": "服务范围",
+        },
+        "testimonial": {
+            "visual": "testimonial", "seconds": 9.0,
+            "quote": "剪辑速度快了不止一倍。", "name": "David Chan", "role": "客户",
+        },
+        "icon_cluster": {
+            "visual": "icon_cluster", "seconds": 10.0, "title": "支持的来源",
+            "items": [
+                {"icon": "chat", "label": "WhatsApp", "label_en": "CHAT"},
+                {"icon": "camera", "label": "拍摄", "label_en": "CAMERA"},
+            ],
+        },
+    }
+    plan_key_by_visual = {
+        "comparison": "comparisons", "ranked_list": "ranked_lists", "checklist": "checklists",
+        "location_pin": "location_pins", "testimonial": "testimonials", "icon_cluster": "icon_clusters",
+    }
+    for visual, dp in new_type_points.items():
+        plan_key = plan_key_by_visual[visual]
+        solo_plan = _to_frame_plan({
+            "chapters": [{"at_seconds": 0, "label": "A"}],
+            "data_points": [dp],
+        }, duration=30.0)
+        check(f"{visual} 正常映射到 plan['{plan_key}']", len(solo_plan[plan_key]) == 1, solo_plan[plan_key])
+        entry = solo_plan[plan_key][0]
+        check(f"{visual} 计入 _coverage_spans（不会被当成空档）",
+              (entry["mountFrame"], entry["endFrame"]) in _coverage_spans(solo_plan),
+              _coverage_spans(solo_plan))
+        failures = _plan_quality_failures({"data_points": [dp]}, solo_plan, 30.0)
+        check(f"{visual} 计入 total_visuals（不会被质量标准误判为零图形）",
+              not any("ZERO visual moments" in f for f in failures), failures)
+
+    # 必填字段缺失时整卡跳过，不产出半成品（同 Rule "required text field" 的既有原则）。
+    missing_field_points = {
+        "comparison": {"visual": "comparison", "seconds": 5.0, "columns": [{"label": "A", "items": ["x"]}]},  # 只有 1 列
+        "ranked_list": {"visual": "ranked_list", "seconds": 6.0, "items": [{"label": "A", "value": 1}]},  # 只有 1 项
+        "checklist": {"visual": "checklist", "items": [{"label": "A", "seconds": 7.0}]},  # 只有 1 项
+        "location_pin": {"visual": "location_pin", "seconds": 8.0},  # 没有 place
+        "testimonial": {"visual": "testimonial", "seconds": 9.0, "quote": "hi"},  # 没有 name
+        "icon_cluster": {"visual": "icon_cluster", "seconds": 10.0, "items": [{"icon": "star", "label": "A"}]},  # 只有 1 项
+    }
+    for visual, dp in missing_field_points.items():
+        plan_key = plan_key_by_visual[visual]
+        bad_plan = _to_frame_plan({
+            "chapters": [{"at_seconds": 0, "label": "A"}],
+            "data_points": [dp],
+        }, duration=30.0)
+        check(f"{visual} 缺必填内容时整卡跳过，不产出半成品", bad_plan[plan_key] == [], bad_plan[plan_key])
+
     print()
     if FAILED:
         print(f"{len(FAILED)} FAILED: {FAILED}")

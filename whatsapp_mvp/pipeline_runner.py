@@ -1201,6 +1201,7 @@ def _mode_schedule_to_scenes(mode_schedule: list[dict]) -> tuple[list[dict], lis
 _WORKFLOW_CONTENT_PROP_KEYS = (
     "dataCards", "gauges", "countdowns", "calendarEvents", "beforeAfter",
     "pills", "stepLists", "topicCards",
+    "comparisons", "rankedLists", "checklists", "locationPins", "testimonials", "iconClusters",
 )
 
 
@@ -1242,6 +1243,38 @@ def _recompute_scenes_from_content(props: dict, duration_frames: int) -> dict:
         ranges.append((sec["fromFrame"], sec["toFrame"], SECTION_PIP_SENTINEL))
 
     mode_schedule = _workflow_mode_schedule(ranges, duration_frames)
+
+    # Fix C50（2026-07-21，同一支 job_452ef6c48100，验证 C47/C49 的下一次
+    # 真实渲染里复现）：C47/C49 的避让检查在 `_build()` 里只跑了一次，用的
+    # 是那一刻的 mode_schedule——但 `_recompute_scenes_from_content` 自己
+    # 的文档（Fix C33/C38）说得很清楚："scenes/opacityKeyframes 一旦从
+    # mode_schedule 定型，后面任何再挪动/插入内容区图形的代码都必须重新
+    # 调用这个函数"。C47/C49 的避让调用本身就是"挪动内容区图形的代码"，
+    # 但它们发生在 `_build()` 里最后一次 `_recompute_scenes_from_content`
+    # 之前，而不是之后——真正定型的 mode_schedule（这里重算出来的这份）
+    # 从未被拿去重新检查过 zoneHeaders/dataCards 会不会撞上它。这是
+    # Rule 15 那条教训的又一次重演："最终保证"只有跑在真正最后一次改动
+    # 之后才算数。修复：既然这个函数已经是 scenes 定型的唯一权威入口，
+    # 避让检查也搬进来，用这里刚算出的、真正最终的 mode_schedule 重新跑
+    # 一遍——跑完可能又轻微挪动了内容区图形的边界，所以再重算一次
+    # ranges/mode_schedule/scenes，保证两者互相一致，而不是留下一份对不上
+    # 号的 scenes。
+    for key in _WORKFLOW_CONTENT_PROP_KEYS:
+        _shift_off_dominant_windows(props.get(key), mode_schedule)
+    _shift_off_dominant_windows_headers(props.get("zoneHeaders"), mode_schedule)
+
+    ranges = []
+    for key in _WORKFLOW_CONTENT_PROP_KEYS:
+        for it in props.get(key) or []:
+            if "mountFrame" in it and "endFrame" in it:
+                ranges.append((it["mountFrame"], it["endFrame"], _CONTENT_ZONE_WIDTH))
+    for q in props.get("quotes") or []:
+        if "mountFrame" in q and "endFrame" in q:
+            ranges.append((q["mountFrame"], q["endFrame"], SECTION_PIP_SENTINEL))
+    for sec in props.get("sections") or []:
+        ranges.append((sec["fromFrame"], sec["toFrame"], SECTION_PIP_SENTINEL))
+    mode_schedule = _workflow_mode_schedule(ranges, duration_frames)
+
     props = dict(props)
     props["scenes"], opacity = _mode_schedule_to_scenes(mode_schedule)
     if opacity:
@@ -1317,6 +1350,18 @@ def _next_docked_frame(mode_schedule: list[dict], after_frame: int) -> Optional[
     return None
 
 
+def _next_dominant_grow_start(mode_schedule: list[dict], after_frame: int) -> Optional[int]:
+    """after_frame（不含）之后，卡片下一次开始从 docked 长回 dominant 的第一
+    帧——即真正开始变形的时刻，比 mode_schedule 自己的 dominant 时间戳早
+    _CARD_TRANSITION_FRAMES（Rule 15/Fix C39：growing 转场提前那么多帧起
+    步，只在真正的下一次转场前那 _CARD_TRANSITION_FRAMES 帧才开始长大）。
+    后面再没有 dominant 窗口就返回 None。"""
+    for entry in mode_schedule:
+        if entry["frame"] > after_frame and entry.get("mode") == "dominant":
+            return max(after_frame, entry["frame"] - _CARD_TRANSITION_FRAMES)
+    return None
+
+
 def _shift_off_dominant_windows(items: Optional[list[dict]], mode_schedule: list[dict]) -> None:
     """Fix C24（2026-07-20，真实生产复现——job_452ef6c48100，用户在渲染出的
     截图里直接抓到）：content-zone 元素（zoneHeaders/dataCards/gauges/...）
@@ -1336,41 +1381,79 @@ def _shift_off_dominant_windows(items: Optional[list[dict]], mode_schedule: list
     （保留原有停留时长）。已经落在 workflow 窗口内的元素是 no-op。后面
     再没有 workflow 窗口了（最后一段一直是 Dominant 到片尾）就保持原状，
     没有更好的位置可躲。
+
+    Fix C49（2026-07-21，同一支 job_452ef6c48100，验证 C47/C48 的同一次
+    渲染里复现——跟 Fix C47 一模一样的形状，只是这次撞上的是普通的
+    dataCard/countdown/gauge 而不是 zoneHeader）：这里原本也只检查
+    mountFrame 那一刻的模式，没检查 endFrame 之前模式会不会变回
+    dominant。跟 C47 用同一套修复：起点判定之后，再检查会不会撞上下一次
+    dominant 增长，会的话把 endFrame 截短到长大真正开始之前。截短一段
+    数字/图形的展示时间比让它跟长大中的卡片肉眼可见地叠在一起要好——跟
+    C47 的取舍一致，只是这次代价从"装饰性标题少露 20 帧"变成"数据卡少
+    露 20 帧"，仍然远好于真的叠在说话人脸上。
     """
     for g in items or []:
         if not isinstance(g, dict) or "mountFrame" not in g:
             continue
-        if _mode_at(mode_schedule, g["mountFrame"]) == "workflow":
-            continue
-        target = _next_docked_frame(mode_schedule, g["mountFrame"])
-        if target is None:
-            continue
-        delta = target - g["mountFrame"]
-        if delta <= 0:
-            continue
-        g["mountFrame"] += delta
+        # Fix C51（2026-07-22，真实生产复现 job_2729b2e0a795，用户直接在 WhatsApp
+        # 上收到"品牌样式渲染没成功"，排查发现跟 Redis/ngrok/网关完全无关，是这里
+        # 纯 Python 的 UnboundLocalError）：C49 把原来"提前 continue"的写法改成了
+        # 嵌套 if，但 `delta` 只在"需要挪动"这个分支里赋值——mountFrame 已经在
+        # workflow 窗口内（最常见、完全正常的情况）时整个分支被跳过，`delta` 从未
+        # 赋值，一旦这个元素恰好带 secondRevealFrame 字段，下面就直接崩溃。这不是
+        # 偶发的基础设施问题，是每次遇到"已经在 workflow 内 + 带 secondRevealFrame"
+        # 这个组合就必现的代码 bug。修复：delta 提前初始化为 0——没发生挪动时，
+        # secondRevealFrame 也不该被挪动，语义上正确，不只是消除崩溃。
+        delta = 0
+        if _mode_at(mode_schedule, g["mountFrame"]) != "workflow":
+            target = _next_docked_frame(mode_schedule, g["mountFrame"])
+            if target is None:
+                continue
+            delta = target - g["mountFrame"]
+            if delta > 0:
+                g["mountFrame"] += delta
+                if "endFrame" in g:
+                    g["endFrame"] += delta
         if "endFrame" in g:
-            g["endFrame"] += delta
+            grow_start = _next_dominant_grow_start(mode_schedule, g["mountFrame"])
+            if grow_start is not None and grow_start < g["endFrame"]:
+                g["endFrame"] = max(g["mountFrame"], grow_start)
         if "secondRevealFrame" in g:
             g["secondRevealFrame"] += delta
 
 
 def _shift_off_dominant_windows_headers(headers: Optional[list[dict]], mode_schedule: list[dict]) -> None:
     """跟 _shift_off_dominant_windows 同样的避让逻辑，ZoneHeader 的字段名是
-    fromFrame/toFrame。"""
+    fromFrame/toFrame。
+
+    Fix C47（2026-07-21，同一支 job_452ef6c48100 真实复现，就在 C46 验证
+    的同一次渲染里）：C24 的原始版本只检查 fromFrame 那一刻的模式，判定
+    "从 workflow 开始就没事"——但没检查 toFrame 之前模式会不会再变回
+    dominant。真实案例：COVERAGE 的 zoneHeader fromFrame=381 时确实是
+    workflow（判定 continue，跳过），但卡片在 toFrame=592 之前的 572 帧就
+    已经开始长回 dominant（下一次真实转场提前 _CARD_TRANSITION_FRAMES 帧
+    起步，Rule 15/Fix C39 的既有设计），于是 header 还在显示的最后 20 帧
+    (572-592) 跟正在长大的卡片撞在一起——vision QA 真实抓到了这一帧，标题
+    文字叠在了说话人身上。C24 的"只看起点"假设只对"进场后一直保持
+    workflow 到 toFrame"这一种形状成立，这支视频的内容形状（COVERAGE 章节
+    结束后紧接着又要变回 Dominant）恰好不满足。修复：起点判定之后，再单独
+    检查 toFrame 之前会不会撞上下一次 dominant 增长——会的话把 toFrame
+    （连同 EXIT_FRAMES 的退场空间由组件自己处理）截短到长大真正开始之前，
+    只平移/截短，不影响 fromFrame 的正常入场时机。"""
     for h in headers or []:
         if not isinstance(h, dict) or "fromFrame" not in h:
             continue
-        if _mode_at(mode_schedule, h["fromFrame"]) == "workflow":
-            continue
-        target = _next_docked_frame(mode_schedule, h["fromFrame"])
-        if target is None:
-            continue
-        delta = target - h["fromFrame"]
-        if delta <= 0:
-            continue
-        h["fromFrame"] += delta
-        h["toFrame"] += delta
+        if _mode_at(mode_schedule, h["fromFrame"]) != "workflow":
+            target = _next_docked_frame(mode_schedule, h["fromFrame"])
+            if target is None:
+                continue
+            delta = target - h["fromFrame"]
+            if delta > 0:
+                h["fromFrame"] += delta
+                h["toFrame"] += delta
+        grow_start = _next_dominant_grow_start(mode_schedule, h["fromFrame"])
+        if grow_start is not None and grow_start < h["toFrame"]:
+            h["toFrame"] = max(h["fromFrame"], grow_start)
 
 
 def _run_enhancement_chain(src: str, workdir: Path) -> str:
@@ -1428,6 +1511,7 @@ _PROPS_LINT_MAX_ATTEMPTS = 3
 _RICHNESS_FIELDS = (
     "dataCards", "gauges", "countdowns", "calendarEvents", "beforeAfter",
     "stepLists", "topicCards", "cornerCards", "quotes",
+    "comparisons", "rankedLists", "checklists", "locationPins", "testimonials", "iconClusters",
 )
 
 
@@ -1836,6 +1920,12 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
             plan_step_lists = op.get("step_lists") or []
             plan_topic_cards = op.get("topic_cards") or []
             plan_corner_cards = op.get("corner_cards") or []
+            plan_comparisons = op.get("comparisons") or []
+            plan_ranked_lists = op.get("ranked_lists") or []
+            plan_checklists = op.get("checklists") or []
+            plan_location_pins = op.get("location_pins") or []
+            plan_testimonials = op.get("testimonials") or []
+            plan_icon_clusters = op.get("icon_clusters") or []
         else:
             logger.info("  apply_style: 内容规划中（章节 + 数据展示分析）...")
             content_plan = plan_content(segments, duration, feedback=feedback, word_timestamps=word_timestamps)
@@ -1856,6 +1946,12 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
             plan_step_lists = content_plan.get("step_lists") or []
             plan_topic_cards = content_plan.get("topic_cards") or []
             plan_corner_cards = content_plan.get("corner_cards") or []
+            plan_comparisons = content_plan.get("comparisons") or []
+            plan_ranked_lists = content_plan.get("ranked_lists") or []
+            plan_checklists = content_plan.get("checklists") or []
+            plan_location_pins = content_plan.get("location_pins") or []
+            plan_testimonials = content_plan.get("testimonials") or []
+            plan_icon_clusters = content_plan.get("icon_clusters") or []
             logger.info(
                 f"  apply_style: 规划出 {len(chapters)} 个章节、{len(data_cards)} 个数据卡、"
                 f"{len(gauges)} 个仪表盘、{len(countdowns)} 个倒计时、{len(calendar_events)} 个日历、"
@@ -1892,6 +1988,18 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
             props["topicCards"] = plan_topic_cards
         if plan_corner_cards:
             props["cornerCards"] = plan_corner_cards
+        if plan_comparisons:
+            props["comparisons"] = plan_comparisons
+        if plan_ranked_lists:
+            props["rankedLists"] = plan_ranked_lists
+        if plan_checklists:
+            props["checklists"] = plan_checklists
+        if plan_location_pins:
+            props["locationPins"] = plan_location_pins
+        if plan_testimonials:
+            props["testimonials"] = plan_testimonials
+        if plan_icon_clusters:
+            props["iconClusters"] = plan_icon_clusters
 
         # 开场标题卡/片尾 CTA：模板一直支持（IntroTitle/OutroSection），此前管线从不
         # 生成——这是与 video-studio 手工参考成片(VeLL)最大的一块可自动化差距。
@@ -1958,14 +2066,18 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
             # back via props.get(...) here would silently no-op.
             _mount_floor = intro_out + 20 + 20  # intro_out+20(clamp) + TRANSITION_FRAMES(20)
             for _items in (data_cards, gauges, countdowns, calendar_events,
-                           before_after, plan_quotes, plan_pills, plan_step_lists, plan_topic_cards):
+                           before_after, plan_quotes, plan_pills, plan_step_lists, plan_topic_cards,
+                           plan_comparisons, plan_ranked_lists, plan_checklists,
+                           plan_location_pins, plan_testimonials, plan_icon_clusters):
                 _floor_shift_graphics(_items, _mount_floor)
             _floor_shift_zone_headers(plan_zone_headers, _mount_floor)
 
             # Fix C24: 片头这一次 dominant 窗口处理完了，但视频中段还会按内容
             # 反复回到 Dominant——同一类避让要对每一次窗口都做，不只是片头。
             for _items in (data_cards, gauges, countdowns, calendar_events,
-                           before_after, plan_quotes, plan_pills, plan_step_lists, plan_topic_cards):
+                           before_after, plan_quotes, plan_pills, plan_step_lists, plan_topic_cards,
+                           plan_comparisons, plan_ranked_lists, plan_checklists,
+                           plan_location_pins, plan_testimonials, plan_icon_clusters):
                 _shift_off_dominant_windows(_items, mode_schedule)
             _shift_off_dominant_windows_headers(plan_zone_headers, mode_schedule)
 
@@ -2007,7 +2119,9 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
                 last_content_end = 0
                 for group in (data_cards, gauges, countdowns, calendar_events,
                               before_after, plan_quotes, plan_pills,
-                              plan_step_lists, plan_topic_cards):
+                              plan_step_lists, plan_topic_cards,
+                              plan_comparisons, plan_ranked_lists, plan_checklists,
+                              plan_location_pins, plan_testimonials, plan_icon_clusters):
                     for g in group or []:
                         end = min(int(g.get("endFrame", 0) or 0), duration_frames)
                         last_content_end = max(last_content_end, end)
