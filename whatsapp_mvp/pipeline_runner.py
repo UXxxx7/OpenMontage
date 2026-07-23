@@ -1202,6 +1202,7 @@ _WORKFLOW_CONTENT_PROP_KEYS = (
     "dataCards", "gauges", "countdowns", "calendarEvents", "beforeAfter",
     "pills", "stepLists", "topicCards",
     "comparisons", "rankedLists", "checklists", "locationPins", "testimonials", "iconClusters",
+    "progressBars", "prosCons", "milestoneTracks", "trustBadges", "barCharts", "milestoneUnlocks",
 )
 
 
@@ -1512,6 +1513,7 @@ _RICHNESS_FIELDS = (
     "dataCards", "gauges", "countdowns", "calendarEvents", "beforeAfter",
     "stepLists", "topicCards", "cornerCards", "quotes",
     "comparisons", "rankedLists", "checklists", "locationPins", "testimonials", "iconClusters",
+    "progressBars", "prosCons", "milestoneTracks", "trustBadges", "barCharts", "milestoneUnlocks",
 )
 
 
@@ -1926,6 +1928,12 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
             plan_location_pins = op.get("location_pins") or []
             plan_testimonials = op.get("testimonials") or []
             plan_icon_clusters = op.get("icon_clusters") or []
+            plan_progress_bars = op.get("progress_bars") or []
+            plan_pros_cons = op.get("pros_cons") or []
+            plan_milestone_tracks = op.get("milestone_tracks") or []
+            plan_trust_badges = op.get("trust_badges") or []
+            plan_bar_charts = op.get("bar_charts") or []
+            plan_milestone_unlocks = op.get("milestone_unlocks") or []
         else:
             logger.info("  apply_style: 内容规划中（章节 + 数据展示分析）...")
             content_plan = plan_content(segments, duration, feedback=feedback, word_timestamps=word_timestamps)
@@ -1952,6 +1960,12 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
             plan_location_pins = content_plan.get("location_pins") or []
             plan_testimonials = content_plan.get("testimonials") or []
             plan_icon_clusters = content_plan.get("icon_clusters") or []
+            plan_progress_bars = content_plan.get("progress_bars") or []
+            plan_pros_cons = content_plan.get("pros_cons") or []
+            plan_milestone_tracks = content_plan.get("milestone_tracks") or []
+            plan_trust_badges = content_plan.get("trust_badges") or []
+            plan_bar_charts = content_plan.get("bar_charts") or []
+            plan_milestone_unlocks = content_plan.get("milestone_unlocks") or []
             logger.info(
                 f"  apply_style: 规划出 {len(chapters)} 个章节、{len(data_cards)} 个数据卡、"
                 f"{len(gauges)} 个仪表盘、{len(countdowns)} 个倒计时、{len(calendar_events)} 个日历、"
@@ -2000,6 +2014,18 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
             props["testimonials"] = plan_testimonials
         if plan_icon_clusters:
             props["iconClusters"] = plan_icon_clusters
+        if plan_progress_bars:
+            props["progressBars"] = plan_progress_bars
+        if plan_pros_cons:
+            props["prosCons"] = plan_pros_cons
+        if plan_milestone_tracks:
+            props["milestoneTracks"] = plan_milestone_tracks
+        if plan_trust_badges:
+            props["trustBadges"] = plan_trust_badges
+        if plan_bar_charts:
+            props["barCharts"] = plan_bar_charts
+        if plan_milestone_unlocks:
+            props["milestoneUnlocks"] = plan_milestone_unlocks
 
         # 开场标题卡/片尾 CTA：模板一直支持（IntroTitle/OutroSection），此前管线从不
         # 生成——这是与 video-studio 手工参考成片(VeLL)最大的一块可自动化差距。
@@ -2068,7 +2094,9 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
             for _items in (data_cards, gauges, countdowns, calendar_events,
                            before_after, plan_quotes, plan_pills, plan_step_lists, plan_topic_cards,
                            plan_comparisons, plan_ranked_lists, plan_checklists,
-                           plan_location_pins, plan_testimonials, plan_icon_clusters):
+                           plan_location_pins, plan_testimonials, plan_icon_clusters,
+                           plan_progress_bars, plan_pros_cons, plan_milestone_tracks,
+                           plan_trust_badges, plan_bar_charts, plan_milestone_unlocks):
                 _floor_shift_graphics(_items, _mount_floor)
             _floor_shift_zone_headers(plan_zone_headers, _mount_floor)
 
@@ -2077,7 +2105,9 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
             for _items in (data_cards, gauges, countdowns, calendar_events,
                            before_after, plan_quotes, plan_pills, plan_step_lists, plan_topic_cards,
                            plan_comparisons, plan_ranked_lists, plan_checklists,
-                           plan_location_pins, plan_testimonials, plan_icon_clusters):
+                           plan_location_pins, plan_testimonials, plan_icon_clusters,
+                           plan_progress_bars, plan_pros_cons, plan_milestone_tracks,
+                           plan_trust_badges, plan_bar_charts, plan_milestone_unlocks):
                 _shift_off_dominant_windows(_items, mode_schedule)
             _shift_off_dominant_windows_headers(plan_zone_headers, mode_schedule)
 
@@ -2121,7 +2151,9 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
                               before_after, plan_quotes, plan_pills,
                               plan_step_lists, plan_topic_cards,
                               plan_comparisons, plan_ranked_lists, plan_checklists,
-                              plan_location_pins, plan_testimonials, plan_icon_clusters):
+                              plan_location_pins, plan_testimonials, plan_icon_clusters,
+                              plan_progress_bars, plan_pros_cons, plan_milestone_tracks,
+                              plan_trust_badges, plan_bar_charts, plan_milestone_unlocks):
                     for g in group or []:
                         end = min(int(g.get("endFrame", 0) or 0), duration_frames)
                         last_content_end = max(last_content_end, end)

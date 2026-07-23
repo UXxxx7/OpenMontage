@@ -1491,6 +1491,84 @@ def main():
         }, duration=30.0)
         check(f"{visual} 缺必填内容时整卡跳过，不产出半成品", bad_plan[plan_key] == [], bad_plan[plan_key])
 
+    # 21b. xiaojin arsenal round 3 (2026-07-23) — 6 more content-zone visual
+    # types (progress_bar/pros_cons/milestone_track/trust_badge/bar_chart/
+    # milestone_unlock). Same regression class as round 2 above.
+    new_type_points_r3 = {
+        "progress_bar": {
+            "visual": "progress_bar", "seconds": 5.0, "title": "RENEWAL STEPS",
+            "label": "Document review", "percent": 80, "sub": "4 of 5 steps complete",
+        },
+        "pros_cons": {
+            "visual": "pros_cons", "seconds": 6.0, "title": "Renew vs Lapse",
+            "pros_label": "RENEW", "cons_label": "LAPSE",
+            "pros": ["Same rate locked in", "Coverage stays active"],
+            "cons": ["Rates may increase", "New underwriting required"],
+        },
+        "milestone_track": {
+            "visual": "milestone_track", "title": "Policy Timeline",
+            "milestones": [
+                {"label": "Purchased", "sublabel": "2023", "seconds": 7.0},
+                {"label": "Renewal Due", "sublabel": "2026", "seconds": 9.0},
+            ],
+        },
+        "trust_badge": {
+            "visual": "trust_badge", "seconds": 8.0, "title": "Credentials",
+            "badges": [
+                {"icon": "shield", "primary": "Licensed Agent", "secondary": "CA LICENSE #88291"},
+            ],
+        },
+        "bar_chart": {
+            "visual": "bar_chart", "seconds": 9.0, "title": "Avg Claim Payout",
+            "items": [
+                {"label": "BASIC", "value": 5000, "display_value": "$5K"},
+                {"label": "PREMIUM", "value": 40000, "display_value": "$40K"},
+            ],
+        },
+        "milestone_unlock": {
+            "visual": "milestone_unlock", "seconds": 10.0, "value": 1000,
+            "suffix": "+", "label": "Families Protected", "icon": "award",
+        },
+    }
+    plan_key_by_visual_r3 = {
+        "progress_bar": "progress_bars", "pros_cons": "pros_cons",
+        "milestone_track": "milestone_tracks", "trust_badge": "trust_badges",
+        "bar_chart": "bar_charts", "milestone_unlock": "milestone_unlocks",
+    }
+    for visual, dp in new_type_points_r3.items():
+        plan_key = plan_key_by_visual_r3[visual]
+        solo_plan = _to_frame_plan({
+            "chapters": [{"at_seconds": 0, "label": "A"}],
+            "data_points": [dp],
+        }, duration=30.0)
+        check(f"{visual} 正常映射到 plan['{plan_key}']", len(solo_plan[plan_key]) == 1, solo_plan[plan_key])
+        entry = solo_plan[plan_key][0]
+        check(f"{visual} 计入 _coverage_spans（不会被当成空档）",
+              (entry["mountFrame"], entry["endFrame"]) in _coverage_spans(solo_plan),
+              _coverage_spans(solo_plan))
+        failures = _plan_quality_failures({"data_points": [dp]}, solo_plan, 30.0)
+        check(f"{visual} 计入 total_visuals（不会被质量标准误判为零图形）",
+              not any("ZERO visual moments" in f for f in failures), failures)
+
+    missing_field_points_r3 = {
+        "progress_bar": {"visual": "progress_bar", "seconds": 5.0, "label": "Steps"},  # 没有 percent
+        "pros_cons": {"visual": "pros_cons", "seconds": 6.0, "pros_label": "RENEW",
+                      "cons_label": "LAPSE", "pros": ["x"], "cons": []},  # cons 是空的
+        "milestone_track": {"visual": "milestone_track",
+                             "milestones": [{"label": "A", "seconds": 7.0}]},  # 只有 1 个
+        "trust_badge": {"visual": "trust_badge", "seconds": 8.0, "badges": [{"icon": "shield"}]},  # 缺 primary/secondary
+        "bar_chart": {"visual": "bar_chart", "seconds": 9.0,
+                      "items": [{"label": "A", "value": 1}]},  # 只有 1 项
+        "milestone_unlock": {"visual": "milestone_unlock", "seconds": 10.0, "value": 1000},  # 没有 label
+    }
+    for visual, dp in missing_field_points_r3.items():
+        plan_key = plan_key_by_visual_r3[visual]
+        bad_plan = _to_frame_plan({
+            "chapters": [{"at_seconds": 0, "label": "A"}],
+            "data_points": [dp],
+        }, duration=30.0)
+        check(f"{visual} 缺必填内容时整卡跳过，不产出半成品", bad_plan[plan_key] == [], bad_plan[plan_key])
+
     print()
     if FAILED:
         print(f"{len(FAILED)} FAILED: {FAILED}")

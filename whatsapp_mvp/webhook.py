@@ -600,6 +600,21 @@ def _animations_summary(job) -> Optional[list]:
     for ic in props.get("iconClusters") or []:
         item_count = len(ic.get("items") or [])
         names.append(f"Icon cluster — {ic.get('title') or f'{item_count} items'}")
+    for pb in props.get("progressBars") or []:
+        names.append(f"Progress bar — {pb.get('label', '')}")
+    for pcn in props.get("prosCons") or []:
+        pc_fallback = f"{pcn.get('prosLabel', '')} vs {pcn.get('consLabel', '')}"
+        names.append(f"Pros/cons — {pcn.get('title') or pc_fallback}")
+    for mt in props.get("milestoneTracks") or []:
+        stops = len(mt.get("milestones") or [])
+        names.append(f"Milestone track — {mt.get('title') or f'{stops} stops'}")
+    for tb in props.get("trustBadges") or []:
+        badge_count = len(tb.get("badges") or [])
+        names.append(f"Trust badge — {tb.get('title') or f'{badge_count} credentials'}")
+    for bc in props.get("barCharts") or []:
+        names.append(f"Bar chart — {bc.get('title', '')}")
+    for mu in props.get("milestoneUnlocks") or []:
+        names.append(f"Milestone unlock — {mu.get('label', '')}")
     for sec in props.get("sections") or []:
         if sec.get("timeline"):
             names.append(f"Multi-stage timeline — {sec['timeline'].get('heading', '')}")

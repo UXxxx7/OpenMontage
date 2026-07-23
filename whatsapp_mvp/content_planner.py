@@ -149,6 +149,7 @@ _EST_HEIGHT_BY_VISUAL = {
     "gauge": 330, "countdown": 300, "calendar": 560,
     "before_after": 330, "contact_cue": 200, "topic_card": 180,
     "location_pin": 190, "testimonial": 220,
+    "progress_bar": 190, "milestone_track": 210, "bar_chart": 360, "milestone_unlock": 240,
 }
 _PILL_EST_HEIGHT = 100
 # Calendar.tsx's own default `width` prop — kept in sync manually (component
@@ -178,6 +179,15 @@ CHECKLIST_ITEM_HOLD_FRAMES = 120
 LOCATION_PIN_DISPLAY_FRAMES = 150
 TESTIMONIAL_DISPLAY_FRAMES = 180
 ICON_CLUSTER_DISPLAY_FRAMES = 150
+# xiaojin "arsenal" round 3 (2026-07-23): 6 more content-zone card types
+# (ProgressBar/ProsCons/MilestoneTrack/TrustBadge/BarChart/MilestoneUnlock),
+# same dispatch/stacking machinery as round 2 above.
+PROGRESS_BAR_DISPLAY_FRAMES = 150
+PROS_CONS_DISPLAY_FRAMES = 180
+MILESTONE_TRACK_HOLD_FRAMES = 120
+TRUST_BADGE_DISPLAY_FRAMES = 180
+BAR_CHART_DISPLAY_FRAMES = 180
+MILESTONE_UNLOCK_DISPLAY_FRAMES = 150
 
 
 def _est_height(visual: str, entry: dict) -> int:
@@ -195,6 +205,11 @@ def _est_height(visual: str, entry: dict) -> int:
         return 30 + 68 * len(entry.get("items") or [])
     if visual == "icon_cluster":
         return 70 + 60 * math.ceil(len(entry.get("items") or []) / 3)
+    if visual == "pros_cons":
+        max_items = max(len(entry.get("pros") or []), len(entry.get("cons") or []), 0)
+        return 50 + 34 * max_items
+    if visual == "trust_badge":
+        return 30 + 68 * len(entry.get("badges") or [])
     return _EST_HEIGHT_BY_VISUAL.get(visual, 320)
 
 
@@ -237,6 +252,12 @@ SYSTEM_PROMPT = """You analyze a talking-head video's transcript and produce a c
    - A specific place/city/country/region being named -> "location_pin".
    - A THIRD PARTY's words being quoted (a client, a reviewer, a colleague's remark — NOT the main speaker's own words) -> "testimonial". Distinct from "quote", which is reserved for the main speaker's own striking line.
    - Several related named things mentioned together with no ordering and no hard numbers (works with X/Y/Z, supports A/B/C) -> "icon_cluster". Distinct from step_list (ordered) and topic_card (one single statement).
+   - A plain "how far along" completion figure with no risk or time-remaining framing ("we're 80% done", "4 of 5 steps complete") -> "progress_bar". Distinct from gauge (risk-framed) and countdown (time-remaining framed).
+   - A decision or warning moment where BOTH the upside of one choice AND the downside of the other are spoken together (renew vs. lapse, do this vs. don't) -> "pros_cons". Distinct from comparison, which is a neutral side-by-side of attributes with no good/bad framing.
+   - A short spoken history of 2-4 key dates/events for the same subject ("bought it in 2023, filed a claim in 2024, renewal's now") -> "milestone_track". Distinct from the full-canvas process_timeline (3b below), which is for a multi-stage PROCESS being explained, not a short past history.
+   - The speaker states a credential, license, years of experience, or a trust-building stat about themselves/their business ("licensed agent", "8 years in the business", "10,000 clients served") -> "trust_badge". Only for moments building the SPEAKER'S OWN authority, not a client testimonial (that's "testimonial") or a generic count-up.
+   - Multiple numbers being compared across categories that would naturally read as a CHART, not a ranked list (spending by year, scores by category) -> "bar_chart". Use "ranked_list" instead when the point is explicitly the RANKING (top 3, best X); use "bar_chart" when it's just magnitude-by-category with no ranking implied.
+   - A single big number stated as a genuine achievement/scale moment worth celebrating ("we've protected 1,000 families", "reached 50,000 users") -> "milestone_unlock". Reserve this for a real celebratory beat, not a routine figure — most numbers are still "count_up".
 3b. Multi-stage process timeline: if (and only if) the transcript describes a genuine multi-step SEQUENTIAL process with 3-5 distinct stages, each with its own duration/quantity ("first we do X for N weeks, then Y for M months, then Z..." — a workflow, a production pipeline, a plan with ordered phases), this deserves a full-canvas timeline graphic instead of a data card. It must correspond to exactly one chapter that you also mark "takeover": true (and "icon": null — the timeline fills that space instead) — set "process_timeline" to describe it, referencing that chapter's exact "label" text. This graphic now renders correctly in BOTH color modes (Fix D6, 2026-07-16) — set "dark" on that chapter based on the content's actual tone (a warning/dramatic process -> dark: true, a normal upbeat/neutral one -> dark: false), not as a requirement for the graphic to work. Most videos have none of this; only use it for a real ordered multi-stage process, not a simple list.
 4. Output shape per visual type (all times in seconds, matching when that number/date is actually spoken):
    - count_up: {"visual":"count_up","title":"...","rows":[{"label":"short label in the video's primary language","label_en":"1-3 word UPPERCASE ENGLISH","seconds":12.3,"value":42,"prefix":"","divideBy":1,"decimals":0,"unit":"","tone":"accent|good|bad|normal","end_keyword":"the exact word/short phrase spoken right where this number's sentence finishes, e.g. \"8,400\" or \"premium\""}]} — group values that belong together into ONE card as multiple rows, not separate cards (but see "before_after" above for a two-point comparison of the SAME metric — that's richer as its own visual, not a two-row count_up card). prefix/divideBy/decimals/unit format the number so it's compact and readable (e.g. divideBy 1000000 + decimals 1 -> "1.5" for 1,500,000) — never a raw unformatted number.
@@ -255,6 +276,12 @@ SYSTEM_PROMPT = """You analyze a talking-head video's transcript and produce a c
    - location_pin: {"visual":"location_pin","seconds":12.3,"place":"the place name in the video's primary language","place_en":"optional English form","sub":"optional one-line context, <=60 chars"}
    - testimonial: {"visual":"testimonial","seconds":12.3,"quote":"the exact quoted words, verbatim, <=100 chars","name":"who said it","role":"optional short role/context, e.g. \"Pacific Life client\""}
    - icon_cluster: {"visual":"icon_cluster","seconds":12.3,"title":"optional short UPPERCASE label","items":[{"icon":"chat|camera|play|star|bolt|heart","label":"short label in the video's primary language","label_en":"optional 1-3 word UPPERCASE ENGLISH"}, ...]} — 2-6 items; icon should loosely match each item's nature (chat=messaging/social, camera=recording/photo, play=media/video, star=highlight/favorite, bolt=speed/power/automation, heart=care/community) — default to "star" if nothing fits better.
+   - progress_bar: {"visual":"progress_bar","seconds":12.3,"title":"optional short UPPERCASE label","label":"short label, e.g. \"Document review\"","percent":0-100,"sub":"optional supporting detail, <=60 chars"}
+   - pros_cons: {"visual":"pros_cons","seconds":12.3,"title":"optional short label","pros_label":"short UPPERCASE label for the positive column, e.g. \"RENEW\"","cons_label":"short UPPERCASE label for the negative column, e.g. \"LAPSE\"","pros":["short item, grounded in what was actually said", ...],"cons":["short item, grounded in what was actually said", ...]} — 2-4 items per side.
+   - milestone_track: {"visual":"milestone_track","seconds":12.3,"title":"optional short label","milestones":[{"label":"short label","sublabel":"optional short detail, e.g. a year","seconds":12.3}, ...]} — 2-4 milestones, each "seconds" is when THAT specific milestone is actually spoken.
+   - trust_badge: {"visual":"trust_badge","seconds":12.3,"title":"optional short label","badges":[{"icon":"shield|star|award|clock","primary":"short credential/stat text","secondary":"short supporting label"}, ...]} — 1-3 badges.
+   - bar_chart: {"visual":"bar_chart","seconds":12.3,"title":"...","items":[{"label":"short category name","value":42,"display_value":"optional pre-formatted, e.g. \"$40K\""}, ...]} — 2-4 categories, real numbers actually spoken.
+   - milestone_unlock: {"visual":"milestone_unlock","seconds":12.3,"value":1000,"prefix":"optional, e.g. \"$\"","suffix":"optional, e.g. \"+\"","label":"short label, e.g. \"Families Protected\"","icon":"award|star|heart|bolt"}
 4a. keyword/end_keyword: wherever a shape above lists them, they are optional but STRONGLY preferred whenever the moment has a clear trigger/conclusion word in the transcript — they anchor the graphic's entrance/exit precisely to the words being spoken (checked against the transcript's own timestamps) instead of relying on your estimated "seconds" being exactly right. Always copy the word exactly as it appears in the transcript (same capitalization/punctuation is fine, just don't paraphrase it). Omit only when there's genuinely no single clear word to point to.
 4b. Accent pill: EVERY data point above (count_up/gauge/countdown/calendar/before_after) may additionally carry "pill": a short punchy takeaway line (<=44 chars, in the video's primary spoken language) shown as a full-width accent pill directly under that graphic — e.g. a coverage card's pill might be "Policy Active — Renew in 30 Days". It must be grounded in that exact sentence's content, never invented. Include it whenever the sentence has a natural takeaway (most do); omit only when nothing fits. These pills are how the canvas stays visually full, so prefer including one.
 5. If the transcript has no genuinely dramatic/comparison-worthy moments AND no quote-worthy lines, return an empty data_points array. Do not invent one to fill the response, and do not force a domain's framing (financial, fitness, etc.) onto content that isn't actually about that.
@@ -344,6 +371,8 @@ def plan_content(segments: list[dict], duration: float, *, feedback: Optional[st
         "pills": [], "zone_headers": [], "step_lists": [], "topic_cards": [], "corner_cards": [],
         "comparisons": [], "ranked_lists": [], "checklists": [], "location_pins": [],
         "testimonials": [], "icon_clusters": [],
+        "progress_bars": [], "pros_cons": [], "milestone_tracks": [], "trust_badges": [],
+        "bar_charts": [], "milestone_unlocks": [],
     }
 
     transcript_text = _build_transcript_text(segments)
@@ -838,6 +867,12 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
     location_pins: list[dict] = []
     testimonials: list[dict] = []
     icon_clusters: list[dict] = []
+    progress_bars: list[dict] = []
+    pros_cons: list[dict] = []
+    milestone_tracks: list[dict] = []
+    trust_badges: list[dict] = []
+    bar_charts: list[dict] = []
+    milestone_unlocks: list[dict] = []
     # One (chapter_idx, start, end) window per content-zone stack that
     # reserved header space (see _ZONE_HEADER_HEIGHT/stack_header_offset
     # below) — used after the main loop to emit one ZoneHeader PER STACK,
@@ -1020,6 +1055,18 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
                 entry, target = _plan_testimonial(dp, min_mount), testimonials
             elif visual == "icon_cluster":
                 entry, target = _plan_icon_cluster(dp, min_mount), icon_clusters
+            elif visual == "progress_bar":
+                entry, target = _plan_progress_bar(dp, min_mount), progress_bars
+            elif visual == "pros_cons":
+                entry, target = _plan_pros_cons(dp, min_mount), pros_cons
+            elif visual == "milestone_track":
+                entry, target = _plan_milestone_track(dp, min_mount), milestone_tracks
+            elif visual == "trust_badge":
+                entry, target = _plan_trust_badge(dp, min_mount), trust_badges
+            elif visual == "bar_chart":
+                entry, target = _plan_bar_chart(dp, min_mount), bar_charts
+            elif visual == "milestone_unlock":
+                entry, target = _plan_milestone_unlock(dp, min_mount), milestone_unlocks
             else:
                 entry, target = _plan_count_up(dp, min_mount), data_cards
         except (KeyError, TypeError, ValueError) as e:
@@ -1140,7 +1187,9 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
     for target_list in (data_cards, quotes, gauges, countdowns, calendar_events,
                         before_afters, contact_cues, pills, step_lists, topic_cards,
                         corner_cards, comparisons, ranked_lists, checklists,
-                        location_pins, testimonials, icon_clusters):
+                        location_pins, testimonials, icon_clusters,
+                        progress_bars, pros_cons, milestone_tracks, trust_badges,
+                        bar_charts, milestone_unlocks):
         target_list[:] = [
             e for e in target_list
             if e.get("endFrame", e.get("mountFrame", 0) + 1) > e.get("mountFrame", 0)
@@ -1189,7 +1238,9 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
             for group in (gauges, countdowns, calendar_events, data_cards,
                           before_afters, pills, step_lists, topic_cards,
                           comparisons, ranked_lists, checklists, location_pins,
-                          testimonials, icon_clusters):
+                          testimonials, icon_clusters,
+                          progress_bars, pros_cons, milestone_tracks, trust_badges,
+                          bar_charts, milestone_unlocks):
                 for g in group:
                     g_end = g.get("endFrame", g.get("mountFrame", start))
                     if g["mountFrame"] < natural_end and g_end > start:
@@ -1401,7 +1452,9 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
     slotted = sorted(
         (g for g in (data_cards + gauges + countdowns + calendar_events + quotes + before_afters
                       + step_lists + topic_cards + comparisons + ranked_lists + checklists
-                      + location_pins + testimonials + icon_clusters)),
+                      + location_pins + testimonials + icon_clusters
+                      + progress_bars + pros_cons + milestone_tracks + trust_badges
+                      + bar_charts + milestone_unlocks)),
         key=lambda g: g["mountFrame"],
     )
     for cur, nxt in zip(slotted, slotted[1:]):
@@ -1459,6 +1512,7 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
         data_cards, gauges, countdowns, calendar_events, before_afters,
         pills, step_lists, topic_cards,
         comparisons, ranked_lists, checklists, location_pins, testimonials, icon_clusters,
+        progress_bars, pros_cons, milestone_tracks, trust_badges, bar_charts, milestone_unlocks,
     )
 
     # Fix C31（2026-07-20，真实生产复现——用户直接从交付的成片里抓到：WORKFLOW
@@ -1476,7 +1530,8 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
     final_workflow_ranges = list(workflow_ranges)
     for _items in (data_cards, gauges, countdowns, calendar_events, before_afters,
                    pills, step_lists, topic_cards,
-                   comparisons, ranked_lists, checklists, location_pins, testimonials, icon_clusters):
+                   comparisons, ranked_lists, checklists, location_pins, testimonials, icon_clusters,
+                   progress_bars, pros_cons, milestone_tracks, trust_badges, bar_charts, milestone_unlocks):
         for _it in _items:
             if "mountFrame" in _it and "endFrame" in _it:
                 final_workflow_ranges.append((_it["mountFrame"], _it["endFrame"], _CONTENT_ZONE_WIDTH))
@@ -1492,6 +1547,8 @@ def _to_frame_plan(raw: dict, duration: float) -> dict[str, Any]:
         "topic_cards": topic_cards, "corner_cards": corner_cards,
         "comparisons": comparisons, "ranked_lists": ranked_lists, "checklists": checklists,
         "location_pins": location_pins, "testimonials": testimonials, "icon_clusters": icon_clusters,
+        "progress_bars": progress_bars, "pros_cons": pros_cons, "milestone_tracks": milestone_tracks,
+        "trust_badges": trust_badges, "bar_charts": bar_charts, "milestone_unlocks": milestone_unlocks,
     }
 
 
@@ -1618,6 +1675,16 @@ def _dp_seconds(dp: dict) -> float:
         # on its own spoken beat (see _plan_checklist).
         secs: list[float] = []
         for it in dp.get("items") or []:
+            try:
+                secs.append(float(it["seconds"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        return min(secs) if secs else float("inf")
+    if visual == "milestone_track":
+        # Same shape as step_list/checklist — no top-level "seconds", each
+        # milestone has its own spoken beat (see _plan_milestone_track).
+        secs: list[float] = []
+        for it in dp.get("milestones") or []:
             try:
                 secs.append(float(it["seconds"]))
             except (KeyError, TypeError, ValueError):
@@ -1983,6 +2050,184 @@ def _plan_icon_cluster(dp: dict, min_mount_frame: int) -> Optional[dict]:
     }
     if dp.get("title"):
         entry["title"] = str(dp["title"])[:40]
+    return entry
+
+
+def _plan_progress_bar(dp: dict, min_mount_frame: int) -> Optional[dict]:
+    """Straight linear completion bar (ProgressBarCard) — for a plain "how
+    far along is this" moment, distinct from gauge (risk-framed) and
+    countdown (time-remaining framed)."""
+    label = str(dp.get("label", "")).strip()
+    percent = _num(dp.get("percent"))
+    if not label or percent is None:
+        return None
+    sec = float(dp["seconds"])
+    mount_frame = max(min_mount_frame, round(sec * FPS) - MOUNT_LEAD_FRAMES)
+    end_frame = _grounded_or_fallback_end(dp, mount_frame, mount_frame + PROGRESS_BAR_DISPLAY_FRAMES)
+    entry: dict[str, Any] = {
+        "label": label[:40], "percent": max(0.0, min(100.0, percent)),
+        "x": _CONTENT_ZONE_X, "y": _CONTENT_ZONE_Y, "width": _CONTENT_ZONE_WIDTH,
+        "mountFrame": mount_frame, "endFrame": end_frame,
+    }
+    if dp.get("title"):
+        entry["title"] = str(dp["title"])[:40]
+    if dp.get("sub"):
+        entry["subtext"] = str(dp["sub"])[:60]
+    return entry
+
+
+def _plan_pros_cons(dp: dict, min_mount_frame: int) -> Optional[dict]:
+    """Polarized two-column pros/cons (ProsConsCard) — distinct from
+    comparison (neutral labeled columns): baked-in good/bad framing for a
+    decision or warning moment."""
+    pros = [str(it).strip()[:60] for it in (dp.get("pros") or []) if str(it).strip()]
+    cons = [str(it).strip()[:60] for it in (dp.get("cons") or []) if str(it).strip()]
+    pros_label = str(dp.get("pros_label", "")).strip()
+    cons_label = str(dp.get("cons_label", "")).strip()
+    if not pros or not cons or not pros_label or not cons_label:
+        return None
+    sec = float(dp["seconds"])
+    mount_frame = max(min_mount_frame, round(sec * FPS) - MOUNT_LEAD_FRAMES)
+    end_frame = _grounded_or_fallback_end(dp, mount_frame, mount_frame + PROS_CONS_DISPLAY_FRAMES)
+    entry: dict[str, Any] = {
+        "prosLabel": pros_label[:16], "consLabel": cons_label[:16],
+        "pros": pros[:4], "cons": cons[:4],
+        "x": _CONTENT_ZONE_X, "y": _CONTENT_ZONE_Y, "width": _CONTENT_ZONE_WIDTH,
+        "mountFrame": mount_frame, "endFrame": end_frame,
+    }
+    if dp.get("title"):
+        entry["title"] = str(dp["title"])[:40]
+    return entry
+
+
+def _plan_milestone_track(dp: dict, min_mount_frame: int) -> Optional[dict]:
+    """Lightweight inline history dot-track (MilestoneTrackCard) — distinct
+    from process_timeline (full-canvas dark takeover): stays in the normal
+    content zone for a quick journey/history beat that doesn't warrant
+    taking over the screen (same "each row has its own seconds" shape as
+    step_list/checklist, see _plan_step_list)."""
+    items_in = dp.get("milestones") or []
+    item_seconds: list[float] = []
+    for it in items_in:
+        if not isinstance(it, dict):
+            return None
+        try:
+            item_seconds.append(float(it["seconds"]))
+        except (KeyError, TypeError, ValueError):
+            return None
+    if len(item_seconds) < 2:
+        return None
+    card_mount_frame = max(min_mount_frame, round(min(item_seconds) * FPS) - MOUNT_LEAD_FRAMES)
+    milestones: list[dict] = []
+    for it, sec in zip(items_in, item_seconds):
+        label = str(it.get("label", "")).strip()
+        if not label:
+            continue
+        m: dict[str, Any] = {"label": label[:20]}
+        if it.get("sublabel"):
+            m["sublabel"] = str(it["sublabel"])[:16]
+        milestones.append(m)
+    milestones = milestones[:4]
+    if len(milestones) < 2:
+        return None
+    last_frame = round(max(item_seconds) * FPS)
+    end_frame = max(last_frame, card_mount_frame) + MILESTONE_TRACK_HOLD_FRAMES
+    entry: dict[str, Any] = {
+        "milestones": milestones,
+        "x": _CONTENT_ZONE_X, "y": _CONTENT_ZONE_Y, "width": _CONTENT_ZONE_WIDTH,
+        "mountFrame": card_mount_frame, "endFrame": end_frame,
+    }
+    if dp.get("title"):
+        entry["title"] = str(dp["title"])[:40]
+    return entry
+
+
+def _plan_trust_badge(dp: dict, min_mount_frame: int) -> Optional[dict]:
+    """Credential/authority stack (TrustBadgeCard) — icon + stat/credential
+    rows, for a moment building the speaker's own trust rather than
+    conveying a number/date. Distinct from testimonial (a third party's
+    words)."""
+    valid_icons = ("shield", "star", "award", "clock")
+    items_in = dp.get("badges") or []
+    badges: list[dict] = []
+    for it in items_in:
+        if not isinstance(it, dict):
+            continue
+        primary = str(it.get("primary", "")).strip()
+        secondary = str(it.get("secondary", "")).strip()
+        if not primary or not secondary:
+            continue
+        icon = it.get("icon") if it.get("icon") in valid_icons else "shield"
+        badges.append({"icon": icon, "primary": primary[:28], "secondary": secondary[:32]})
+    if not badges:
+        return None
+    sec = float(dp["seconds"])
+    mount_frame = max(min_mount_frame, round(sec * FPS) - MOUNT_LEAD_FRAMES)
+    end_frame = _grounded_or_fallback_end(dp, mount_frame, mount_frame + TRUST_BADGE_DISPLAY_FRAMES)
+    entry: dict[str, Any] = {
+        "badges": badges[:3],
+        "x": _CONTENT_ZONE_X, "y": _CONTENT_ZONE_Y, "width": _CONTENT_ZONE_WIDTH,
+        "mountFrame": mount_frame, "endFrame": end_frame,
+    }
+    if dp.get("title"):
+        entry["title"] = str(dp["title"])[:40]
+    return entry
+
+
+def _plan_bar_chart(dp: dict, min_mount_frame: int) -> Optional[dict]:
+    """Real axis-based column chart (BarChartCard) — for genuinely
+    chart-shaped multi-value data, distinct from ranked_list (a ranked list
+    of single values with rank badges, not a chart)."""
+    items_in = dp.get("items") or []
+    items: list[dict] = []
+    for it in items_in:
+        if not isinstance(it, dict):
+            continue
+        label = str(it.get("label", "")).strip()
+        value = _num(it.get("value"))
+        if not label or value is None:
+            continue
+        item: dict[str, Any] = {"label": label[:16], "value": value}
+        if it.get("display_value"):
+            item["displayValue"] = str(it["display_value"])[:12]
+        items.append(item)
+    if len(items) < 2:
+        return None
+    sec = float(dp["seconds"])
+    mount_frame = max(min_mount_frame, round(sec * FPS) - MOUNT_LEAD_FRAMES)
+    end_frame = _grounded_or_fallback_end(dp, mount_frame, mount_frame + BAR_CHART_DISPLAY_FRAMES)
+    entry: dict[str, Any] = {
+        "items": items[:4],
+        "x": _CONTENT_ZONE_X, "y": _CONTENT_ZONE_Y, "width": _CONTENT_ZONE_WIDTH,
+        "mountFrame": mount_frame, "endFrame": end_frame,
+    }
+    if dp.get("title"):
+        entry["title"] = str(dp["title"])[:40]
+    return entry
+
+
+def _plan_milestone_unlock(dp: dict, min_mount_frame: int) -> Optional[dict]:
+    """Celebratory single-number reveal (MilestoneUnlockCard) — reserved for
+    a genuine scale/achievement moment, distinct from a routine count_up
+    row."""
+    value = _num(dp.get("value"))
+    label = str(dp.get("label", "")).strip()
+    if value is None or not label:
+        return None
+    valid_icons = ("award", "star", "heart", "bolt")
+    icon = dp.get("icon") if dp.get("icon") in valid_icons else "award"
+    sec = float(dp["seconds"])
+    mount_frame = max(min_mount_frame, round(sec * FPS) - MOUNT_LEAD_FRAMES)
+    end_frame = _grounded_or_fallback_end(dp, mount_frame, mount_frame + MILESTONE_UNLOCK_DISPLAY_FRAMES)
+    entry: dict[str, Any] = {
+        "value": value, "label": label[:28], "icon": icon,
+        "x": _CONTENT_ZONE_X, "y": _CONTENT_ZONE_Y, "width": _CONTENT_ZONE_WIDTH,
+        "mountFrame": mount_frame, "endFrame": end_frame,
+    }
+    if dp.get("suffix"):
+        entry["suffix"] = str(dp["suffix"])[:4]
+    if dp.get("prefix"):
+        entry["prefix"] = str(dp["prefix"])[:4]
     return entry
 
 
@@ -2664,6 +2909,8 @@ def _plan_quality_failures(raw: dict, plan: dict, duration: float, segments: Opt
             + len(plan["sections"])
             + len(plan["comparisons"]) + len(plan["ranked_lists"]) + len(plan["checklists"])
             + len(plan["location_pins"]) + len(plan["testimonials"]) + len(plan["icon_clusters"])
+            + len(plan["progress_bars"]) + len(plan["pros_cons"]) + len(plan["milestone_tracks"])
+            + len(plan["trust_badges"]) + len(plan["bar_charts"]) + len(plan["milestone_unlocks"])
         )
         if total_visuals == 0:
             failures.append(
@@ -2780,7 +3027,9 @@ def _coverage_spans(plan: dict) -> list[tuple[int, int]]:
               + plan["calendar_events"] + plan["quotes"] + plan["topic_cards"]
               + plan["step_lists"] + plan["corner_cards"]
               + plan["comparisons"] + plan["ranked_lists"] + plan["checklists"]
-              + plan["location_pins"] + plan["testimonials"] + plan["icon_clusters"]):
+              + plan["location_pins"] + plan["testimonials"] + plan["icon_clusters"]
+              + plan["progress_bars"] + plan["pros_cons"] + plan["milestone_tracks"]
+              + plan["trust_badges"] + plan["bar_charts"] + plan["milestone_unlocks"]):
         spans.append((g["mountFrame"], g.get("endFrame", g["mountFrame"] + 90)))
     for sec in plan["sections"]:
         spans.append((sec["fromFrame"], sec["toFrame"]))

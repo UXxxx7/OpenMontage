@@ -78,6 +78,12 @@ import { ChecklistCard, ChecklistCardProps } from "./components/xiaojin/Checklis
 import { LocationPinCard, LocationPinCardProps } from "./components/xiaojin/LocationPinCard";
 import { TestimonialCard, TestimonialCardProps } from "./components/xiaojin/TestimonialCard";
 import { IconClusterCard, IconClusterCardProps } from "./components/xiaojin/IconClusterCard";
+import { ProgressBarCard, ProgressBarCardProps } from "./components/xiaojin/ProgressBarCard";
+import { ProsConsCard, ProsConsCardProps } from "./components/xiaojin/ProsConsCard";
+import { MilestoneTrackCard, MilestoneTrackCardProps } from "./components/xiaojin/MilestoneTrackCard";
+import { TrustBadgeCard, TrustBadgeCardProps } from "./components/xiaojin/TrustBadgeCard";
+import { BarChartCard, BarChartCardProps } from "./components/xiaojin/BarChartCard";
+import { MilestoneUnlockCard, MilestoneUnlockCardProps } from "./components/xiaojin/MilestoneUnlockCard";
 import { ColorMode } from "./components/xiaojin/theme";
 
 export interface ComplianceInfo {
@@ -133,6 +139,12 @@ export type ChecklistCardItem = Omit<ChecklistCardProps, "colorMode" | "headingF
 export type LocationPinCardItem = Omit<LocationPinCardProps, "colorMode" | "headingFont" | "labelFont">;
 export type TestimonialCardItem = Omit<TestimonialCardProps, "colorMode" | "headingFont" | "labelFont">;
 export type IconClusterCardItem = Omit<IconClusterCardProps, "colorMode" | "headingFont" | "labelFont">;
+export type ProgressBarCardItem = Omit<ProgressBarCardProps, "colorMode" | "headingFont" | "labelFont">;
+export type ProsConsCardItem = Omit<ProsConsCardProps, "colorMode" | "headingFont" | "labelFont">;
+export type MilestoneTrackCardItem = Omit<MilestoneTrackCardProps, "colorMode" | "headingFont" | "labelFont">;
+export type TrustBadgeCardItem = Omit<TrustBadgeCardProps, "colorMode" | "headingFont" | "labelFont">;
+export type BarChartCardItem = Omit<BarChartCardProps, "colorMode" | "headingFont" | "labelFont">;
+export type MilestoneUnlockCardItem = Omit<MilestoneUnlockCardProps, "colorMode" | "headingFont" | "labelFont">;
 
 export interface OutroInfo {
   kicker: string;
@@ -195,6 +207,18 @@ export interface XiaojinEditorialProps extends Record<string, unknown> {
   testimonials?: TestimonialCardItem[];
   /** An unordered set of related named things — see IconClusterCard. */
   iconClusters?: IconClusterCardItem[];
+  /** Straight linear completion bars — see ProgressBarCard. */
+  progressBars?: ProgressBarCardItem[];
+  /** Polarized two-column pros/cons — see ProsConsCard. */
+  prosCons?: ProsConsCardItem[];
+  /** Lightweight inline history dot-tracks — see MilestoneTrackCard. */
+  milestoneTracks?: MilestoneTrackCardItem[];
+  /** Credential/authority stacks — see TrustBadgeCard. */
+  trustBadges?: TrustBadgeCardItem[];
+  /** Real axis-based column charts — see BarChartCard. */
+  barCharts?: BarChartCardItem[];
+  /** Celebratory single-number reveals — see MilestoneUnlockCard. */
+  milestoneUnlocks?: MilestoneUnlockCardItem[];
   /** QR + WhatsApp CTA close. Only set when a real contact URL was actually supplied. */
   qrContact?: QRContact;
   /** "Pattern 2" dark title-card intro (see IntroTitle's doc comment). Omit to skip. */
@@ -279,6 +303,12 @@ export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = ({
   locationPins,
   testimonials,
   iconClusters,
+  progressBars,
+  prosCons,
+  milestoneTracks,
+  trustBadges,
+  barCharts,
+  milestoneUnlocks,
   qrContact,
   intro,
   outro,
@@ -408,6 +438,24 @@ export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = ({
       ))}
       {iconClusters?.map((card, i) => (
         <IconClusterCard key={i} {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+      ))}
+      {progressBars?.map((card, i) => (
+        <ProgressBarCard key={i} {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+      ))}
+      {prosCons?.map((card, i) => (
+        <ProsConsCard key={i} {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+      ))}
+      {milestoneTracks?.map((card, i) => (
+        <MilestoneTrackCard key={i} {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+      ))}
+      {trustBadges?.map((card, i) => (
+        <TrustBadgeCard key={i} {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+      ))}
+      {barCharts?.map((card, i) => (
+        <BarChartCard key={i} {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+      ))}
+      {milestoneUnlocks?.map((card, i) => (
+        <MilestoneUnlockCard key={i} {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
       ))}
       {/* outro renders BEFORE qrContact (not the other way around): OutroSection
           paints an opaque full-canvas background (y=88 to H-72). Rendering
