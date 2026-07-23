@@ -2475,6 +2475,91 @@ def _ungrounded_count_up_rows(raw: dict, segments: list[dict]) -> list[str]:
     return bad
 
 
+def _uncovered_spoken_values(raw: dict, segments: list[dict]) -> list[str]:
+    """Spoken numeric figures (dollar amounts and word-form big numbers) with
+    NO matching count_up row or before_after value anywhere in the plan —
+    the mirror image of `_ungrounded_count_up_rows` (that one catches a card
+    value with no matching spoken figure; this one catches a spoken figure
+    with no matching card).
+
+    Confirmed real bug (2026-07-23, WhatsApp-delivered preview of the David/
+    Pacific Life renewal video): the same sentence ("your current plan covers
+    you for one and a half million and your annual premium is $8,400")
+    produced a plan with ONLY the Premium row — Coverage's $1.5M was silently
+    dropped even though $8,400 survived from the exact same sentence. C41
+    (`has_numeric_card`, criterion 4 below) only checks "does at least one
+    numeric card exist anywhere" — that check passes here because the
+    Premium card exists; it has no opinion on whether EVERY distinct spoken
+    figure got covered, so a plan that keeps one figure and drops another
+    sails through clean.
+
+    Only checks count_up rows and before_after left/right values — gauge's
+    "value" is a 0-1 risk fraction and countdown's is a day-count, neither is
+    a monetary figure, so including them would risk a coincidental numeric
+    match against a semantically unrelated field. Same scale-ambiguity
+    tolerance as `_ungrounded_count_up_rows` (a plan value may legitimately
+    be raw OR pre-scaled per SYSTEM_PROMPT's two conventions), just applied
+    in the opposite direction — expand the PLAN's values up through the
+    scale factors instead of the candidates down."""
+    candidates = _grounded_spoken_values(segments)
+    if not candidates:
+        return []
+    plan_values: list[float] = []
+    for dp in raw.get("data_points", []) or []:
+        if not isinstance(dp, dict):
+            continue
+        if dp.get("visual") == "count_up":
+            for r in (dp.get("rows") or []):
+                if isinstance(r, dict):
+                    v = _num(r.get("value"))
+                    if v is not None:
+                        plan_values.append(v)
+        elif dp.get("visual") == "before_after":
+            for key in ("leftValue", "rightValue"):
+                v = _num(dp.get(key))
+                if v is not None:
+                    plan_values.append(v)
+    expanded_plan = [scaled for v in plan_values for scaled in (v, v * 1_000, v * 1_000_000)]
+    missing: list[str] = []
+    seen: set = set()
+    for c in candidates:
+        if any(abs(c - p) <= max(abs(c), 1.0) * 0.01 for p in expanded_plan):
+            continue
+        label = f"{c:g}"
+        if label not in seen:
+            seen.add(label)
+            missing.append(label)
+    return missing
+
+
+# 一句话里同时出现"还剩 N 天/周/月"式的倒计时措辞和一个具体月份名——续保/到期
+# 类句子的典型形状("renewal in 30 days on the 28th of July")。范围刻意收窄到
+# 这个具体组合，不是"凡是提到天数就该有倒计时"（那会在描述时长的无关句子上
+# 大量误报，例如"我做这行十年了"、分步流程里的"用了三天完成"）。
+_COUNTDOWN_PHRASE_RE = re.compile(r"\b\d{1,3}\s*(?:day|days|week|weeks|month|months)\b", re.IGNORECASE)
+_MONTH_NAME_RE = re.compile(
+    r"\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\b",
+    re.IGNORECASE,
+)
+
+
+def _spoken_countdown_and_date_together(segments: list[dict]) -> bool:
+    """True when the SAME transcript segment names both a time-remaining
+    figure ("30 days") and a calendar month — the shape of a renewal-style
+    sentence describing one event two ways. Confirmed real bug (2026-07-23,
+    same job as `_uncovered_spoken_values`): "30 days on the 28th of July"
+    landed in one ASR segment (verified against the real transcript), the
+    plan produced a calendar card for July 28th but zero countdown cards for
+    the 30-day figure — content_planner's own SYSTEM_PROMPT treats countdown
+    and calendar as two independently flaggable moments for exactly this
+    kind of sentence, but nothing enforced that both actually get emitted."""
+    for seg in segments or []:
+        text = str(seg.get("text", ""))
+        if _COUNTDOWN_PHRASE_RE.search(text) and _MONTH_NAME_RE.search(text):
+            return True
+    return False
+
+
 def _plan_quality_failures(raw: dict, plan: dict, duration: float, segments: Optional[list[dict]] = None) -> list[str]:
     """规划质量标准——纯函数、确定性、不依赖 LLM 自评。plan_content 的
     criterion loop 每轮规划后跑一遍：返回空列表 = 全部达标（提前退出循环）；
@@ -2511,6 +2596,23 @@ def _plan_quality_failures(raw: dict, plan: dict, duration: float, segments: Opt
        （"$8,400"）和词面大数（"one and a half million"），只在转写里确实
        能解析出至少一个数字候选时才生效，避免误伤解析不了的行（百分比、
        小计数等）。
+    6. 说了多个具体数字，但只有一部分落进了卡片——2026-07-23 真实复现（WhatsApp
+       实际交付的预览）：同一句话里 "one and a half million" 和 "$8,400" 都被
+       说出来了，规划却只留下 Premium 那一张卡，Coverage 的 $1.5M 整个消失。
+       标准 4 只查"有没有数字卡"，这里已经有一张（Premium），检查照样通过；
+       标准 5 只查"卡片里的数字有没有编造"，这张卡的数字（$8,400）也确实是
+       转写里说的，同样通过。两条现有标准都不覆盖"漏了另一个数字"这一种情况。
+       `_uncovered_spoken_values` 反过来查：每一个转写里说过的数字，有没有
+       在某张 count_up/before_after 卡里落地——跟标准 5 用同一套刻度换算兜底
+       （卡片数值可能是原始值也可能是已经缩放过的），方向相反而已。
+    7. 同一句话里既有"还剩 N 天"式的倒计时措辞，又有具体月份/日期，但规划
+       只产出日历卡，倒计时整个消失——同一次真实复现："30 days on the 28th
+       of July" 落在同一个转写分段里（真实数据验证过），SYSTEM_PROMPT 把倒计
+       时和日历当成同一句话可以各自独立触发的两个数据点，但没有任何机制
+       保证两个都真的被产出。`_spoken_countdown_and_date_together` 的匹配范围
+       刻意收窄到"倒计时措辞跟月份名同段共现"，不是"凡是提到天数就该有倒计
+       时"，避免在描述时长的无关句子上（"我做这行十年了"、分步流程的"用了
+       三天完成"）大量误报。
     """
     failures: list[str] = []
     if duration >= _MIN_DURATION_FOR_VISUALS_S:
@@ -2568,6 +2670,24 @@ def _plan_quality_failures(raw: dict, plan: dict, duration: float, segments: Opt
             f"figures: {', '.join(f'{v:g}' for v in spoken)} — re-read the transcript and use "
             "the exact spoken figure for this card, do not invent or approximate a nearby "
             "number."
+        )
+    uncovered_values = _uncovered_spoken_values(raw, segments or [])
+    if uncovered_values:
+        failures.append(
+            f"These figure(s) are spoken in the transcript but have NO matching count_up/"
+            f"before_after value anywhere in the plan: {', '.join(uncovered_values)}. If multiple "
+            "distinct numbers are spoken in the same sentence/moment (e.g. a coverage amount AND "
+            "a premium amount), each one needs its OWN row/card — do not keep only one number and "
+            "silently drop the other."
+        )
+    if (_spoken_countdown_and_date_together(segments or [])
+            and plan["calendar_events"] and not plan["countdowns"]):
+        failures.append(
+            "The transcript names both a time-remaining figure (e.g. \"N days\") and a specific "
+            "calendar date for the same event, but the plan only produced a calendar card and ZERO "
+            "countdown cards. Add a \"countdown\" data point for the day-count figure IN ADDITION "
+            "to the calendar — they are two independently valid visuals for the same moment, not "
+            "alternatives."
         )
     return failures
 

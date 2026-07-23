@@ -1100,6 +1100,84 @@ def main():
     check("转写里实际说的数字（$8,400/$1.5M，含词面大数）不被标准 5 误报",
           not any("do not match ANY number" in f for f in f_correct), f_correct)
 
+    # 16f1. 标准 6（新增，2026-07-23，真实 WhatsApp 交付的预览复现）——真实
+    # segment 数据（job_452ef6c48100 的 _op_nofiller_transcript.json 原文，
+    # "30 days on the 28th of July" 跟 "renewal in" 分属两个 ASR 分段，验证过
+    # 不是简化过的测试夹具）：转写里 "$8,400" 和 "one and a half million" 同一
+    # 句话都说了，规划却只留下 Premium 卡，Coverage 的 $1.5M 消失——标准 4/5
+    # 都不会抓到这种情况（各自的检查角度不覆盖"漏了另一个数字"）。
+    real_segments = [
+        {"start": 0.21, "end": 7.99, "text": "Hi there, it's David from Pacific life quick "
+                                              "reminder your policy is coming up for renewal in"},
+        {"start": 7.99, "end": 11.23, "text": "30 days on the 28th of July"},
+        {"start": 11.23, "end": 17.43, "text": "Your current plan covers you for one and a half "
+                                                "million and your annual premium is"},
+        {"start": 17.43, "end": 23.54, "text": "$8,400 I've put the full breakdown in this video. "
+                                                "So you have everything in one place"},
+    ]
+    premium_only_raw = {"data_points": [
+        {"visual": "count_up", "title": "Premium", "rows": [
+            {"label": "Premium", "seconds": 18.0, "value": 8400, "divideBy": 1, "decimals": 0,
+             "prefix": "$"}]},
+        {"visual": "calendar", "seconds": 9.0, "year": 2026, "month": 7, "targetDay": 28,
+         "eventLabel": "RENEWAL"},
+    ]}
+    premium_only_plan = _to_frame_plan({"chapters": [], **premium_only_raw}, duration=30.0)
+    f_premium_only = _plan_quality_failures(premium_only_raw, premium_only_plan, 30.0, real_segments)
+    check("Coverage 的 $1.5M 有说但没卡时被标准 6 抓住（标准 4/5 都不会触发）",
+          any("1.5e+06" in f or "1.5" in f for f in f_premium_only)
+          and not any("explicitly says" in f for f in f_premium_only)
+          and not any("do not match ANY number" in f for f in f_premium_only),
+          f_premium_only)
+
+    both_covered_raw = {"data_points": [
+        {"visual": "count_up", "title": "Your Coverage & Premium", "rows": [
+            {"label": "Coverage", "seconds": 12.0, "value": 1500000, "divideBy": 1000000,
+             "decimals": 1, "prefix": "$", "unit": "M"},
+            {"label": "Premium", "seconds": 18.0, "value": 8400, "divideBy": 1, "decimals": 0,
+             "prefix": "$"},
+        ]},
+        {"visual": "calendar", "seconds": 9.0, "year": 2026, "month": 7, "targetDay": 28,
+         "eventLabel": "RENEWAL"},
+    ]}
+    both_covered_plan = _to_frame_plan({"chapters": [], **both_covered_raw}, duration=30.0)
+    f_both_covered = _plan_quality_failures(both_covered_raw, both_covered_plan, 30.0, real_segments)
+    check("Coverage 和 Premium 都有对应卡片时标准 6 不误报",
+          not any("NO matching count_up" in f for f in f_both_covered), f_both_covered)
+
+    # 16f1b. 标准 7（新增，同一次真实复现）——转写里 "30 days" 和 "July" 同一个
+    # ASR 分段里共现，规划只产出日历卡（July 28），倒计时("30 DAYS")整个消失。
+    calendar_only_raw = {"data_points": [
+        {"visual": "calendar", "seconds": 9.0, "year": 2026, "month": 7, "targetDay": 28,
+         "eventLabel": "RENEWAL"},
+    ]}
+    calendar_only_plan = _to_frame_plan({"chapters": [], **calendar_only_raw}, duration=30.0)
+    f_calendar_only = _plan_quality_failures(calendar_only_raw, calendar_only_plan, 30.0, real_segments)
+    check("倒计时措辞跟月份名同段共现，但只有日历卡没有倒计时卡时被标准 7 抓住",
+          any("countdown" in f and "calendar" in f for f in f_calendar_only), f_calendar_only)
+
+    both_countdown_and_calendar_raw = {"data_points": [
+        {"visual": "calendar", "seconds": 9.0, "year": 2026, "month": 7, "targetDay": 28,
+         "eventLabel": "RENEWAL"},
+        {"visual": "countdown", "seconds": 8.0, "value": 30, "unitLabel": "DAYS", "label": "RENEWAL",
+         "headline": "Your policy renews in 30 days"},
+    ]}
+    both_cd_plan = _to_frame_plan({"chapters": [], **both_countdown_and_calendar_raw}, duration=30.0)
+    f_both_cd = _plan_quality_failures(both_countdown_and_calendar_raw, both_cd_plan, 30.0, real_segments)
+    check("日历卡和倒计时卡都有时标准 7 不误报",
+          not any("ZERO countdown cards" in f for f in f_both_cd), f_both_cd)
+
+    unrelated_days_raw = {"data_points": [
+        {"visual": "topic_card", "seconds": 5.0, "headline": "I've done this for ten years", "icon": "check"},
+    ]}
+    unrelated_segments = [
+        {"start": 0.0, "end": 5.0, "text": "I've been doing this job for ten years now."},
+    ]
+    unrelated_plan = _to_frame_plan({"chapters": [], **unrelated_days_raw}, duration=20.0)
+    f_unrelated = _plan_quality_failures(unrelated_days_raw, unrelated_plan, 20.0, unrelated_segments)
+    check("无关的时长描述句（没有月份名同段共现）不触发标准 7 的误报",
+          not any("ZERO countdown cards" in f for f in f_unrelated), f_unrelated)
+
     # 16f. Fix C42 —— process_timeline.chapter_label 跟 chapters[].label 精确
     # 匹配失败时，退回到唯一被标记 takeover 的章节，而不是整段丢弃。
     timeline_chapters = [

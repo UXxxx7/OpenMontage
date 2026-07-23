@@ -15,6 +15,36 @@
 
 ---
 
+## 2026-07-23 (2) — "at least one card" and "no invented numbers" don't guarantee "every spoken number got a card" (C51/C52)
+- **Who**: Claude
+- **Branch/commit**: worktree-whatsapp-message-fix (uncommitted at time of writing)
+- **What changed**: two new `_plan_quality_failures` criteria in `content_planner.py`.
+  `_uncovered_spoken_values` (criterion 6) flags a spoken monetary figure with no
+  matching count_up/before_after value anywhere in the plan — the mirror image of
+  C45's `_ungrounded_count_up_rows`. `_spoken_countdown_and_date_together` (criterion 7)
+  flags a calendar-only plan when the transcript names both a countdown-style
+  day-count and a calendar month in the same ASR segment.
+- **Why / impact**: user reported a genuine WhatsApp-delivered preview of the David/
+  Pacific Life fixture missing the Coverage ($1.5M) card, the renewal countdown, and
+  the outro, worried it was a regression of a previously-fixed bug (possibly from a
+  collaborator's in-progress filler-removal work). Direct transcription + frame
+  inspection of the actual delivered video showed the cutting was clean (the known
+  duplicate retake was correctly collapsed to one instance) — the real cause was
+  content_planner dropping the Coverage figure and the countdown while keeping the
+  Premium figure and calendar from the very same sentence. Neither C41 ("at least one
+  numeric card exists") nor C45 ("no card's number is invented") covers "some numbers
+  present, others silently dropped" — a real gap in the existing criteria, not a
+  regression. See `whatsapp_mvp/CLAUDE.md` Rule 23.
+- **Status**: 🧪 to verify. Both criteria validated at the unit level against REAL
+  segment data pulled from `storage/jobs/job_452ef6c48100/_op_nofiller_transcript.json`
+  (confirms "30 days" and "the 28th of July" land in the same ASR segment despite
+  being split across captions), correctly silent when the plan is complete or the
+  transcript is unrelated. Full 6-suite test run clean. Outro's absence not yet
+  root-caused (couldn't access the exact job that produced the reported preview to
+  inspect its props directly) — flagged as an open question, not guessed at.
+
+---
+
 ## 2026-07-23 — worker.js C-roll preview message had a shifted argument, plus 6 new xiaojin cards wired into content_planner
 - **Who**: Claude
 - **Branch/commit**: whatsapp-studio (uncommitted at time of writing)
