@@ -15,6 +15,124 @@
 
 ---
 
+## 2026-07-21 (9) — C47/C49's avoidance check ran before, not after, the function that actually finalizes scenes (C50)
+- **Who**: Claude (same session, next live render after C49)
+- **Branch/commit**: whatsapp-studio (uncommitted at time of writing)
+- **What changed**: `pipeline_runner.py`'s `_recompute_scenes_from_content`
+  now runs `_shift_off_dominant_windows`/`_shift_off_dominant_windows_
+  headers` internally against the schedule it just derived, then rebuilds
+  `mode_schedule`/`scenes` a second time from the (possibly-adjusted)
+  content ranges before returning — folding C47/C49's guarantee into the
+  single function that's already the authoritative source of truth for
+  `scenes`, instead of relying on callers to re-run it at the right time.
+- **Why / impact**: the exact C47/C49 collision reproduced again (ghosted
+  "DETAILS" header over the speaker) even with both fixes in place — because
+  they ran inside `_build()` *before* its final
+  `_recompute_scenes_from_content` call, and that function's own docstring
+  (Fix C33/C38) already says any code moving content-zone graphics after it
+  runs must call it again. C47/C49 themselves move graphics but ran before,
+  not after — Rule 15's lesson recurring a third time. See
+  `whatsapp_mvp/CLAUDE.md` Rule 22.
+- **Status**: 🧪 to verify. New regression test calls the function directly
+  and confirms the returned header is capped. Full 5-suite run clean. Sixth
+  live verification render in progress.
+
+---
+
+## 2026-07-21 (8) — C47's fix was scoped to zoneHeaders; the sibling dataCard/countdown/gauge path had the same gap (C49)
+- **Who**: Claude (same session, next live verification render after C47+C48)
+- **Branch/commit**: whatsapp-studio (uncommitted at time of writing)
+- **What changed**: `pipeline_runner.py` — `_shift_off_dominant_windows`
+  (the dataCard/gauge/countdown sibling of C47's header fix) now also caps
+  `endFrame` via `_next_dominant_grow_start`, same as C47 did for
+  `toFrame`. Updated `test_shift_off_dominant_windows_no_op_when_already_
+  workflow`'s fixture (it had the exact same latent collision, just never
+  checked) and added a dedicated capping test.
+- **Why / impact**: a "Renew in 30 Days" card overlapped the speaker
+  mid-transition — same mechanism as C47, reproducing in the sibling
+  function C47's own writeup had already flagged as an unfixed gap. See
+  `whatsapp_mvp/CLAUDE.md` Rule 21.
+- **Status**: 🧪 to verify. Full 5-suite test run clean. Live verification
+  in progress.
+
+---
+
+## 2026-07-21 (7) — C46 fixed one sampling rule's bad-frame case, not the class of bug (C48)
+- **Who**: Claude (same session, immediately after C47 — next live
+  verification render, before C47 had even been confirmed, hit yet another
+  distinct issue)
+- **Branch/commit**: whatsapp-studio (uncommitted at time of writing)
+- **What changed**: `qa_stills.py`'s `pick_qa_frames` — added a final pass
+  (before the existing frame-0 guard) that pushes any sampled frame landing
+  inside ANY count_up row's own `[mountFrame+mountOffset, +45)` animation
+  window out to that window's end, regardless of which rule produced it.
+- **Why / impact**: `$4,200` flagged against a `$8,400` transcript — exactly
+  50% (frame 20/40 of the count-up), not the 75% case C46 fixed. C46 only
+  patched the ONE rule that samples data cards directly; this run's mismatch
+  came from a *different* rule (transition-window sampling) independently
+  landing inside the same animation window. Same failure shape Fix C22
+  already solved once (Rule 14: fix the invariant once at the function's
+  exit point, not per-rule) — C46 quietly repeated the mistake C22 had
+  already named. See `whatsapp_mvp/CLAUDE.md` Rule 20.
+- **Status**: 🧪 to verify. New regression test in `test_qa_stills.py`
+  (a transition window deliberately landing inside a count_up window,
+  independent of C46's own rule) passes; full 5-suite run clean. A fourth
+  live verification render is in progress to confirm no further distinct
+  issues surface.
+
+---
+
+## 2026-07-21 (6) — zoneHeader dominant-window avoidance only checked the start frame, not the whole window (C47)
+- **Who**: Claude (same session, found in the very next live verification
+  render after C46 — user asked to keep fixing since "the server is still
+  being used")
+- **Branch/commit**: whatsapp-studio (uncommitted at time of writing)
+- **What changed**: `pipeline_runner.py` — new `_next_dominant_grow_start`
+  helper; `_shift_off_dominant_windows_headers` now also caps a zoneHeader's
+  `toFrame` if the SpeakerCard starts regrowing to Dominant size before the
+  header's own window ends, not just checking the mode at `fromFrame`.
+- **Why / impact**: opened the actual flagged QA still (`f584.png`, per Rule
+  9) from job_452ef6c48100's latest run and saw a real, reproducible defect
+  — the "COVERAGE" zoneHeader title ghosted over the speaker's face as the
+  card grew back to Dominant size mid-window. Root cause: Fix C24's
+  avoidance check only inspects the header's `fromFrame` mode — docked at
+  381, but the card starts regrowing at 572 (592 minus the 20-frame
+  transition), which falls *inside* the header's own 381→592 display span.
+  "Starts docked" and "stays docked for the whole window" are different
+  claims that C24 conflated. See `whatsapp_mvp/CLAUDE.md` Rule 19.
+- **Status**: 🧪 to verify. New regression tests in `test_pipeline_runner.py`
+  using the real job's mode_schedule shape pass; full 5-suite test run
+  (`test_pipeline_runner`/`test_content_planner`/`test_qa_stills`/
+  `test_filler_review`/`test_golden_extraction`) clean. Live re-render to
+  confirm this exact frame no longer reproduces is the next step.
+
+---
+
+## 2026-07-21 (5) — vision-QA sampled count_up cards mid-animation, misread as wrong content (C46)
+- **Who**: Claude (same session, immediately after C45 — a fresh end-to-end
+  re-render of `job_452ef6c48100` with C45 in place still degraded to
+  no-video-delivered, so kept digging instead of declaring it fixed)
+- **Branch/commit**: whatsapp-studio (uncommitted at time of writing)
+- **What changed**: `qa_stills.py`'s `pick_qa_frames` — data-card sample
+  point moved from `mountFrame + last_row_mountOffset + 30` to `+ 45`.
+- **Why / impact**: inspected the actually-delivered props directly and
+  confirmed the planned values were correct (`$8,400`/`$1.5M`, matching the
+  transcript exactly) — the vision-QA "mismatch" was reading the count_up
+  number's own reveal animation (`InfoCard.tsx`:
+  `interpolate(rowLocal, [0, 40], [0, row.value], ...)`, 40 frames to reach
+  the final value) 10 frames before it finished. Math checks out exactly:
+  `8400 * (30/40) = 6300`, `1,500,000 * (30/40) = 1,125,000` ("$1.1M") — the
+  precise two "wrong" values flagged on real runs. Not a content_planner bug
+  at all; a QA sampling-timing bug, same class as Rule 14 (frame 0 sampled
+  before anything's rendered) but a different mechanism (a component's
+  reveal animation legitimately still in progress when sampled). See
+  `whatsapp_mvp/CLAUDE.md` Rule 18.
+- **Status**: 🧪 to verify. `test_qa_stills.py` covers it with the real
+  job's actual props shape (new regression test). Not yet verified via a
+  full live re-render — that's the next step.
+
+---
+
 ## 2026-07-21 (4) — count_up values weren't checked against the transcript at all (C45)
 - **Who**: Claude (same session, next day's live re-run of the C43/C44 fix —
   user's reaction: "you're saying it's error again???? wtf i thought we
