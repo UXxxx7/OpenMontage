@@ -15,6 +15,118 @@
 
 ---
 
+## 2026-07-23 (3) — outro silently missing from a delivered preview is its own criterion, not the same bug as C51/C52 (C53)
+- **Who**: Claude (same session, immediately after C51/C52 — user separately confirmed
+  "the outro is not there again" for the same reported preview)
+- **Branch/commit**: worktree-whatsapp-message-fix (uncommitted at time of writing)
+- **What changed**: a third new `_plan_quality_failures` criterion (8),
+  `_transcript_has_closing_language` — fires when a segment in the last quarter of
+  the video contains farewell/closing/contact-CTA language but the plan has no outro
+  (or an outro with an empty headline). Gated at the same `duration >= 12s` threshold
+  `pipeline_runner.py` already uses before attempting an outro at all.
+- **Why / impact**: closes the third of the three symptoms in the original report
+  (Coverage card, countdown, outro all missing from the same preview). Deliberately
+  did NOT touch `pipeline_runner.py`'s own outro-placement skip logic (the
+  `duration_frames - outro["fromFrame"] >= 60` gate) — that logic exists specifically
+  to stop an outro from covering real content near a video's end, and without direct
+  access to the job that produced the reported preview there's no way to confirm
+  whether that skip (rather than a missing LLM-written outro) is what actually
+  happened. Loosening an anti-overlap guard on a guess risks reintroducing the bug it
+  was built to prevent — flagged as the next place to look if this criterion alone
+  doesn't resolve a future case, not fixed blind. See `whatsapp_mvp/CLAUDE.md` Rule 23.
+- **Status**: 🧪 to verify. Validated against the FULL real segment list for
+  `job_452ef6c48100` (through its actual final "Take care." line, not a truncated
+  excerpt) — confirms the real closing lines land in the last quarter and correctly
+  trigger the check; also confirmed silent on short videos, videos with a real outro
+  already present, and closing-sounding language that appears early (not in the tail).
+  Full 6-suite test run clean. Live render still the natural next confirmation.
+
+---
+
+## 2026-07-23 (2) — "at least one card" and "no invented numbers" don't guarantee "every spoken number got a card" (C51/C52)
+- **Who**: Claude
+- **Branch/commit**: worktree-whatsapp-message-fix (uncommitted at time of writing)
+- **What changed**: two new `_plan_quality_failures` criteria in `content_planner.py`.
+  `_uncovered_spoken_values` (criterion 6) flags a spoken monetary figure with no
+  matching count_up/before_after value anywhere in the plan — the mirror image of
+  C45's `_ungrounded_count_up_rows`. `_spoken_countdown_and_date_together` (criterion 7)
+  flags a calendar-only plan when the transcript names both a countdown-style
+  day-count and a calendar month in the same ASR segment.
+- **Why / impact**: user reported a genuine WhatsApp-delivered preview of the David/
+  Pacific Life fixture missing the Coverage ($1.5M) card, the renewal countdown, and
+  the outro, worried it was a regression of a previously-fixed bug (possibly from a
+  collaborator's in-progress filler-removal work). Direct transcription + frame
+  inspection of the actual delivered video showed the cutting was clean (the known
+  duplicate retake was correctly collapsed to one instance) — the real cause was
+  content_planner dropping the Coverage figure and the countdown while keeping the
+  Premium figure and calendar from the very same sentence. Neither C41 ("at least one
+  numeric card exists") nor C45 ("no card's number is invented") covers "some numbers
+  present, others silently dropped" — a real gap in the existing criteria, not a
+  regression. See `whatsapp_mvp/CLAUDE.md` Rule 23.
+- **Status**: 🧪 to verify. Both criteria validated at the unit level against REAL
+  segment data pulled from `storage/jobs/job_452ef6c48100/_op_nofiller_transcript.json`
+  (confirms "30 days" and "the 28th of July" land in the same ASR segment despite
+  being split across captions), correctly silent when the plan is complete or the
+  transcript is unrelated. Full 6-suite test run clean. Outro's absence not yet
+  root-caused (couldn't access the exact job that produced the reported preview to
+  inspect its props directly) — flagged as an open question, not guessed at.
+
+---
+
+## 2026-07-23 — worker.js C-roll preview message had a shifted argument, plus 6 new xiaojin cards wired into content_planner
+- **Who**: Claude
+- **Branch/commit**: whatsapp-studio (uncommitted at time of writing)
+- **What changed**: two independent pieces of work.
+  1. **Bug fix**: `server/worker.js`'s `crollGenerate` (the photo→HeyGen-digital-human→video
+     flow) called `previewReadyMessage(jobLang, jobId, status.degraded_operations,
+     status.generation_cost_usd)` — missing the `status.animations` argument every
+     other call site (`editVideo`, `confirmJob`, `retryJob`, the multi/b-roll flow)
+     passes. This shifted every later parameter: `degraded_operations` got read as
+     `animations` (printing raw op keys like "apply_style" as fake animation names),
+     `generation_cost_usd` got read as `degradedOps` (silently dropping the "this step
+     failed, reply retry" warning — the exact guarantee Rule 9/C10 built), and the real
+     AI-generation cost never got reported. Fixed by adding the missing argument.
+  2. **Feature**: the 6 new xiaojin content-zone components sitting unused since the
+     last session (`ComparisonCard`/`RankedListCard`/`ChecklistCard`/`LocationPinCard`/
+     `TestimonialCard`/`IconClusterCard`, previously only exercised via
+     `NewGraphicsDemo.tsx`) are now real content_planner visual types (`comparison`,
+     `ranked_list`, `checklist`, `location_pin`, `testimonial`, `icon_cluster`) —
+     SYSTEM_PROMPT vocabulary + 6 new `_plan_*` functions in `content_planner.py`,
+     wired into every touchpoint `_to_frame_plan` needs (dispatch table, `_est_height`,
+     `_dp_seconds` for checklist's per-item timing, the defensive-cleanup/takeover-span/
+     same-slot/`_resolve_same_slot_overlaps`/`final_workflow_ranges` loops, the final
+     return dict, `_plan_quality_failures`'s `total_visuals`, and `_coverage_spans` —
+     this last one is exactly the function Fix C30 already had to patch once for
+     step_list/corner_card, see `whatsapp_mvp/CLAUDE.md` Rule 3's own warning), then
+     through `pipeline_runner.py` (`_WORKFLOW_CONTENT_PROP_KEYS`, `_RICHNESS_FIELDS`,
+     both `op.get`/`content_plan.get` extraction branches, props assembly, the
+     mount-floor/dominant-window-avoidance/outro loops), `props_lint.py`
+     (`_RICHNESS_FIELDS`, `_EST_HEIGHT`, `_collect_elements`), `webhook.py`
+     (`_animations_summary` — required per Rule 3, "add it or it silently won't be
+     announced"), `contracts/render_props.schema.json` (mandatory — top-level
+     `additionalProperties: false` means an unlisted prop key hard-fails ajv
+     validation, not a silent skip), and `XiaojinEditorial.tsx` (imports, prop types,
+     interface fields, destructure, render blocks).
+- **Why / impact**: (1) is a real production bug — every C-roll job's preview message
+  has been showing garbled/missing content since whichever commit introduced the
+  argument-count drift between call sites. (2) unblocks the two new visual types from
+  ever being planned — content_planner had no way to select them and the render
+  pipeline had no way to render them even if it had.
+- **Status**: ✅ verified at the unit/type level — full 6-suite Python test run
+  (`test_content_planner`/`test_pipeline_runner`/`test_props_lint`/`test_qa_stills`/
+  `test_filler_review`/`test_golden_extraction`) clean, including new regression tests
+  per new visual type (happy-path mapping, required-field-missing skip,
+  `_coverage_spans`/`total_visuals` wiring — the exact class of bug Rule 3/C30 warns
+  about); `npx tsc --noEmit` clean on `remotion-composer`. **Not yet verified via a
+  live render or a real WhatsApp job** — per Rule 1/Rule 13's own standard, a
+  props-level and type-level pass is necessary but not sufficient; the next step is a
+  live `apply_style` run against a video whose transcript actually contains
+  comparison/ranked-list/checklist/location/testimonial/icon-cluster-shaped content,
+  since none of the existing fixtures (David's insurance video) naturally produce any
+  of these 6 new visual types.
+
+---
+
 ## 2026-07-21 (9) — C47/C49's avoidance check ran before, not after, the function that actually finalizes scenes (C50)
 - **Who**: Claude (same session, next live render after C49)
 - **Branch/commit**: whatsapp-studio (uncommitted at time of writing)

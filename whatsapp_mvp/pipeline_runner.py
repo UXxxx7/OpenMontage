@@ -1201,6 +1201,7 @@ def _mode_schedule_to_scenes(mode_schedule: list[dict]) -> tuple[list[dict], lis
 _WORKFLOW_CONTENT_PROP_KEYS = (
     "dataCards", "gauges", "countdowns", "calendarEvents", "beforeAfter",
     "pills", "stepLists", "topicCards",
+    "comparisons", "rankedLists", "checklists", "locationPins", "testimonials", "iconClusters",
 )
 
 
@@ -1510,6 +1511,7 @@ _PROPS_LINT_MAX_ATTEMPTS = 3
 _RICHNESS_FIELDS = (
     "dataCards", "gauges", "countdowns", "calendarEvents", "beforeAfter",
     "stepLists", "topicCards", "cornerCards", "quotes",
+    "comparisons", "rankedLists", "checklists", "locationPins", "testimonials", "iconClusters",
 )
 
 
@@ -1918,6 +1920,12 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
             plan_step_lists = op.get("step_lists") or []
             plan_topic_cards = op.get("topic_cards") or []
             plan_corner_cards = op.get("corner_cards") or []
+            plan_comparisons = op.get("comparisons") or []
+            plan_ranked_lists = op.get("ranked_lists") or []
+            plan_checklists = op.get("checklists") or []
+            plan_location_pins = op.get("location_pins") or []
+            plan_testimonials = op.get("testimonials") or []
+            plan_icon_clusters = op.get("icon_clusters") or []
         else:
             logger.info("  apply_style: 内容规划中（章节 + 数据展示分析）...")
             content_plan = plan_content(segments, duration, feedback=feedback, word_timestamps=word_timestamps)
@@ -1938,6 +1946,12 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
             plan_step_lists = content_plan.get("step_lists") or []
             plan_topic_cards = content_plan.get("topic_cards") or []
             plan_corner_cards = content_plan.get("corner_cards") or []
+            plan_comparisons = content_plan.get("comparisons") or []
+            plan_ranked_lists = content_plan.get("ranked_lists") or []
+            plan_checklists = content_plan.get("checklists") or []
+            plan_location_pins = content_plan.get("location_pins") or []
+            plan_testimonials = content_plan.get("testimonials") or []
+            plan_icon_clusters = content_plan.get("icon_clusters") or []
             logger.info(
                 f"  apply_style: 规划出 {len(chapters)} 个章节、{len(data_cards)} 个数据卡、"
                 f"{len(gauges)} 个仪表盘、{len(countdowns)} 个倒计时、{len(calendar_events)} 个日历、"
@@ -1974,6 +1988,18 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
             props["topicCards"] = plan_topic_cards
         if plan_corner_cards:
             props["cornerCards"] = plan_corner_cards
+        if plan_comparisons:
+            props["comparisons"] = plan_comparisons
+        if plan_ranked_lists:
+            props["rankedLists"] = plan_ranked_lists
+        if plan_checklists:
+            props["checklists"] = plan_checklists
+        if plan_location_pins:
+            props["locationPins"] = plan_location_pins
+        if plan_testimonials:
+            props["testimonials"] = plan_testimonials
+        if plan_icon_clusters:
+            props["iconClusters"] = plan_icon_clusters
 
         # 开场标题卡/片尾 CTA：模板一直支持（IntroTitle/OutroSection），此前管线从不
         # 生成——这是与 video-studio 手工参考成片(VeLL)最大的一块可自动化差距。
@@ -2040,14 +2066,18 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
             # back via props.get(...) here would silently no-op.
             _mount_floor = intro_out + 20 + 20  # intro_out+20(clamp) + TRANSITION_FRAMES(20)
             for _items in (data_cards, gauges, countdowns, calendar_events,
-                           before_after, plan_quotes, plan_pills, plan_step_lists, plan_topic_cards):
+                           before_after, plan_quotes, plan_pills, plan_step_lists, plan_topic_cards,
+                           plan_comparisons, plan_ranked_lists, plan_checklists,
+                           plan_location_pins, plan_testimonials, plan_icon_clusters):
                 _floor_shift_graphics(_items, _mount_floor)
             _floor_shift_zone_headers(plan_zone_headers, _mount_floor)
 
             # Fix C24: 片头这一次 dominant 窗口处理完了，但视频中段还会按内容
             # 反复回到 Dominant——同一类避让要对每一次窗口都做，不只是片头。
             for _items in (data_cards, gauges, countdowns, calendar_events,
-                           before_after, plan_quotes, plan_pills, plan_step_lists, plan_topic_cards):
+                           before_after, plan_quotes, plan_pills, plan_step_lists, plan_topic_cards,
+                           plan_comparisons, plan_ranked_lists, plan_checklists,
+                           plan_location_pins, plan_testimonials, plan_icon_clusters):
                 _shift_off_dominant_windows(_items, mode_schedule)
             _shift_off_dominant_windows_headers(plan_zone_headers, mode_schedule)
 
@@ -2089,7 +2119,9 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
                 last_content_end = 0
                 for group in (data_cards, gauges, countdowns, calendar_events,
                               before_after, plan_quotes, plan_pills,
-                              plan_step_lists, plan_topic_cards):
+                              plan_step_lists, plan_topic_cards,
+                              plan_comparisons, plan_ranked_lists, plan_checklists,
+                              plan_location_pins, plan_testimonials, plan_icon_clusters):
                     for g in group or []:
                         end = min(int(g.get("endFrame", 0) or 0), duration_frames)
                         last_content_end = max(last_content_end, end)

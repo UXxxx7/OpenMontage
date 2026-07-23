@@ -33,6 +33,7 @@ _TRANSITION_DURATION_FRAMES = 20  # 卡片一次真实变形动画的时长上�
 _RICHNESS_FIELDS = (
     "dataCards", "gauges", "countdowns", "calendarEvents", "beforeAfter",
     "stepLists", "topicCards", "cornerCards", "quotes",
+    "comparisons", "rankedLists", "checklists", "locationPins", "testimonials", "iconClusters",
 )
 _SECONDS_PER_RICHNESS_UNIT = 12
 
@@ -42,6 +43,7 @@ _SECONDS_PER_RICHNESS_UNIT = 12
 _EST_HEIGHT = {
     "gauge": 330, "countdown": 300, "calendar": 560, "beforeAfter": 330,
     "pill": 100, "zoneHeader": 130, "topicCard": 180, "qrContact": 260,
+    "locationPin": 190, "testimonial": 220,
 }
 
 
@@ -50,6 +52,16 @@ def _rect_height(kind: str, entry: dict) -> int:
         return 100 + 112 * len(entry.get("rows") or [])
     if kind == "stepList":
         return 40 + 95 * len(entry.get("steps") or [])
+    if kind == "comparison":
+        cols = entry.get("columns") or []
+        max_items = max((len(c.get("items") or []) for c in cols), default=0)
+        return 60 + 40 * max_items
+    if kind == "rankedList":
+        return 50 + 68 * len(entry.get("items") or [])
+    if kind == "checklist":
+        return 30 + 68 * len(entry.get("items") or [])
+    if kind == "iconCluster":
+        return 70 + 60 * -(-len(entry.get("items") or []) // 3)
     return _EST_HEIGHT.get(kind, 320)
 
 
@@ -139,6 +151,12 @@ def _collect_elements(props: dict) -> list[dict]:
     add("topicCard", props.get("topicCards"))
     add("zoneHeader", props.get("zoneHeaders"))
     add("quote", props.get("quotes"))
+    add("comparison", props.get("comparisons"))
+    add("rankedList", props.get("rankedLists"))
+    add("checklist", props.get("checklists"))
+    add("locationPin", props.get("locationPins"))
+    add("testimonial", props.get("testimonials"))
+    add("iconCluster", props.get("iconClusters"))
     qr = props.get("qrContact")
     if qr:
         add("qrContact", [qr])

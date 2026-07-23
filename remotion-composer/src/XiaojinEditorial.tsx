@@ -72,6 +72,12 @@ import { StepList, StepListProps } from "./components/xiaojin/StepList";
 import { TopicCard, TopicCardProps } from "./components/xiaojin/TopicCard";
 import { ZoneHeader, ZoneHeaderProps } from "./components/xiaojin/ZoneHeader";
 import { Presenter, PresenterProps } from "./components/xiaojin/Presenter";
+import { ComparisonCard, ComparisonCardProps } from "./components/xiaojin/ComparisonCard";
+import { RankedListCard, RankedListCardProps } from "./components/xiaojin/RankedListCard";
+import { ChecklistCard, ChecklistCardProps } from "./components/xiaojin/ChecklistCard";
+import { LocationPinCard, LocationPinCardProps } from "./components/xiaojin/LocationPinCard";
+import { TestimonialCard, TestimonialCardProps } from "./components/xiaojin/TestimonialCard";
+import { IconClusterCard, IconClusterCardProps } from "./components/xiaojin/IconClusterCard";
 import { ColorMode } from "./components/xiaojin/theme";
 
 export interface ComplianceInfo {
@@ -116,6 +122,17 @@ export type ZoneHeaderItem = Omit<ZoneHeaderProps, "colorMode" | "headingFont" |
 export type StepListItem = Omit<StepListProps, "colorMode" | "headingFont" | "labelFont">;
 export type TopicCardItem = Omit<TopicCardProps, "colorMode" | "headingFont" | "labelFont">;
 export type CornerCardItem = CornerCardProps;
+// "CardItem" (not "Item") suffix deliberately, matching CornerCardItem — these
+// are the outer per-card props for the props array, and Ranked/Checklist/
+// IconCluster each already export their OWN per-row "...Item" type from their
+// own component file (RankedListItem/ChecklistItem/IconClusterItem); reusing
+// that exact name here for the outer card type would shadow-confuse the two.
+export type ComparisonCardItem = Omit<ComparisonCardProps, "colorMode" | "headingFont" | "labelFont">;
+export type RankedListCardItem = Omit<RankedListCardProps, "colorMode" | "headingFont" | "labelFont">;
+export type ChecklistCardItem = Omit<ChecklistCardProps, "colorMode" | "headingFont" | "labelFont">;
+export type LocationPinCardItem = Omit<LocationPinCardProps, "colorMode" | "headingFont" | "labelFont">;
+export type TestimonialCardItem = Omit<TestimonialCardProps, "colorMode" | "headingFont" | "labelFont">;
+export type IconClusterCardItem = Omit<IconClusterCardProps, "colorMode" | "headingFont" | "labelFont">;
 
 export interface OutroInfo {
   kicker: string;
@@ -166,6 +183,18 @@ export interface XiaojinEditorialProps extends Record<string, unknown> {
   topicCards?: TopicCardItem[];
   /** Compact illustration overlays anchored inside the SpeakerCard — see CornerCard. */
   cornerCards?: CornerCardItem[];
+  /** Side-by-side 2-3 column comparisons across multiple attributes — see ComparisonCard. */
+  comparisons?: ComparisonCardItem[];
+  /** Several numbers compared/ranked against each other in one beat — see RankedListCard. */
+  rankedLists?: RankedListCardItem[];
+  /** Items ticking on one by one, each on its own spoken beat — see ChecklistCard. */
+  checklists?: ChecklistCardItem[];
+  /** A named place, map-pin drop — see LocationPinCard. */
+  locationPins?: LocationPinCardItem[];
+  /** A third party's quoted words — see TestimonialCard. */
+  testimonials?: TestimonialCardItem[];
+  /** An unordered set of related named things — see IconClusterCard. */
+  iconClusters?: IconClusterCardItem[];
   /** QR + WhatsApp CTA close. Only set when a real contact URL was actually supplied. */
   qrContact?: QRContact;
   /** "Pattern 2" dark title-card intro (see IntroTitle's doc comment). Omit to skip. */
@@ -244,6 +273,12 @@ export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = ({
   stepLists,
   topicCards,
   cornerCards,
+  comparisons,
+  rankedLists,
+  checklists,
+  locationPins,
+  testimonials,
+  iconClusters,
   qrContact,
   intro,
   outro,
@@ -355,6 +390,24 @@ export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = ({
       ))}
       {topicCards?.map((card, i) => (
         <TopicCard key={i} {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+      ))}
+      {comparisons?.map((card, i) => (
+        <ComparisonCard key={i} {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+      ))}
+      {rankedLists?.map((card, i) => (
+        <RankedListCard key={i} {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+      ))}
+      {checklists?.map((card, i) => (
+        <ChecklistCard key={i} {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+      ))}
+      {locationPins?.map((card, i) => (
+        <LocationPinCard key={i} {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+      ))}
+      {testimonials?.map((card, i) => (
+        <TestimonialCard key={i} {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+      ))}
+      {iconClusters?.map((card, i) => (
+        <IconClusterCard key={i} {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
       ))}
       {/* outro renders BEFORE qrContact (not the other way around): OutroSection
           paints an opaque full-canvas background (y=88 to H-72). Rendering

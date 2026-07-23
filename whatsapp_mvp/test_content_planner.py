@@ -1100,6 +1100,142 @@ def main():
     check("转写里实际说的数字（$8,400/$1.5M，含词面大数）不被标准 5 误报",
           not any("do not match ANY number" in f for f in f_correct), f_correct)
 
+    # 16f1. 标准 6（新增，2026-07-23，真实 WhatsApp 交付的预览复现）——真实
+    # segment 数据（job_452ef6c48100 的 _op_nofiller_transcript.json 原文，
+    # "30 days on the 28th of July" 跟 "renewal in" 分属两个 ASR 分段，验证过
+    # 不是简化过的测试夹具）：转写里 "$8,400" 和 "one and a half million" 同一
+    # 句话都说了，规划却只留下 Premium 卡，Coverage 的 $1.5M 消失——标准 4/5
+    # 都不会抓到这种情况（各自的检查角度不覆盖"漏了另一个数字"）。
+    real_segments = [
+        {"start": 0.21, "end": 7.99, "text": "Hi there, it's David from Pacific life quick "
+                                              "reminder your policy is coming up for renewal in"},
+        {"start": 7.99, "end": 11.23, "text": "30 days on the 28th of July"},
+        {"start": 11.23, "end": 17.43, "text": "Your current plan covers you for one and a half "
+                                                "million and your annual premium is"},
+        {"start": 17.43, "end": 23.54, "text": "$8,400 I've put the full breakdown in this video. "
+                                                "So you have everything in one place"},
+    ]
+    premium_only_raw = {"data_points": [
+        {"visual": "count_up", "title": "Premium", "rows": [
+            {"label": "Premium", "seconds": 18.0, "value": 8400, "divideBy": 1, "decimals": 0,
+             "prefix": "$"}]},
+        {"visual": "calendar", "seconds": 9.0, "year": 2026, "month": 7, "targetDay": 28,
+         "eventLabel": "RENEWAL"},
+    ]}
+    premium_only_plan = _to_frame_plan({"chapters": [], **premium_only_raw}, duration=30.0)
+    f_premium_only = _plan_quality_failures(premium_only_raw, premium_only_plan, 30.0, real_segments)
+    check("Coverage 的 $1.5M 有说但没卡时被标准 6 抓住（标准 4/5 都不会触发）",
+          any("1.5e+06" in f or "1.5" in f for f in f_premium_only)
+          and not any("explicitly says" in f for f in f_premium_only)
+          and not any("do not match ANY number" in f for f in f_premium_only),
+          f_premium_only)
+
+    both_covered_raw = {"data_points": [
+        {"visual": "count_up", "title": "Your Coverage & Premium", "rows": [
+            {"label": "Coverage", "seconds": 12.0, "value": 1500000, "divideBy": 1000000,
+             "decimals": 1, "prefix": "$", "unit": "M"},
+            {"label": "Premium", "seconds": 18.0, "value": 8400, "divideBy": 1, "decimals": 0,
+             "prefix": "$"},
+        ]},
+        {"visual": "calendar", "seconds": 9.0, "year": 2026, "month": 7, "targetDay": 28,
+         "eventLabel": "RENEWAL"},
+    ]}
+    both_covered_plan = _to_frame_plan({"chapters": [], **both_covered_raw}, duration=30.0)
+    f_both_covered = _plan_quality_failures(both_covered_raw, both_covered_plan, 30.0, real_segments)
+    check("Coverage 和 Premium 都有对应卡片时标准 6 不误报",
+          not any("NO matching count_up" in f for f in f_both_covered), f_both_covered)
+
+    # 16f1b. 标准 7（新增，同一次真实复现）——转写里 "30 days" 和 "July" 同一个
+    # ASR 分段里共现，规划只产出日历卡（July 28），倒计时("30 DAYS")整个消失。
+    calendar_only_raw = {"data_points": [
+        {"visual": "calendar", "seconds": 9.0, "year": 2026, "month": 7, "targetDay": 28,
+         "eventLabel": "RENEWAL"},
+    ]}
+    calendar_only_plan = _to_frame_plan({"chapters": [], **calendar_only_raw}, duration=30.0)
+    f_calendar_only = _plan_quality_failures(calendar_only_raw, calendar_only_plan, 30.0, real_segments)
+    check("倒计时措辞跟月份名同段共现，但只有日历卡没有倒计时卡时被标准 7 抓住",
+          any("countdown" in f and "calendar" in f for f in f_calendar_only), f_calendar_only)
+
+    both_countdown_and_calendar_raw = {"data_points": [
+        {"visual": "calendar", "seconds": 9.0, "year": 2026, "month": 7, "targetDay": 28,
+         "eventLabel": "RENEWAL"},
+        {"visual": "countdown", "seconds": 8.0, "value": 30, "unitLabel": "DAYS", "label": "RENEWAL",
+         "headline": "Your policy renews in 30 days"},
+    ]}
+    both_cd_plan = _to_frame_plan({"chapters": [], **both_countdown_and_calendar_raw}, duration=30.0)
+    f_both_cd = _plan_quality_failures(both_countdown_and_calendar_raw, both_cd_plan, 30.0, real_segments)
+    check("日历卡和倒计时卡都有时标准 7 不误报",
+          not any("ZERO countdown cards" in f for f in f_both_cd), f_both_cd)
+
+    unrelated_days_raw = {"data_points": [
+        {"visual": "topic_card", "seconds": 5.0, "headline": "I've done this for ten years", "icon": "check"},
+    ]}
+    unrelated_segments = [
+        {"start": 0.0, "end": 5.0, "text": "I've been doing this job for ten years now."},
+    ]
+    unrelated_plan = _to_frame_plan({"chapters": [], **unrelated_days_raw}, duration=20.0)
+    f_unrelated = _plan_quality_failures(unrelated_days_raw, unrelated_plan, 20.0, unrelated_segments)
+    check("无关的时长描述句（没有月份名同段共现）不触发标准 7 的误报",
+          not any("ZERO countdown cards" in f for f in f_unrelated), f_unrelated)
+
+    # 16f1c. 标准 8（新增，2026-07-23，用户直接反馈"the outro is not there
+    # again"）——真实转写全文（job_452ef6c48100 的 _op_nofiller_transcript.json
+    # 完整片段列表，不是截断片段）：末段明显在做收尾（"Looking forward to
+    # keeping you..."/"Take care."），落在视频最后 1/4 时间段内。
+    full_real_segments = [
+        {"start": 0.21, "end": 7.99, "text": "Hi there, it's David from Pacific life quick "
+                                              "reminder your policy is coming up for renewal in"},
+        {"start": 7.99, "end": 11.23, "text": "30 days on the 28th of July"},
+        {"start": 11.23, "end": 17.43, "text": "Your current plan covers you for one and a half "
+                                                "million and your annual premium is"},
+        {"start": 17.43, "end": 23.54, "text": "$8,400 I've put the full breakdown in this video. "
+                                                "So you have everything in one place"},
+        {"start": 23.54, "end": 29.18, "text": "Renewing on time really matters. If your policy "
+                                                "lapses, you'd have to go"},
+        {"start": 29.18, "end": 33.74, "text": "through underwriting again, which could affect "
+                                                "both your coverage and your rate."},
+        {"start": 34.38, "end": 38.96, "text": "If you have any questions, just WhatsApp me "
+                                                "directly. If you have any"},
+        {"start": 38.96, "end": 44.98, "text": "questions, just WhatsApp me directly or scan the "
+                                                "QR code below. I'll get back"},
+        {"start": 44.98, "end": 49.0, "text": "you right away. Looking forward to keeping you and "
+                                               "your family protected."},
+        {"start": 49.46, "end": 49.84, "text": "Take care."},
+    ]
+    no_outro_raw = {"data_points": [
+        {"visual": "count_up", "title": "Your Coverage & Premium", "rows": [
+            {"label": "Coverage", "seconds": 12.0, "value": 1500000, "divideBy": 1000000,
+             "decimals": 1, "prefix": "$", "unit": "M"},
+            {"label": "Premium", "seconds": 18.0, "value": 8400, "divideBy": 1, "decimals": 0,
+             "prefix": "$"}]},
+    ]}
+    no_outro_plan = _to_frame_plan({"chapters": [], **no_outro_raw}, duration=50.0)
+    f_no_outro = _plan_quality_failures(no_outro_raw, no_outro_plan, 50.0, full_real_segments)
+    check("转写末段明显在收尾但计划没有 outro 时被标准 8 抓住（真实转写数据）",
+          any("NO outro" in f for f in f_no_outro), f_no_outro)
+
+    with_outro_raw = {**no_outro_raw, "outro": {
+        "kicker": "CONTACT", "headline": "Looking forward to keeping you",
+        "subtext": "I'll get back to you right away", "cta_label": "Scan QR",
+    }}
+    with_outro_plan = _to_frame_plan({"chapters": [], **with_outro_raw}, duration=50.0)
+    f_with_outro = _plan_quality_failures(with_outro_raw, with_outro_plan, 50.0, full_real_segments)
+    check("outro 已经有 headline 时标准 8 不误报", not any("NO outro" in f for f in f_with_outro), f_with_outro)
+
+    short_no_outro_plan = _to_frame_plan({"chapters": [], **no_outro_raw}, duration=10.0)
+    f_short = _plan_quality_failures(no_outro_raw, short_no_outro_plan, 10.0,
+                                      [{"start": 0.0, "end": 9.0, "text": "Take care, thanks for watching!"}])
+    check("视频短于 outro 门槛(12s)时标准 8 不强求（呼应 pipeline_runner 自己的 duration_frames>=360 门槛）",
+          not any("NO outro" in f for f in f_short), f_short)
+
+    early_closing_plan = _to_frame_plan({"chapters": [], **no_outro_raw}, duration=50.0)
+    f_early = _plan_quality_failures(
+        no_outro_raw, early_closing_plan, 50.0,
+        [{"start": 2.0, "end": 6.0, "text": "Feel free to contact me or scan the QR code anytime."},
+         {"start": 40.0, "end": 45.0, "text": "So that's the coverage breakdown for this year."}],
+    )
+    check("收尾措辞出现在视频前段（不是最后 1/4）时标准 8 不误报", not any("NO outro" in f for f in f_early), f_early)
+
     # 16f. Fix C42 —— process_timeline.chapter_label 跟 chapters[].label 精确
     # 匹配失败时，退回到唯一被标记 takeover 的章节，而不是整段丢弃。
     timeline_chapters = [
@@ -1272,6 +1408,88 @@ def main():
     cc_entry = plan_with_corner_card_only["corner_cards"][0]
     check("corner_card 的挂载区间出现在覆盖范围里，不再被当成空档",
           (cc_entry["mountFrame"], cc_entry["endFrame"]) in cc_spans, cc_spans)
+
+    # 21. xiaojin arsenal round 2 (2026-07-23) — 6 new content-zone visual
+    # types (comparison/ranked_list/checklist/location_pin/testimonial/
+    # icon_cluster). Same regression class as test 20 above (Fix C30): each
+    # new type must (a) map correctly, (b) skip cleanly when its required
+    # field is missing, and (c) actually count toward _coverage_spans/
+    # _plan_quality_failures' total_visuals — a type that plans correctly but
+    # never reaches those two functions produces the exact "criterion loop
+    # thinks this span is still empty" bug C30 fixed for step_list/corner_card.
+    new_type_points = {
+        "comparison": {
+            "visual": "comparison", "seconds": 5.0, "title": "OLD VS NEW",
+            "columns": [
+                {"label": "旧方案", "label_en": "BEFORE", "accent": "bad", "items": ["手动剪辑", "耗时长"]},
+                {"label": "新方案", "label_en": "AFTER", "accent": "good", "items": ["AI 自动化", "更快"]},
+            ],
+        },
+        "ranked_list": {
+            "visual": "ranked_list", "seconds": 6.0, "title": "TOP USAGE",
+            "items": [
+                {"label": "字幕", "label_en": "CAPTIONS", "value": 94, "suffix": "%"},
+                {"label": "品牌", "label_en": "BRAND", "value": 81, "suffix": "%"},
+            ],
+        },
+        "checklist": {
+            "visual": "checklist", "title": "READY",
+            "items": [
+                {"label": "字幕已生成", "label_en": "CAPTIONS", "seconds": 7.0},
+                {"label": "样式已渲染", "label_en": "STYLE", "seconds": 9.0},
+            ],
+        },
+        "location_pin": {
+            "visual": "location_pin", "seconds": 8.0, "place": "香港", "place_en": "HONG KONG",
+            "sub": "服务范围",
+        },
+        "testimonial": {
+            "visual": "testimonial", "seconds": 9.0,
+            "quote": "剪辑速度快了不止一倍。", "name": "David Chan", "role": "客户",
+        },
+        "icon_cluster": {
+            "visual": "icon_cluster", "seconds": 10.0, "title": "支持的来源",
+            "items": [
+                {"icon": "chat", "label": "WhatsApp", "label_en": "CHAT"},
+                {"icon": "camera", "label": "拍摄", "label_en": "CAMERA"},
+            ],
+        },
+    }
+    plan_key_by_visual = {
+        "comparison": "comparisons", "ranked_list": "ranked_lists", "checklist": "checklists",
+        "location_pin": "location_pins", "testimonial": "testimonials", "icon_cluster": "icon_clusters",
+    }
+    for visual, dp in new_type_points.items():
+        plan_key = plan_key_by_visual[visual]
+        solo_plan = _to_frame_plan({
+            "chapters": [{"at_seconds": 0, "label": "A"}],
+            "data_points": [dp],
+        }, duration=30.0)
+        check(f"{visual} 正常映射到 plan['{plan_key}']", len(solo_plan[plan_key]) == 1, solo_plan[plan_key])
+        entry = solo_plan[plan_key][0]
+        check(f"{visual} 计入 _coverage_spans（不会被当成空档）",
+              (entry["mountFrame"], entry["endFrame"]) in _coverage_spans(solo_plan),
+              _coverage_spans(solo_plan))
+        failures = _plan_quality_failures({"data_points": [dp]}, solo_plan, 30.0)
+        check(f"{visual} 计入 total_visuals（不会被质量标准误判为零图形）",
+              not any("ZERO visual moments" in f for f in failures), failures)
+
+    # 必填字段缺失时整卡跳过，不产出半成品（同 Rule "required text field" 的既有原则）。
+    missing_field_points = {
+        "comparison": {"visual": "comparison", "seconds": 5.0, "columns": [{"label": "A", "items": ["x"]}]},  # 只有 1 列
+        "ranked_list": {"visual": "ranked_list", "seconds": 6.0, "items": [{"label": "A", "value": 1}]},  # 只有 1 项
+        "checklist": {"visual": "checklist", "items": [{"label": "A", "seconds": 7.0}]},  # 只有 1 项
+        "location_pin": {"visual": "location_pin", "seconds": 8.0},  # 没有 place
+        "testimonial": {"visual": "testimonial", "seconds": 9.0, "quote": "hi"},  # 没有 name
+        "icon_cluster": {"visual": "icon_cluster", "seconds": 10.0, "items": [{"icon": "star", "label": "A"}]},  # 只有 1 项
+    }
+    for visual, dp in missing_field_points.items():
+        plan_key = plan_key_by_visual[visual]
+        bad_plan = _to_frame_plan({
+            "chapters": [{"at_seconds": 0, "label": "A"}],
+            "data_points": [dp],
+        }, duration=30.0)
+        check(f"{visual} 缺必填内容时整卡跳过，不产出半成品", bad_plan[plan_key] == [], bad_plan[plan_key])
 
     print()
     if FAILED:

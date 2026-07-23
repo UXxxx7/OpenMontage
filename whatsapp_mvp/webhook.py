@@ -584,6 +584,22 @@ def _animations_summary(job) -> Optional[list]:
         names.append(f"Quote typography — {str(q.get('text', ''))[:30]}")
     for cc in props.get("cornerCards") or []:
         names.append(f"Corner app card — {cc.get('appName') or cc.get('variant', '')}")
+    for cp in props.get("comparisons") or []:
+        labels = " vs ".join(str(c.get("label", "")) for c in (cp.get("columns") or []))
+        names.append(f"Side-by-side comparison — {cp.get('title') or labels}")
+    for rl in props.get("rankedLists") or []:
+        item_count = len(rl.get("items") or [])
+        names.append(f"Ranked list — {rl.get('title') or f'{item_count} items'}")
+    for cl in props.get("checklists") or []:
+        item_count = len(cl.get("items") or [])
+        names.append(f"Checklist — {cl.get('title') or f'{item_count} items'}")
+    for lp in props.get("locationPins") or []:
+        names.append(f"Location pin — {lp.get('place', '')}")
+    for tm in props.get("testimonials") or []:
+        names.append(f"Testimonial — {tm.get('name', '')}")
+    for ic in props.get("iconClusters") or []:
+        item_count = len(ic.get("items") or [])
+        names.append(f"Icon cluster — {ic.get('title') or f'{item_count} items'}")
     for sec in props.get("sections") or []:
         if sec.get("timeline"):
             names.append(f"Multi-stage timeline — {sec['timeline'].get('heading', '')}")
