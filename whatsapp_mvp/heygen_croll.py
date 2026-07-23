@@ -39,6 +39,24 @@ def _api_key() -> Optional[str]:
     return os.environ.get("HEYGEN_API_KEY")
 
 
+def _http_error_detail(e: Exception) -> str:
+    """跟 pipeline_runner.py 的 ElevenLabs 401 修复同一个教训（Rule 10）：
+    resp.raise_for_status() 抛出的异常字符串只有泛泛的状态行（"400 Client
+    Error: BAD REQUEST for url: ..."），真正有用的原因在响应体里，
+    raise_for_status() 从不读它。这里优先读 body 的 message/error 字段，
+    读不到才退回原始异常字符串。"""
+    resp = getattr(e, "response", None)
+    if resp is not None:
+        try:
+            body = resp.json()
+            msg = body.get("message") or (body.get("error") or {}).get("message")
+            if msg:
+                return f"{msg} (HTTP {resp.status_code})"
+        except ValueError:
+            pass
+    return str(e)
+
+
 def is_available() -> bool:
     return bool(_api_key())
 
@@ -61,7 +79,7 @@ def upload_talking_photo(image_path: Path) -> Optional[str]:
         r.raise_for_status()
         return r.json()["data"]["talking_photo_id"]
     except Exception as e:
-        logger.warning(f"heygen_croll: 照片上传失败: {e}")
+        logger.warning(f"heygen_croll: 照片上传失败: {_http_error_detail(e)}")
         return None
 
 
@@ -97,7 +115,7 @@ def generate_talking_video(talking_photo_id: str, script: str, lang: str = "zh",
         r.raise_for_status()
         return r.json()["data"]["video_id"]
     except Exception as e:
-        logger.warning(f"heygen_croll: 提交生成失败: {e}")
+        logger.warning(f"heygen_croll: 提交生成失败: {_http_error_detail(e)}")
         return None
 
 
@@ -142,6 +160,28 @@ def _download(url: str, out_path: Path) -> bool:
         return out_path.exists() and out_path.stat().st_size > 0
     except Exception as e:
         logger.warning(f"heygen_croll: 成片下载失败: {e}")
+        return False
+
+
+def delete_talking_photo(talking_photo_id: str) -> bool:
+    """用完即删，释放 HeyGen 账号的 photo avatar 配额（标准档只给 3 个，见
+    2026-07-17 实测：`DELETE /v1/talking_photo/{id}` 返回 200 但不释放配额，
+    配额单位其实是 avatar group——同一张照片上传后 group id 就等于
+    talking_photo_id，删 group 才是真删除。失败只记警告不抛异常：清理失败不该
+    把一次已经成功的生成变成失败任务。（合并自 PR #39，2026-07-20）"""
+    key = _api_key()
+    if not key:
+        return False
+    try:
+        r = requests.delete(
+            f"https://api.heygen.com/v2/avatar_group/{talking_photo_id}",
+            headers={"x-api-key": key}, timeout=15,
+        )
+        r.raise_for_status()
+        logger.info(f"heygen_croll: 已清理 talking photo {talking_photo_id}，释放配额")
+        return True
+    except Exception as e:
+        logger.warning(f"heygen_croll: 清理 talking photo {talking_photo_id} 失败（不影响本次任务）: {_http_error_detail(e)}")
         return False
 
 
