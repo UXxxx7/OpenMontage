@@ -2394,13 +2394,28 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         # 都满足才采用这一轮；丰富度下降就算 findings 更少也不换。
         if len(candidate_findings) < len(best_findings) and candidate_richness >= best_richness:
             best_props, best_findings, best_richness = candidate, candidate_findings, candidate_richness
-        elif len(candidate_findings) < len(best_findings):
+            attempt += 1
+            continue
+        # 早退（保质量提速）：本轮没有产出"更少问题且不降丰富度"的改进。喂回的
+        # lint_feedback 只由 best_findings 决定，而 best 这轮没变——再跑同样的重
+        # 规划只会得到同样结果，后续轮次是确定性空转（low_visual_richness/
+        # element_over_card 这类"内容本身改不动"的 finding 会一路耗满 _PROPS_LINT_
+        # MAX_ATTEMPTS 轮，每轮一次完整 LLM 规划）。提前结束：best_props 已保留，
+        # 交付版本与跑满全部轮次完全一致，只省掉注定白烧的后续 LLM 调用。通用于
+        # 任何"重规划改不动"的 finding，不特判某一类；能持续改进时仍会继续（上面
+        # accept 分支 continue）。
+        if len(candidate_findings) < len(best_findings):
             logger.warning(
                 f"  apply_style: props_lint 第 {attempt}/{_PROPS_LINT_MAX_ATTEMPTS} 轮的重规划"
                 f"findings 更少({len(candidate_findings)} < {len(best_findings)})，但丰富度从 "
                 f"{best_richness} 降到 {candidate_richness}——拒绝采用，保留内容更丰富的版本"
             )
-        attempt += 1
+        else:
+            logger.info(
+                f"  apply_style: props_lint 第 {attempt} 轮重规划未改进"
+                f"（{[f['check'] for f in best_findings]} 修不动）——提前结束重试，交付当前最佳版本"
+            )
+        break
     if best_findings:
         logger.warning(
             f"  apply_style: props_lint {_PROPS_LINT_MAX_ATTEMPTS} 轮后仍有 "
@@ -2623,8 +2638,13 @@ def _probe_dimensions(path: Path) -> tuple:
              "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", str(path)],
             capture_output=True, text=True, check=True,
         )
-        w, h = probe.stdout.strip().split("x")
-        return int(w), int(h)
+        # 稳健解析：某些容器（如 Remotion 输出的 _op_styled.mp4）ffprobe 会带
+        # 尾随分隔符，"1080x1920x" 直接解包 w,h 会 ValueError→被 except 吞成
+        # (0,0)，让 insert_broll 误判“无法读取主视频画幅”。改为取前两个纯数字段。
+        parts = [p for p in probe.stdout.strip().split("x") if p.isdigit()]
+        if len(parts) >= 2:
+            return int(parts[0]), int(parts[1])
+        return 0, 0
     except Exception:
         return 0, 0
 
