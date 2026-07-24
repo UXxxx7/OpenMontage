@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from contextlib import asynccontextmanager
 from typing import List, Optional
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
@@ -19,6 +20,7 @@ from .job_manager import (
     get_active_job_for_user,
     get_assets,
     get_job,
+    get_jobs_by_status,
     get_or_create_user,
     message_exists,
     save_message,
@@ -29,7 +31,45 @@ from .whatsapp_client import WhatsAppClient
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="OpenMontage WhatsApp MVP")
+
+def _recover_orphaned_jobs() -> None:
+    """Jobs run as a daemon thread inside *this* process (`_run_in_background`
+    in this file) unless `USE_RQ_WORKER=true` routes them to an independent RQ
+    worker process instead. In the (default, no env var set) in-process mode,
+    if this server restarts while a job's pipeline/render thread is running,
+    that thread dies with the old process — the DB is left holding a stale
+    RUNNING_PIPELINE/RENDERING status with nothing behind it, forever. Worse,
+    `/jobs/{id}/retry`'s own idempotency guard refuses to touch a job in
+    either of those states (reasonably assumes something's already handling
+    it), so nothing short of manually editing the DB row could ever unstick
+    it. Confirmed real: job_d9111d13d08b sat dead for ~30 minutes on 2026-07-23
+    after exactly this restart, silently, until fixed by hand.
+
+    At a fresh startup (in-process mode), any job already in one of those two
+    states is provably orphaned — this process just started, so nothing here
+    could have put it there. Mark it ERROR (with an explanatory message) so
+    the user's next 'retry' actually restarts the pipeline, and the existing
+    WhatsApp failure-notification path (server/worker.js) tells them so
+    instead of leaving them waiting on a job that will never move again.
+    """
+    if os.getenv("USE_RQ_WORKER", "").lower() == "true":
+        return  # separate RQ worker process — a webhook-server restart doesn't touch it
+    orphaned = get_jobs_by_status([JobStatus.RUNNING_PIPELINE, JobStatus.RENDERING])
+    for job in orphaned:
+        logger.warning(f"[startup] recovering orphaned job {job.id} (was {job.status.value}) -> ERROR")
+        update_job_status(job.id, JobStatus.ERROR,
+            error_message="Orphaned by a server restart mid-pipeline; no process was left driving it. Reply 'retry' to try again.")
+    if orphaned:
+        logger.warning(f"[startup] recovered {len(orphaned)} orphaned job(s)")
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    _recover_orphaned_jobs()
+    yield
+
+
+app = FastAPI(title="OpenMontage WhatsApp MVP", lifespan=_lifespan)
 
 
 # ---------------------------------------------------------------------------
