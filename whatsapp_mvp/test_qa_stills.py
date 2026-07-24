@@ -36,6 +36,71 @@ REAL_JOB_AC008 = {
 }
 
 
+# 真实生产 props（job_452ef6c48100，2026-07-21 复现的"品牌样式渲染"降级——
+# 数据卡显示 "$6,300"/"$1.1M"，但转写只说过 "$8,400"/"one and a half
+# million"）——只保留 pick_qa_frames 会用到的字段，原样摘自
+# storage/jobs/job_452ef6c48100/_op_apply_style_props.json。
+REAL_JOB_452EF6 = {
+    "durationSeconds": 50.042,
+    "introOutFrame": 80,
+    "scenes": [
+        {"frame": 0, "w": 960, "h": 1100}, {"frame": 20, "w": 960, "h": 900},
+        {"frame": 180, "w": 960, "h": 900}, {"frame": 592, "w": 960, "h": 900},
+        {"frame": 612, "w": 960, "h": 1100}, {"frame": 632, "w": 960, "h": 900},
+        {"frame": 700, "w": 960, "h": 900}, {"frame": 950, "w": 960, "h": 900},
+        {"frame": 1098, "w": 960, "h": 900}, {"frame": 1118, "w": 960, "h": 1100},
+    ],
+    "dataCards": [{
+        "mountFrame": 378,
+        "rows": [{"label": "Coverage", "mountOffset": 0}, {"label": "Annual Premium", "mountOffset": 186}],
+    }],
+}
+
+
+def test_data_card_sampled_after_count_up_animation_settles():
+    """Fix C46 回归测试——真实生产 bug job_452ef6c48100：InfoCard.tsx 的
+    count_up 数字用 interpolate(rowLocal, [0, 40], [0, row.value], ...)
+    动画，40 帧才到最终值，但旧代码只在 mountFrame+last_row+30 处采样——
+    早了 10 帧，抓到的是还在往上数、尚未到达目标值的数字。真实复现：
+    最后一行 mountOffset=186，卡片 mountFrame=378，旧代码采样第
+    378+186+30=594 帧（動畫進度 30/40=75%），把 "$8,400" 读成"$6,300"
+    （8400*0.75=6300，分毫不差），vision QA 因此把这个纯粹的动画进度当成
+    了内容错误，触发降级交付——不是 content_planner 提取错了数字。"""
+    frames = pick_qa_frames(REAL_JOB_452EF6)
+    check("不再采样動畫進度 75% 的旧位置(378+186+30=594)——那一帧数字还没数完",
+          594 not in frames, frames)
+    check("改采样動畫已經定格之後的帧(378+186+45=609)",
+          609 in frames, frames)
+
+
+def test_other_rules_frame_pushed_out_of_count_up_window_too():
+    """Fix C48 回归测试——真实生产复现（同一支 job_452ef6c48100，就在验证
+    C46 之后的下一次真实渲染里）：这次不是 C46 已经堵住的"数据卡专属"采样
+    规则，是转场窗口规则（win_end+8）独立算出的帧，恰好也落进了同一个
+    count_up 行还在数数的窗口，读到 "$4,200"——正好是 "$8,400" 的 50%，
+    也就是 40 帧动画走到第 20 帧时的读数，不是 C46 修的那个 75% 位置。
+    构造一个转场窗口，让它的 win_end+8 落进 count_up 窗口内，验证统一
+    后处理（不管哪条规则产生的帧）都会把它推出去，而不是只堵一条路。"""
+    props = {
+        "durationSeconds": 50.0,
+        "introOutFrame": 20,
+        "dataCards": [{
+            "mountFrame": 400,
+            "rows": [{"label": "Annual Premium", "mountOffset": 0, "value": 8400}],
+        }],
+        "scenes": [
+            {"frame": 0, "w": 960, "h": 1100},
+            {"frame": 300, "w": 960, "h": 900},
+            {"frame": 412, "w": 960, "h": 1100},  # win_end+8 = 420, lands inside [400, 445)
+        ],
+    }
+    frames = pick_qa_frames(props)
+    check("转场规则独立算出的帧(412+8=420)落进了 count_up 窗口，不会原样保留",
+          420 not in frames, frames)
+    check("被推到 count_up 窗口结束点(400+45=445)，数字已经数完",
+          445 in frames, frames)
+
+
 def test_frame_zero_not_sampled_as_pre_transition_check():
     """Fix C22 回归测试——真实生产 bug job_ac00838adea9（同一模式也在
     job_1b7254abcd66 上复现过）：scenes[0] 恒为 frame=0，_transition_windows
@@ -223,6 +288,8 @@ def test_second_call_failure_drops_all_high_findings():
 
 
 def main():
+    test_data_card_sampled_after_count_up_animation_settles()
+    test_other_rules_frame_pushed_out_of_count_up_window_too()
     test_frame_zero_not_sampled_as_pre_transition_check()
     test_transition_starting_at_frame_zero_without_other_frames()
     test_full_frames_midpoint_does_not_resolve_to_frame_zero()

@@ -96,9 +96,20 @@ def pick_qa_frames(props: dict) -> list[int]:
     每个全画布接管的中点、全屏区间中点、片尾、每次卡片转场前后各一帧。"""
     duration_frames = max(1, round(props["durationSeconds"] * _FPS))
     frames = {min(props.get("introOutFrame", 20) + 15, duration_frames - 1)}
+    # Fix C46 (2026-07-21, real production reproduction, job_452ef6c48100):
+    # a count_up row's number animates via `interpolate(rowLocal, [0, 40],
+    # [0, row.value], ...)` in InfoCard.tsx — 40 frames from that row's own
+    # mountOffset to its FINAL value. This used to sample only mountFrame +
+    # last_row + 30, i.e. 10 frames before the animation settles, catching the
+    # still-counting-up number and misreading it as a wrong delivered value.
+    # Confirmed exactly: a still sampled at +30/40 of the way through reads
+    # ~75% of the true target ($8,400 -> "$6,300", $1,500,000 -> "$1.1M" after
+    # formatting) — bit-for-bit what vision QA flagged as a content mismatch
+    # on two separate real runs. +45 (not just +40) leaves a small settle
+    # margin past the interpolate's own clamp point.
     for card in props.get("dataCards", []):
         last_row = max((r.get("mountOffset", 0) for r in card.get("rows", [])), default=0)
-        frames.add(min(card["mountFrame"] + last_row + 30, duration_frames - 1))
+        frames.add(min(card["mountFrame"] + last_row + 45, duration_frames - 1))
     # beforeAfter cards weren't sampled at all before this — both values need
     # to have actually landed, not just the card's own mount, for the still
     # to show the finished reveal.
@@ -123,6 +134,44 @@ def pick_qa_frames(props: dict) -> list[int]:
     for win_start, win_end in _transition_windows(scenes):
         frames.add(max(0, min(win_start - 8, duration_frames - 1)))
         frames.add(max(0, min(win_end + 8, duration_frames - 1)))
+    # Fix C48（2026-07-21，同一支 job_452ef6c48100，就在验证 C46 的下一次
+    # 真实渲染里复现——这次是一个不同的 finding："Annual Premium $4,200"
+    # 对着转写的 "$8,400"，4200 恰好是 8400 的 50%，也就是 interpolate(
+    # rowLocal, [0, 40], ...) 走到第 20 帧（40 的一半）时的读数，不是 C46
+    # 修过的那条数据卡专属采样规则算出来的帧（那条规则现在直接跳到 +45，
+    # 已经在窗口结束之后）——是上面 transition-window/full-frame 等其它规则
+    # 独立算出的某个帧，恰好也落进了同一个 count_up 行还在数数的窗口内。
+    # C46 只修了"数据卡专属"这一条规则，没有堵住其它规则各自算出的帧同样
+    # 可能落进同一个动画窗口——重演的正是 Fix C22 自己写下的教训："不要
+    # 特事特办每条可能算出问题帧的规则，在唯一真正重要的地方强制这条不
+    # 变量"。所以这里不再头痛医头，改成在真正返回之前统一扫一遍：任何
+    # 规则算出的帧，只要落进了任意一个 count_up 行自己的动画窗口
+    # [mountFrame+mountOffset, +45)，一律推到那个窗口结束之后，不管是哪条
+    # 规则产生的。
+    count_up_windows: list[tuple[int, int]] = []
+    for card in props.get("dataCards", []) or []:
+        mount = card.get("mountFrame")
+        if mount is None:
+            continue
+        for row in card.get("rows", []) or []:
+            if not isinstance(row, dict) or row.get("value") is None:
+                continue
+            start = mount + row.get("mountOffset", 0)
+            count_up_windows.append((start, min(start + 45, duration_frames)))
+    if count_up_windows:
+        adjusted = set()
+        for f in frames:
+            shifted = f
+            moved = True
+            while moved:
+                moved = False
+                for start, end in count_up_windows:
+                    if start <= shifted < end:
+                        shifted = min(end, duration_frames - 1)
+                        moved = True
+            adjusted.add(shifted)
+        frames = adjusted
+
     # Fix C22（2026-07-19，真实生产复现 job_ac00838adea9/job_1b7254abcd66，
     # both times reproduced again on a live re-run after the first attempt at
     # this fix only patched the transition-window path above）: frame 0 is the

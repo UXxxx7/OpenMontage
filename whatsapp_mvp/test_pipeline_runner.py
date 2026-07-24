@@ -12,6 +12,7 @@ from whatsapp_mvp.pipeline_runner import (
     _fill_intro_lead_dead_space, _restore_facecam_before_end,
     _FACECAM_RESTORE_BUFFER_FRAMES, _recompute_scenes_from_content,
     _mode_schedule_to_scenes, _TRANSITION_HOLD_FRAMES,
+    _content_unchanged,
 )
 
 FAILED = []
@@ -118,9 +119,22 @@ def test_shift_off_dominant_windows_pushes_past_mid_video_hold():
 
 
 def test_shift_off_dominant_windows_no_op_when_already_workflow():
-    items = [{"mountFrame": 100, "endFrame": 300}]  # 落在 40-200 这段 workflow 窗口内
+    # endFrame=180 完全在下一次 dominant 增长开始(200-20=180)之前结束——
+    # 真正的"整段都在 workflow 窗口内"no-op 场景，不触发 Fix C49 的截短。
+    items = [{"mountFrame": 100, "endFrame": 180}]  # 落在 40-200 这段 workflow 窗口内
     _shift_off_dominant_windows(items, _MID_VIDEO_MODE_SCHEDULE)
-    check("已经在 workflow 窗口内的图形不受影响", items[0] == {"mountFrame": 100, "endFrame": 300}, items[0])
+    check("已经在 workflow 窗口内、且结束在下次增长之前的图形不受影响",
+          items[0] == {"mountFrame": 100, "endFrame": 180}, items[0])
+
+
+def test_shift_off_dominant_windows_caps_endFrame_before_regrow():
+    """Fix C49 回归测试——跟 Fix C47 一模一样的形状，只是这次是普通的
+    dataCard/countdown/gauge 而不是 zoneHeader：起点在 workflow 内，但
+    endFrame 撞上了下一次真正的 dominant 增长（200-20=180）。"""
+    items = [{"mountFrame": 100, "endFrame": 300}]  # 跟旧版本共享同一个坐标，但这次会被截短
+    _shift_off_dominant_windows(items, _MID_VIDEO_MODE_SCHEDULE)
+    check("endFrame 被截短到下次增长真正开始之前(200-20=180)",
+          items[0] == {"mountFrame": 100, "endFrame": 180}, items[0])
 
 
 def test_shift_off_dominant_windows_headers_same_behavior():
@@ -128,6 +142,45 @@ def test_shift_off_dominant_windows_headers_same_behavior():
     _shift_off_dominant_windows_headers(headers, _MID_VIDEO_MODE_SCHEDULE)
     check("zoneHeader 用 fromFrame/toFrame 字段也一样被推移",
           headers[0]["fromFrame"] == 612 and headers[0]["toFrame"] == 612 + (592 - 378), headers[0])
+
+
+# Fix C47 回归测试——同一支 job_452ef6c48100，就在验证 C46 的同一次真实
+# 渲染里复现：C24 只检查 fromFrame 那一刻的模式（起点在 workflow 就判定
+# no-op），没检查 toFrame 之前模式会不会再变回 dominant。真实案例：
+# COVERAGE 的 zoneHeader fromFrame=381 时确实是 workflow，但卡片在
+# toFrame=592 之前的 572 帧（592 - _CARD_TRANSITION_FRAMES）就已经开始长回
+# dominant——header 还在显示的最后 20 帧跟正在长大的卡片撞在一起，vision QA
+# 真实抓到了标题文字叠在说话人身上的这一帧。
+_COVERAGE_MODE_SCHEDULE = [
+    {"frame": 0, "mode": "dominant"},
+    {"frame": 180, "mode": "workflow"},
+    {"frame": 592, "mode": "dominant"},  # 内容驱动的真实回涨时间点（Fix C14）
+]
+
+
+def test_shift_off_dominant_windows_headers_caps_toFrame_before_regrow():
+    headers = [{"fromFrame": 381, "toFrame": 592}]  # 真实 COVERAGE zoneHeader
+    _shift_off_dominant_windows_headers(headers, _COVERAGE_MODE_SCHEDULE)
+    check("起点在 workflow 内，fromFrame 不被平移",
+          headers[0]["fromFrame"] == 381, headers[0])
+    check("toFrame 被截短到卡片真正开始长大之前(592-20=572)，不再跟长大中的卡片重叠",
+          headers[0]["toFrame"] == 572, headers[0])
+
+
+def test_shift_off_dominant_windows_headers_no_op_when_toFrame_before_regrow():
+    headers = [{"fromFrame": 200, "toFrame": 400}]  # 整段都在 workflow 窗口内结束
+    _shift_off_dominant_windows_headers(headers, _COVERAGE_MODE_SCHEDULE)
+    check("toFrame 本来就在下一次长大之前，不被截短",
+          headers[0] == {"fromFrame": 200, "toFrame": 400}, headers[0])
+
+
+def test_shift_off_dominant_windows_headers_no_op_when_no_further_dominant():
+    # 后面再没有 dominant 窗口——没有什么好躲的，保持原状。
+    schedule = [{"frame": 0, "mode": "dominant"}, {"frame": 40, "mode": "workflow"}]
+    headers = [{"fromFrame": 100, "toFrame": 900}]
+    _shift_off_dominant_windows_headers(headers, schedule)
+    check("后面没有 dominant 窗口时 toFrame 不被截短",
+          headers[0] == {"fromFrame": 100, "toFrame": 900}, headers[0])
 
 
 def test_shift_off_dominant_windows_leaves_unrescuable_item_alone():
@@ -268,6 +321,33 @@ def test_recompute_scenes_from_content_covers_a_late_inserted_card():
           mode_at(800) == "workflow", result["scenes"])
 
 
+def test_recompute_scenes_from_content_reapplies_dominant_avoidance():
+    """Fix C50 回归测试——真实生产复现（job_452ef6c48100，就在验证 C47/C49
+    的下一次真实渲染里）：C47/C49 的避让检查只在 `_build()` 里跑了一次，用
+    的是那一刻的 mode_schedule；但 `_build()` 最后还会再调一次
+    `_recompute_scenes_from_content`（Fix C33/C38 本身要求"任何挪动内容区
+    图形之后都要重算"，而 C47/C49 的避让本身就是"挪动内容区图形"），从
+    这一刻起才算真正定型的 mode_schedule，从来没有被拿去重新检查过
+    zoneHeaders 会不会撞上它。真实复现：一个 gauge 撑出 200-400 这段
+    workflow 窗口，DETAILS 的 zoneHeader fromFrame=250(在窗口内，安全)，
+    toFrame=450(超出窗口，撞上卡片从 400 帧开始长回 dominant)——旧代码
+    这个 toFrame 永远不会被检查，因为避让只在 recompute *之前* 跑过一次。
+    验证：既然避让已经搬进 `_recompute_scenes_from_content` 内部，直接调
+    这个函数也能拿到修正后的 toFrame，不需要依赖调用方记得在正确的时机
+    再调一次。"""
+    props = {
+        "durationSeconds": 30.0,
+        "gauges": [{"label": "x", "mountFrame": 200, "endFrame": 400, "x": 60, "y": 1040}],
+        "zoneHeaders": [{"title": "DETAILS", "fromFrame": 250, "toFrame": 450, "x": 60, "y": 1040}],
+        "scenes": [],
+    }
+    result = _recompute_scenes_from_content(props, 900)
+    check("zoneHeader 的 toFrame 被截短到卡片真正开始长回 dominant 之前(400-20=380)",
+          result["zoneHeaders"][0]["toFrame"] == 380, result["zoneHeaders"])
+    check("fromFrame 本来就安全，不受影响",
+          result["zoneHeaders"][0]["fromFrame"] == 250, result["zoneHeaders"])
+
+
 def test_transition_hold_shrinking_arrives_early_and_holds():
     # Original Fix C21 scenario: card is Dominant for a long time (a takeover
     # section runs late), then shrinks to Workflow -- should arrive at the
@@ -298,6 +378,38 @@ def test_transition_hold_growing_stays_small_until_the_end():
     check("cur 自己那一帧仍然是长大后的尺寸", scenes[-1]["h"] == 1100, scenes)
 
 
+def test_content_unchanged_ignores_derived_fields_but_detects_real_changes():
+    # 派生字段（scenes/opacityKeyframes 由 _recompute_scenes_from_content 每次
+    # 重算）不同不该算"内容变了"——不然这个检查永远判定"变了"，形同虚设。
+    props_a = {
+        "chapters": [{"label": "intro"}],
+        "dataCards": [{"title": "Coverage", "value": 8400}],
+        "scenes": [{"frame": 0, "h": 900}],
+        "opacityKeyframes": [{"frame": 0, "opacity": 1}],
+    }
+    props_b_same_content_different_derived = {
+        "chapters": [{"label": "intro"}],
+        "dataCards": [{"title": "Coverage", "value": 8400}],
+        "scenes": [{"frame": 999, "h": 500}],
+        "opacityKeyframes": [{"frame": 50, "opacity": 0}],
+    }
+    check("derived-field-only diff counts as unchanged",
+          _content_unchanged(props_a, props_b_same_content_different_derived) is True)
+
+    props_c_real_content_change = {
+        "chapters": [{"label": "intro"}],
+        "dataCards": [{"title": "Coverage", "value": 6300}],  # 数值真的变了
+        "scenes": [{"frame": 0, "h": 900}],
+        "opacityKeyframes": [{"frame": 0, "opacity": 1}],
+    }
+    check("real content diff (dataCards value) is detected as changed",
+          _content_unchanged(props_a, props_c_real_content_change) is False)
+
+    props_d_missing_field = {"chapters": [{"label": "intro"}]}
+    check("a field present in one and absent in the other counts as changed",
+          _content_unchanged(props_a, props_d_missing_field) is False)
+
+
 def main():
     test_shifts_below_floor_preserving_duration()
     test_before_after_second_reveal_frame_shifts_too()
@@ -307,7 +419,11 @@ def main():
     test_no_op_on_empty_or_none()
     test_shift_off_dominant_windows_pushes_past_mid_video_hold()
     test_shift_off_dominant_windows_no_op_when_already_workflow()
+    test_shift_off_dominant_windows_caps_endFrame_before_regrow()
     test_shift_off_dominant_windows_headers_same_behavior()
+    test_shift_off_dominant_windows_headers_caps_toFrame_before_regrow()
+    test_shift_off_dominant_windows_headers_no_op_when_toFrame_before_regrow()
+    test_shift_off_dominant_windows_headers_no_op_when_no_further_dominant()
     test_shift_off_dominant_windows_leaves_unrescuable_item_alone()
     test_self_intro_repeat_is_not_inserted()
     test_non_first_caption_still_gets_fallback_card()
@@ -316,8 +432,10 @@ def main():
     test_restore_facecam_no_op_without_matching_finding()
     test_restore_facecam_no_op_when_no_room_to_cap()
     test_recompute_scenes_from_content_covers_a_late_inserted_card()
+    test_recompute_scenes_from_content_reapplies_dominant_avoidance()
     test_transition_hold_shrinking_arrives_early_and_holds()
     test_transition_hold_growing_stays_small_until_the_end()
+    test_content_unchanged_ignores_derived_fields_but_detects_real_changes()
 
     print()
     if FAILED:

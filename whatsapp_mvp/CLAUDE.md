@@ -884,6 +884,365 @@ work," check whether the existing fix's criterion was ever capable of
 catching the specific failure being reported, not just whether it fires at
 all.
 
+## Rule 18 — a QA still sampled mid-way through a component's OWN entrance/reveal animation will read as wrong content, even when the delivered value is correct
+
+Confirmed real bug (2026-07-21, same-day follow-up to Rule 17's fix — a fresh
+end-to-end re-render of `job_452ef6c48100`, this time with C45 in place,
+*still* degraded to no-video-delivered). Inspecting the actually-delivered
+`_op_apply_style_props.json` directly (Rule 13's own standard: don't trust a
+props-level pass, check the real artifact) showed the planned values were
+correct — `Coverage: 1,500,000` / `Annual Premium: 8,400`, exactly what the
+transcript says. The vision-QA "mismatch" was real in the sense that the
+still genuinely showed a different number — but the number was correct, just
+not yet *finished animating* at the exact frame QA happened to sample.
+
+**Root cause:** `InfoCard.tsx`'s count_up row animates via
+`interpolate(rowLocal, [0, 40], [0, row.value], ...)` — the displayed number
+climbs from 0 to its final value over 40 frames from that row's own
+`mountOffset`. `qa_stills.pick_qa_frames` sampled each data card at
+`mountFrame + last_row_mountOffset + 30` — 10 frames *before* the animation
+reaches its clamp point. The math confirms it exactly: a still taken at
+30/40 (75%) of the way through reads `8400 * 0.75 = 6300` and
+`1,500,000 * 0.75 = 1,125,000` ("$1.1M" after formatting) — bit-for-bit the
+two "wrong" values vision QA flagged on two separate real runs. This isn't a
+content bug at all; it's a sampling bug, same *class* as Rule 14 (frame 0
+sampled before SpeakerCard has rendered anything) but a different mechanism
+— Rule 14 is about a component that hasn't started its entrance yet, this
+one is about a component whose entrance/reveal animation is legitimately
+still in progress when sampled.
+
+**The fix (Fix C46):** the data-card sample point moved from `+ 30` to
+`+ 45` frames past the last row's `mountOffset` — past the animation's own
+40-frame clamp point, with a small settle margin. This is a single-line
+change but was only findable by reading the actual Remotion component's
+animation code (`interpolate(..., [0, 40], ...)`), not by staring at
+`qa_stills.py` alone — the "30" there was never derived from the real
+animation duration in the first place, just an unlabeled constant that
+happened to work often enough not to get questioned until a real job's
+timing exposed the 10-frame gap.
+
+**General principle, extending Rule 14's own lesson:** before trusting a
+vision-QA "content mismatch" finding, check not just *whether* the sampled
+frame is meaningful (Rule 14) but *whether whatever's on it has finished
+animating yet* — any component with its own multi-frame reveal (count-up
+numbers, gauges filling, progress bars) can produce a technically-accurate
+screenshot of a state that was never meant to be final. When a "wrong value"
+finding's number is a suspiciously round fraction (half, three-quarters,
+etc.) of the plausible correct value, check the animation timing before
+assuming content_planner extracted the wrong figure.
+
+## Rule 19 — a "no-op if it starts docked" avoidance check needs to cover the WHOLE display window, not just the start frame
+
+Confirmed real bug (2026-07-21, same-day, same job as Rule 18 — found by
+opening the actual flagged still per Rule 9's standard, in the very next live
+verification render after C46 landed): with the count_up hallucination (C45)
+and mid-animation sampling (C46) bugs both fixed, the pipeline *still*
+degraded — this time on a real, reproducible layout defect, not a sampling
+artifact. `f584.png` shows the ghosted "COVERAGE" zoneHeader title
+overlapping the speaker's face, mid-collision with the SpeakerCard as it
+grows back to Dominant size.
+
+**Root cause:** Fix C24 (`_shift_off_dominant_windows_headers`,
+`whatsapp_mvp/pipeline_runner.py`) only checks the mode at a header's
+`fromFrame` — if that's already `"workflow"` (docked), it's treated as
+entirely safe and left alone. But `fromFrame` being docked says nothing
+about whether the mode flips back to `"dominant"` again before `toFrame`.
+Real case: COVERAGE's zoneHeader spans `fromFrame=381` (correctly docked at
+that instant) to `toFrame=592` — but the SpeakerCard's next real transition
+starts growing at frame 572 (592 minus the 20-frame `_CARD_TRANSITION_FRAMES`
+transition, per Rule 15/Fix C39's "arrive at the bigger size right before the
+next transition" design), which is *inside* the header's own still-active
+window. C24's "does it start docked" check is a correct necessary condition
+but was silently treated as sufficient — it only holds for content shapes
+where docked mode persists for the element's entire display span, which this
+video's shape (a workflow window that ends mid-header) doesn't satisfy.
+
+**The fix (Fix C47):** added `_next_dominant_grow_start` (mirrors the
+existing `_next_docked_frame` in the opposite direction — finds when the
+card next starts growing back to Dominant, accounting for the same
+`_CARD_TRANSITION_FRAMES` head start). `_shift_off_dominant_windows_headers`
+now checks this *in addition to* the existing start-frame check: if the
+video would start regrowing before the header's `toFrame`, the header is
+capped to end right as the regrowth begins, rather than continuing to
+display (at full opacity, per its own animation) into the collision window.
+Scoped to `zoneHeaders` only, not `_shift_off_dominant_windows`'s data-card
+sibling — a data card carries actual information (and, post-C46, may still
+be settling its own count-up animation), so truncating it early risks
+cutting off real content before it's fully read; a decorative chapter title
+losing its last ~20 frames of display time is a much smaller cost than a
+literal readable-text collision, so the two element types don't necessarily
+want the same fix even though they share the older, incomplete C24 check.
+
+**Verified:** new regression tests in `test_pipeline_runner.py` using the
+real job's actual `mode_schedule` shape (workflow 180→592, matching the
+observed `scenes`) — confirms the header's `toFrame` gets capped to 572, and
+that headers whose full window already sits before the next regrow point (or
+where there's no further Dominant window at all) are correctly left
+untouched. Full suite (`test_pipeline_runner`, `test_content_planner`,
+`test_qa_stills`, `test_filler_review`, `test_golden_extraction`) re-run
+clean. Live re-render against the same job to confirm this specific frame no
+longer reproduces is the natural next check — same standard as every rule
+above: a props-level/unit-level pass is necessary but not sufficient.
+
+**General principle, sharpening C24's own lesson (and Rule 15's "a scheduler
+feeding a broken converter still produces broken output"):** an "is it safe"
+check that only inspects the start of a time window is a different, weaker
+claim than "is it safe for the whole window" — and the two are trivially
+conflated when the check happens to `continue`/return early on the start
+condition, because that reads exactly like "confirmed safe" at the call
+site. Before trusting a start-frame check as clearing an entire span, ask
+whether the underlying condition (here: docked-vs-dominant mode) can change
+*during* that span — content-driven mode_schedule changes were explicitly
+designed (Rule 15/C14) to happen mid-video, so any per-element safety check
+spanning more than one frame needs to account for that, not just sample the
+first instant.
+
+## Rule 20 — a per-rule fix for "this sampling rule can land on a bad frame" doesn't stop OTHER rules from landing on the same bad frame
+
+Confirmed real bug (2026-07-21, same day, same job — the very next live
+verification render after Rule 18/Fix C46 landed): vision QA flagged
+"Annual Premium $4,200" against a transcript that says "$8,400" — `4200` is
+exactly 50% of `8400`, i.e. `InfoCard.tsx`'s `interpolate(rowLocal, [0, 40],
+...)` count-up animation caught at frame 20 of 40. This is the *same*
+mechanism as Rule 18, but Rule 18's fix (Fix C46) only changed the ONE
+sampling rule in `pick_qa_frames` that samples data cards directly
+(`mountFrame + last_row + 30` → `+ 45`). This finding came from a
+*different* rule entirely (the transition-window / full-frame-midpoint
+sampling above it in the same function) independently computing a frame
+number that happened to also fall inside the same count_up row's still-
+animating window, at an earlier point (50%) than the rule Rule 18 fixed
+(75%).
+
+**This is exactly the failure shape Fix C22 already named and solved once
+before** (Rule 14's own "don't special-case every individual rule that
+might land on a bad frame, enforce the invariant once at the only place
+that actually matters") — and Fix C46 quietly reintroduced the same
+mistake by fixing only the rule that was reproducing in that specific test
+case, instead of applying C22's own lesson to this new class of bad frame.
+
+**The fix (Fix C48):** after every existing sampling rule in
+`pick_qa_frames` has proposed its candidate frames, one final pass scans
+all of them against every count_up row's own `[mountFrame + mountOffset,
++45)` animation window (the same window C46 already computes for its own
+direct rule) and pushes any frame landing inside ANY of them out to the
+window's end — regardless of which rule produced that frame. C46's own
+direct rule is untouched and still valid (it already proposes a frame at
+the window's end, so the new pass is a no-op for it); this closes every
+*other* path.
+
+**Verified:** new regression test in `test_qa_stills.py` constructs a
+transition window whose `win_end + 8` deliberately lands inside a count_up
+row's animation window and confirms it gets pushed out, independent of
+C46's own rule. Full 5-suite test run clean.
+
+**General principle, restating Rule 14's lesson because it clearly needs
+restating:** when a bad-frame mechanism is discovered, the fix belongs at
+the function's single exit point over every candidate, not inside the one
+rule that happened to reproduce it in the test/incident at hand — a
+sampling function with N independent rules that can each produce a frame
+number has N independent chances to land on the same bad frame, and fixing
+rule K only ever proves rule K is safe.
+
+## Rule 21 — the same "start-frame-only" mistake (Rule 19) has a sibling function; fix both together or the second one just reproduces the first bug under a different element type
+
+Confirmed real bug (2026-07-21, same session, same live verification chain
+as Rule 19/Fix C47 — the very next render after C47+C48 landed): vision QA
+flagged a "Renew in 30 Days" card overlapping the speaker mid-transition.
+Same mechanism as Rule 19, but Rule 19's fix (Fix C47) was deliberately
+scoped to `_shift_off_dominant_windows_headers` (zoneHeaders) only — its own
+writeup explicitly flagged `_shift_off_dominant_windows` (the sibling
+function for dataCards/gauges/countdowns) as carrying the identical
+start-frame-only gap, left unfixed "for now" to keep the change narrow. That
+gap reproduced on the very next render, for a countdown card instead of a
+zoneHeader.
+
+**The fix (Fix C49):** applied the identical `_next_dominant_grow_start`
+check to `_shift_off_dominant_windows`'s `endFrame` field, mirroring C47's
+`toFrame` handling exactly. Confirmed the fix by running the existing test
+suite first — `test_shift_off_dominant_windows_no_op_when_already_workflow`
+started failing immediately, because its own fixture (`endFrame=300` against
+a schedule that regrows to Dominant at frame 200) had always had this same
+latent collision, just never been checked for it. Fixed the test's fixture
+to represent a genuine no-op case and added a dedicated new test for the
+capping behavior — the old test was itself blind to the exact bug class this
+rule describes, same as Fix C24's original code was.
+
+**General principle:** when a fix is deliberately scoped to one of several
+structurally-identical call sites (documented as a known-remaining-gap, not
+an oversight), budget for the sibling site reproducing the same finding on
+the very next real input, not as a surprise but as the expected next step —
+and check whether any existing test's fixture happens to share the same
+blind spot before trusting it as evidence the sibling site was already fine.
+
+## Rule 22 — a fix applied before the function that redefines "final" runs is not applied to the final result
+
+Confirmed real bug (2026-07-21, same night, same verification chain — the
+next render after C47/C49/C50's siblings landed): a ghosted "DETAILS"
+zoneHeader overlapping the speaker again, mathematically the exact
+mechanism Rule 19/21 already fixed — except the saved props showed
+`toFrame=572`, completely uncapped, as if the fix had never run at all.
+
+**Root cause:** `_shift_off_dominant_windows`/`_shift_off_dominant_windows_
+headers` were called inside `_build()` at one point, using the
+`mode_schedule` computed at that point in the function. But
+`_recompute_scenes_from_content` (Fix C33/C38) runs *after* that — and its
+own docstring already states the load-bearing rule: "any code that moves or
+inserts content-zone graphics after this must call it again, or the frozen
+scenes stop matching reality." The C47/C49 avoidance calls ARE exactly that
+kind of code (they move `mountFrame`/`endFrame`/`toFrame`), but they ran
+*before* the recompute, not after — so the `mode_schedule` actually baked
+into the final `scenes` (and therefore the actual rendered card-growth
+timing) was never the one the avoidance check saw. This is Rule 15's own
+lesson (C38/C39: "a guarantee is only final if it runs after every step
+that can still touch the thing it's guaranteeing"), reproducing a third
+time, now against C47/C49 themselves rather than against C13/C15/C37.
+
+**The fix (Fix C50):** folded the avoidance re-check directly into
+`_recompute_scenes_from_content` itself, since that function is already the
+single authoritative place `scenes` gets finalized (same reasoning as
+Rule 15's own fix). It now: computes `mode_schedule` from current content
+ranges (as before) → runs `_shift_off_dominant_windows` /
+`_shift_off_dominant_windows_headers` against that schedule → rebuilds
+`ranges`/`mode_schedule` a second time from the now-adjusted items (since
+the avoidance pass can itself move things) → derives the final `scenes`
+from that. Every caller of `_recompute_scenes_from_content` — all three
+call sites — gets this for free without needing to remember to re-run
+avoidance themselves, closing the gap structurally rather than by
+convention.
+
+**Verified:** new regression test calls `_recompute_scenes_from_content`
+directly with a gauge and an overlapping zoneHeader and confirms the
+returned header's `toFrame` is capped, proving the guarantee now lives in
+the function itself, not in caller discipline. Full 5-suite run clean.
+
+**General principle, now stated three times because it keeps
+recurring (Rule 15, Rule 19/21, this rule):** in a pipeline with more than
+one "this recomputes the derived state" step, a fix belongs in the
+*last* such step that runs before the artifact is finalized — or, better,
+inside the recompute function itself so it applies unconditionally to every
+call site, present and future. A fix placed earlier in the pipeline is only
+as final as the code immediately after it promises to be, and that promise
+is easy to accidentally break the next time someone adds a step between the
+fix and the finalize call.
+
+## Rule 23 — "at least one card exists" and "the card's number isn't invented" are both different guarantees from "every distinct spoken figure got its own card"
+
+Confirmed real bug (2026-07-23, found by the user from a genuine WhatsApp-delivered
+preview — same David/Pacific Life fixture as Rules 16-22, `job_452ef6c48100`'s
+transcript). The user's report looked, at first, exactly like a regression of a
+previously-fixed class of bug: the Coverage ($1.5M) card was missing, the renewal
+countdown ring was missing, and the outro was missing — "we had fixed every single
+bug to perfection... now it's back to the original shite quality." The user's own
+working theory was that a collaborator's in-progress filler-removal ("cutting")
+changes had broken something.
+
+**Investigation, not assumption, first (per the user's own explicit standing
+instruction and Rule 13/16's precedent):** transcribed the actual delivered
+`preview.mp4` directly (faster-whisper, local) and frame-sampled it. Findings:
+
+- The known duplicate retake ("if you have any questions, just WhatsApp me
+  directly" — Rules 16/17/C43/C44's own fixture) appears exactly ONCE in this
+  video, not twice. The cut is clean, audio flows naturally. **The cutting was
+  not the problem** — reverting it, as the user initially asked, would have
+  been the wrong move and risked reintroducing the duplicate-retake bug for no
+  benefit.
+- "$1.5 million" is spoken clearly at ~11-14s in the audio. The rendered card
+  only ever shows "Annual Premium: $8,400" — one row, titled just "ANNUAL
+  PREMIUM." The Coverage row was never planned, even though the figure is
+  right there in the transcript, in the same sentence as the Premium figure
+  that DID make it onto the card.
+- The transcript also names both a countdown-eligible figure ("30 days") and
+  a calendar date ("28th of July") in the same ASR segment (verified against
+  real segment data, not a synthetic fixture) — the plan produced only a
+  calendar card, zero countdown cards.
+- No commits, no pushed branches, no other worktree anywhere in the repo could
+  explain this — this session's own unrelated feature work (6 new xiaojin card
+  types) was still on an unmerged draft PR and couldn't have touched a live
+  render.
+
+**Root cause: neither C41 (criterion 4) nor C45 (criterion 5) covers this
+failure shape.** C41 only checks "does at least one numeric card exist
+anywhere" — passes, because the Premium card exists. C45 only checks "does
+each existing card's value match something actually spoken" — passes, because
+$8,400 really was said. Both are watching the numbers that DID make it into
+the plan; neither has any way to notice a number that never showed up at all.
+This is the same LLM non-determinism Rule 17 already named ("same input,
+different output across independent planning calls... don't try to fix it
+with more prompt wording, add a deterministic criterion instead") — not a
+regression from any code change, just a failure shape the existing criteria
+happen not to cover.
+
+**The fix (criteria 6, 7, and 8 in `_plan_quality_failures`):**
+
+- **Criterion 6**, `_uncovered_spoken_values` — the mirror image of C45's
+  `_ungrounded_count_up_rows`. That function checks every count_up row's value
+  against the spoken figures (catches invention); this one checks every spoken
+  figure against every count_up row / before_after value (catches omission).
+  Same scale-ambiguity tolerance as C45 (a plan value may legitimately be raw
+  or pre-scaled), just expanded in the opposite direction. Deliberately scoped
+  to count_up rows and before_after left/right values only — gauge's "value"
+  is a 0-1 risk fraction and countdown's is a day-count, neither is a
+  monetary figure, and including them risked a coincidental numeric collision
+  against a semantically unrelated field.
+- **Criterion 7**, `_spoken_countdown_and_date_together` — fires only when a
+  day/week/month countdown-style phrase and a calendar month name co-occur in
+  the SAME transcript segment, and the plan has a calendar entry but zero
+  countdown entries. Deliberately narrow (not "any day-count phrase needs a
+  countdown," which would misfire constantly on unrelated duration mentions,
+  e.g. "I've done this for ten years" or a step_list's "took three days") —
+  scoped to the exact linguistic shape of the observed failure.
+- **Criterion 8**, `_transcript_has_closing_language` — added same day, after
+  the user separately confirmed "the outro is not there again" for the same
+  preview. Fires when a segment landing in the last quarter of the video
+  contains farewell/closing/contact-CTA language ("take care," "looking
+  forward to," "scan the QR," etc.) but the plan has no outro or an outro
+  with an empty headline. Gated at the same `duration >= 12s` threshold
+  `pipeline_runner.py` itself uses before it will even attempt an outro, and
+  scoped to the tail of the video specifically so an early-video "contact me"
+  mention doesn't misfire. Validated against the FULL real segment list for
+  `job_452ef6c48100` (not a truncated excerpt) — confirms the actual closing
+  lines ("Looking forward to keeping you and your family protected." /
+  "Take care.") land in the last quarter and correctly trigger the check.
+  **Left `pipeline_runner.py`'s own outro-placement skip logic (the
+  `duration_frames - outro["fromFrame"] >= 60` gate, added because an earlier
+  bug let outro cover a real before/after reveal near the end) untouched** —
+  no direct access to the job that produced the reported preview to confirm
+  whether that skip, rather than a missing LLM-written outro, was the actual
+  mechanism, and loosening an anti-overlap guard on a guess risks
+  reintroducing the bug it was built to prevent. If criterion 8 alone doesn't
+  resolve a future case, that skip logic is the next place to look — with
+  real props in hand first, not another guess.
+
+All three wired into `_plan_quality_failures` the same way every other
+criterion is (Rule 3): automatically covers the main `plan_content` loop AND
+the vision-QA-triggered `_build()` replan path, zero special-casing needed at
+either call site.
+
+**Verified:** unit-level against REAL segment data pulled directly from
+`storage/jobs/job_452ef6c48100/_op_nofiller_transcript.json` (not a simplified
+test fixture, and for criterion 8 the FULL segment list through the video's
+actual final line, not a truncated excerpt) — confirms "30 days" and "on the
+28th of July" really do land in the same ASR segment despite being split
+across two captions, and that all three new criteria fire on the exact real
+failure shape while staying silent when the plan is actually complete or the
+transcript content is unrelated. Full 6-suite test run clean. **Not yet
+verified via a live render** — same standard as every rule above; this closes
+a real gap in the deterministic checks but a live re-run against a transcript
+with this exact shape is the natural next confirmation.
+
+**General principle, extending Rule 17's own lesson a third time:** when a bug
+report sounds exactly like a previously-fixed class of bug, resist the urge to
+assume it's a regression (or to blame whatever unrelated work happened most
+recently) before actually opening the delivered artifact. Here, the user's
+instinct (something got broken) was right in spirit but wrong in target — the
+cutting was fine; a different, adjacent gap in the criteria was the real cause.
+And when you do find the real cause: "a check exists for this class of thing"
+is not the same claim as "a check exists for THIS SPECIFIC shape of this class
+of thing" — C41 and C45 both sound, from their names alone, like they should
+cover "wrong/missing numbers," but neither actually covers "some numbers
+present, others silently dropped." Read what a check actually tests, not what
+its docstring's general description implies it tests.
+
 ## Where the rest of the story lives
 
 - `docs/STATUS.md` — architecture baseline, branch status (predates most of the

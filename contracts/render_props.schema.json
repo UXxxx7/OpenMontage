@@ -1068,6 +1068,537 @@
           }
         }
       }
+    },
+    "comparisons": {
+      "type": "array",
+      "description": "[xiaojin arsenal round 2] Side-by-side 2-3 column comparison across MULTIPLE attributes at once (ComparisonCard). New content_planner visual type 'comparison'. Distinct from beforeAfter, which is a single metric across two points in time.",
+      "items": {
+        "type": "object",
+        "required": [
+          "columns",
+          "mountFrame"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "title": {
+            "type": "string",
+            "maxLength": 40
+          },
+          "columns": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 3,
+            "items": {
+              "type": "object",
+              "required": [
+                "label",
+                "items"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "label": {
+                  "type": "string",
+                  "maxLength": 24
+                },
+                "labelEn": {
+                  "type": "string",
+                  "maxLength": 16
+                },
+                "accent": {
+                  "type": "string",
+                  "enum": ["good", "bad", "neutral"]
+                },
+                "items": {
+                  "type": "array",
+                  "maxItems": 4,
+                  "items": {
+                    "type": "string",
+                    "maxLength": 60
+                  }
+                }
+              }
+            }
+          },
+          "mountFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "endFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "x": {
+            "type": "number",
+            "default": 60
+          },
+          "y": {
+            "type": "number",
+            "default": 1040
+          },
+          "width": {
+            "type": "number",
+            "default": 960
+          }
+        }
+      }
+    },
+    "rankedLists": {
+      "type": "array",
+      "description": "[xiaojin arsenal round 2] Several numeric items compared/ranked against each other at once, largest first (RankedListCard). New content_planner visual type 'ranked_list'. Distinct from dataCards (independent count-up rows, not explicitly ranked).",
+      "items": {
+        "type": "object",
+        "required": [
+          "items",
+          "mountFrame"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "title": {
+            "type": "string",
+            "maxLength": 40
+          },
+          "items": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 5,
+            "items": {
+              "type": "object",
+              "required": [
+                "label",
+                "value"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "label": {
+                  "type": "string",
+                  "maxLength": 24
+                },
+                "labelEn": {
+                  "type": "string",
+                  "maxLength": 16
+                },
+                "value": {
+                  "type": "number"
+                },
+                "displayValue": {
+                  "type": "string"
+                },
+                "suffix": {
+                  "type": "string",
+                  "maxLength": 8
+                }
+              }
+            }
+          },
+          "maxValue": {
+            "type": "number"
+          },
+          "mountFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "endFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "x": {
+            "type": "number",
+            "default": 60
+          },
+          "y": {
+            "type": "number",
+            "default": 1040
+          },
+          "width": {
+            "type": "number",
+            "default": 960
+          }
+        }
+      }
+    },
+    "checklists": {
+      "type": "array",
+      "description": "[xiaojin arsenal round 2] Items ticking on one by one, each on its own spoken beat (ChecklistCard) — a confirmation/requirements-met beat. New content_planner visual type 'checklist'. Distinct from stepLists, which reads as an ordered how-to.",
+      "items": {
+        "type": "object",
+        "required": [
+          "items",
+          "mountFrame"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "title": {
+            "type": "string",
+            "maxLength": 40
+          },
+          "items": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 6,
+            "items": {
+              "type": "object",
+              "required": [
+                "label",
+                "activateOffset"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "label": {
+                  "type": "string",
+                  "maxLength": 24
+                },
+                "labelEn": {
+                  "type": "string",
+                  "maxLength": 28
+                },
+                "activateOffset": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            }
+          },
+          "mountFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "endFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "x": {
+            "type": "number",
+            "default": 60
+          },
+          "y": {
+            "type": "number",
+            "default": 1040
+          },
+          "width": {
+            "type": "number",
+            "default": 960
+          }
+        }
+      }
+    },
+    "locationPins": {
+      "type": "array",
+      "description": "[xiaojin arsenal round 2] A stylized map pin drop for a named place (LocationPinCard). New content_planner visual type 'location_pin'.",
+      "items": {
+        "type": "object",
+        "required": [
+          "place",
+          "mountFrame"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "place": {
+            "type": "string",
+            "maxLength": 24
+          },
+          "placeEn": {
+            "type": "string",
+            "maxLength": 20
+          },
+          "sub": {
+            "type": "string",
+            "maxLength": 60
+          },
+          "mountFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "endFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "x": {
+            "type": "number",
+            "default": 60
+          },
+          "y": {
+            "type": "number",
+            "default": 900
+          },
+          "width": {
+            "type": "number",
+            "default": 960
+          }
+        }
+      }
+    },
+    "testimonials": {
+      "type": "array",
+      "description": "[xiaojin arsenal round 2] Compact avatar + name/role + short quoted line from a THIRD PARTY (TestimonialCard). New content_planner visual type 'testimonial'. Distinct from quotes, which is the main speaker's own full-canvas line.",
+      "items": {
+        "type": "object",
+        "required": [
+          "quote",
+          "name",
+          "mountFrame"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "quote": {
+            "type": "string",
+            "maxLength": 100
+          },
+          "name": {
+            "type": "string",
+            "maxLength": 32
+          },
+          "role": {
+            "type": "string",
+            "maxLength": 40
+          },
+          "initials": {
+            "type": "string",
+            "maxLength": 3
+          },
+          "mountFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "endFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "x": {
+            "type": "number",
+            "default": 60
+          },
+          "y": {
+            "type": "number",
+            "default": 900
+          },
+          "width": {
+            "type": "number",
+            "default": 960
+          }
+        }
+      }
+    },
+    "iconClusters": {
+      "type": "array",
+      "description": "[xiaojin arsenal round 2] A staggered grid of icon+label chips for an unordered SET of related things mentioned together (IconClusterCard). New content_planner visual type 'icon_cluster'. Distinct from stepLists (ordered) and topicCards (one statement).",
+      "items": {
+        "type": "object",
+        "required": [
+          "items",
+          "mountFrame"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "title": {
+            "type": "string",
+            "maxLength": 40
+          },
+          "items": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 6,
+            "items": {
+              "type": "object",
+              "required": [
+                "icon",
+                "label"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "icon": {
+                  "type": "string",
+                  "enum": ["chat", "camera", "play", "star", "bolt", "heart"]
+                },
+                "label": {
+                  "type": "string",
+                  "maxLength": 20
+                },
+                "labelEn": {
+                  "type": "string",
+                  "maxLength": 16
+                }
+              }
+            }
+          },
+          "mountFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "endFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "x": {
+            "type": "number",
+            "default": 60
+          },
+          "y": {
+            "type": "number",
+            "default": 900
+          },
+          "width": {
+            "type": "number",
+            "default": 960
+          }
+        }
+      }
+    },
+    "progressBars": {
+      "type": "array",
+      "description": "[xiaojin arsenal round 3] A straight linear completion bar (ProgressBarCard). New content_planner visual type 'progress_bar'. Distinct from gauges (risk-framed) and countdowns (time-remaining framed).",
+      "items": {
+        "type": "object",
+        "required": ["label", "percent", "mountFrame"],
+        "additionalProperties": false,
+        "properties": {
+          "title": { "type": "string", "maxLength": 40 },
+          "label": { "type": "string", "maxLength": 40 },
+          "percent": { "type": "number", "minimum": 0, "maximum": 100 },
+          "subtext": { "type": "string", "maxLength": 60 },
+          "mountFrame": { "type": "integer", "minimum": 0 },
+          "endFrame": { "type": "integer", "minimum": 0 },
+          "x": { "type": "number", "default": 60 },
+          "y": { "type": "number", "default": 1040 },
+          "width": { "type": "number", "default": 960 }
+        }
+      }
+    },
+    "prosCons": {
+      "type": "array",
+      "description": "[xiaojin arsenal round 3] Polarized two-column pros/cons with baked-in good/bad framing (ProsConsCard). New content_planner visual type 'pros_cons'. Distinct from comparisons, which are neutral labeled columns.",
+      "items": {
+        "type": "object",
+        "required": ["prosLabel", "consLabel", "pros", "cons", "mountFrame"],
+        "additionalProperties": false,
+        "properties": {
+          "title": { "type": "string", "maxLength": 40 },
+          "prosLabel": { "type": "string", "maxLength": 16 },
+          "consLabel": { "type": "string", "maxLength": 16 },
+          "pros": { "type": "array", "maxItems": 4, "items": { "type": "string", "maxLength": 60 } },
+          "cons": { "type": "array", "maxItems": 4, "items": { "type": "string", "maxLength": 60 } },
+          "mountFrame": { "type": "integer", "minimum": 0 },
+          "endFrame": { "type": "integer", "minimum": 0 },
+          "x": { "type": "number", "default": 60 },
+          "y": { "type": "number", "default": 900 },
+          "width": { "type": "number", "default": 960 }
+        }
+      }
+    },
+    "milestoneTracks": {
+      "type": "array",
+      "description": "[xiaojin arsenal round 3] A lightweight inline history dot-track for 2-4 key dates (MilestoneTrackCard). New content_planner visual type 'milestone_track'. Distinct from sections.timeline, the full-canvas process takeover.",
+      "items": {
+        "type": "object",
+        "required": ["milestones", "mountFrame"],
+        "additionalProperties": false,
+        "properties": {
+          "title": { "type": "string", "maxLength": 40 },
+          "milestones": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 4,
+            "items": {
+              "type": "object",
+              "required": ["label"],
+              "additionalProperties": false,
+              "properties": {
+                "label": { "type": "string", "maxLength": 20 },
+                "sublabel": { "type": "string", "maxLength": 16 }
+              }
+            }
+          },
+          "mountFrame": { "type": "integer", "minimum": 0 },
+          "endFrame": { "type": "integer", "minimum": 0 },
+          "x": { "type": "number", "default": 60 },
+          "y": { "type": "number", "default": 900 },
+          "width": { "type": "number", "default": 960 }
+        }
+      }
+    },
+    "trustBadges": {
+      "type": "array",
+      "description": "[xiaojin arsenal round 3] Icon + credential/stat rows building the speaker's own authority (TrustBadgeCard). New content_planner visual type 'trust_badge'. Distinct from testimonials, which quote a third party.",
+      "items": {
+        "type": "object",
+        "required": ["badges", "mountFrame"],
+        "additionalProperties": false,
+        "properties": {
+          "title": { "type": "string", "maxLength": 40 },
+          "badges": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 3,
+            "items": {
+              "type": "object",
+              "required": ["icon", "primary", "secondary"],
+              "additionalProperties": false,
+              "properties": {
+                "icon": { "type": "string", "enum": ["shield", "star", "award", "clock"] },
+                "primary": { "type": "string", "maxLength": 28 },
+                "secondary": { "type": "string", "maxLength": 32 }
+              }
+            }
+          },
+          "mountFrame": { "type": "integer", "minimum": 0 },
+          "endFrame": { "type": "integer", "minimum": 0 },
+          "x": { "type": "number", "default": 60 },
+          "y": { "type": "number", "default": 900 },
+          "width": { "type": "number", "default": 960 }
+        }
+      }
+    },
+    "barCharts": {
+      "type": "array",
+      "description": "[xiaojin arsenal round 3] A real axis-based column chart for genuinely chart-shaped multi-value data (BarChartCard). New content_planner visual type 'bar_chart'. Distinct from rankedLists, which imply a ranking, not just magnitude comparison.",
+      "items": {
+        "type": "object",
+        "required": ["items", "mountFrame"],
+        "additionalProperties": false,
+        "properties": {
+          "title": { "type": "string", "maxLength": 40 },
+          "items": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 4,
+            "items": {
+              "type": "object",
+              "required": ["label", "value"],
+              "additionalProperties": false,
+              "properties": {
+                "label": { "type": "string", "maxLength": 16 },
+                "value": { "type": "number" },
+                "displayValue": { "type": "string" }
+              }
+            }
+          },
+          "mountFrame": { "type": "integer", "minimum": 0 },
+          "endFrame": { "type": "integer", "minimum": 0 },
+          "x": { "type": "number", "default": 60 },
+          "y": { "type": "number", "default": 900 },
+          "width": { "type": "number", "default": 960 }
+        }
+      }
+    },
+    "milestoneUnlocks": {
+      "type": "array",
+      "description": "[xiaojin arsenal round 3] A celebratory single-number reveal reserved for a genuine scale/achievement moment (MilestoneUnlockCard). New content_planner visual type 'milestone_unlock'. Distinct from a routine dataCards count_up row.",
+      "items": {
+        "type": "object",
+        "required": ["value", "label", "mountFrame"],
+        "additionalProperties": false,
+        "properties": {
+          "value": { "type": "number" },
+          "prefix": { "type": "string", "maxLength": 4 },
+          "suffix": { "type": "string", "maxLength": 4 },
+          "label": { "type": "string", "maxLength": 28 },
+          "icon": { "type": "string", "enum": ["award", "star", "heart", "bolt"] },
+          "mountFrame": { "type": "integer", "minimum": 0 },
+          "endFrame": { "type": "integer", "minimum": 0 },
+          "x": { "type": "number", "default": 60 },
+          "y": { "type": "number", "default": 900 },
+          "width": { "type": "number", "default": 960 }
+        }
+      }
     }
   }
 }
