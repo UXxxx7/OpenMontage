@@ -26,6 +26,25 @@ from tools.base_tool import (
 )
 
 
+# 进程级模型缓存：WhisperModel 加载一次即可反复用于多次 transcribe。原实现每次
+# execute() 都从磁盘重新加载模型——同一个 job 里转写会被调多次（原始/剪过口误的/
+# 增强后的中间文件），大模型每次加载要数秒~数十秒，纯重复开销。按
+# (model_size, device, compute_type) 缓存，跨调用、跨 job 复用（同一进程内）。
+# 质量零影响：同一模型对象、转写结果完全一致，只省掉重复加载时间。CTranslate2
+# 后端的模型对并发 transcribe 线程安全，共享无需加锁。
+_WHISPER_MODEL_CACHE: dict = {}
+
+
+def _get_cached_whisper_model(model_size: str, device: str, compute_type: str):
+    key = (model_size, device, compute_type)
+    model = _WHISPER_MODEL_CACHE.get(key)
+    if model is None:
+        from faster_whisper import WhisperModel
+        model = WhisperModel(model_size, device=device, compute_type=compute_type)
+        _WHISPER_MODEL_CACHE[key] = model
+    return model
+
+
 class Transcriber(BaseTool):
     name = "transcriber"
     version = "0.1.0"
@@ -145,7 +164,7 @@ class Transcriber(BaseTool):
             device = "cpu"
             compute_type = "int8"
 
-        model = WhisperModel(model_size, device=device, compute_type=compute_type)
+        model = _get_cached_whisper_model(model_size, device, compute_type)
 
         # Transcribe
         # condition_on_previous_text=False：默认 True 会用前面片段的转写文本当
