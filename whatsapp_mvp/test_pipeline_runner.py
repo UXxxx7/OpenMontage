@@ -12,6 +12,7 @@ from whatsapp_mvp.pipeline_runner import (
     _fill_intro_lead_dead_space, _restore_facecam_before_end,
     _FACECAM_RESTORE_BUFFER_FRAMES, _recompute_scenes_from_content,
     _mode_schedule_to_scenes, _TRANSITION_HOLD_FRAMES,
+    _content_unchanged,
 )
 
 FAILED = []
@@ -377,6 +378,38 @@ def test_transition_hold_growing_stays_small_until_the_end():
     check("cur 自己那一帧仍然是长大后的尺寸", scenes[-1]["h"] == 1100, scenes)
 
 
+def test_content_unchanged_ignores_derived_fields_but_detects_real_changes():
+    # 派生字段（scenes/opacityKeyframes 由 _recompute_scenes_from_content 每次
+    # 重算）不同不该算"内容变了"——不然这个检查永远判定"变了"，形同虚设。
+    props_a = {
+        "chapters": [{"label": "intro"}],
+        "dataCards": [{"title": "Coverage", "value": 8400}],
+        "scenes": [{"frame": 0, "h": 900}],
+        "opacityKeyframes": [{"frame": 0, "opacity": 1}],
+    }
+    props_b_same_content_different_derived = {
+        "chapters": [{"label": "intro"}],
+        "dataCards": [{"title": "Coverage", "value": 8400}],
+        "scenes": [{"frame": 999, "h": 500}],
+        "opacityKeyframes": [{"frame": 50, "opacity": 0}],
+    }
+    check("derived-field-only diff counts as unchanged",
+          _content_unchanged(props_a, props_b_same_content_different_derived) is True)
+
+    props_c_real_content_change = {
+        "chapters": [{"label": "intro"}],
+        "dataCards": [{"title": "Coverage", "value": 6300}],  # 数值真的变了
+        "scenes": [{"frame": 0, "h": 900}],
+        "opacityKeyframes": [{"frame": 0, "opacity": 1}],
+    }
+    check("real content diff (dataCards value) is detected as changed",
+          _content_unchanged(props_a, props_c_real_content_change) is False)
+
+    props_d_missing_field = {"chapters": [{"label": "intro"}]}
+    check("a field present in one and absent in the other counts as changed",
+          _content_unchanged(props_a, props_d_missing_field) is False)
+
+
 def main():
     test_shifts_below_floor_preserving_duration()
     test_before_after_second_reveal_frame_shifts_too()
@@ -402,6 +435,7 @@ def main():
     test_recompute_scenes_from_content_reapplies_dominant_avoidance()
     test_transition_hold_shrinking_arrives_early_and_holds()
     test_transition_hold_growing_stays_small_until_the_end()
+    test_content_unchanged_ignores_derived_fields_but_detects_real_changes()
 
     print()
     if FAILED:

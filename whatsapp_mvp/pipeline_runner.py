@@ -1516,6 +1516,27 @@ _RICHNESS_FIELDS = (
     "progressBars", "prosCons", "milestoneTracks", "trustBadges", "barCharts", "milestoneUnlocks",
 )
 
+# 视觉复审重规划的"内容是否真的变了"对比字段——_RICHNESS_FIELDS 加上
+# chapters/sections（vision QA 实际审的是这些字段的渲染结果）。刻意不比较
+# scenes/opacityKeyframes 等派生字段：_recompute_scenes_from_content 每次都
+# 会重算它们，哪怕内容一字未变也会产生不同的值，拿来比较只会永远判定"变了"。
+_CONTENT_COMPARISON_FIELDS = ("chapters", "sections") + _RICHNESS_FIELDS
+
+
+def _content_unchanged(props_a: dict, props_b: dict) -> bool:
+    """视觉复审触发重规划后，新一轮 `_build(feedback=...)` 产出的内容是否跟
+    上一轮完全一样（LLM 没有真的按反馈调整任何东西，只是原样吐回来）。
+
+    只在这种"确认没变"的情况下跳过第二轮 qa_stills（还是几帧静态图 + 一次
+    视觉模型调用，不是整片重渲染——重渲染在这一步之后才发生、且全程只有
+    一次，见 _op_apply_style 末尾）：内容没变，第二轮复审几乎一定会原样
+    再报一次同样的 high severity 问题，等于花一次视觉模型调用去确认一个
+    已经知道的答案。严格相等比较（不做"差不多算变了"的模糊匹配）——只有
+    真正的一字不差才会命中，任何真实调整过的版本都会走回正常的复审路径，
+    不会有内容真的变了却被误判"没变"而跳过复审的风险。
+    """
+    return all(props_a.get(f) == props_b.get(f) for f in _CONTENT_COMPARISON_FIELDS)
+
 
 def _fill_intro_lead_dead_space(props: dict, findings: list[dict], captions: list[dict], segments: list[dict]) -> dict:
     """Fix C13（2026-07-17，真实生产复现——同一支 backtest 视频连续 3 轮重规划
@@ -2366,7 +2387,18 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         if major:
             feedback = "; ".join(f"still #{f.get('frame_index')}: {f.get('issue', '')}" for f in major)[:500]
             logger.warning(f"  apply_style: 视觉复审发现问题，重新规划一次: {feedback}")
-            props = _apply_deterministic_guarantees(_build(feedback=feedback))
+            replanned = _apply_deterministic_guarantees(_build(feedback=feedback))
+            # 重规划内容跟上一轮一字不差 → LLM 没有真的按反馈调整任何东西，
+            # 第二轮 qa_stills 几乎一定原样报回同样的 high severity 问题——
+            # 直接跳过（省一次视觉模型调用 + 几帧静态图渲染），走跟"重试后
+            # 仍有问题"完全一样的降级路径，不做无意义的重复确认。
+            if _content_unchanged(props, replanned):
+                logger.warning(
+                    "  apply_style: 重规划内容与上一轮完全一致，判定反馈未被采纳，"
+                    "跳过第二轮视觉复审直接触发降级交付"
+                )
+                raise RuntimeError(f"apply_style: 重规划未产生实质变化，视觉复审发现的问题预计仍然存在，触发降级交付: {major}")
+            props = replanned
             # _build() 自己已经无条件写过一次 props_path（未经确定性保底的版本，
             # 见 Fix C9 的注释）——这里必须用保底之后的版本覆盖写回去，否则
             # run_props_qa/最终渲染读到的还是磁盘上那份没经过 C13/C15 的旧内容
