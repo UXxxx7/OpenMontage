@@ -10,6 +10,7 @@ import json
 import logging
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -35,6 +36,12 @@ from .concurrency import (
 # ============================================================================
 # 主入口
 # ============================================================================
+
+# add_music 重试前的等待：Pixabay 检索失败常是 Cloudflare 反爬挑战（非官方 API，
+# 爬公开搜索页），这类拦截一般数十秒内解除，立即重试大概率还在同一个挑战窗口里。
+# （合并自 PR #39，2026-07-20）
+_MUSIC_RETRY_DELAY_S = 30
+
 
 def run_talking_head_pipeline(job: Job) -> dict[str, Any]:
     """按编辑计划用 OpenMontage 正式工具执行编辑，输出 preview.mp4。
@@ -139,7 +146,13 @@ def run_talking_head_pipeline(job: Job) -> dict[str, Any]:
         try:
             new_src = _op_add_music(src, music_op, job_dir)
         except Exception as e:
-            logger.warning(f"    add_music: 执行失败，自动重试一次。原因: {e}")
+            # Pixabay 检索走的是公开搜索页爬取（没有官方 API），失败常是 Cloudflare
+            # 的人机验证挑战（cf-mitigated: challenge）——这类拦截通常几十秒内自行
+            # 放行，立即重试大概率撞在同一个挑战窗口里、白重试一次。等一段再重试，
+            # 成功率明显更高（2026-07-17 实测复现过：403 立即重试仍 403，等待后
+            # 用完全相同的请求参数直接成功）。
+            logger.warning(f"    add_music: 执行失败，{_MUSIC_RETRY_DELAY_S}s 后重试一次。原因: {e}")
+            time.sleep(_MUSIC_RETRY_DELAY_S)
             try:
                 new_src = _op_add_music(src, music_op, job_dir)
             except Exception as e2:
