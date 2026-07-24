@@ -72,6 +72,7 @@ const worker = new Worker(queueName, async (job) => {
       case "collection-choice": return collectionChoice(job.data);
       case "idle-warn": return idleWarn(job.data);
       case "idle-cancel": return idleCancel(job.data);
+      case "await-continue": return awaitContinue(job.data);
       default: throw new Error(`Unknown job type: ${job.name}`);
     }
   } catch (err) {
@@ -98,7 +99,7 @@ worker.on("failed", async (job, error) => {
   console.error(`[worker] failed ${job?.name} ${job?.id}: ${error.message}`);
   const waNumber = job?.data?.waNumber;
   if (waNumber && !_SILENT_FAIL_JOBS.has(job?.name)) {
-    const lang = resolveLang(DEFAULT_LANG, job?.data?.text, job?.data?.editRequest);
+    const lang = resolveLang(DEFAULT_LANG, job?.data?.text, job?.data?.editRequest, job?.data?.lang);
     await safeSendText(waNumber, t(lang,
       "抱歉，视频处理任务失败了，请重新尝试。",
       "Sorry, the video job failed. Please try again."));
@@ -127,23 +128,12 @@ async function editVideo({ waNumber, mediaId, editRequest }) {
 
     const status = await waitForStatus(jobId,
       ["WAITING_CONFIRMATION", "NEEDS_CLARIFICATION", "PREVIEW_READY", "ERROR"],
-      Number(env("WA_PLAN_TIMEOUT_MS", "180000")));
-    const jobLang = resolveLang(lang, status.edit_request);
-
+      Number(env("WA_PLAN_TIMEOUT_MS", "180000")), { waNumber, lang });
+    if (!status) return;
     if (status.status === "ERROR") {
       throw new Error(status.error_message || "Python planning failed");
     }
-    if (status.status === "NEEDS_CLARIFICATION") {
-      await sendText(waNumber, clarificationMessage(jobLang, status));
-      return;
-    }
-    if (status.status === "PREVIEW_READY") {
-      await sendText(waNumber, previewReadyMessage(jobLang, jobId, status.animations, status.degraded_operations, status.generation_cost_usd) + idleHint(jobLang, "export"));
-      await armIdle(waNumber, jobId, "export", jobLang);
-      return;
-    }
-    await sendText(waNumber, formatPlanMessage(status, jobLang) + idleHint(jobLang, "confirm"));
-    await armIdle(waNumber, jobId, "confirm", jobLang);
+    await deliverStageResult(waNumber, jobId, status, lang);
   } finally {
     await fs.promises.rm(tempPath, { force: true });
   }
@@ -171,23 +161,12 @@ async function crollGenerate({ waNumber, mediaId, caption }) {
 
     const status = await waitForStatus(jobId,
       ["WAITING_CONFIRMATION", "NEEDS_CLARIFICATION", "PREVIEW_READY", "ERROR"],
-      Number(env("WA_CROLL_TIMEOUT_MS", "1200000")));
-    const jobLang = resolveLang(lang, status.edit_request);
-
+      Number(env("WA_CROLL_TIMEOUT_MS", "1200000")), { waNumber, lang });
+    if (!status) return;
     if (status.status === "ERROR") {
       throw new Error(status.error_message || "C-roll generation failed");
     }
-    if (status.status === "NEEDS_CLARIFICATION") {
-      await sendText(waNumber, clarificationMessage(jobLang, status));
-      return;
-    }
-    if (status.status === "PREVIEW_READY") {
-      await sendText(waNumber, previewReadyMessage(jobLang, jobId, status.animations, status.degraded_operations, status.generation_cost_usd) + idleHint(jobLang, "export"));
-      await armIdle(waNumber, jobId, "export", jobLang);
-      return;
-    }
-    await sendText(waNumber, formatPlanMessage(status, jobLang) + idleHint(jobLang, "confirm"));
-    await armIdle(waNumber, jobId, "confirm", jobLang);
+    await deliverStageResult(waNumber, jobId, status, lang);
   } finally {
     await fs.promises.rm(tempPath, { force: true });
   }
@@ -217,12 +196,12 @@ async function confirmJob({ waNumber, jobId }) {
   await sendText(waNumber, t(lang, "已确认，正在剪辑视频...", "Confirmed. Editing video now..."));
   const status = await waitForStatus(jobId,
     ["PREVIEW_READY", "ERROR"],
-    Number(env("WA_PIPELINE_TIMEOUT_MS", "900000")));
+    Number(env("WA_PIPELINE_TIMEOUT_MS", "900000")), { waNumber, lang });
+  if (!status) return;
   if (status.status === "ERROR") {
     throw new Error(status.error_message || "Python pipeline failed");
   }
-  await sendText(waNumber, previewReadyMessage(lang, jobId, status.animations, status.degraded_operations, status.generation_cost_usd) + idleHint(lang, "export"));
-  await armIdle(waNumber, jobId, "export", lang); // 进入"等待导出"，重新计时
+  await deliverStageResult(waNumber, jobId, status, lang);
 }
 
 // 整单按原方案重跑：预览有降级步骤（用户要完整效果）或 ERROR 后再试。
@@ -237,13 +216,12 @@ async function retryJob({ waNumber, jobId, text }) {
     "Retrying the edit with the same plan..."));
   const status = await waitForStatus(jobId,
     ["PREVIEW_READY", "ERROR"],
-    Number(env("WA_PIPELINE_TIMEOUT_MS", "900000")));
+    Number(env("WA_PIPELINE_TIMEOUT_MS", "900000")), { waNumber, lang });
+  if (!status) return;
   if (status.status === "ERROR") {
     throw new Error(status.error_message || "Python pipeline failed");
   }
-  const jobLang = resolveLang(lang, status.edit_request);
-  await sendText(waNumber, previewReadyMessage(jobLang, jobId, status.animations, status.degraded_operations, status.generation_cost_usd) + idleHint(jobLang, "export"));
-  await armIdle(waNumber, jobId, "export", jobLang);
+  await deliverStageResult(waNumber, jobId, status, lang);
 }
 
 async function renderJob({ waNumber, jobId }) {
@@ -256,16 +234,13 @@ async function renderJob({ waNumber, jobId }) {
     "Export started. Will send the final video when ready."));
   const status = await waitForStatus(jobId,
     ["DONE", "ERROR"],
-    Number(env("WA_RENDER_TIMEOUT_MS", "900000")));
+    Number(env("WA_RENDER_TIMEOUT_MS", "900000")), { waNumber, lang });
+  if (!status) return;
   if (status.status === "ERROR") {
     throw new Error(status.error_message || "Python render failed");
   }
-
   // 成品通常 > 16MB，超出 WhatsApp 视频消息上限，统一以链接投递（走 PUBLIC_BASE_URL）
-  await sendText(waNumber, t(lang,
-    `最终视频已生成：${fileUrl(jobId, "final.mp4")}`,
-    `Your final video is ready: ${fileUrl(jobId, "final.mp4")}`));
-  await redis.del(activeJobKey(waNumber));
+  await deliverStageResult(waNumber, jobId, status, lang);
 }
 
 async function cancelJob({ waNumber, jobId }) {
@@ -548,23 +523,12 @@ async function runCollectionJob(waNumber, mainItem, brollItems, editRequest, lan
 
     const status = await waitForStatus(jobId,
       ["WAITING_CONFIRMATION", "NEEDS_CLARIFICATION", "PREVIEW_READY", "ERROR"],
-      Number(env("WA_PLAN_TIMEOUT_MS", "180000")));
-    const jobLang = resolveLang(effLang, status.edit_request);
-
+      Number(env("WA_PLAN_TIMEOUT_MS", "180000")), { waNumber, lang: effLang });
+    if (!status) return;
     if (status.status === "ERROR") {
       throw new Error(status.error_message || "Python planning failed");
     }
-    if (status.status === "NEEDS_CLARIFICATION") {
-      await sendText(waNumber, clarificationMessage(jobLang, status));
-      return;
-    }
-    if (status.status === "PREVIEW_READY") {
-      await sendText(waNumber, previewReadyMessage(jobLang, jobId, status.animations, status.degraded_operations, status.generation_cost_usd) + idleHint(jobLang, "export"));
-      await armIdle(waNumber, jobId, "export", jobLang);
-      return;
-    }
-    await sendText(waNumber, formatPlanMessage(status, jobLang) + idleHint(jobLang, "confirm"));
-    await armIdle(waNumber, jobId, "confirm", jobLang);
+    await deliverStageResult(waNumber, jobId, status, effLang);
   } finally {
     for (const p of tempPaths) await fs.promises.rm(p, { force: true });
   }
@@ -639,29 +603,84 @@ async function reviseJob({ waNumber, jobId, text }) {
   await postPythonForm(`/jobs/${encodeURIComponent(jobId)}/revise`, text);
   const status = await waitForStatus(jobId,
     ["WAITING_CONFIRMATION", "NEEDS_CLARIFICATION", "ERROR"],
-    Number(env("WA_PLAN_TIMEOUT_MS", "180000")));
+    Number(env("WA_PLAN_TIMEOUT_MS", "180000")), { waNumber, lang });
+  if (!status) return;
   if (status.status === "ERROR") {
     throw new Error(status.error_message || "Revise failed");
   }
-  const jobLang = resolveLang(lang, status.edit_request);
-  if (status.status === "NEEDS_CLARIFICATION") {
-    const q = status.planned_edit?.clarification_question ||
-      t(jobLang, "需要更多信息才能继续。", "I need more information to continue.");
-    await sendText(waNumber, q);
-    return;
-  }
-  await sendText(waNumber, formatPlanMessage(status, jobLang) + idleHint(jobLang, "confirm"));
-  await armIdle(waNumber, jobId, "confirm", jobLang); // 新方案又回到"等待确认"，重新计时
+  await deliverStageResult(waNumber, jobId, status, lang); // 新方案又回到"等待确认"，重新计时
 }
 
-async function waitForStatus(jobId, wanted, timeoutMs) {
+async function waitForStatus(jobId, wanted, timeoutMs, ctx) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const last = await getPythonJob(jobId);
     if (wanted.includes(last.status)) return last;
     await delay(Number(env("WA_STATUS_POLL_MS", "3000")));
   }
-  throw new Error(`Timed out waiting for ${jobId}`);
+  // Backend hasn't reported ERROR — it's just slower than this poll window
+  // (heavy edits: face enhance + color grade + audio enhance + template
+  // render can legitimately run long). Telling the user "job failed" here
+  // used to be a false failure: the Python pipeline kept running underneath
+  // and often finished minutes later with nobody watching for it anymore.
+  // Instead, requeue a job that resumes waiting for the same terminal
+  // states and delivers the real result once it lands — never re-issues
+  // the original confirm/render/etc. call, just keeps polling.
+  if (ctx && ctx.waNumber) {
+    const round = (ctx.round || 0) + 1;
+    await timers.add("await-continue",
+      { waNumber: ctx.waNumber, jobId, wanted, lang: ctx.lang, round },
+      { removeOnComplete: true, removeOnFail: true });
+  }
+  return null;
+}
+
+// Shared "what to tell the user" for every terminal status a job can reach.
+// Used by every stage function below AND by awaitContinue() so a wait that
+// had to be resumed past the original poll window delivers the exact same
+// message a same-round success would have.
+async function deliverStageResult(waNumber, jobId, status, lang) {
+  const jobLang = resolveLang(lang, status.edit_request);
+  if (status.status === "NEEDS_CLARIFICATION") {
+    await sendText(waNumber, clarificationMessage(jobLang, status));
+    return;
+  }
+  if (status.status === "PREVIEW_READY") {
+    await sendText(waNumber, previewReadyMessage(jobLang, jobId, status.animations, status.degraded_operations, status.generation_cost_usd) + idleHint(jobLang, "export"));
+    await armIdle(waNumber, jobId, "export", jobLang);
+    return;
+  }
+  if (status.status === "DONE") {
+    await sendText(waNumber, t(jobLang,
+      `最终视频已生成：${fileUrl(jobId, "final.mp4")}`,
+      `Your final video is ready: ${fileUrl(jobId, "final.mp4")}`));
+    await redis.del(activeJobKey(waNumber));
+    return;
+  }
+  // WAITING_CONFIRMATION
+  await sendText(waNumber, formatPlanMessage(status, jobLang) + idleHint(jobLang, "confirm"));
+  await armIdle(waNumber, jobId, "confirm", jobLang);
+}
+
+// Resumed wait after a previous round's poll window ran out without the
+// backend actually erroring. Keeps polling for the same terminal states;
+// only tells the user something went wrong if the backend really does
+// report ERROR, or this has gone on for an unreasonable number of rounds.
+async function awaitContinue({ waNumber, jobId, wanted, lang, round }) {
+  const maxRounds = Number(env("WA_AWAIT_CONTINUE_MAX_ROUNDS", "6"));
+  if (round > maxRounds) {
+    await safeSendText(waNumber, t(lang || DEFAULT_LANG,
+      `任务 ${jobId} 处理时间远超预期。可以回复 *retry* 重新尝试，或稍后再看。`,
+      `Job ${jobId} is taking far longer than expected. Reply *retry* to try again, or check back later.`));
+    return;
+  }
+  const status = await waitForStatus(jobId, wanted,
+    Number(env("WA_PIPELINE_TIMEOUT_MS", "900000")), { waNumber, lang, round });
+  if (!status) return; // still going — waitForStatus already queued the next round
+  if (status.status === "ERROR") {
+    throw new Error(status.error_message || "Pipeline failed");
+  }
+  await deliverStageResult(waNumber, jobId, status, lang);
 }
 
 async function downloadWhatsAppMedia(mediaId, kind = "video") {
