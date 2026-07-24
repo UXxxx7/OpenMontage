@@ -336,6 +336,7 @@ export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = ({
         videoSrc={videoSrc}
         scenes={scenes}
         opacityKeyframes={opacityKeyframes}
+        brollWindows={presenter?.windows}
         objectPosition={speakerObjectPosition}
         colorMode={colorMode}
       >

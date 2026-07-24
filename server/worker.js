@@ -62,6 +62,7 @@ const worker = new Worker(queueName, async (job) => {
       case "cancel-job": return cancelJob(job.data);
       case "retry-job": return retryJob(job.data);
       case "revise-job": return reviseJob(job.data);
+      case "add-broll-job": return addBrollJob(job.data);
       case "send-help": return sendHelp(job.data);
       case "answer-question": return answerQuestion(job.data);
       case "collect-ack": return collectAck(job.data);
@@ -599,6 +600,97 @@ async function createPythonJob(videoPath, editRequest) {
   form.append("edit_request", editRequest);
   form.append("pipeline", "talking-head");
   const resp = await axios.post(`${pythonApiBase}/jobs`, form, {
+    headers: form.getHeaders(),
+    maxBodyLength: Infinity, maxContentLength: Infinity,
+    timeout: Number(env("WA_PYTHON_CREATE_TIMEOUT_MS", "180000")),
+  });
+  return resp.data;
+}
+
+// 单任务模型：把待追加缓冲(addcollect/addnotes)里的片段挂到活跃 job → POST
+// /add_broll（服务端只改方案、直接重渲染）→ 等 PREVIEW_READY。422=定位不到/重叠，
+// 把服务端中文提示如实转达，不当失败。
+async function addBrollJob({ waNumber, jobId }) {
+  await disarmIdle(waNumber);
+  const addKey = `wa:user:${waNumber}:addcollect`;
+  const addNotesKey = `wa:user:${waNumber}:addnotes`;
+  const items = (await redis.lrange(addKey, 0, -1)).map((s) => JSON.parse(s));
+  const notes = await redis.lrange(addNotesKey, 0, -1);
+  const claimed = await redis.del(addKey);   // 原子认领，避免并发重复
+  if (!claimed) return;
+  await redis.del(addNotesKey);
+  const clips = items.filter((i) => i.kind === "video" || i.kind === "image");
+  const captionSignal = items.map((i) => i.caption).find((c) => c);
+  const noteText = [...notes, ...items.map((i) => i.caption).filter(Boolean)].filter(Boolean).join("；");
+  const before = await getPythonJob(jobId).catch(() => null);
+  const lang = resolveLang(DEFAULT_LANG, noteText, captionSignal, before?.edit_request);
+  if (!clips.length) {
+    await safeSendText(waNumber, t(lang, "没有待追加的素材。", "No pending clip to add."));
+    return;
+  }
+  if (!before) {
+    await safeSendText(waNumber, t(lang,
+      "找不到当前任务，请重新发送主视频从头开始。",
+      "No active job found; send the main video to start over."));
+    return;
+  }
+  await sendText(waNumber, t(lang,
+    `收到 ${clips.length} 段追加素材，正在剪进已有成片并重新生成预览...`,
+    `Got ${clips.length} clip(s), splicing into the existing edit and re-rendering...`));
+  const tempPaths = [];
+  try {
+    const brollPaths = [];
+    for (const c of clips) {
+      const p = await downloadWhatsAppMedia(c.mediaId, c.kind);
+      tempPaths.push(p);
+      brollPaths.push({ path: p, label: c.caption || "", kind: c.kind });
+    }
+    try {
+      await createPythonAddBroll(jobId, noteText, brollPaths);
+    } catch (err) {
+      const detail = err && err.response && err.response.data && err.response.data.detail;
+      if (err && err.response && err.response.status === 422 && detail) {
+        await safeSendText(waNumber, detail);
+        return;
+      }
+      throw err;
+    }
+    const status = await waitForStatus(jobId,
+      ["PREVIEW_READY", "WAITING_CONFIRMATION", "NEEDS_CLARIFICATION", "ERROR"],
+      Number(env("WA_PLAN_TIMEOUT_MS", "180000")));
+    if (status.status === "ERROR") {
+      throw new Error(status.error_message || "Add-broll render failed");
+    }
+    const jobLang = resolveLang(lang, status.edit_request);
+    if (status.status === "NEEDS_CLARIFICATION") {
+      await sendText(waNumber, clarificationMessage(jobLang, status));
+      return;
+    }
+    if (status.status === "WAITING_CONFIRMATION") {
+      await sendText(waNumber, formatPlanMessage(status, jobLang) + idleHint(jobLang, "confirm"));
+      await armIdle(waNumber, jobId, "confirm", jobLang);
+      return;
+    }
+    await sendText(waNumber, previewReadyMessage(jobLang, jobId, status.animations, status.degraded_operations, status.generation_cost_usd) + idleHint(jobLang, "export"));
+    await armIdle(waNumber, jobId, "export", jobLang);
+  } finally {
+    for (const p of tempPaths) await fs.promises.rm(p, { force: true });
+  }
+}
+
+async function createPythonAddBroll(jobId, text, brollPaths) {
+  const form = new FormData();
+  form.append("text", text || "");
+  brollPaths.forEach((b, i) => {
+    const ext = path.extname(b.path) || (b.kind === "image" ? ".jpg" : ".mp4");
+    const ctype = b.kind === "image" ? "image/jpeg" : "video/mp4";
+    form.append("broll", fs.createReadStream(b.path),
+      { filename: `broll_add_${i}${ext}`, contentType: ctype });
+    form.append("broll_labels", b.label || "");
+    form.append("broll_kinds", b.kind || "video");
+  });
+  const resp = await axios.post(
+    `${pythonApiBase}/jobs/${encodeURIComponent(jobId)}/add_broll`, form, {
     headers: form.getHeaders(),
     maxBodyLength: Infinity, maxContentLength: Infinity,
     timeout: Number(env("WA_PYTHON_CREATE_TIMEOUT_MS", "180000")),

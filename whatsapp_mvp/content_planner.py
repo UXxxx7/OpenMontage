@@ -2567,6 +2567,26 @@ _FLOOR_TAIL_SKIP_FRAMES = 150       # 片尾有 outro CTA 罩着
 _PLAN_MAX_ATTEMPTS = 3
 _MIN_DURATION_FOR_VISUALS_S = 15.0
 
+# ── 单一事实源（single source of truth）────────────────────────────────
+# 哪些 plan 字段是"独立视觉元素"：每项都带 mountFrame/endFrame，在画面上
+# 构成一次可见的图形/动画事件。零视觉检查(_plan_quality_failures 的
+# total_visuals) 和空档覆盖检查(_coverage_spans → _sparse_gaps) 都从这一份
+# 派生，不再各自手抄。历史 bug：这两处曾各抄一份且抄岔——_coverage_spans
+# 漏掉 before_after/step_lists/corner_cards，于是密度门禁一边叫 LLM 用
+# step_list/corner_card 补空档、另一边覆盖检查又不认这几类，加了等于没加，
+# 密度循环永远收不了尾（工具演示/工作流类视频天然视觉就是这几类，最坏命中）。
+# 以后新增视觉类型只改这一处，三处自动同步。sections 是全画布接管、字段是
+# fromFrame/toFrame（形状不同），两个消费者各自单列处理，不在这份清单里。
+_VISUAL_PLAN_KEYS = (
+    "data_cards", "gauges", "countdowns", "calendar_events", "before_after",
+    "quotes", "step_lists", "topic_cards", "corner_cards",
+    # 队友 whatsapp-studio 扩充的图形类型，一并纳入单一事实源，
+    # 两个消费者(total_visuals/_coverage_spans)自动同步，不再手抄漏项。
+    "comparisons", "ranked_lists", "checklists", "location_pins", "testimonials",
+    "icon_clusters", "progress_bars", "pros_cons", "milestone_tracks",
+    "trust_badges", "bar_charts", "milestone_unlocks",
+)
+
 
 def _spoken_dollar_amounts(segments: list[dict]) -> list[str]:
     """Every distinct '$<amount>' substring actually spoken in the transcript
@@ -2903,14 +2923,8 @@ def _plan_quality_failures(raw: dict, plan: dict, duration: float, segments: Opt
     failures: list[str] = []
     if duration >= _MIN_DURATION_FOR_VISUALS_S:
         total_visuals = (
-            len(plan["data_cards"]) + len(plan["gauges"]) + len(plan["countdowns"])
-            + len(plan["calendar_events"]) + len(plan["before_after"]) + len(plan["quotes"])
-            + len(plan["step_lists"]) + len(plan["topic_cards"]) + len(plan["corner_cards"])
-            + len(plan["sections"])
-            + len(plan["comparisons"]) + len(plan["ranked_lists"]) + len(plan["checklists"])
-            + len(plan["location_pins"]) + len(plan["testimonials"]) + len(plan["icon_clusters"])
-            + len(plan["progress_bars"]) + len(plan["pros_cons"]) + len(plan["milestone_tracks"])
-            + len(plan["trust_badges"]) + len(plan["bar_charts"]) + len(plan["milestone_unlocks"])
+            sum(len(plan.get(k) or []) for k in _VISUAL_PLAN_KEYS)
+            + len(plan.get("sections") or [])
         )
         if total_visuals == 0:
             failures.append(
@@ -3007,32 +3021,20 @@ Output ONLY valid JSON: {"data_points": [ ... ]}"""
 
 
 def _coverage_spans(plan: dict) -> list[tuple[int, int]]:
+    # 覆盖范围 = 所有"独立视觉元素"占据的时间区间。类型清单来自单一事实源
+    # _VISUAL_PLAN_KEYS（与 total_visuals 同源），确保"叫 LLM 补的类型"和
+    # "覆盖检查认可的类型"永远一致——历史 bug 就是这里少认了 before_after/
+    # step_lists/corner_cards，导致密度循环空转。防御式取 mountFrame：缺该
+    # 字段的异常条目跳过，不 KeyError 拖垮整条规划。
     spans = []
-    # topic_cards 必须算进覆盖范围——LLM 自己规划的、或密度下限补规划产出的
-    # 都可能是 topic_card，漏掉它会让密度检查始终觉得这段"还是空的"，导致
-    # 同一段时间被重复补规划、堆出用户明确反对的"互相盖住"的多张卡片。
-    #
-    # Fix C30（2026-07-20，真实生产复现——job_f7b171f8d952/Dixon 视频）：这个
-    # 列表漏了 step_lists 和 corner_cards 整整两种图形类型——SYSTEM_PROMPT 第
-    # 2(b)/3 条明确把这两个列为"非数字内容"（命名工具/应用、进行中的动作、
-    # 说出来的分步流程）的正确选择，LLM 也确实按提示词的引导规划出了真实、
-    # 有信息量的 step_list("發送內容→AI製作數字人→自動剪接→收回上傳"四步)
-    # 和 corner_card(WhatsApp 聊天气泡)——但因为这两类从没进过覆盖范围统计，
-    # _sparse_gaps 死活觉得这段时间"还是空的"，criterion loop 三轮重规划全部
-    # 判定失败，C28 的确定性兜底也跟着白白尝试、白白放弃。不是 LLM 没听
-    # 提示词的话，是负责"检查画面是否已经有内容"的这个函数自己没跟上
-    # SYSTEM_PROMPT 早就支持的完整图形词汇表——这个漏洞影响的是*所有*用
-    # step_list/corner_card 覆盖非数字内容的视频，不只是这一支。
-    for g in (plan["data_cards"] + plan["gauges"] + plan["countdowns"]
-              + plan["calendar_events"] + plan["quotes"] + plan["topic_cards"]
-              + plan["step_lists"] + plan["corner_cards"]
-              + plan["comparisons"] + plan["ranked_lists"] + plan["checklists"]
-              + plan["location_pins"] + plan["testimonials"] + plan["icon_clusters"]
-              + plan["progress_bars"] + plan["pros_cons"] + plan["milestone_tracks"]
-              + plan["trust_badges"] + plan["bar_charts"] + plan["milestone_unlocks"]):
-        spans.append((g["mountFrame"], g.get("endFrame", g["mountFrame"] + 90)))
-    for sec in plan["sections"]:
-        spans.append((sec["fromFrame"], sec["toFrame"]))
+    for k in _VISUAL_PLAN_KEYS:
+        for g in (plan.get(k) or []):
+            if not isinstance(g, dict) or "mountFrame" not in g:
+                continue
+            spans.append((g["mountFrame"], g.get("endFrame", g["mountFrame"] + 90)))
+    for sec in (plan.get("sections") or []):
+        if "fromFrame" in sec and "toFrame" in sec:
+            spans.append((sec["fromFrame"], sec["toFrame"]))
     return sorted(spans)
 
 

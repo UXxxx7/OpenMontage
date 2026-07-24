@@ -886,7 +886,7 @@ def _has_audio_stream(path: str) -> bool:
         r = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries",
              "stream=index", "-of", "csv=p=0", path],
-            capture_output=True, text=True,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
         )
         return bool((r.stdout or "").strip())
     except Exception:
@@ -950,7 +950,7 @@ def _op_add_music(src: str, op: dict, workdir: Path) -> Optional[str]:
         "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
         "-shortest", str(out),
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
     if r.returncode != 0 or not out.exists():
         raise RuntimeError(f"add_music: ffmpeg 混音失败: {(r.stderr or '')[-300:]}")
 
@@ -987,9 +987,33 @@ def _composite_broll(src: str, resolved: list, out: Path,
         if r["mode"] == "pip":
             boxw = int(out_w * 0.38)
             fc.append(f"[{vin}]scale={boxw}:-2{offset}{_norm}[bro{i}]")
-        else:  # broll_main / cutaway：铺满画布（等比放大后居中裁切）
-            fc.append(f"[{vin}]scale={out_w}:{out_h}:force_original_aspect_ratio=increase,"
-                      f"crop={out_w}:{out_h}{offset}{_norm}[bro{i}]")
+        else:  # broll_main / cutaway
+            # 比例差大（如横屏录屏进竖屏）时，cover 会裁掉两侧内容 → 改用"模糊填充
+            # contain"：前景整帧不裁居中，背景用同帧放大模糊铺满（无死黑边）；差不多
+            # 时仍 cover。pip 不受影响。宽高探测内联，不依赖外部函数。
+            try:
+                _pr = subprocess.run(
+                    ["ffprobe", "-v", "quiet", "-select_streams", "v:0",
+                     "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", r["path"]],
+                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+                _pw, _ph = _pr.stdout.strip().split("x")
+                _sar = int(_pw) / int(_ph)
+            except Exception:
+                _sar = out_w / max(1, out_h)
+            _car = out_w / max(1, out_h)
+            if _sar > 0 and max(_sar / _car, _car / _sar) > 1.4:
+                _sp = f"setpts=PTS-STARTPTS+{r['start']}/TB," if not r["is_img"] else ""
+                _nn = _norm[1:]  # 去掉前导逗号
+                fc.append(
+                    f"[{vin}]{_sp}{_nn},split[bgs{i}][fgs{i}];"
+                    f"[bgs{i}]scale={out_w}:{out_h}:force_original_aspect_ratio=increase,"
+                    f"crop={out_w}:{out_h},boxblur=20:1[bbg{i}];"
+                    f"[fgs{i}]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease[bfg{i}];"
+                    f"[bbg{i}][bfg{i}]overlay=(W-w)/2:(H-h)/2[bro{i}]"
+                )
+            else:
+                fc.append(f"[{vin}]scale={out_w}:{out_h}:force_original_aspect_ratio=increase,"
+                          f"crop={out_w}:{out_h}{offset}{_norm}[bro{i}]")
         if r["mode"] == "broll_main":
             fc.append(f"[ins{ins_map[i]}]scale=-2:{ins_h}{_norm}[insv{i}]")
     cur = "base"
@@ -1013,7 +1037,7 @@ def _composite_broll(src: str, resolved: list, out: Path,
     if base_dur and base_dur > 0:
         cmd += ["-t", f"{base_dur:.3f}"]
     cmd += [str(out), "-loglevel", "error"]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if proc.returncode != 0 or not out.exists():
         raise RuntimeError(f"insert_broll 合成失败: {proc.stderr[-500:]}")
 
@@ -2280,13 +2304,28 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         # 都满足才采用这一轮；丰富度下降就算 findings 更少也不换。
         if len(candidate_findings) < len(best_findings) and candidate_richness >= best_richness:
             best_props, best_findings, best_richness = candidate, candidate_findings, candidate_richness
-        elif len(candidate_findings) < len(best_findings):
+            attempt += 1
+            continue
+        # 早退（保质量提速）：本轮没有产出"更少问题且不降丰富度"的改进。喂回的
+        # lint_feedback 只由 best_findings 决定，而 best 这轮没变——再跑同样的重
+        # 规划只会得到同样结果，后续轮次是确定性空转（low_visual_richness/
+        # element_over_card 这类"内容本身改不动"的 finding 会一路耗满 _PROPS_LINT_
+        # MAX_ATTEMPTS 轮，每轮一次完整 LLM 规划）。提前结束：best_props 已保留，
+        # 交付版本与跑满全部轮次完全一致，只省掉注定白烧的后续 LLM 调用。通用于
+        # 任何"重规划改不动"的 finding，不特判某一类；能持续改进时仍会继续（上面
+        # accept 分支 continue）。
+        if len(candidate_findings) < len(best_findings):
             logger.warning(
                 f"  apply_style: props_lint 第 {attempt}/{_PROPS_LINT_MAX_ATTEMPTS} 轮的重规划"
                 f"findings 更少({len(candidate_findings)} < {len(best_findings)})，但丰富度从 "
                 f"{best_richness} 降到 {candidate_richness}——拒绝采用，保留内容更丰富的版本"
             )
-        attempt += 1
+        else:
+            logger.info(
+                f"  apply_style: props_lint 第 {attempt} 轮重规划未改进"
+                f"（{[f['check'] for f in best_findings]} 修不动）——提前结束重试，交付当前最佳版本"
+            )
+        break
     if best_findings:
         logger.warning(
             f"  apply_style: props_lint {_PROPS_LINT_MAX_ATTEMPTS} 轮后仍有 "
@@ -2406,7 +2445,7 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
     last_result = None
     for attempt in range(2):
         with _RENDER_SLOTS:  # Remotion 渲染跨任务串行 + 硬超时防卡死占坑
-            result = subprocess.run(cmd, cwd=str(remotion_dir), capture_output=True, text=True,
+            result = subprocess.run(cmd, cwd=str(remotion_dir), capture_output=True, text=True, encoding="utf-8", errors="replace",
                                     timeout=_RENDER_TIMEOUT_S)
         if result.returncode == 0:
             last_result = None
@@ -2483,7 +2522,7 @@ def _probe_duration(path: Path) -> float:
         probe = subprocess.run(
             ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
              "-of", "csv=p=0", str(path)],
-            capture_output=True, text=True, check=True,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", check=True,
         )
         return float(probe.stdout.strip())
     except Exception:
@@ -2496,7 +2535,7 @@ def _probe_dimensions(path: Path) -> tuple:
         probe = subprocess.run(
             ["ffprobe", "-v", "quiet", "-select_streams", "v:0",
              "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", str(path)],
-            capture_output=True, text=True, check=True,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", check=True,
         )
         w, h = probe.stdout.strip().split("x")
         return int(w), int(h)

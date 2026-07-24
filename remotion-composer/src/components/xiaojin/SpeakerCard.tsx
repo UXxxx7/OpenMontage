@@ -34,6 +34,12 @@ export interface SpeakerCardProps {
   scenes: SpeakerCardScene[];
   opacityKeyframes?: SpeakerCardOpacityKeyframe[];
   /**
+   * b-roll 时间窗（帧）。presenter 模式下这些窗口内卡片放的是整屏 b-roll(cutaway)；
+   * 窗口内改用"contain + 模糊背景"渲染，避免横屏 b-roll 被竖屏卡片的 cover 裁掉
+   * 两侧。不传或为空时行为与原来完全一致（纯 cover on face）。
+   */
+  brollWindows?: { fromFrame: number; toFrame: number }[];
+  /**
    * Calibrated per source video: face_center_y_in_source / source_height * 100.
    * Never assume a fixed value works across different source videos.
    */
@@ -82,6 +88,7 @@ export const SpeakerCard: React.FC<SpeakerCardProps> = ({
   videoSrc,
   scenes,
   opacityKeyframes,
+  brollWindows,
   objectPosition = "50% 35%",
   colorMode = "warm",
   enterFrames = 26,
@@ -89,6 +96,11 @@ export const SpeakerCard: React.FC<SpeakerCardProps> = ({
 }) => {
   const frame = useCurrentFrame();
   const palette = PALETTES[colorMode];
+
+  const resolvedSrc = videoSrc.startsWith("http") ? videoSrc : staticFile(videoSrc);
+  const inBroll = (brollWindows || []).some(
+    (w) => frame >= w.fromFrame && frame <= w.toFrame
+  );
 
   if (scenes.length === 0) return null;
 
@@ -141,16 +153,45 @@ export const SpeakerCard: React.FC<SpeakerCardProps> = ({
         background: "#000",
       }}
     >
-      <OffthreadVideo
-        src={videoSrc.startsWith("http") ? videoSrc : staticFile(videoSrc)}
-        style={{
-          width: "100%",
-          height: "100%",
-          objectFit: "cover",
-          objectPosition,
-          filter: "contrast(1.06) brightness(0.88) saturate(1.06)",
-        }}
-      />
+      {inBroll ? (
+        <>
+          <OffthreadVideo
+            src={resolvedSrc}
+            muted
+            style={{
+              position: "absolute",
+              inset: 0,
+              width: "100%",
+              height: "100%",
+              objectFit: "cover",
+              filter: "blur(24px) brightness(0.72)",
+              transform: "scale(1.12)",
+            }}
+          />
+          <OffthreadVideo
+            src={resolvedSrc}
+            style={{
+              position: "absolute",
+              inset: 0,
+              width: "100%",
+              height: "100%",
+              objectFit: "contain",
+              filter: "contrast(1.06) brightness(0.88) saturate(1.06)",
+            }}
+          />
+        </>
+      ) : (
+        <OffthreadVideo
+          src={resolvedSrc}
+          style={{
+            width: "100%",
+            height: "100%",
+            objectFit: "cover",
+            objectPosition,
+            filter: "contrast(1.06) brightness(0.88) saturate(1.06)",
+          }}
+        />
+      )}
       {/* Top scrim to tame blown-out exposure/lens flare — the 0.30-opacity/
           32%-falloff version this replaced was too weak/shallow for footage
           with a genuinely overexposed light source (confirmed against real

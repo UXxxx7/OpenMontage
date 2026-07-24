@@ -182,6 +182,20 @@ async function handleMessage(message) {
     const mediaId = media.id;
     if (!mediaId) return;
     const caption = media.caption || "";
+    // 单任务模型②：已有活跃单 → 这段是给它追加的 b-roll，进待追加缓冲（不新开一单）。
+    const _activeJobId = await withTimeout(redis.get(activeJobKey(waNumber)),
+      Number(env("WA_REDIS_OP_TIMEOUT_MS", "2000")), null);
+    if (_activeJobId) {
+      const _n = await redis.rpush(`wa:user:${waNumber}:addcollect`,
+        JSON.stringify({ mediaId, caption, kind: msgType }));
+      await redis.expire(`wa:user:${waNumber}:addcollect`, Number(env("WA_COLLECT_TTL", "3600")));
+      const _lang = resolveLang(env("WA_DEFAULT_LANG", "zh"), caption);
+      const _note = caption ? t(_lang, `（说明：${caption}）`, ` (note: ${caption})`) : "";
+      await gatewaySendText(waNumber, t(_lang,
+        `已加入当前任务的待追加素材（第 ${_n} 段）${_note}。配文或文字写清它对应视频里说到的哪句话，发完回复 *go* 剪进去。想结束当前任务请回 *export*（导出）或 *cancel*（取消）。`,
+        `Added to the current job as pending b-roll (#${_n})${_note}. Say (in caption or text) which spoken line it goes with, then reply *go* to splice it in. To finish the current job, reply *export* or *cancel*.`));
+      return;
+    }
     const count = await redis.rpush(collectKey(waNumber),
       JSON.stringify({ mediaId, caption, kind: msgType }));
     await redis.expire(collectKey(waNumber), Number(env("WA_COLLECT_TTL", "3600")));
@@ -214,6 +228,40 @@ async function handleMessage(message) {
       Number(env("WA_REDIS_OP_TIMEOUT_MS", "2000")),
       null
     );
+
+    // 单任务模型③：有活跃单 + 有待追加素材（上传后、go 前）——文字=放置说明，
+    // cancel=只撤这次追加、保留预览，都不走 revise。
+    const _addKey = `wa:user:${waNumber}:addcollect`;
+    const _addNotesKey = `wa:user:${waNumber}:addnotes`;
+    const _addPending = await withTimeout(redis.llen(_addKey),
+      Number(env("WA_REDIS_OP_TIMEOUT_MS", "2000")), 0);
+    if (activeJobId && _addPending > 0) {
+      const _lang = resolveLang(env("WA_DEFAULT_LANG", "zh"), text);
+      if (["cancel", "no", "stop", "取消"].includes(normalized)) {
+        await redis.del(_addKey);
+        await redis.del(_addNotesKey);
+        await gatewaySendText(waNumber, t(_lang,
+          "已撤掉本次待追加的素材，当前预览保留。想改方案直接打字，想结束任务回 *export*。",
+          "Discarded the pending b-roll; your current preview stays. Type feedback to revise, or reply *export* to finish."));
+        return;
+      }
+      if (["go", "start", "done", "开始", "完成", "好了"].includes(normalized)) {
+        await videoQueue.add("add-broll-job", { waNumber, jobId: activeJobId, msgId }, queueOptions(msgId));
+        return;
+      }
+      if (["export", "final", "render", "retry", "重试", "confirm", "continue", "yes", "ok"].includes(normalized)) {
+        await gatewaySendText(waNumber, t(_lang,
+          "你还有待追加的素材没剪进去。请先回 *go* 剪进去，或回 *cancel* 撤掉这次追加。",
+          "You have pending b-roll not spliced in yet. Reply *go* to add it, or *cancel* to discard it."));
+        return;
+      }
+      await redis.rpush(_addNotesKey, text);
+      await redis.expire(_addNotesKey, Number(env("WA_COLLECT_TTL", "3600")));
+      await gatewaySendText(waNumber, t(_lang,
+        "已记下放置说明。可继续发片段或补说明；发完回 *go* 剪进去。",
+        "Got the placement note. Send more clips/notes; reply *go* when done to splice them in."));
+      return;
+    }
 
     // ── 收集流程优先 ──
     // 用户刚发过素材（缓冲非空）或正处在“选主视频”阶段时，意图是开一个新任务，

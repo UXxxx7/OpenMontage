@@ -106,3 +106,7 @@ remotion-composer/.bundle.lock
 
 # runtime logs (file handler in main.py)
 logs/
+
+# 一次性补丁脚本与备份
+apply_*.py
+*.bak

@@ -733,6 +733,156 @@ async def revise_job_endpoint(job_id: str, text: str = Form("")):
     return {"job_id": job_id, "status": "PLANNING"}
 
 
+def _locate_broll_window(instruction, segments, taken):
+    """确定性：把自然语言放置说明映射成转录里的时间窗 [start, end]。
+    找不到可靠匹配返回 None；与已占用窗口重叠返回 "overlap"。不动 LLM。"""
+    import re
+    text = (instruction or "").lower()
+    ascii_toks = re.findall(r"[a-z0-9]{2,}", text)
+    cjk = re.findall(r"[\u4e00-\u9fff]", text)
+    bigrams = [cjk[i] + cjk[i + 1] for i in range(len(cjk) - 1)]
+    stop = {
+        "the", "a", "an", "and", "or", "to", "of", "in", "on", "at", "as",
+        "when", "he", "she", "it", "we", "you", "they", "is", "are", "be",
+        "insert", "clip", "broll", "video", "add", "here", "this", "that",
+        "说到", "到时", "时候", "插入", "加入", "这里", "这段", "位置", "素材",
+        "视频", "时插", "放在", "那段", "地方", "的时", "对应", "剪进",
+    }
+    toks = {t for t in (ascii_toks + bigrams) if t not in stop}
+    if not toks or not segments:
+        return None
+    # 收集所有有匹配的候选段（分数>0、窗口有效）。
+    scored = []
+    for seg in segments:
+        seg_text = (seg.get("text") or "").lower()
+        score = sum(1 for t in toks if t in seg_text)
+        if score <= 0:
+            continue
+        try:
+            s = float(seg.get("start", 0.0))
+            e = float(seg.get("end", s))
+        except (TypeError, ValueError):
+            continue
+        if e > s:
+            scored.append((score, s, e))
+    if not scored:
+        return None
+    # 按分数高→低、再时间早→晚排；优先选不与已有 b-roll 重叠的候选（改选择策略，
+    # 不换匹配机制）。这样'code'并列时会跳过重叠的 VSCode 段、落到 Cloud Code 段。
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    for score, s, e in scored:
+        if not any(s < we and ws < e for ws, we in taken):
+            return (round(s, 2), round(e, 2))
+    return "overlap"
+
+
+@app.post("/jobs/{job_id}/add_broll")
+async def add_broll_endpoint(
+    job_id: str,
+    text: str = Form(""),
+    broll: List[UploadFile] = File(default=[]),
+    broll_labels: List[str] = Form(default=[]),
+    broll_kinds: List[str] = Form(default=[]),
+):
+    """第一性增量：往已确认方案追加一段 b-roll（只改方案、直接重渲染，不重规划）。"""
+    import json as _json
+    job = get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if not job.planned_edit:
+        raise HTTPException(status_code=400, detail="该任务还没有可追加的方案。")
+    try:
+        plan = _json.loads(job.planned_edit)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="方案数据损坏，无法追加。")
+
+    segments = []
+    tpath = job.job_dir / "input_transcript.json"
+    if tpath.exists():
+        try:
+            segments = _json.loads(tpath.read_text(encoding="utf-8")).get("segments", [])
+        except (ValueError, OSError):
+            segments = []
+
+    ops = plan.get("edit_operations", [])
+    broll_op = next((o for o in ops if o.get("type") == "insert_broll"), None)
+    taken = []
+    if broll_op:
+        for it in broll_op.get("items", []) or []:
+            try:
+                taken.append((float(it.get("start_seconds", 0.0)),
+                              float(it.get("end_seconds", 0.0))))
+            except (TypeError, ValueError):
+                pass
+
+    uploads = []
+    for k, up in enumerate(broll):
+        data = await up.read()
+        label = broll_labels[k] if k < len(broll_labels) else ""
+        kindhint = broll_kinds[k] if k < len(broll_kinds) else ""
+        uploads.append((data, up.filename or "", label, kindhint))
+    if not uploads:
+        raise HTTPException(status_code=400, detail="没有收到要追加的 b-roll 素材。")
+
+    # Pass 1：先算好所有窗口，任一定位不到就整体不落盘（避免半成品资产）。
+    _IMAGE_EXTS = ("jpg", "jpeg", "png", "webp", "gif", "bmp")
+    staged = []
+    for data, fname, label, kindhint in uploads:
+        instruction = label or text
+        win = _locate_broll_window(instruction, segments, taken)
+        if win is None:
+            raise HTTPException(
+                status_code=422,
+                detail="没定位到插入位置。请在片段配文里写清它对应视频里说到的那句话（尽量用视频里出现的原词）。",
+            )
+        if win == "overlap":
+            raise HTTPException(
+                status_code=422,
+                detail="该位置已经有 b-roll 了。请换一处（配文写清对应的另一句话）。",
+            )
+        taken.append(win)
+        ext = (os.path.splitext(fname)[1].lstrip(".") or "mp4").lower()
+        kind = kindhint or ("image" if ext in _IMAGE_EXTS else "video")
+        staged.append((data, ext, kind, label, win))
+
+    # Pass 2：落盘 + 登记资产 + 组装新 item。order 与 append_asset 的 len(assets) 对齐。
+    from .job_manager import append_asset, set_asset_local_path, get_assets
+    assets_dir = job.job_dir / "assets"
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    new_items = []
+    for data, ext, kind, label, win in staged:
+        fresh = get_job(job_id)
+        order = len(get_assets(fresh)) if fresh is not None else 0
+        dest = assets_dir / f"broll_{order}.{ext}"
+        dest.write_bytes(data)
+        media_id = f"local_add_{order}"
+        append_asset(job_id, media_id, kind, label)
+        set_asset_local_path(job_id, media_id, str(dest))
+        new_items.append({
+            "asset_ref": order,
+            "start_seconds": win[0],
+            "end_seconds": win[1],
+            "mode": "broll_main",
+        })
+
+    if broll_op is None:
+        broll_op = {"type": "insert_broll", "items": []}
+        ops.append(broll_op)
+    broll_op.setdefault("items", []).extend(new_items)
+    plan["edit_operations"] = ops
+
+    update_job_fields(
+        job_id,
+        planned_edit=_json.dumps(plan, ensure_ascii=False),
+        status=JobStatus.RUNNING_PIPELINE,
+        error_message=None,
+        degraded_operations=None,
+        generation_cost_usd=None,
+    )
+    _run_in_background(_enqueue_pipeline, job_id)
+    return {"job_id": job_id, "status": "RUNNING_PIPELINE", "added_broll": len(new_items)}
+
+
 # ---------------------------------------------------------------------------
 # File serving
 # ---------------------------------------------------------------------------
