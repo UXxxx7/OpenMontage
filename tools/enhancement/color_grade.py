@@ -160,7 +160,7 @@ class ColorGrade(BaseTool):
             "ffmpeg", "-y",
             "-i", str(input_path),
             "-vf", vf,
-            "-c:v", codec, "-crf", str(crf),
+            "-c:v", codec, "-crf", str(crf), "-preset", "fast",
             "-fps_mode", "cfr", "-r", str(fps), "-g", str(int(fps)),
             "-c:a", "copy",
             str(output_path),
