@@ -54,7 +54,16 @@ def main():
     # create ourselves.
     from uvicorn import Config, Server
 
-    config = Config(app, host="0.0.0.0", port=8000, log_level="info")
+    # timeout_graceful_shutdown defaults to None (uvicorn 0.49) — wait
+    # forever for every open connection to close before exiting on SIGTERM.
+    # Confirmed live (2026-07-23/24, this session, repeatedly): Node's
+    # worker.js polls GET /jobs/{id} over a keep-alive axios connection that
+    # never closes on its own, so a plain `kill`/SIGTERM never actually
+    # terminates the process — every restart during local dev left one more
+    # unkillable zombie behind (still requiring `kill -9`). Bound it so
+    # SIGTERM drains in-flight requests for a few seconds, then force-exits
+    # regardless of lingering keep-alive sockets.
+    config = Config(app, host="0.0.0.0", port=8000, log_level="info", timeout_graceful_shutdown=5)
     server = Server(config)
 
     if sys.platform == "win32":

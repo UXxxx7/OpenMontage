@@ -223,8 +223,14 @@ def generate_croll(job_id: str, photo_path: str, lang: str = "zh", hint: str = "
     if job is None:
         return
 
+    from . import heygen_croll
+
+    # 标准档账号只给 3 个 photo avatar 名额，用完必须清理——2026-07-17 实测撞过：
+    # 连续测 3 次直接把配额堵死，第 4 次上传直接 400。放 finally 里保证无论后面
+    # 生成成功/超时/异常都会清理，因为上传这一步本身就已经占了名额，不清理的话
+    # 即使后续步骤失败，这个名额也白白浪费掉。（合并自 PR #39，2026-07-20）
+    talking_photo_id: Optional[str] = None
     try:
-        from . import heygen_croll
         from .croll_script import write_script
 
         if not heygen_croll.is_available():
@@ -234,6 +240,11 @@ def generate_croll(job_id: str, photo_path: str, lang: str = "zh", hint: str = "
         if not script:
             raise RuntimeError("看图写文案失败（视觉 LLM 不可用或未返回内容）")
         logger.info(f"  C-roll 文案（{job_id}）: {script[:80]}")
+        # HeyGen 数字人念的就是这段文字，逐字保证准确——存下来给后面的
+        # transcribe_segments 用来纠正 ASR 听错的同音字/含糊音（而不是让
+        # ASR 重新"猜"一遍这段本来就 100% 已知的文本，见 pipeline_runner.py
+        # _correct_transcript_against_script 的说明）。
+        (job.job_dir / "croll_script.txt").write_text(script, encoding="utf-8")
 
         talking_photo_id = heygen_croll.upload_talking_photo(Path(photo_path))
         if not talking_photo_id:
@@ -274,6 +285,9 @@ def generate_croll(job_id: str, photo_path: str, lang: str = "zh", hint: str = "
     except Exception as e:
         logger.exception(f"C-roll 生成出错 {job_id}: {e}")
         update_job_status(job_id, JobStatus.ERROR, str(e))
+    finally:
+        if talking_photo_id:
+            heygen_croll.delete_talking_photo(talking_photo_id)
 
 
 # ---------------------------------------------------------------------------

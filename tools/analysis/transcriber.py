@@ -119,6 +119,7 @@ class Transcriber(BaseTool):
         language = inputs.get("language")
         diarize = inputs.get("diarize", False)
         output_dir = Path(inputs.get("output_dir", input_path.parent))
+        hotwords = inputs.get("hotwords")
 
         if not input_path.exists():
             return ToolResult(success=False, error=f"Input file not found: {input_path}")
@@ -160,6 +161,7 @@ class Transcriber(BaseTool):
             word_timestamps=True,
             vad_filter=True,
             condition_on_previous_text=False,
+            hotwords=hotwords,
         )
 
         segments = []

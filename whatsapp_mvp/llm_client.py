@@ -43,7 +43,10 @@ def _post_with_retries(
     for attempt in range(1, _MAX_ATTEMPTS + 1):
         try:
             resp = requests.post(url, headers=headers, json=body, timeout=timeout)
-        except (requests.ConnectionError, requests.Timeout) as e:
+        # ChunkedEncodingError（"Response ended prematurely"）不是 ConnectionError/
+        # Timeout 的子类——响应体传输中途被切断时抛的是这个，之前漏抓，导致一次
+        # 廉价的传输层抖动被迫升级成调用方（apply_style）整段重跑。
+        except (requests.ConnectionError, requests.Timeout, requests.exceptions.ChunkedEncodingError) as e:
             if attempt == _MAX_ATTEMPTS:
                 logger.error(f"{label} call failed after {attempt} attempts (network): {e}")
                 return None

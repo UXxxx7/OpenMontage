@@ -5,10 +5,12 @@
 
 from __future__ import annotations
 
+import difflib
 import json
 import logging
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -34,6 +36,12 @@ from .concurrency import (
 # ============================================================================
 # 主入口
 # ============================================================================
+
+# add_music 重试前的等待：Pixabay 检索失败常是 Cloudflare 反爬挑战（非官方 API，
+# 爬公开搜索页），这类拦截一般数十秒内解除，立即重试大概率还在同一个挑战窗口里。
+# （合并自 PR #39，2026-07-20）
+_MUSIC_RETRY_DELAY_S = 30
+
 
 def run_talking_head_pipeline(job: Job) -> dict[str, Any]:
     """按编辑计划用 OpenMontage 正式工具执行编辑，输出 preview.mp4。
@@ -138,7 +146,13 @@ def run_talking_head_pipeline(job: Job) -> dict[str, Any]:
         try:
             new_src = _op_add_music(src, music_op, job_dir)
         except Exception as e:
-            logger.warning(f"    add_music: 执行失败，自动重试一次。原因: {e}")
+            # Pixabay 检索走的是公开搜索页爬取（没有官方 API），失败常是 Cloudflare
+            # 的人机验证挑战（cf-mitigated: challenge）——这类拦截通常几十秒内自行
+            # 放行，立即重试大概率撞在同一个挑战窗口里、白重试一次。等一段再重试，
+            # 成功率明显更高（2026-07-17 实测复现过：403 立即重试仍 403，等待后
+            # 用完全相同的请求参数直接成功）。
+            logger.warning(f"    add_music: 执行失败，{_MUSIC_RETRY_DELAY_S}s 后重试一次。原因: {e}")
+            time.sleep(_MUSIC_RETRY_DELAY_S)
             try:
                 new_src = _op_add_music(src, music_op, job_dir)
             except Exception as e2:
@@ -446,7 +460,71 @@ def _transcribe_elevenlabs(src: str, api_key: str):
     )
 
 
-def _safe_transcribe(src: str, workdir: Path, model_size: str):
+# 真实事故（2026-07-23，job_08b94c0922ce）：faster-whisper "small" 模型把
+# "重疾险"听成同音字"重极险"，把整句"保额、价格、购买条款也要看清楚"听成
+# "保额紧张买购,条款也要看清楚"——这些错字被 content_planner 原样（甚至
+# 进一步）抄进了卡片文案，最终渲染出明显的错别字。faster-whisper 的
+# hotwords 参数就是为这种"领域术语容易被听成同音字"设计的解码期偏置，
+# 不依赖 condition_on_previous_text（该参数已被上面的 Fix 关闭），给出正确
+# 写法能显著降低同音字误听。这里给的是保险这个业务域的常见术语——不是
+# 这条视频专属，所有转写都会带上，对非保险内容基本无副作用。
+_HOTWORDS_INSURANCE = (
+    "重疾险 定期寿险 终身寿险 医疗险 意外险 年金险 车险 家财险 "
+    "保额 保费 理赔 保单 投保 承保 保险公司 保障"
+)
+
+
+def _correct_transcript_against_script(segments: list[dict], script: str) -> list[dict]:
+    """C-roll 场景下，数字人念的就是 write_script() 生成的这段文字，逐字
+    100% 已知——用户原话："这个文案可以直接送给他进行判断吧，文案是百分之
+    百准确的啊"，说得对：与其指望 ASR 把这段本来就已知的话再听一遍还可能
+    听错（真实事故：'重疾险'->'重极险'、'出岔子'->'出差子'），不如直接用
+    已知原文纠正 ASR 输出的文字。
+
+    只换文字，不碰时间戳——ASR 的 start/end 依然是基于真实音频对齐出来的，
+    照样可信；script 只提供"这段音频对应的文字应该是什么"。用字符级 diff
+    把 ASR 全文和 script 对齐，再按每个 segment 原来的字符长度切回去。如果
+    某个 segment 对齐出来的文字长度跟原文字长度差太多（说明这段对不上，比如
+    ASR 漏听/多听了一整块），保留 ASR 原文，不强行覆盖成可能文不对时的内容
+    ——宁可保留一个听错的字，也不要引入一段跟时间戳对不上的文字。
+    """
+    script_norm = script.replace("\n", "").replace(" ", "")
+    asr_full = "".join(seg["text"] for seg in segments)
+    if not asr_full.strip() or not script_norm.strip():
+        return segments
+
+    opcodes = difflib.SequenceMatcher(None, asr_full, script_norm, autojunk=False).get_opcodes()
+
+    def script_slice(i1: int, i2: int) -> Optional[str]:
+        out = []
+        for _tag, a1, a2, b1, b2 in opcodes:
+            if a2 <= i1 or a1 >= i2 or a2 == a1:
+                continue
+            lo, hi = max(i1, a1), min(i2, a2)
+            frac_lo = (lo - a1) / (a2 - a1)
+            frac_hi = (hi - a1) / (a2 - a1)
+            out.append(script_norm[b1 + round(frac_lo * (b2 - b1)):b1 + round(frac_hi * (b2 - b1))])
+        return "".join(out) if out else None
+
+    corrected = []
+    pos = 0
+    changed = 0
+    for seg in segments:
+        seg_len = len(seg["text"])
+        piece = script_slice(pos, pos + seg_len)
+        new_seg = dict(seg)
+        if piece and piece.strip() and abs(len(piece) - seg_len) <= max(2, seg_len // 3):
+            if piece != seg["text"]:
+                changed += 1
+            new_seg["text"] = piece
+        corrected.append(new_seg)
+        pos += seg_len
+    if changed:
+        logger.info(f"  转写文本按已知口播文案（croll_script.txt）纠正了 {changed}/{len(segments)} 段")
+    return corrected
+
+
+def _safe_transcribe(src: str, workdir: Path, model_size: str, hotwords: str = _HOTWORDS_INSURANCE):
     """跑转写，把"工具报告失败"和"工具本身抛异常"统一收敛成返回 None。
 
     config.transcribe_provider == "elevenlabs"（默认，见该字段注释）时优先走
@@ -506,10 +584,23 @@ def _safe_transcribe(src: str, workdir: Path, model_size: str):
         except OSError:
             pass  # 写缓存失败不影响本次转写结果，只是下次少一次命中机会
 
+    def _apply_croll_correction(data: dict) -> None:
+        """workdir 下有 croll_script.txt（generate_croll 写的已知口播原文）
+        时，用它纠正这次转写结果的文字——就地修改 data["segments"]。"""
+        script_path = workdir / "croll_script.txt"
+        if not script_path.exists():
+            return
+        try:
+            script = script_path.read_text(encoding="utf-8")
+            data["segments"] = _correct_transcript_against_script(data["segments"], script)
+        except OSError:
+            pass
+
     config = get_config()
     if config.transcribe_provider == "elevenlabs" and config.elevenlabs_api_key:
         t = _transcribe_elevenlabs(src, config.elevenlabs_api_key)
         if t.success:
+            _apply_croll_correction(t.data)
             _save_cache(t.data)
             return t
         # 确认过的真实生产 bug：ElevenLabs 密钥"配了但被拒绝"(401/过期/限流/
@@ -533,6 +624,7 @@ def _safe_transcribe(src: str, workdir: Path, model_size: str):
                 "input_path": src,
                 "output_dir": str(workdir),
                 "model_size": model_size,
+                "hotwords": hotwords,
             })
     except Exception as e:
         logger.warning(f"  转写调用异常: {e}")
@@ -544,6 +636,7 @@ def _safe_transcribe(src: str, workdir: Path, model_size: str):
     if not t.success:
         logger.warning(f"  转写失败: {t.error}")
         return None
+    _apply_croll_correction(t.data)
     _save_cache(t.data)
     return t
 

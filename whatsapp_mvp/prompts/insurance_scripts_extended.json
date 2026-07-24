@@ -1,0 +1,299 @@
+{
+  "_comment": "保险行业口播文案素材库（中英双语，2026-07-21 用户提供）。跟 croll_reference_scripts.json 是同一个 schema，但目前独立成文件、未接入 croll_script.py 的 few-shot 逻辑——先落地存档，接入管线前再决定怎么改 _pick_examples（比如按 category 精确匹配代替关键词命中，或按 duration_seconds 过滤，因为这批文案实测普遍在 100-150+ 秒，远超当前 C-roll 60 秒的目标时长）。",
+  "scripts": [
+    {
+      "id": "INS_ZH_001",
+      "category": "重疾险",
+      "title": "病来如山倒，赔款如盾牢",
+      "lang": "zh",
+      "primary_language": "zh-CN (with EN terms)",
+      "duration_seconds": 101,
+      "target_audience": "25~45岁家庭支柱",
+      "script": "各位朋友，您有没有认真算过，一场大病会给家庭带来多大的经济冲击？除了医院里那张几十万的医疗账单，还有房贷车贷要还，孩子的补习费不能停，父母的养老金要照给，甚至康复期间的营养品、护工费，样样都是真金白银。重疾险，就是专门应对这些隐性损失的。它不像医疗险那样凭发票报销，而是确诊合同约定的重疾后，保司一次性把全部保额打到您的银行卡上，这笔钱怎么花，完全由您自己决定。我们这款产品覆盖120种重大疾病，同时还包含轻症和中症多次赔付，更贴心的是，一旦首次确诊重疾，后续所有未交保费全部豁免，但保障依然有效。给您举个真实案例：35岁的张先生投保了60万保额，年缴保费不到六千元，第二年体检意外发现早期肺癌，保险公司直接赔付60万，后续二十多年的保费一分不用再交，合同继续为他保驾护航。您看，每天少抽一包烟，少喝一杯咖啡，换来的却是几十万的确诊即赔，让您安心治疗，家人生活如常。这样的重疾险，是不是每个家庭顶梁柱都该配置？"
+    },
+    {
+      "id": "INS_ZH_002",
+      "category": "重疾险",
+      "title": "别让一场病，拖垮一个家",
+      "lang": "zh",
+      "primary_language": "zh-CN (with EN terms)",
+      "duration_seconds": 95,
+      "target_audience": "25~45岁家庭支柱",
+      "script": "我经常跟客户说，重疾险不是消费，而是给未来自己储备的一份'收入损失补偿金'。您想想，一旦罹患大病，至少需要三到五年的休养期，期间无法工作，收入中断，但家里的开销一分不会少。重疾险赔的这笔钱，就相当于保险公司替您发工资，每月按时给您'发薪'，让您不必为了生计急着返岗。我们这款产品设计灵活，保额最高可达100万，而且针对高发疾病额外赔付，比如恶性肿瘤、心脑血管疾病都能获得加倍保障。同时，我们提供全程健康管理服务，包括专家门诊预约、住院绿通、二次诊疗意见，让您看病不求人。举个例子，王女士投保了80万保额，去年确诊乳腺癌，她拿到了80万赔款，除去治疗自费部分，剩余的钱足够她安心休养两年，还能请专业护工照顾自己。她说，这笔钱不仅是经济支撑，更是心理上的定心丸。所以，重疾险保额一定要充足，至少覆盖您年收入的3到5倍。爱自己，爱家人，就从一份足额的重疾险开始吧。"
+    },
+    {
+      "id": "INS_ZH_003",
+      "category": "医疗险",
+      "title": "百万医疗，住院不慌",
+      "lang": "zh",
+      "primary_language": "zh-CN (with EN terms)",
+      "duration_seconds": 90,
+      "target_audience": "所有有社保、担心目录外用药自费的成年人",
+      "script": "您知道吗？国家医保报销有上限，很多特效药、进口药、ICU费用都得自己掏。这时候，一份百万医疗险就是最佳补充。每年只需几百块钱，就能撬动高达600万的医疗保障，自费药、靶向药、质子重离子治疗、甚至CAR-T疗法全都写进合同。住院期间产生的合理且必要的医疗费用，扣除免赔额后，剩余部分100%报销。而且我们这款产品保证续保20年，不用担心今年理赔了明年就不让买。更实用的是，它附带住院垫付服务，如果一时凑不出住院押金，保险公司直接帮您垫付，免去四处借钱的尴尬。还有就医绿通，快速安排专家手术。比如，刘先生突发急性胰腺炎，住院花了30万，社保报了12万，剩余的18万，百万医疗险全给报了，自己只出了1万免赔额。您说，这每年几百块的投入，是不是花得特别值？没有医疗险，生病就只能靠存款硬扛；有了它，看病真正实现了'财务自由'。"
+    },
+    {
+      "id": "INS_ZH_004",
+      "category": "医疗险",
+      "title": "看病自由，从一份医疗险开始",
+      "lang": "zh",
+      "primary_language": "zh-CN (with EN terms)",
+      "duration_seconds": 95,
+      "target_audience": "所有有社保、担心目录外用药自费的成年人",
+      "script": "我们常说社保是底裤，医疗险才是外套。因为社保有目录限制，很多好药、好疗法都不在报销范围内。而商业医疗险不限社保目录，不限疾病种类，只要符合医学必需，无论是去公立医院普通部还是特需部（根据计划），都能按约定报销。现在的百万医疗险还拓展了院外特药清单，覆盖上百种抗癌特效药，凭医生处方就可以在指定药房取药，保险公司直接结算。另外，很多客户担心免赔额太高，其实现在有家庭共享免赔额选项，一家人一起买，更划算。举个例子，陈女士给孩子买了份医疗险，孩子肺炎住院花了1.2万，社保报了5千，剩余7千，扣除1万免赔额，因为超过了，能赔吗？注意，如果购买的是0免赔额的版本，那1.2万全报。我们这款提供可选0免赔，更贴心。医疗险让您面对医生时，可以毫不犹豫地说'用最好的药，用最先进的设备'，因为背后有百万保额撑腰。看病自由，从来不是一句空话，而是一份实实在在的医疗险合同。"
+    },
+    {
+      "id": "INS_ZH_005",
+      "category": "意外险",
+      "title": "明天和意外，谁先来？",
+      "lang": "zh",
+      "primary_language": "zh-CN (with EN terms)",
+      "duration_seconds": 94,
+      "target_audience": "所有年龄层，尤其经常出行/工作压力大的人群",
+      "script": "意外险，是所有人身保险里杠杆最高的产品。每年一百多元，就能获得上百万的身故和伤残保障，还能报销意外医疗费用。生活中，猫抓狗咬、摔伤烫伤、交通事故、高空坠物，这些意外防不胜防。意外险的医疗责任不限社保用药，门诊和住院都能赔，免赔额通常只有100元，剩余部分按比例报销。伤残则按照《人身保险伤残评定标准》按比例赔付，从十级到一级，覆盖各种程度的损伤。而且我们这款产品特别包含猝死责任，要知道猝死不属于意外，但现代人工作压力大，这项责任非常实用。举个例子，小赵骑车摔成骨折，住院花了2万，社保报了8千，意外险报销了剩下的1.2万，自己几乎没花钱。同时，他因为骨折评定为十级伤残，获赔10%保额即10万元。这笔钱弥补了他休养期间的收入损失。意外险没有健康告知，投保门槛极低，是每个人最先应该配置的兜底保障。明天和意外，我们无法预知先后，但可以提前备好这把保护伞。"
+    },
+    {
+      "id": "INS_ZH_006",
+      "category": "意外险",
+      "title": "生活不是剧本，没有NG重来",
+      "lang": "zh",
+      "primary_language": "zh-CN (with EN terms)",
+      "duration_seconds": 92,
+      "target_audience": "所有年龄层，尤其经常出行/工作压力大的人群",
+      "script": "成年人的世界，意外无处不在。开车上下班、出差坐飞机、周末带孩子去游乐场，风险随时可能降临。意外险的价值就在于，它用极小的成本，转移极大的风险。保额建议至少做到年收入的5到10倍，尤其是家庭经济支柱，一旦发生重大意外，理赔款可以替代您的收入，继续支撑家庭运转。我们的意外险还包含多项特色服务，比如紧急救援、医疗运送、亲属慰问探访等。同时，意外医疗部分扩展了自费药，狂犬疫苗、破伤风针都能报。说个真实案例，孙先生在家修理电器不慎触电，导致左手部分功能丧失，评定为七级伤残，他投保的100万意外险赔付了40万（七级赔40%）。这笔钱加上他的积蓄，保证了康复期间家里没断粮。意外险保费低，保额高，人人都买得起，但它往往被忽略。请不要等到意外发生才后悔，现在花一顿饭钱，就能给家人一份踏实的安全感。生活没有彩排，但我们可以提前写好保障的剧本。"
+    },
+    {
+      "id": "INS_ZH_007",
+      "category": "定期寿险",
+      "title": "留爱不留债，定寿护家",
+      "lang": "zh",
+      "primary_language": "zh-CN (with EN terms)",
+      "duration_seconds": 100,
+      "target_audience": "有房贷/有子女的已婚人士",
+      "script": "定期寿险，是我最建议家庭支柱购买的险种，没有之一。它保障责任简单纯粹：在保障期内，若被保险人身故或全残，保险公司直接赔付保额。这笔钱可以用来还清房贷车贷、支付子女教育费、赡养年迈父母，确保家人生活不受影响。我们这款定寿保至60岁或70岁，正好覆盖责任最重的阶段。保费低廉，杠杆极高，30岁男性投保100万保额，保至60岁，每年仅需一千多元，女性更便宜。而且健康告知宽松，只有三条，大多数人都能买。您想想，万一哪天我们不在了，留给家人的不应该只有悲伤，更应该是经济上的从容。李先生就是听了我的建议，投保了200万定寿，去年因意外不幸去世，保险公司迅速赔付200万，他妻子用这笔钱还清了房贷，孩子以后的教育费也有了着落。李太太说，虽然失去了爱人，但这份保险让她的生活没有崩塌。定期寿险，站着是印钞机，倒下是人民币，这句话一点也不夸张。如果您是家里的主要收入来源，请务必配置一份足额的定寿，这是责任，更是深爱。"
+    },
+    {
+      "id": "INS_ZH_008",
+      "category": "终身寿险",
+      "title": "最长情的告别，是提前备好保障",
+      "lang": "zh",
+      "primary_language": "zh-CN (with EN terms)",
+      "duration_seconds": 90,
+      "target_audience": "关注资产配置与财富传承的高净值人群",
+      "script": "如果说定期寿险是阶段性的守护，那么终身寿险则是一份穿越时空的承诺。它保障终身，因为人终有一死，所以赔付是确定的。这笔钱指定受益人，可以定向传承，免遗产税，避免家庭纠纷。我们这款增额终身寿险，保额每年按3.5%复利递增，越到后期保额越高，现金价值也随之增长，需要用钱时还可以通过减保取现，灵活应急。它兼具保障和储蓄功能，非常适合做资产配置和财富传承。比如，王总为自己投保了500万保额的终身寿险，指定儿子为受益人。他不仅锁定了身价保障，而且保单的现金价值逐年上升，未来若企业需要周转，还可以申请保单贷款。身故后，500万甚至更高的保额直接给到儿子，免去了复杂的继承手续。终身寿险，是给家人最确定、最体面的告别礼物。我们无法预知生命的长度，但可以决定生命的厚度，以及留给家人的温度。提前备好这份保障，让爱跨越时间，永续传递。"
+    },
+    {
+      "id": "INS_ZH_009",
+      "category": "年金险",
+      "title": "给未来写一封确定的情书",
+      "lang": "zh",
+      "primary_language": "zh-CN (with EN terms)",
+      "duration_seconds": 93,
+      "target_audience": "30~50岁有中长期储蓄或子女教育需求者",
+      "script": "年金险，是唯一能保证与生命等长的现金流工具。您现在每年存入一笔钱，到了约定年龄，比如60岁，保险公司就会按月或按年给您发养老金，活多久领多久，终身领取。它不受市场利率波动影响，锁定长期复利，安全确定。对于孩子的教育金，同样可以规划，在孩子上大学、出国留学等关键阶段，定时定量给钱，确保教育不受任何意外影响。我们的这款年金产品，投保门槛低，缴费期灵活，3年、5年、10年任选，而且支持附加万能账户，让资金二次增值。举个例子，张女士为0岁的宝宝每年存5万，存10年，等到孩子18岁时，账户价值已经累积到约80万，可以分批取出支付大学学费和生活费。如果一直不取，到孩子30岁，账户价值可达100多万，作为婚嫁金或创业金。年金险的意义，就是'强制储蓄，锁定未来'，把现在的闲钱，变成未来确定的支出保障。您给自己写的那封未来情书，就从一份年金险开始吧。"
+    },
+    {
+      "id": "INS_ZH_010",
+      "category": "年金险",
+      "title": "退休后，你想过怎样的生活？",
+      "lang": "zh",
+      "primary_language": "zh-CN (with EN terms)",
+      "duration_seconds": 96,
+      "target_audience": "30~50岁有中长期储蓄或子女教育需求者",
+      "script": "我们这一代人，养老不能只靠社保。随着人口老龄化加剧，社保养老金替代率逐年下降，想要退休后维持品质生活，必须自己补充商业养老年金。年金险的好处是，它给您一笔与生命等长的被动收入，不用担心钱花完，更不用担心长寿带来的经济压力。我们的养老年金产品，最早55岁即可领取，女性55岁，男性60岁，保证领取20年，即使没领够年限就不幸身故，剩余部分会给到受益人。同时，它可附加护理保障，解决失能照护问题。举个例子，陈叔叔60岁退休时，一次性领取了之前投保的年金，同时每月还能领5000元补充养老金，加上社保退休金，他每月收入过万，经常和老伴旅游、上老年大学，日子过得非常滋润。反观没有养老金储备的老同事，只能省吃俭用。养老尊严，是自己年轻时给的。现在开始规划，每年存下一笔不影响生活的钱，让将来的您，感谢现在明智的自己。退休生活，您是愿意精打细算，还是从容潇洒？选择权就在今天。"
+    },
+    {
+      "id": "INS_ZH_011",
+      "category": "车险",
+      "title": "车轮上的安全，不止是技术",
+      "lang": "zh",
+      "primary_language": "zh-CN (with EN terms)",
+      "duration_seconds": 91,
+      "target_audience": "私家车主",
+      "script": "有车一族都知道，交强险是国家强制，但保障有限，尤其撞了豪车或造成第三方人伤，交强险那点保额根本不够。所以商业车险必须买足，三者险建议直接上200万以上，车损险现在包含涉水、自燃、盗抢、玻璃、不计免赔等多项责任，非常全面。我们推荐的这套车险方案，还附加了医保外医疗费用责任，因为事故中用到自费药，三者险是不赔的，有了这项附加，就可以报销。另外，我们提供全年无限次道路救援，包括拖车、搭电、换胎、送油，还有代驾服务。李先生去年在高速上追尾，对方车辆维修费加医疗费共花了50万，他的三者险200万全部覆盖，自己车损维修也由车损险赔付，全程没有自掏腰包。他说，买车险时觉得贵，出险时才知道多么值得。车险不仅是应付年检的工具，更是您行车路上的护身符。记住，保险宁可千日不用，不可一日不备。给自己的爱车配上完整的保障，让每一段旅途都安心无忧。"
+    },
+    {
+      "id": "INS_ZH_012",
+      "category": "车险",
+      "title": "路况千变，保障不变",
+      "lang": "zh",
+      "primary_language": "zh-CN (with EN terms)",
+      "duration_seconds": 84,
+      "target_audience": "私家车主",
+      "script": "现在的城市道路，车多人多，小剐蹭难以避免，大事故也时有发生。车险的理赔服务就显得尤为重要。我们合作的保险公司提供快速定损、小额案件线上自助理赔，拍照上传，最快当天到账。而且我们还有专人协助您处理事故纠纷，提供法律援助。对于新手司机，我们强烈建议购买全险，包括车损、三者、驾乘险，驾乘险可以保自己车上人员，万一发生意外，可以补充医疗费用。另外，涉水险现在已经并入车损险，不用单独购买。王女士在暴雨天涉水行驶导致发动机损坏，因为买了车损险，保险公司赔付了发动机维修费用，省了好几万。记住，暴雨天如果车辆熄火，千万不要二次启动，否则可能拒赔，这是我们给您的友情提醒。车险条款复杂，但选对套餐，找对代理人，就能省心省力。路况千变万化，只有保障稳如磐石，才能从容应对每一次出发和归途。"
+    },
+    {
+      "id": "INS_ZH_013",
+      "category": "家财险",
+      "title": "家的安全，不容侥幸",
+      "lang": "zh",
+      "primary_language": "zh-CN (with EN terms)",
+      "duration_seconds": 88,
+      "target_audience": "自有住房业主、租客",
+      "script": "房子是大多数家庭最重要的资产，但很少有人为房子买保险。家财险，就是给您的房屋和室内财产上的一道安全锁。它保障房屋主体结构、室内装修、家具家电、贵重物品等，因火灾爆炸、台风暴雨、洪水、盗窃等原因造成的损失，保险公司都会按约定赔偿。我们这款家财险，每天保费不到一块钱，却能提供高达几百万的保障。而且扩展了水暖管爆裂责任，特别是北方冬天暖气漏水，殃及自家和邻居，这项责任非常实用。另外还包含第三者责任险，比如自家阳台花盆掉落砸伤路人，保险公司代为赔偿。赵先生家里因电线老化发生火灾，虽然扑救及时，但墙面和家具损坏严重，维修花了8万，家财险全赔了。赵先生说，以前觉得家财险没用，现在才知道它多么必要。家是我们最温暖的港湾，保护它不能只靠运气，更要靠一份实实在在的保障。一年几百块，换一家人的心安，这笔账怎么算都划算。"
+    },
+    {
+      "id": "INS_ZH_014",
+      "category": "家财险",
+      "title": "邻里漏水不用愁，家财险来解忧",
+      "lang": "zh",
+      "primary_language": "zh-CN (with EN terms)",
+      "duration_seconds": 88,
+      "target_audience": "自有住房业主、租客",
+      "script": "生活中最常见的邻里纠纷，大多因为漏水。楼上水管爆裂，泡了楼下天花板，不仅赔偿扯皮，还伤和气。家财险中的水暖管爆裂责任，不仅赔偿自家修复费用，还包含对第三方造成的损失。也就是说，如果您家漏水淹了楼下邻居，保险公司会负责赔偿邻居的损失，不用您个人掏腰包。此外，家财险还能保障室内财产被盗，但需要公安部门出具证明。我们这款产品还提供临时住宿津贴，如果房屋因事故无法居住，保险公司补贴您临时住宿费用。举个小例子，陈女士家厨房水管爆裂，水流到楼下，楼下要求赔偿2万元，陈女士报案后，保险公司核实定损，直接赔付了2万给楼下，自己家的地板也赔了1.5万。她感慨，几块钱的日保费，解决了大麻烦。家的安全，不只是一把锁，更是一份家财险的周全守护。别等到事故发生了才后悔，现在给您的家穿上'防护服'，让居住更安心，邻里更和谐。"
+    },
+    {
+      "id": "INS_EN_001",
+      "category": "重疾险",
+      "category_en": "Critical Illness Insurance",
+      "title": "Your Financial Shield Against Critical Illness",
+      "lang": "en",
+      "primary_language": "en-US",
+      "duration_seconds": 94,
+      "target_audience": "household breadwinners, ages 25-45",
+      "script": "Have you ever calculated the true economic impact of a serious disease on your family? It's not just the hospital bills – it's the mortgage payments, your children's school fees, daily living expenses, and the cost of long-term recovery. Critical illness insurance is designed to cover all that. Unlike medical insurance that reimburses actual expenses, this policy pays a lump sum cash benefit directly to you upon diagnosis of a covered condition. You decide how to spend it – whether on treatment, debt repayment, or simply to replace your lost income while you recover. Our plan covers over 120 major diseases, plus multiple payouts for early-stage and intermediate conditions. And here's the best part: if you're diagnosed with a critical illness, all future premiums are waived, yet your coverage continues in full. Take Mr. Zhang, a 35-year-old office worker. He bought a 600,000 yuan policy for less than 6,000 yuan per year. In his second year, he was diagnosed with early-stage lung cancer. The insurer paid him the full 600,000 immediately, and he never had to pay another premium. That money allowed him to take a full year off work, get the best treatment, and still support his family. For the cost of a daily coffee, you can secure that same peace of mind. Don't wait until it's too late – critical illness insurance is not an expense, it's an investment in your family's future stability."
+    },
+    {
+      "id": "INS_EN_002",
+      "category": "重疾险",
+      "category_en": "Critical Illness Insurance",
+      "title": "Don't Let a Disease Destroy Your Family's Future",
+      "lang": "en",
+      "primary_language": "en-US",
+      "duration_seconds": 90,
+      "target_audience": "household breadwinners, ages 25-45",
+      "script": "I often tell my clients that critical illness coverage is not a luxury – it's your personal 'income replacement fund' for the toughest times. Think about it: if you're diagnosed with cancer or heart disease, you'll likely need three to five years to recover. During that period, you cannot work, but your bills keep coming. This policy pays you a tax-free lump sum that acts as your salary, paid by the insurer, so you can focus on healing without financial stress. Our product allows coverage up to 1 million yuan, with extra protection for high-incidence conditions like malignancy and stroke. We also include a free health management package – access to top specialists, hospital admission coordination, and second medical opinions. Consider Ms. Wang, who bought 800,000 yuan of coverage. When she was diagnosed with breast cancer, she received the full amount. After covering her out-of-pocket medical costs, the remainder allowed her to hire a caregiver and take two full years off work to recover fully. She told me that this money gave her not just financial security, but mental peace. So, how much coverage should you buy? At least three to five times your annual income. Protecting yourself is protecting the ones who depend on you. Get a quote today – it could be the most important decision you ever make for your family."
+    },
+    {
+      "id": "INS_EN_003",
+      "category": "医疗险",
+      "category_en": "Medical Insurance",
+      "title": "Millions in Coverage, Zero Hospital Worries",
+      "lang": "en",
+      "primary_language": "en-US",
+      "duration_seconds": 86,
+      "target_audience": "anyone on basic/state insurance worried about out-of-formulary drug costs",
+      "script": "Did you know that government health insurance has many limits? Expensive targeted drugs, imported medications, ICU stays, and advanced therapies like proton beam or CAR-T – these are often not fully covered. That's where a million-dollar medical insurance plan comes in. For just a few hundred yuan per year, you can access up to 6 million yuan in coverage. All reasonable and necessary inpatient expenses, after a small deductible, are reimbursed at 100% – including self-paid drugs, hospital beds, and even ambulance fees. Our policy guarantees renewal for up to 20 years, so you never lose coverage after a claim. More importantly, we offer a direct hospital payment service: if you can't afford the deposit, we pay the hospital upfront, so you don't have to borrow from relatives. We also arrange quick specialist appointments and surgeries. Take Mr. Liu, who had acute pancreatitis and spent 300,000 yuan in hospital. Government insurance covered 120,000, and our policy paid the remaining 180,000 – he only paid the 10,000 deductible. That's real financial freedom when you're sick. For the price of a dinner out, you can protect yourself from catastrophic medical bills. Don't let a health crisis become a financial crisis. Get covered today and never hesitate to tell your doctor, 'Give me the best treatment available.'"
+    },
+    {
+      "id": "INS_EN_004",
+      "category": "医疗险",
+      "category_en": "Medical Insurance",
+      "title": "True Healthcare Freedom Starts with Medical Insurance",
+      "lang": "en",
+      "primary_language": "en-US",
+      "duration_seconds": 78,
+      "target_audience": "anyone on basic/state insurance worried about out-of-formulary drug costs",
+      "script": "We often say that public health insurance is like underwear – essential, but not enough to keep you warm outside. Commercial medical insurance is your outer coat. Why? Because it covers drugs and treatments outside the government list – whether it's imported chemotherapy, robotic surgery, or expensive immunotherapy. Our plan has no restriction on disease type or hospital department. It also includes a specific list of over 100 out-of-hospital specialty medications, so you can pick up your cancer drugs at designated pharmacies with direct billing. We even offer a family deductible option – if you buy for the whole family, you can share the deductible, making it more affordable. For example, Ms. Chen bought a zero-deductible version for her child. When her son was hospitalized with pneumonia, the total bill was 12,000 yuan. After government reimbursement of 5,000, our policy paid the remaining 7,000 in full – she paid nothing out of pocket. Medical insurance gives you the power to say 'yes' to the best doctors and the latest treatments, without checking your bank balance. It's not just insurance; it's the ticket to true healthcare freedom. Apply now and secure your peace of mind."
+    },
+    {
+      "id": "INS_EN_005",
+      "category": "意外险",
+      "category_en": "Accident Insurance",
+      "title": "Accidents Happen – Be Prepared Today",
+      "lang": "en",
+      "primary_language": "en-US",
+      "duration_seconds": 88,
+      "target_audience": "all ages, especially frequent travelers or high-stress jobs",
+      "script": "Accident insurance offers the highest leverage of any personal protection product. For just over a hundred yuan a year, you can get a million yuan in death and disability coverage, plus reimbursement for medical expenses from accidents. Think about everyday risks – dog bites, burns, falls, traffic collisions – they happen when we least expect them. Our accident policy covers emergency medical treatment, including self-paid medicines, with a very low deductible of only 100 yuan. For disability, we pay a percentage of the sum insured based on the official disability grading scale, from 10% to 100%. We also include sudden death coverage – which is not normally covered by accident policies – because we know modern life is stressful. Here's a true story: Mr. Zhao fell off his bicycle and fractured his leg. His hospital bill was 20,000 yuan; government insurance paid 8,000, and our accident plan covered the remaining 12,000. In addition, his fracture was assessed as a 10% disability, so he received 10,000 yuan in compensation. That extra money helped cover his lost wages during recovery. Accident insurance has no health questions and is easy to buy – everyone should have it. You never know when an accident will strike, but you can always prepare. Get protected now – it's the simplest and smartest decision you'll make today."
+    },
+    {
+      "id": "INS_EN_006",
+      "category": "意外险",
+      "category_en": "Accident Insurance",
+      "title": "Life Has No Rehearsal – Insure Every Step",
+      "lang": "en",
+      "primary_language": "en-US",
+      "duration_seconds": 79,
+      "target_audience": "all ages, especially frequent travelers or high-stress jobs",
+      "script": "For adults, the world is full of risks – commuting, flying for business, playing with kids at the park. Accident insurance transfers that massive risk for a tiny cost. We recommend coverage of at least five to ten times your annual income, especially if you're the breadwinner. A major accident could leave your family without your income; the insurance payout will replace that and keep your household running. Our plan includes emergency rescue, medical evacuation, and family visit services. It also covers rabies vaccines and tetanus shots – all self-paid drugs are included. Consider Mr. Sun, who had an electric shock while repairing his home. He lost partial function in his left hand, rated as a 7th-degree disability. With his 1 million yuan policy, he received 400,000 yuan (40% of sum insured). That money, together with his savings, carried his family through his recovery period. Accident insurance is cheap, yet often overlooked. Don't wait until tragedy strikes – spend the cost of a nice meal today to give your family a solid safety net. Life doesn't have a rehearsal, but you can write a protection script now. Sign up today and drive, walk, and live with confidence."
+    },
+    {
+      "id": "INS_EN_007",
+      "category": "定期寿险",
+      "category_en": "Term Life Insurance",
+      "title": "Leave Love, Not Debt – Term Life for Families",
+      "lang": "en",
+      "primary_language": "en-US",
+      "duration_seconds": 102,
+      "target_audience": "married with a mortgage and/or children",
+      "script": "Term life insurance is, in my opinion, the single most important policy for any family breadwinner. Its mission is simple: if you pass away or become totally disabled during the policy term, your beneficiaries receive a tax-free lump sum. That money can pay off your mortgage, fund your children's college education, support your elderly parents, and cover daily living expenses – ensuring your family's life doesn't collapse after you're gone. Our term life plan covers you to age 60 or 70 – exactly the period when your responsibilities are heaviest. Premiums are astonishingly low: a 30-year-old male can get 1 million yuan of coverage for just over a thousand yuan per year; females pay even less. The health questionnaire is very lenient – only three simple questions, so most people qualify. Let me share a real case: Mr. Li, who took 2 million yuan of term life, tragically died in an accident last year. The insurer paid the full 2 million within days. His wife used it to clear their mortgage and set aside funds for their children's future education. She told me that although she lost her husband, this money prevented her life from falling apart. Term life insurance – you're an ATM when you're alive, and you become a pile of cash if you're gone. It's not a morbid thought; it's a profound act of love. If you have dependents, please get covered. There's no better way to say 'I love you' than to ensure they are financially secure, no matter what."
+    },
+    {
+      "id": "INS_EN_008",
+      "category": "终身寿险",
+      "category_en": "Whole Life Insurance",
+      "title": "The Longest Goodbye Is a Prepared Legacy – Whole Life",
+      "lang": "en",
+      "primary_language": "en-US",
+      "duration_seconds": 84,
+      "target_audience": "high-net-worth individuals focused on estate planning",
+      "script": "While term life covers your working years, whole life insurance is a permanent promise. Since everyone eventually passes away, the death benefit is guaranteed. You can name specific beneficiaries to receive the proceeds directly, bypassing probate and estate taxes – a clean and private transfer of wealth. Our whole life policy also grows in cash value: the death benefit increases at a fixed rate (e.g., 3.5% annually) over time, and the policy builds a savings component that you can access via policy loans or partial withdrawals if you need liquidity. It's a powerful tool for estate planning and business succession. Take Mr. Wang, who bought a 5 million yuan whole life policy and named his son as beneficiary. Not only did he lock in a substantial legacy, but the policy's cash value grew every year. When his business needed short-term funds, he took a low-interest loan from the policy. Upon his passing, his son received the full increased death benefit, tax-free, with no delays. Whole life insurance is the most dignified goodbye you can give your family. We cannot know the length of our lives, but we can certainly determine their financial impact. Plan ahead, and your love will endure across generations. Contact us to design a legacy that truly lasts."
+    },
+    {
+      "id": "INS_EN_009",
+      "category": "年金险",
+      "category_en": "Annuity (Retirement & Education)",
+      "title": "Write a Love Letter to Your Future Self – Annuity",
+      "lang": "en",
+      "primary_language": "en-US",
+      "duration_seconds": 90,
+      "target_audience": "ages 30-50 with mid/long-term savings or education-funding needs",
+      "script": "An annuity is the only financial product that guarantees an income stream for as long as you live. You pay a set amount each year, and from a chosen age – say 60 – the insurer pays you a regular pension every month or year, for life. It's not affected by stock market swings or interest rate drops; it locks in long-term compound growth, providing absolute certainty. For education, you can design a plan that pays out exactly when your child enters university or graduate school – ensuring their studies are never interrupted by financial difficulties. Our annuity product has low entry thresholds, flexible payment terms (3, 5, or 10 years), and an optional universal account that allows any unused funds to grow further. Consider Ms. Zhang, who saved 50,000 yuan per year for 10 years for her newborn. By age 18, the account had grown to around 800,000 yuan, which she used to pay for her child's college tuition and living expenses. If she left it untouched until age 30, it would exceed 1 million – perfect for a wedding or startup fund. An annuity is 'forced savings with a guaranteed future'. It turns today's spare cash into tomorrow's essential income. Start writing that love letter to your future self – because the best time to begin was yesterday; the next best time is now."
+    },
+    {
+      "id": "INS_EN_010",
+      "category": "年金险",
+      "category_en": "Annuity (Retirement & Education)",
+      "title": "Retirement Dreams – Don't Leave Them to Chance",
+      "lang": "en",
+      "primary_language": "en-US",
+      "duration_seconds": 87,
+      "target_audience": "ages 30-50 with mid/long-term savings or education-funding needs",
+      "script": "Our generation cannot rely solely on state pensions. With an aging population and declining replacement rates, maintaining a comfortable retirement requires your own supplementary annuity. An annuity provides a passive income that lasts your entire life – you'll never outlive your money, and you won't have to worry about running out of savings. Our retirement annuity allows you to start receiving income as early as age 55 for women and 60 for men. It guarantees payment for at least 20 years – if you pass away before that, the remaining payments go to your beneficiaries. We also offer an optional long-term care rider to cover nursing expenses. Take Uncle Chen, who retired at 60 and began receiving an extra 5,000 yuan per month from his annuity, in addition to his state pension. His total monthly income exceeded 10,000 yuan, allowing him to travel and enjoy his golden years. Meanwhile, his colleagues without private pensions had to tighten their belts. Retirement dignity is earned when you're young. Start setting aside a little each year – a sum that won't hurt your current lifestyle – and your future self will thank you. Would you rather count pennies or live abundantly in retirement? The choice is yours today. Act now to secure a retirement that truly reflects your hard work."
+    },
+    {
+      "id": "INS_EN_011",
+      "category": "车险",
+      "category_en": "Auto Insurance",
+      "title": "Drive with Confidence – Full Auto Protection",
+      "lang": "en",
+      "primary_language": "en-US",
+      "duration_seconds": 91,
+      "target_audience": "private car owners",
+      "script": "Every car owner knows that compulsory liability insurance is required by law, but its coverage is far too low – especially if you hit a luxury car or cause serious injury to a third party. That's why commercial auto insurance is essential. We recommend a third-party liability limit of at least 2 million yuan. Our comprehensive car policy now includes vehicle damage, theft, fire, glass breakage, and even flood damage – all in one package. We also include an optional rider for out-of-pocket medical expenses, because standard liability policies don't cover non-medical drugs. Additionally, we offer 24/7 roadside assistance – towing, jump-starts, tire changes, fuel delivery – and even designated driver services. Last year, Mr. Li was rear-ended on the highway. The other party's car repair and medical costs totalled 500,000 yuan – his 2 million liability limit covered everything, and his own vehicle repairs were paid under his comprehensive coverage, so he paid nothing out of pocket. He told me that when he bought the policy, he thought it was expensive, but after the accident, he knew it was priceless. Auto insurance isn't just for annual inspections; it's your co-pilot on every journey. Remember, it's better to have it and not need it than to need it and not have it. Protect your car, your passengers, and your peace of mind with our complete auto insurance suite."
+    },
+    {
+      "id": "INS_EN_012",
+      "category": "车险",
+      "category_en": "Auto Insurance",
+      "title": "Roads Change, But Our Protection Stays Constant",
+      "lang": "en",
+      "primary_language": "en-US",
+      "duration_seconds": 78,
+      "target_audience": "private car owners",
+      "script": "City streets are busier than ever – fender benders are common, and serious accidents can happen anytime. That's why our auto insurance claims service is designed for speed and convenience. We offer fast damage assessment, online self-service claims for minor incidents – upload photos and get paid within a day. Our dedicated agents will also assist you in accident disputes and provide legal advice. For new drivers, we strongly recommend a full package – liability, vehicle damage, and occupant accident coverage. Occupant coverage protects your own passengers, providing additional medical benefits in case of injury. Flood damage is now included in vehicle damage coverage, so no separate purchase is needed. Ms. Wang drove through a flooded street and her engine stalled. Since she had comprehensive coverage, the insurer paid for the engine repair – saving her thousands. But remember: if your car stalls in water, never restart the engine – that may void coverage. Auto insurance can be complex, but with the right package and a reliable agent, you're worry-free. Roads may be unpredictable, but our protection is steady as a rock. Equip your car with complete coverage and enjoy every drive with total assurance."
+    },
+    {
+      "id": "INS_EN_013",
+      "category": "家财险",
+      "category_en": "Home Insurance",
+      "title": "Protect Your Biggest Asset – Home Insurance",
+      "lang": "en",
+      "primary_language": "en-US",
+      "duration_seconds": 76,
+      "target_audience": "homeowners and renters",
+      "script": "Your home is likely your most valuable asset, yet few people insure it. Home insurance acts as a safety net for your house and its contents. It covers the building structure, interior decorations, furniture, appliances, and even valuables against perils like fire, explosion, typhoons, floods, and burglary. Our policy costs less than a dollar per day but provides up to millions in coverage. We also include coverage for burst water pipes – especially useful in cold climates where pipes freeze and burst, damaging both your unit and your neighbours. We also include third-party liability – if your balcony planter falls and injures a passerby, we pay the compensation. Mr. Zhao's home suffered a fire due to old wiring; although extinguished quickly, wall and furniture damage totalled 80,000 yuan – our home insurance paid the full amount. He admitted he never thought home insurance was necessary until that day. Your home is your sanctuary – don't protect it with luck, but with a solid policy. A few hundred yuan a year gives your family priceless peace of mind. It's a small price for the biggest comfort – a safe and sound home."
+    },
+    {
+      "id": "INS_EN_014",
+      "category": "家财险",
+      "category_en": "Home Insurance",
+      "title": "Neighbourly Leaks? Home Insurance Has You Covered",
+      "lang": "en",
+      "primary_language": "en-US",
+      "duration_seconds": 79,
+      "target_audience": "homeowners and renters",
+      "script": "One of the most common neighbourhood disputes is water damage from an upstairs leak. When your pipe bursts and floods the downstairs flat, arguments over compensation can ruin relationships. Home insurance with water pipe burst coverage not only pays for your own repairs but also covers the damage you cause to others – so your insurer handles the claim, and you avoid personal arguments. Our policy also protects against theft, though a police report is required. We even provide temporary accommodation allowance if your home becomes uninhabitable after an insured event. Take Ms. Chen: her kitchen pipe burst and water seeped into the downstairs unit. The neighbour demanded 20,000 yuan in compensation. Ms. Chen filed a claim, and our insurer assessed and paid the neighbour directly, plus she received 15,000 yuan for her own floor repairs. She said, 'A few yuan a day solved a huge headache.' Home protection is more than a lock – it's a comprehensive home insurance policy. Don't wait for a disaster to strike; dress your home in a protective suit. With our home insurance, you can live peacefully and keep your neighbourhood harmonious. Enrol today – your home deserves the best defence."
+    }
+  ]
+}

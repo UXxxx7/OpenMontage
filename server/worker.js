@@ -96,9 +96,17 @@ worker.on("completed", (job) => {
 const _SILENT_FAIL_JOBS = new Set(["idle-warn", "idle-cancel", "collect-ack", "collect-nudge", "collect-note"]);
 
 worker.on("failed", async (job, error) => {
-  console.error(`[worker] failed ${job?.name} ${job?.id}: ${error.message}`);
+  const attemptsMade = job?.attemptsMade ?? 1;
+  const attemptsMax = job?.opts?.attempts ?? 1;
+  const isFinalAttempt = attemptsMade >= attemptsMax;
+  console.error(`[worker] failed ${job?.name} ${job?.id} (attempt ${attemptsMade}/${attemptsMax}): ${error.message}`);
+  // 真实事故（2026-07-23，job_08b94c0922ce）：BullMQ 还有自动重试在路上时
+  // 这里就无条件先给用户发"失败了，请重新尝试"——Python 后台管线其实完全
+  // 没被打断，只是这一次尝试的等待窗口不够长；用户被误导以为要手动重来，
+  // 而 BullMQ 的自动重试（以及原来那个从未中断的后台任务）往往几分钟后
+  // 自己就成功了。现在只在真正没有下一次重试时才打扰用户。
   const waNumber = job?.data?.waNumber;
-  if (waNumber && !_SILENT_FAIL_JOBS.has(job?.name)) {
+  if (isFinalAttempt && waNumber && !_SILENT_FAIL_JOBS.has(job?.name)) {
     const lang = resolveLang(DEFAULT_LANG, job?.data?.text, job?.data?.editRequest, job?.data?.lang);
     await safeSendText(waNumber, t(lang,
       "抱歉，视频处理任务失败了，请重新尝试。",
@@ -115,8 +123,8 @@ async function editVideo({ waNumber, mediaId, editRequest }) {
     throw new Error("WhatsApp credentials not configured");
   }
   await sendText(waNumber, t(lang,
-    "视频已收到，正在下载并生成剪辑方案...",
-    "Video received. Downloading and preparing edit plan..."));
+    "视频已收到，正在下载并生成剪辑方案（预计 1-3 分钟）...",
+    "Video received. Downloading and preparing edit plan (usually 1-3 min)..."));
 
   const tempPath = await downloadWhatsAppMedia(mediaId);
   try {
@@ -152,6 +160,9 @@ async function crollGenerate({ waNumber, mediaId, caption }) {
       "Service is starting up. Please send your photo again in a moment."));
     throw new Error("WhatsApp credentials not configured");
   }
+  await sendText(waNumber, t(lang,
+    "照片已收到，正在生成口播文案和数字人视频（预计 3-8 分钟）...",
+    "Photo received. Generating your script and talking-head video (usually 3-8 min)..."));
   const tempPath = await downloadWhatsAppMedia(mediaId, "image");
   try {
     const created = await createPythonCrollJob(tempPath, lang, caption);
@@ -193,10 +204,12 @@ async function confirmJob({ waNumber, jobId }) {
   const before = await getPythonJob(jobId).catch(() => null);
   const lang = resolveLang(DEFAULT_LANG, before?.edit_request);
   await postPython(`/jobs/${encodeURIComponent(jobId)}/confirm`);
-  await sendText(waNumber, t(lang, "已确认，正在剪辑视频...", "Confirmed. Editing video now..."));
+  await sendText(waNumber, t(lang,
+    "已确认，正在剪辑视频（预计 3-10 分钟）...",
+    "Confirmed. Editing video now (usually 3-10 min)..."));
   const status = await waitForStatus(jobId,
     ["PREVIEW_READY", "ERROR"],
-    Number(env("WA_PIPELINE_TIMEOUT_MS", "900000")), { waNumber, lang });
+    Number(env("WA_PIPELINE_TIMEOUT_MS", "1200000")), { waNumber, lang });
   if (!status) return;
   if (status.status === "ERROR") {
     throw new Error(status.error_message || "Python pipeline failed");
@@ -212,11 +225,11 @@ async function retryJob({ waNumber, jobId, text }) {
   const lang = resolveLang(DEFAULT_LANG, text, before?.edit_request);
   await postPython(`/jobs/${encodeURIComponent(jobId)}/retry`);
   await sendText(waNumber, t(lang,
-    "正在按原方案重新剪辑...",
-    "Retrying the edit with the same plan..."));
+    "正在按原方案重新剪辑（预计 3-10 分钟）...",
+    "Retrying the edit with the same plan (usually 3-10 min)..."));
   const status = await waitForStatus(jobId,
     ["PREVIEW_READY", "ERROR"],
-    Number(env("WA_PIPELINE_TIMEOUT_MS", "900000")), { waNumber, lang });
+    Number(env("WA_PIPELINE_TIMEOUT_MS", "1200000")), { waNumber, lang });
   if (!status) return;
   if (status.status === "ERROR") {
     throw new Error(status.error_message || "Python pipeline failed");
@@ -230,11 +243,11 @@ async function renderJob({ waNumber, jobId }) {
   const lang = resolveLang(DEFAULT_LANG, before?.edit_request);
   await postPython(`/jobs/${encodeURIComponent(jobId)}/render`);
   await sendText(waNumber, t(lang,
-    "已开始导出，完成后会把最终视频发给你。",
-    "Export started. Will send the final video when ready."));
+    "已开始导出（预计 3-10 分钟），完成后会把最终视频发给你。",
+    "Export started (usually 3-10 min). Will send the final video when ready."));
   const status = await waitForStatus(jobId,
     ["DONE", "ERROR"],
-    Number(env("WA_RENDER_TIMEOUT_MS", "900000")), { waNumber, lang });
+    Number(env("WA_RENDER_TIMEOUT_MS", "1200000")), { waNumber, lang });
   if (!status) return;
   if (status.status === "ERROR") {
     throw new Error(status.error_message || "Python render failed");
@@ -611,11 +624,25 @@ async function reviseJob({ waNumber, jobId, text }) {
   await deliverStageResult(waNumber, jobId, status, lang); // 新方案又回到"等待确认"，重新计时
 }
 
+// heartbeat（通过 ctx.waNumber/ctx.lang 触发，可选）：等待超过
+// WA_HEARTBEAT_AFTER_MS（默认 5 分钟）仍未出结果时，主动发一句"还在处理"，
+// 而不是让用户干等到本轮超时都收不到任何中间反馈（真实事故：
+// job_08b94c0922ce 卡在 DeepSeek 内容规划慢响应，用户全程没有任何中间反馈，
+// 直到超时才收到一条误导性的"失败了"）。每一轮（round）最多发一次，不刷屏；
+// 本轮超时不再抛错——见下方 requeue 逻辑（合并自主线 await-continue 方案）。
 async function waitForStatus(jobId, wanted, timeoutMs, ctx) {
   const deadline = Date.now() + timeoutMs;
+  const heartbeatAt = ctx?.waNumber ? Date.now() + Number(env("WA_HEARTBEAT_AFTER_MS", "300000")) : null;
+  let heartbeatSent = false;
   while (Date.now() < deadline) {
     const last = await getPythonJob(jobId);
     if (wanted.includes(last.status)) return last;
+    if (ctx?.waNumber && !heartbeatSent && Date.now() >= heartbeatAt) {
+      heartbeatSent = true;
+      await sendText(ctx.waNumber, t(ctx.lang,
+        "还在处理中，这一步比预计慢一点，请再耐心等一下，马上就好。",
+        "Still working on it — taking a bit longer than usual, hang tight, almost there.")).catch(() => {});
+    }
     await delay(Number(env("WA_STATUS_POLL_MS", "3000")));
   }
   // Backend hasn't reported ERROR — it's just slower than this poll window
@@ -675,7 +702,7 @@ async function awaitContinue({ waNumber, jobId, wanted, lang, round }) {
     return;
   }
   const status = await waitForStatus(jobId, wanted,
-    Number(env("WA_PIPELINE_TIMEOUT_MS", "900000")), { waNumber, lang, round });
+    Number(env("WA_PIPELINE_TIMEOUT_MS", "1200000")), { waNumber, lang, round });
   if (!status) return; // still going — waitForStatus already queued the next round
   if (status.status === "ERROR") {
     throw new Error(status.error_message || "Pipeline failed");

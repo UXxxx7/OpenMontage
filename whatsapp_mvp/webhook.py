@@ -596,7 +596,16 @@ def _animations_summary(job) -> Optional[list]:
     清单——确认过的真实用户反馈：预览消息只会念模板简介（"floating cards +
     karaoke subtitles..."，条条视频一模一样），从不说这条视频真正规划出了
     什么动画，用户要收到成片才发现是空的。props 是渲染的唯一事实来源，
-    从它读就不会说谎。"""
+    从它读就不会说谎。
+
+    确认过的真实 bug（2026-07-23，job_fa4ee47e9676，用户直接指出"两句话自相
+    矛盾"）：apply_style 整个降级（跳过失败的步骤、只交付上一步结果）时，
+    _op_apply_style_props.json 依然是上一次失败/被放弃的重规划尝试留在磁盘
+    上的内容（_build() 每次调用都无条件写盘，见 Rule 5/C9）——这份 props 从
+    未真正用于渲染交付的视频，念出来的动画清单是假的。降级时必须返回 None，
+    不能假装这些动画真的在成片里。"""
+    if job.degraded_operations and "apply_style" in (json.loads(job.degraded_operations) or []):
+        return None
     props_path = job.job_dir / "_op_apply_style_props.json"
     if not props_path.exists():
         return None
