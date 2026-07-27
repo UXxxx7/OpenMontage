@@ -8,6 +8,7 @@ from __future__ import annotations
 import difflib
 import json
 import logging
+import os
 import shutil
 import subprocess
 import time
@@ -54,6 +55,13 @@ def run_talking_head_pipeline(job: Job) -> dict[str, Any]:
 
     if not input_video.exists():
         raise FileNotFoundError(f"找不到输入视频: {input_video}")
+
+    # apply_style 的内容规划总预算标记（见 _op_apply_style 里的说明）只应该在
+    # *这一次*管线运行内、跨"原始尝试 + 外层自动重试一次"共享；每次重新跑
+    # 整条管线（无论是首次 confirm 还是用户显式 retry）都要清掉上一次留下的
+    # 标记，否则会一直沿用一个早就过期的截止时间，新的一次尝试会被误判成
+    # "预算已用完"，直接跳过所有重试。
+    (job_dir / "_apply_style_deadline.txt").unlink(missing_ok=True)
 
     plan = _load_plan(job)
     operations = plan.get("edit_operations", [])
@@ -625,6 +633,7 @@ def _safe_transcribe(src: str, workdir: Path, model_size: str, hotwords: str = _
                 "output_dir": str(workdir),
                 "model_size": model_size,
                 "hotwords": hotwords,
+                "realign": os.getenv("OM_FORCED_ALIGNMENT", "true").lower() == "true",
             })
     except Exception as e:
         logger.warning(f"  转写调用异常: {e}")
@@ -1556,7 +1565,70 @@ def _run_enhancement_chain(src: str, workdir: Path) -> str:
 
 
 def _run_enhancement_chain_inner(src: str, workdir: Path) -> str:
-    """face_enhance -> color_grade -> audio_enhance，best-effort（单步失败不影响其它步骤）。
+    """face_enhance -> color_grade -> audio_enhance。
+
+    架构复审发现（2026-07-24）：这三步原本是三次完全独立的 ffmpeg 调用，每次
+    都对整段视频重新解码->滤镜->编码——但 face_enhance/color_grade 都只是
+    单纯的 -vf 滤镜串，audio_enhance 是单纯的 -af 滤镜串，三者分别只碰视频流
+    /音频流，天然可以合并成一次 ffmpeg 调用（-vf "人脸滤镜,调色滤镜" -af
+    音频滤镜），把三次解码+编码压成一次。优先走合并路径；合并失败（任何原因：
+    滤镜取不到、ffmpeg 报错、超时……）时退回原来久经考验的三步串行版本，
+    单步失败互不影响的降级行为完全不变——合并只是性能优化，不改变行为保证。
+    """
+    try:
+        return _run_enhancement_chain_combined(src, workdir)
+    except Exception as e:
+        logger.warning(f"  apply_style: 合并增强通道失败，退回三步串行: {e}")
+        return _run_enhancement_chain_sequential(src, workdir)
+
+
+def _run_enhancement_chain_combined(src: str, workdir: Path) -> str:
+    """face_enhance + color_grade + audio_enhance 在一次 ffmpeg 调用里全部做完。
+
+    直接复用三个工具各自的滤镜构造逻辑（_build_filter / PRESETS），只是不
+    分别起 ffmpeg 进程——所以视觉/听觉效果跟三步串行版本应当逐帧一致，唯一
+    区别是省掉两次多余的解码+编码。任何一步取不到滤镜串、或 ffmpeg 本身报错
+    /超时，都整体抛异常交给调用方退回三步串行，不在这里做部分容错（部分容错
+    在单次 ffmpeg 调用里做不到——一旦开始编码就没有"这步跳过、那步继续"的
+    余地，这也是保留三步串行作为退路的原因）。
+    """
+    from tools.audio.audio_enhance import PRESETS as _AUDIO_PRESETS
+    from tools.enhancement.color_grade import ColorGrade
+    from tools.enhancement.face_enhance import FaceEnhance
+
+    face_vf = FaceEnhance()._build_filter({"preset": "talking_head_standard"})
+    color_vf = ColorGrade()._build_filter({"profile": "cinematic_warm", "intensity": 0.85})
+    af = _AUDIO_PRESETS["clean_speech"]["af"]
+    if not face_vf or not color_vf or not af:
+        raise RuntimeError("滤镜串为空")
+
+    # 沿用 face_enhance.py/color_grade.py 里那份 CFR+关键帧间隔的教训（Fix
+    # C12 等）：re-encode 必须钉死 fps/-g，否则 Remotion 渲染阶段会报
+    # "No frame found at position N"。
+    fps = 30
+    out = workdir / "_op_audio_enhance.mp4"  # 沿用原三步链最后一步的文件名，
+    # 下游（simulate_job.py 等）按这个文件名找"增强完成的视频"，合并版本
+    # 产出同名文件保持兼容，不需要改动任何调用方。
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", src,
+        "-vf", f"{face_vf},{color_vf}",
+        "-af", af,
+        "-c:v", "libx264", "-crf", "20", "-preset", "fast",
+        "-fps_mode", "cfr", "-r", str(fps), "-g", str(fps),
+        "-c:a", "aac", "-b:a", "192k",
+        str(out),
+    ]
+    subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=_RENDER_TIMEOUT_S)
+    if not out.exists() or out.stat().st_size == 0:
+        raise RuntimeError("合并增强产出文件为空")
+    logger.info("  apply_style: face_enhance+color_grade+audio_enhance 合并为一次编码完成")
+    return str(out)
+
+
+def _run_enhancement_chain_sequential(src: str, workdir: Path) -> str:
+    """face_enhance -> color_grade -> audio_enhance 原始三步串行版本，
+    best-effort（单步失败不影响其它步骤）——合并路径（见上）失败时的退路。
 
     对应 compose-director.md Step 1（"Attempt every step if the tool is
     available — do not skip steps without a reason"）。三个工具都是纯 FFmpeg
@@ -1600,6 +1672,15 @@ def _run_enhancement_chain_inner(src: str, workdir: Path) -> str:
 # FULFILLED THE CRITERION"，且不是只对某一条视频生效。之前 props_lint 这一层
 # 只重试一次，见 _op_apply_style 里那段旧注释。
 _PROPS_LINT_MAX_ATTEMPTS = 3
+
+# 架构复审后新增（2026-07-24）：content_planner.plan_content 自己的 3 轮质量
+# 判定循环，被 props_lint 的 3 轮重试，又被 vision-QA 触发的重规划各自嵌套调用
+# ——最坏情况下一条视频的 apply_style 要打 9+ 次内容规划 LLM 调用。真实事故
+# （job_fa4ee47e9676，2026-07-23）：DeepSeek 那天响应慢，这套嵌套加起来拖到了
+# 33 分钟。这个预算不改变任何质量判断标准——每一轮该跑的检查一次不少——只是
+# 给"还要不要再等一轮 LLM"这件事设一个总时长上限，超了就直接走本来就有的
+# best-of 交付（正常轮数用尽时也是同一条路径），不是新的降级逻辑。
+_APPLY_STYLE_CONTENT_DEADLINE_S = int(os.getenv("OM_APPLY_STYLE_CONTENT_DEADLINE_S", "720"))
 
 # 参与"丰富度"计分的 props 字段——每一项都是真正的动画/图形，不是纯文字。
 _RICHNESS_FIELDS = (
@@ -2011,6 +2092,29 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
 
     props_path = workdir / "_op_apply_style_props.json"
 
+    # 从内容规划真正开始算起（不算前面 enhancement chain/转写的时间——那些
+    # 各自已经有自己的超时/信号量保护），到 props_lint 循环 + vision-QA 触发
+    # 的重规划全部结束为止的总预算。见 _APPLY_STYLE_CONTENT_DEADLINE_S 的
+    # 说明。
+    #
+    # 真实事故（2026-07-27，job_cb04960d9a48）：run_talking_head_pipeline 主
+    # 循环里 apply_style 失败会自动整体重试一次（_DEGRADABLE_OPS 的通用逻辑，
+    # 见文件顶部）——但这个预算原本每次调用 _op_apply_style 都重新算一次
+    # deadline，导致第一次尝试吃满 12 分钟预算触发降级、外层重试后第二次
+    # 尝试又重新吃满 12 分钟，从确认到交付实测花了 30 分 47 秒，是预算本身的
+    # 2 倍还多。用 workdir 里的一个标记文件让两次调用共享同一个总预算——
+    # 第二次调用读到第一次算好的截止时间，不会重新给满整段预算。用挂钟时间
+    # （不是 time.monotonic()）存盘，两次调用之间即使隔着进程重启也不会失真。
+    _deadline_marker = workdir / "_apply_style_deadline.txt"
+    try:
+        content_deadline_wall = float(_deadline_marker.read_text().strip())
+    except (OSError, ValueError):
+        content_deadline_wall = time.time() + _APPLY_STYLE_CONTENT_DEADLINE_S
+        _deadline_marker.write_text(str(content_deadline_wall))
+    # 内部判断继续用 monotonic 语义（跟 time.time() 的差值在同一次调用里是
+    # 稳定的，不受挂钟被外部改动影响）；两个时间基准这里只做一次换算。
+    content_deadline = time.monotonic() + (content_deadline_wall - time.time())
+
     def _build(feedback: Optional[str] = None) -> dict[str, Any]:
         """内容规划 + 组 contract② props。包成闭包是为了让视觉复核重试只重新
         走这一步（一次 LLM 调用 + 一轮 QA stills），不用重新跑 enhancement
@@ -2050,7 +2154,8 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
             plan_milestone_unlocks = op.get("milestone_unlocks") or []
         else:
             logger.info("  apply_style: 内容规划中（章节 + 数据展示分析）...")
-            content_plan = plan_content(segments, duration, feedback=feedback, word_timestamps=word_timestamps)
+            content_plan = plan_content(segments, duration, feedback=feedback, word_timestamps=word_timestamps,
+                                         deadline=content_deadline)
             chapters = content_plan["chapters"]
             data_cards = content_plan["data_cards"]
             gauges = content_plan["gauges"]
@@ -2380,6 +2485,12 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
     best_richness = _visual_richness(props)
     attempt = 1
     while best_findings and attempt <= _PROPS_LINT_MAX_ATTEMPTS:
+        if time.monotonic() >= content_deadline:
+            logger.warning(
+                f"  apply_style: 内容规划总预算已用完，跳过 props_lint 第 "
+                f"{attempt}/{_PROPS_LINT_MAX_ATTEMPTS} 轮重规划，交付目前最好的一版"
+            )
+            break
         logger.warning(
             f"  apply_style: props_lint 第 {attempt}/{_PROPS_LINT_MAX_ATTEMPTS} 轮发现 "
             f"{len(best_findings)} 处问题，重新规划: {[f['check'] for f in best_findings]}"
@@ -2477,6 +2588,12 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         qa_result = run_props_qa(props, props_path, remotion_dir, workdir / "qa_stills")
         vision_findings = (qa_result.get("vision_review") or {}).get("findings") or []
         major = [f for f in vision_findings if f.get("severity") == "high"]
+        if major and time.monotonic() >= content_deadline:
+            logger.warning(
+                "  apply_style: 内容规划总预算已用完，跳过视觉复审触发的重规划，"
+                "直接走降级交付（不是新逻辑，跟重试后仍有问题走的是同一条路）"
+            )
+            raise RuntimeError(f"apply_style: 内容规划总预算已用完，视觉复审发现的问题未再尝试修复，触发降级交付: {major}")
         if major:
             feedback = "; ".join(f"still #{f.get('frame_index')}: {f.get('issue', '')}" for f in major)[:500]
             logger.warning(f"  apply_style: 视觉复审发现问题，重新规划一次: {feedback}")
