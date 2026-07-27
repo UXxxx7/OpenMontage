@@ -20,6 +20,7 @@ import json
 import logging
 import math
 import re
+import time
 from datetime import date
 from typing import Any, Callable, Optional
 
@@ -348,7 +349,8 @@ def _call_llm_json(label: str, system_prompt: str, user_message: str, *, tempera
 
 
 def plan_content(segments: list[dict], duration: float, *, feedback: Optional[str] = None,
-                  word_timestamps: Optional[list[dict]] = None) -> dict[str, Any]:
+                  word_timestamps: Optional[list[dict]] = None,
+                  deadline: Optional[float] = None) -> dict[str, Any]:
     """转写分段 -> 章节 + 四种图形的计划（已经是 frame 单位，可以直接喂给 XiaojinEditorial）。
 
     LLM 调用失败或没配 key 时，返回空计划——内容判断本来就是锦上添花，不应该
@@ -362,6 +364,14 @@ def plan_content(segments: list[dict], duration: float, *, feedback: Optional[st
     word_timestamps: 词级时间戳（可选）——给 Fix B/E 的入场/收尾关键词校准用
     （_ground_data_point_seconds），把 LLM 估计的 seconds 对齐到真正说出对应
     数字/关键词的那个词。没有词级时间戳时校准整体跳过，规划仍然产出。
+
+    deadline: time.monotonic() 截止时间（可选，架构复审后新增，2026-07-24）。
+    这个 criterion loop 本身跟 _op_apply_style 的 props_lint 循环、vision-QA
+    触发的重规划是三层嵌套的（3×3=9 次 LLM 调用起步），真实事故实测过撞上
+    DeepSeek 响应慢时能拖到 33 分钟。deadline 不改变任何质量判断逻辑——每轮
+    该跑的检查一次不少——只是在轮次开始前先看一眼："还有没有时间做下一轮"，
+    没有就直接走后面本来就有的 best-of 交付（跟轮数正常用尽时完全同一条路
+    径），不会新引入任何质量下降，只是不再无止境地等一个已经很慢的外部 API。
     """
     empty = {
         "chapters": [], "data_cards": [], "gauges": [], "countdowns": [], "calendar_events": [],
@@ -408,6 +418,12 @@ def plan_content(segments: list[dict], duration: float, *, feedback: Optional[st
     best_raw: Optional[dict] = None
     best_failures: Optional[list[str]] = None
     for attempt in range(1, _PLAN_MAX_ATTEMPTS + 1):
+        if deadline is not None and attempt > 1 and time.monotonic() >= deadline:
+            logger.warning(
+                f"content_planner: 总时长预算已用完，跳过第 {attempt}/{_PLAN_MAX_ATTEMPTS} 轮"
+                f"（交付已有的最佳版本，而不是继续等外部 LLM）"
+            )
+            break
         raw = _call_llm_json(f"内容规划(第{attempt}轮)", SYSTEM_PROMPT, user_message,
                              temperature=0.2, model=get_config().llm_model_long_output)
         logger.debug(f"content_planner: 第{attempt}轮原始 data_points = "
@@ -3362,7 +3378,27 @@ def _dedupe_repeated_clauses(words: list[dict], keep_ranges: list[dict]) -> list
 # 单个词正常发音很少超过这个时长（哪怕说话人刻意拖长）。超过的部分极可能是
 # Whisper word-level 强制对齐把一段没有转写出文字的音频错误地记在了这个词
 # 头上——不是这个词真的说了这么久。
-_MAX_PLAUSIBLE_WORD_DURATION = 1.2
+#
+# 确认过的真实误伤（2026-07-24）：原阈值 1.2s 太紧——一段真实视频里单词
+# "Cloud"（"Cloud Code" 的一部分）被 Whisper 报了 1.56s，压过阈值触发强制
+# 裁剪，切掉了 16.72-17.08s 这 0.36 秒，正好切进 "Cloud Code" 里；被切过的
+# 音频重新转写后变成听不懂的 "CodeCode"/"like Code."，比原始转写还烂——
+# 这条安全网本身把干净的音频弄脏了。原始动机的事故是被吞掉整句话、时长
+# 接近 5 秒，2.2s 这个新阈值依然能拦住那类真正的异常，同时不再误伤"略慢
+# 但真实存在"的正常词。
+_MAX_PLAUSIBLE_WORD_DURATION = 2.2
+
+# 置信度兜底（2026-07-24，同一次真实误伤调查的后续）：一开始想用"低置信度
+# 才裁剪"当第二道保险，但拿真实数据一测发现这个直觉是反的——上面那个被误伤
+# 的 "Cloud" 本身 probability 只有 0.320，跟"确实听不清/不常见词"的置信度
+# 区间完全重叠，不是"转写有把握但时长算错"那种能被置信度区分出来的情况。
+# faster-whisper 的置信度反映的是"这个词是不是训练分布里常见的词"，不是
+# "这段时间戳对不对"——"Cloud Code"这种不常见专有名词，哪怕两个字都听对了，
+# 置信度天然就偏低。所以这里没有用"低置信度"当裁剪的理由，而是反过来：只有
+# 置信度低到几乎等于"模型自己都不知道这是什么"（≤0.15，比一般生僻词/专有
+# 名词的置信度还低一截）才裁剪——绝大多数真实存在但少见的词会被保护下来，
+# 只有真正对齐失败、内容成谜的那种极端情况才会触发。
+_UNACCOUNTED_AUDIO_MAX_CONFIDENCE = 0.15
 
 
 def _flag_unaccounted_audio(words: list[dict]) -> list[dict]:
@@ -3374,21 +3410,34 @@ def _flag_unaccounted_audio(words: list[dict]) -> list[dict]:
     机械兜底（_dedupe_repeated_clauses，按文本比较）都无从判断、无从剪——
     结果这段没人审查过的音频靠这个超长时长被原样带进了成片。
 
-    这里直接在源头拦截：扫出任何时长异常的词，把超出合理时长之后的部分
-    当作"不知道是什么内容，默认不能进成片"，转成强制裁剪区间。宁可保守
-    切掉一段听不出问题的音频，也不能放行一段没人看过的内容。
+    这里直接在源头拦截：扫出任何时长异常**且**置信度低到几乎为零的词，把
+    超出合理时长之后的部分当作"不知道是什么内容，默认不能进成片"，转成
+    强制裁剪区间。时长异常单独一个条件不够——见 _UNACCOUNTED_AUDIO_MAX_
+    CONFIDENCE 的说明，必须两个信号同时成立才裁剪，宁可漏放过一段真正的
+    异常，也不能再重演"把真实存在的生僻词当垃圾切掉"的真实事故。
+    ElevenLabs 转写路径不提供置信度（见 _transcribe_elevenlabs），缺失时
+    按 0.0 处理（最不确定），保留原有的纯时长防护，不因为换了转写源就
+    悄悄弱化这道安全网。
     """
     spans = []
     for w in words:
         dur = w["end"] - w["start"]
-        if dur > _MAX_PLAUSIBLE_WORD_DURATION:
-            excess_start = w["start"] + _MAX_PLAUSIBLE_WORD_DURATION
-            spans.append({"start_seconds": excess_start, "end_seconds": w["end"]})
-            logger.warning(
-                f"content_planner: 词 '{w['word']}' 时长异常({dur:.2f}s @ "
-                f"{w['start']:.2f}-{w['end']:.2f})，疑似转写吞掉了一段未知内容，"
-                f"强制裁掉 {excess_start:.2f}-{w['end']:.2f}"
+        if dur <= _MAX_PLAUSIBLE_WORD_DURATION:
+            continue
+        prob = w.get("probability", 0.0)
+        if prob > _UNACCOUNTED_AUDIO_MAX_CONFIDENCE:
+            logger.info(
+                f"content_planner: 词 '{w['word']}' 时长异常({dur:.2f}s)但置信度"
+                f"({prob:.2f})不算低到离谱，判定为真实存在的生僻词/专有名词，不裁剪"
             )
+            continue
+        excess_start = w["start"] + _MAX_PLAUSIBLE_WORD_DURATION
+        spans.append({"start_seconds": excess_start, "end_seconds": w["end"]})
+        logger.warning(
+            f"content_planner: 词 '{w['word']}' 时长异常({dur:.2f}s @ "
+            f"{w['start']:.2f}-{w['end']:.2f})且置信度极低({prob:.2f})，疑似转写"
+            f"吞掉了一段未知内容，强制裁掉 {excess_start:.2f}-{w['end']:.2f}"
+        )
     return spans
 
 
