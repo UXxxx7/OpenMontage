@@ -545,6 +545,7 @@ async def create_job_endpoint(
     broll: List[UploadFile] = File(default=[]),
     broll_labels: List[str] = Form(default=[]),
     broll_kinds: List[str] = Form(default=[]),
+    arm: str = Form(""),
 ):
     config = get_config()
     user = get_or_create_user("api_user")
@@ -553,6 +554,14 @@ async def create_job_endpoint(
 
     job_dir = job.job_dir
     job_dir.mkdir(parents=True, exist_ok=True)
+    # 本 job 显式臂选择(WhatsApp 点选,Node 侧作为 arm 字段传来)→ 落 arm_choice.txt,
+    # arm_router.resolve_arm 最优先读它(仅次于运维急停 force_arm)。空/不传=不写。
+    if arm.strip():
+        try:
+            from .authored.arm_router import set_job_arm
+            set_job_arm(job_dir, arm.strip().lower())
+        except Exception as _e:  # noqa: BLE001 —— 写失败不拖垮建 job,退回默认路由
+            logger.warning(f"写 arm_choice 失败(忽略,走默认路由): {_e}")
     video_data = await video.read()
     (job_dir / "input.mp4").write_bytes(video_data)
 

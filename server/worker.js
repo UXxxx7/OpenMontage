@@ -70,6 +70,7 @@ const worker = new Worker(queueName, async (job) => {
       case "collect-note": return collectNote(job.data);
       case "finalize-collection": return finalizeCollection(job.data);
       case "collection-choice": return collectionChoice(job.data);
+      case "arm-choice": return armChoice(job.data);
       case "idle-warn": return idleWarn(job.data);
       case "idle-cancel": return idleCancel(job.data);
       case "await-continue": return awaitContinue(job.data);
@@ -460,7 +461,81 @@ async function startWithMain(waNumber, items, mainItem, assign, lang) {
     return { ...i, label };
   });
   const editRequest = (assign && assign.edit_request) || mainItem.caption || "";
-  await runCollectionJob(waNumber, mainItem, brollItems, editRequest, lang);
+  // 方案A:go 后先让用户点选臂(套模板 / AI 现写),不立即建 job;点选后由 armChoice 续跑。
+  await askArm(waNumber, { mainItem, brollItems, editRequest, lang });
+}
+
+// ── 方案A:选臂(Arm A 套模板 / Arm B AI 现写)──────────────────────────
+function armPendingKey(waNumber) { return `wa:user:${waNumber}:arm_pending`; }
+function awaitArmKey(waNumber) { return `wa:user:${waNumber}:await_arm`; }
+
+async function askArm(waNumber, ctx) {
+  const ttl = Number(env("WA_COLLECT_TTL", "3600"));
+  await redis.set(armPendingKey(waNumber), JSON.stringify(ctx), "EX", ttl);
+  await redis.set(awaitArmKey(waNumber), "1", "EX", ttl);
+  const lang = ctx.lang || DEFAULT_LANG;
+  const body = t(lang,
+    "先选剪辑方式：\n• 套用模板：用现成品牌模板，快\n• AI 现写：为这条视频量身现写场景，更灵活、稍慢",
+    "Choose an editing style:\n• Template: fast branded preset\n• AI author: a scene written for THIS video, more flexible but a bit slower");
+  const buttons = [
+    { id: "arm_a", title: t(lang, "套用模板", "Template") },
+    { id: "arm_b", title: t(lang, "AI 现写", "AI author") },
+  ];
+  try {
+    await sendButtons(waNumber, body, buttons);
+  } catch (err) {
+    console.warn(`[worker] sendButtons failed, fallback to text: ${err.message}`);
+    await safeSendText(waNumber, t(lang,
+      "先选剪辑方式，回复数字：\n1 = 套用模板\n2 = AI 现写",
+      "Choose an editing style, reply a number:\n1 = Template\n2 = AI author"));
+  }
+}
+
+function _mapArm(armId, armText) {
+  if (armId === "arm_a" || armId === "arm_b") return armId;
+  const n = String(armText == null ? "" : armText).trim().toLowerCase();
+  if (["1", "a", "arm_a", "模板", "套模板", "套用模板", "template", "tpl"].includes(n)) return "arm_a";
+  if (["2", "b", "arm_b", "ai", "ai现写", "ai 现写", "ai剪", "author"].includes(n)) return "arm_b";
+  return null;
+}
+
+async function armChoice({ waNumber, armId, armText }) {
+  const raw = await redis.get(armPendingKey(waNumber));
+  if (!raw) return; // pending 已过期/被认领 —— 别把用户卡住
+  let ctx = {};
+  try { ctx = JSON.parse(raw); } catch (e) { ctx = {}; }
+  const lang = ctx.lang || DEFAULT_LANG;
+  const n = String(armText == null ? "" : armText).trim().toLowerCase();
+  if (["cancel", "no", "stop", "取消"].includes(n)) {
+    await redis.del(armPendingKey(waNumber));
+    await redis.del(awaitArmKey(waNumber));
+    await safeSendText(waNumber, t(lang, "已取消。重新发送视频即可开始。", "Cancelled. Send a new video to start again."));
+    return;
+  }
+  const arm = _mapArm(armId, armText);
+  if (!arm) {
+    await safeSendText(waNumber, t(lang,
+      "没看懂选择。回复 1（套用模板）或 2（AI 现写），也可以直接点上面的按钮。",
+      "Didn't catch that. Reply 1 (Template) or 2 (AI author), or tap a button above."));
+    return;
+  }
+  // 原子认领：双击/重复回复时只有第一个建 job
+  const claimed = await redis.del(armPendingKey(waNumber));
+  if (!claimed) return;
+  await redis.del(awaitArmKey(waNumber));
+  await runCollectionJob(waNumber, ctx.mainItem, ctx.brollItems, ctx.editRequest, lang, arm);
+}
+
+async function sendButtons(to, bodyText, buttons) {
+  await axios.post(`${graphBase}/${whatsappPhoneId()}/messages`, {
+    messaging_product: "whatsapp", recipient_type: "individual", to,
+    type: "interactive",
+    interactive: {
+      type: "button",
+      body: { text: bodyText },
+      action: { buttons: buttons.map((b) => ({ type: "reply", reply: { id: b.id, title: b.title } })) },
+    },
+  }, { headers: authJsonHeaders(), timeout: Number(env("WA_SEND_TIMEOUT_MS", "30000")) });
 }
 
 // 汇总描述文字：各媒体 caption + 收集期独立文字（notes 缓冲）
@@ -497,7 +572,7 @@ async function postAssign(videoCount, notes) {
 }
 
 // 下载主视频 + 所有 b-roll → 一次性 POST /jobs → 设活跃任务 → 等方案 → 回方案
-async function runCollectionJob(waNumber, mainItem, brollItems, editRequest, lang) {
+async function runCollectionJob(waNumber, mainItem, brollItems, editRequest, lang, arm) {
   const effLang = resolveLang(lang || DEFAULT_LANG, editRequest, mainItem.caption);
   if (!hasWACredentials()) {
     await sendText(waNumber, t(effLang,
@@ -530,7 +605,7 @@ async function runCollectionJob(waNumber, mainItem, brollItems, editRequest, lan
     const created = await createPythonJobMulti(
       mainPath,
       editRequest || mainItem.caption || "Remove blank parts, add subtitles, and make it flow smoothly.",
-      brollPaths);
+      brollPaths, arm);
     const jobId = created.job_id;
     await redis.set(activeJobKey(waNumber), jobId, "EX", Number(env("WA_ACTIVE_JOB_TTL", "86400")));
 
@@ -547,12 +622,13 @@ async function runCollectionJob(waNumber, mainItem, brollItems, editRequest, lan
   }
 }
 
-async function createPythonJobMulti(videoPath, editRequest, brollPaths) {
+async function createPythonJobMulti(videoPath, editRequest, brollPaths, arm) {
   const form = new FormData();
   form.append("video", fs.createReadStream(videoPath),
     { filename: "input.mp4", contentType: "video/mp4" });
   form.append("edit_request", editRequest);
   form.append("pipeline", "talking-head");
+  if (arm) form.append("arm", arm);
   brollPaths.forEach((b, i) => {
     const ext = path.extname(b.path) || (b.kind === "image" ? ".jpg" : ".mp4");
     const ctype = b.kind === "image" ? "image/jpeg" : "video/mp4";

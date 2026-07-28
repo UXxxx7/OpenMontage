@@ -45,6 +45,7 @@ DEFAULT_A_WORDS = ["套用模板", "用模板", "模板剪", "固定模板"]
 
 CONFIG_FILE = "authored_config.json"
 PREFS_FILE = "authored_prefs.json"
+ARM_CHOICE_FILE = "arm_choice.txt"   # 本 job 显式臂选择,落在 job_dir 下
 
 
 # ─────────────────────────── 文件 IO(容错)───────────────────────────
@@ -80,6 +81,40 @@ def _config() -> dict:
 
 def _prefs() -> dict:
     return _load_json(PREFS_FILE)
+
+
+def _from_job_choice(job) -> str | None:
+    """本 job 的显式选择(用户在 WhatsApp 点按钮 / 回数字选的臂),写在
+    job_dir/arm_choice.txt。优先级仅次于运维急停 force_arm,压过标签/自然语言/
+    偏好/灰度/env —— 用户当面点的,就该说了算。缺文件/坏内容一律 None(下一层兜)。"""
+    try:
+        jd = getattr(job, "job_dir", None)
+        if not jd:
+            return None
+        p = Path(jd) / ARM_CHOICE_FILE
+        if p.exists():
+            v = p.read_text(encoding="utf-8").strip().lower()
+            if v in (ARM_A, ARM_B):
+                return v
+    except Exception:
+        pass
+    return None
+
+
+def set_job_arm(job_dir, arm: str) -> bool:
+    """写本 job 的显式臂选择(供 /jobs 收到 arm 字段时调用)。arm ∈ {arm_a,arm_b}
+    则写入;其它值(空/非法)=清除已有选择。写失败返回 False(不外抛)。"""
+    try:
+        d = Path(job_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / ARM_CHOICE_FILE
+        if arm in (ARM_A, ARM_B):
+            p.write_text(arm, encoding="utf-8")
+        elif p.exists():
+            p.unlink()
+        return True
+    except Exception:
+        return False
 
 
 def set_user_pref(whatsapp_id: str, arm: str) -> bool:
@@ -179,6 +214,11 @@ def resolve_arm(job) -> str:
     if force in (ARM_A, ARM_B):
         return force
 
+    # 0.5 本 job 显式选择(WhatsApp 点选/回数字):仅次于急停,压过下面所有层
+    choice = _from_job_choice(job)
+    if choice in (ARM_A, ARM_B):
+        return choice
+
     # 1→5 依次,首个非空即采用
     for layer in (_from_tag(text),
                   _from_natural(text, cfg),
@@ -198,6 +238,7 @@ def explain(job) -> dict:
     return {
         "resolved": resolve_arm(job),
         "force_arm": cfg.get("force_arm"),
+        "job_choice": _from_job_choice(job),
         "tag": _from_tag(text),
         "natural": _from_natural(text, cfg),
         "user_pref": _from_user_pref(job),
