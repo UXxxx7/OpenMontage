@@ -18,6 +18,7 @@ from typing import Any, Callable, Optional
 
 from .config import get_config
 from .database import Job
+from . import authored as _armb  # Arm B(模型现写 composition)接线层;flag 关时零行为差异
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,15 @@ def run_talking_head_pipeline(job: Job) -> dict[str, Any]:
 
     if not input_video.exists():
         raise FileNotFoundError(f"找不到输入视频: {input_video}")
+
+    # ── Arm B 灰度门:开关/百分比走环境变量(ARM_B_ENABLED / ARM_B_PERCENT)。
+    # compose_authored 永不抛;返回 None 即"没出片",落穿进下面的 Arm A 原路径(兜底)。
+    # 命中并出片则在此 return,不会走到下面的 Arm A 预算标记清理(那只服务 apply_style)。
+    if _armb.arm_b_enabled(job):
+        _armb_result = _armb.compose_authored(job)
+        if _armb_result is not None:
+            return _armb_result
+        logger.warning("Arm B 未出片,落回 Arm A 继续")
 
     # apply_style 的内容规划总预算标记（见 _op_apply_style 里的说明）只应该在
     # *这一次*管线运行内、跨"原始尝试 + 外层自动重试一次"共享；每次重新跑

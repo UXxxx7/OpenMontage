@@ -169,6 +169,27 @@ def revise_plan(job_id: str, feedback: str) -> None:
     config = get_config()
     wa = WhatsAppClient(config)
     try:
+        # ── Arm B:确认前改草稿(补丁点②)──
+        # 命中 arm_b 且有 scene_draft.tsx → 按反馈改草稿(不渲染),回 WAITING_CONFIRMATION。
+        # 返回 None(未命中 / 无草稿 / 修订失败)→ 落穿下面的 L2 就地修订(Arm A)。
+        try:
+            from .authored import arm_b_enabled, revise_authored_plan
+            if arm_b_enabled(job):
+                _pe = revise_authored_plan(job, feedback)
+                if _pe is not None:
+                    update_job_fields(
+                        job_id,
+                        edit_request=f"{job.edit_request}。补充：{feedback}",
+                        planned_edit=json.dumps(_pe, ensure_ascii=False),
+                    )
+                    job = get_job(job_id)
+                    _send_confirmation(job, wa)
+                    logger.info("ArmB 就地修订完成(改草稿,未渲染,已回 WAITING_CONFIRMATION)")
+                    return
+                logger.info("ArmB revise_authored_plan 落穿 → 走 L2 就地修订(Arm A)")
+        except Exception as _e:  # noqa: BLE001 —— 修订分支绝不拖垮主流程
+            logger.warning(f"ArmB 修订分支异常,落穿 L2: {type(_e).__name__}: {_e}")
+
         try:
             prev = json.loads(job.planned_edit) if job.planned_edit else {}
         except (json.JSONDecodeError, TypeError):
@@ -433,6 +454,22 @@ def _run_llm_planner(job: Any, wa: Any = None) -> None:
     agent 出错时回退到 L1.5 关键词/结构化规划器，保证任务不中断。
     传入 wa 时会在转录/规划两个较慢阶段前回传进度消息（进度预览）。
     """
+    # ── Arm B:author 先行(补丁点①)──
+    # 路由命中 arm_b 时,规划阶段就现写 tsx + 出分镜当方案,短路 L2。
+    # plan_authored 返回 None(未命中 / author 失败)→ 落穿下面的 L2 规划(Arm A)。
+    try:
+        from .authored import arm_b_enabled, plan_authored
+        if arm_b_enabled(job):
+            update_job_status(job.id, JobStatus.PLANNING)
+            _pe = plan_authored(job)
+            if _pe is not None:
+                update_job_fields(job.id, planned_edit=json.dumps(_pe, ensure_ascii=False))
+                logger.info("ArmB 规划完成(author 先行,已短路 L2)")
+                return
+            logger.info("ArmB plan_authored 落穿 → 走 L2 规划(Arm A)")
+    except Exception as _e:  # noqa: BLE001 —— 规划分支绝不拖垮主流程
+        logger.warning(f"ArmB 规划分支异常,落穿 L2: {type(_e).__name__}: {_e}")
+
     # 零指令：给 agent 一句明确的默认需求描述而不是空串（SYSTEM_BASE 定义了
     # 零指令默认方案：remove_filler → apply_style）
     request = job.edit_request or "（用户没有文字指令）按默认方案出一条模板成片"
