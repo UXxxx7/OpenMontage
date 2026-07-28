@@ -16,6 +16,7 @@ from typing import Any, Callable, Optional
 
 from .config import get_config
 from .database import Job
+from . import authored as _armb  # Arm B(模型现写 composition)接线层;flag 关时零行为差异
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,14 @@ def run_talking_head_pipeline(job: Job) -> dict[str, Any]:
 
     if not input_video.exists():
         raise FileNotFoundError(f"找不到输入视频: {input_video}")
+
+    # ── Arm B 灰度门:开关/百分比走环境变量(ARM_B_ENABLED / ARM_B_PERCENT)。
+    # compose_authored 永不抛;返回 None 即"没出片",落穿进下面的 Arm A 原路径(兜底)。
+    if _armb.arm_b_enabled(job):
+        _armb_result = _armb.compose_authored(job)
+        if _armb_result is not None:
+            return _armb_result
+        logger.warning("Arm B 未出片,落回 Arm A 继续")
 
     plan = _load_plan(job)
     operations = plan.get("edit_operations", [])
