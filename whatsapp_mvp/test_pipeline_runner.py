@@ -13,6 +13,9 @@ from whatsapp_mvp.pipeline_runner import (
     _FACECAM_RESTORE_BUFFER_FRAMES, _recompute_scenes_from_content,
     _mode_schedule_to_scenes, _TRANSITION_HOLD_FRAMES,
     _content_unchanged,
+    _is_geometry_or_color_only, _correct_geometry_and_color,
+    _drop_intro_scrim_unfixable_findings, _major_vision_findings,
+    build_caption_phrases, _words_to_caption_text,
 )
 
 FAILED = []
@@ -410,6 +413,243 @@ def test_content_unchanged_ignores_derived_fields_but_detects_real_changes():
           _content_unchanged(props_a, props_d_missing_field) is False)
 
 
+# 架构复审后新增（2026-07-27）——真实统计过 2026-07-13~27 的 22 个跑过
+# apply_style 的任务，6 个（27%）最终降级；降级前的视觉复审高严重度发现
+# 几乎全是"取景不当/脸部被裁切"和"对比度过低"两类，两者都由一次性算好、
+# 内容重规划永远碰不到的 speakerObjectPosition/colorMode 决定。
+def test_is_geometry_or_color_only_true_for_pure_framing_finding():
+    findings = [{"frame_index": 0, "issue": "说话人取景不当，脸部被裁切", "severity": "high"}]
+    check("pure framing finding classified as geometry/color-only",
+          _is_geometry_or_color_only(findings) is True)
+
+
+def test_is_geometry_or_color_only_true_for_contrast_finding():
+    findings = [{"frame_index": 1, "issue": "文字与背景对比度过低，难以辨认", "severity": "high"}]
+    check("pure contrast finding classified as geometry/color-only",
+          _is_geometry_or_color_only(findings) is True)
+
+
+def test_is_geometry_or_color_only_false_when_mixed_with_content_issue():
+    findings = [
+        {"frame_index": 0, "issue": "说话人取景不当，脸部被裁切", "severity": "high"},
+        {"frame_index": 1, "issue": "数据卡显示金额与口播不符", "severity": "high"},
+    ]
+    check("mixed framing + content finding is NOT geometry/color-only (must fall through to content replan)",
+          _is_geometry_or_color_only(findings) is False)
+
+
+def test_is_geometry_or_color_only_false_for_empty_findings():
+    check("empty findings list is not geometry/color-only (nothing to correct)",
+          _is_geometry_or_color_only([]) is False)
+
+
+def test_correct_geometry_and_color_moves_crop_window_up_on_framing_issue():
+    props = {"speakerObjectPosition": "43% 51%", "colorMode": "warm"}
+    findings = [{"frame_index": 0, "issue": "说话人取景不当，脸部被裁切", "severity": "high"}]
+    corrected = _correct_geometry_and_color(props, findings)
+    check("framing correction leaves colorMode untouched",
+          corrected["colorMode"] == "warm")
+    x, y = corrected["speakerObjectPosition"].replace("%", "").split()
+    check("framing correction decreases Y (reveals more headroom) and keeps X unchanged",
+          x == "43" and float(y) == 36.0, detail=corrected["speakerObjectPosition"])
+
+
+def test_correct_geometry_and_color_floors_y_at_10_percent():
+    props = {"speakerObjectPosition": "50% 18%", "colorMode": "warm"}
+    findings = [{"frame_index": 0, "issue": "脸部贴边", "severity": "high"}]
+    corrected = _correct_geometry_and_color(props, findings)
+    _, y = corrected["speakerObjectPosition"].replace("%", "").split()
+    check("framing correction never pushes Y below the 10% floor",
+          float(y) == 10.0, detail=corrected["speakerObjectPosition"])
+
+
+def test_correct_geometry_and_color_flips_color_mode_on_contrast_issue():
+    props = {"speakerObjectPosition": "50% 35%", "colorMode": "warm"}
+    findings = [{"frame_index": 0, "issue": "对比度过低", "severity": "high"}]
+    corrected = _correct_geometry_and_color(props, findings)
+    check("contrast correction flips warm -> dark",
+          corrected["colorMode"] == "dark")
+    check("contrast correction leaves speakerObjectPosition untouched",
+          corrected["speakerObjectPosition"] == "50% 35%")
+
+
+# job_cb04960d9a48（2026-07-27 实测复现）：真正触发这次降级的 finding 采样
+# 到的是 intro 标题卡（IntroTitle.tsx）还没淡出的那一帧（frame 28 <
+# introOutFrame(80) + 12）——那段时间整屏盖着深色渐变蒙层 + 大标题文字，脸
+# 本来就该被压暗/半遮挡，是设计如此。实测把 speakerObjectPosition 的 Y 从
+# 51% 一路调到 25%（挪动了 26 个百分点）这条 finding 原样复现，证明它根本
+# 不归 speakerObjectPosition 管——必须在判断阶段就丢弃，而不是试图"修正"它。
+def test_drop_intro_scrim_unfixable_findings_drops_intro_window_framing_only():
+    stills = [{"frame": 28}, {"frame": 95}, {"frame": 537}]
+    findings = [
+        {"frame_index": 0, "issue": "说话人取景不当，脸部被裁切", "severity": "high"},
+    ]
+    kept = _drop_intro_scrim_unfixable_findings(findings, stills, intro_out_frame=80)
+    check("real job_cb04960d9a48 finding (frame 28, inside intro scrim) is dropped",
+          kept == [])
+
+
+def test_drop_intro_scrim_unfixable_findings_keeps_framing_finding_past_intro_window():
+    stills = [{"frame": 28}, {"frame": 95}]
+    findings = [
+        {"frame_index": 1, "issue": "说话人取景不当，脸部被裁切", "severity": "high"},  # frame 95, past introOutFrame+12=92
+    ]
+    kept = _drop_intro_scrim_unfixable_findings(findings, stills, intro_out_frame=80)
+    check("a genuine framing finding past the intro scrim window is kept",
+          kept == findings)
+
+
+def test_drop_intro_scrim_unfixable_findings_keeps_non_framing_finding_inside_intro_window():
+    stills = [{"frame": 28}]
+    findings = [
+        {"frame_index": 0, "issue": "标题文字被截断", "severity": "high"},
+    ]
+    kept = _drop_intro_scrim_unfixable_findings(findings, stills, intro_out_frame=80)
+    check("a real (non-framing) defect inside the intro window is NOT discarded",
+          kept == findings)
+
+
+# job_7a33f9a80af8（2026-07-27 当晚同一次调查里实测复现，两轮独立尝试都
+# 踩中）：这次 intro 用的是 StatsHookIntro.tsx（"stats_hook" 变体），frame
+# 28 报"对比度过低"。`_correct_geometry_and_color` 照常把 colorMode 从
+# warm 切成 dark 去"修"——但 StatsHookIntro.tsx 第 77 行背景色是
+# `colorMode === "warm" ? "#0D1117" : palette.bgDeep`，dark 主题的
+# `bgDeep` 是 "#090C10"，两个分支都是近乎全黑，colorMode 根本不影响这个
+# 组件的背景。切换 colorMode 对这条 finding 是无效操作，还会把全片其它
+# 组件的配色也带偏（colorMode 是全局属性）。同一帧还报了"画面为黑色，无
+# 任何内容"——StatsHookIntro 的设计就是"深色满屏+居中大数字+细进度条+
+# 最多两行小标签"，本来就没有大面积"内容"，跟 IntroTitle 的深色蒙层是
+# 同一类"设计如此"。
+def test_drop_intro_scrim_unfixable_findings_drops_contrast_finding_in_stats_hook_intro():
+    stills = [{"frame": 28}, {"frame": 95}]
+    findings = [
+        {"frame_index": 0, "issue": "对比度过低，文字难以辨认", "severity": "high"},
+    ]
+    kept = _drop_intro_scrim_unfixable_findings(findings, stills, intro_out_frame=80)
+    check("real job_7a33f9a80af8 contrast finding (frame 28, StatsHookIntro's hardcoded near-black bg) is dropped",
+          kept == [])
+
+
+def test_drop_intro_scrim_unfixable_findings_drops_black_screen_finding_in_intro_window():
+    stills = [{"frame": 28}, {"frame": 95}]
+    findings = [
+        {"frame_index": 0, "issue": "画面为黑色，无任何内容", "severity": "high"},
+    ]
+    kept = _drop_intro_scrim_unfixable_findings(findings, stills, intro_out_frame=80)
+    check("real job_7a33f9a80af8 black-screen finding (StatsHookIntro's by-design minimal opener) is dropped",
+          kept == [])
+
+
+def test_drop_intro_scrim_unfixable_findings_keeps_contrast_finding_past_intro_window():
+    # 对比度问题出现在 intro 窗口之外（比如说话人卡片/数据卡本体）时，
+    # colorMode 切换是真的有效的——不能因为扩大了 intro 豁免范围，就连
+    # 正常能修的对比度问题也一起丢弃。
+    stills = [{"frame": 28}, {"frame": 600}]
+    findings = [
+        {"frame_index": 1, "issue": "文字与背景对比度过低", "severity": "high"},
+    ]
+    kept = _drop_intro_scrim_unfixable_findings(findings, stills, intro_out_frame=80)
+    check("a contrast finding well past the intro window is still kept (colorMode fix still applies there)",
+          kept == findings)
+
+
+def test_major_vision_findings_reproduces_zero_findings_on_real_job_cb04960d9a48():
+    # storage/jobs/job_cb04960d9a48/qa_stills/qa_report.json 的原样摘录——
+    # 这就是这次真实降级发生前的 qa_result。修好后这个 job 的高严重度发现
+    # 应该清零：唯一的 high finding 是 intro 蒙层窗口内的取景类，属于设计
+    # 如此，不是缺陷。
+    props = {"introOutFrame": 80}
+    qa_result = {
+        "stills": [
+            {"frame": 28}, {"frame": 95}, {"frame": 537}, {"frame": 810},
+            {"frame": 922}, {"frame": 955}, {"frame": 1080}, {"frame": 1230},
+        ],
+        "vision_review": {
+            "findings": [
+                {"frame_index": 0, "issue": "说话人取景不当，脸部被裁切", "severity": "high"},
+                {"frame_index": 1, "issue": "无问题", "severity": "none"},
+                {"frame_index": 2, "issue": "无问题", "severity": "none"},
+            ],
+        },
+    }
+    check("real job_cb04960d9a48's recorded qa_result no longer degrades apply_style",
+          _major_vision_findings(qa_result, props) == [])
+
+
+# 确认过的真实 bug（2026-07-27，job_f1eec580e3c7 真实渲染出的成片）：整段
+# 字幕连成一坨（"Hithere,it'sDavidfromPacificLife."），逐词卡拉OK高亮完全
+# 消失——Captions.tsx 靠 text.indexOf(" ", ...) 找词边界，没有空格就永远
+# 找不到。根因是默认开启的 WhisperX 强制对齐（forced_alignment.py）产出的
+# 词表不像 faster-whisper 原生输出那样自带前导空格，而旧代码 "".join(...)
+# 拼接词表时完全依赖这个前导空格做分隔。
+def test_words_to_caption_text_handles_whisperx_words_with_no_leading_space():
+    # job_f1eec580e3c7 真实 _op_audio_enhance_transcript.json 的开头几个词
+    # （强制对齐产出，逐字检查过确实不带前导空格）原样摘录。
+    words = [
+        {"word": "Hi", "start": 0.1, "end": 0.3},
+        {"word": "there,", "start": 0.35, "end": 0.5},
+        {"word": "it's", "start": 0.6, "end": 0.8},
+        {"word": "David", "start": 0.9, "end": 1.1},
+        {"word": "from", "start": 1.15, "end": 1.3},
+        {"word": "Pacific", "start": 1.35, "end": 1.6},
+        {"word": "Life.", "start": 1.65, "end": 1.9},
+    ]
+    check("WhisperX 词表（无前导空格）拼出的字幕文本有正常词间距，不是连成一坨",
+          _words_to_caption_text(words) == "Hi there, it's David from Pacific Life.",
+          _words_to_caption_text(words))
+
+
+def test_words_to_caption_text_still_handles_legacy_leading_space_words():
+    # faster-whisper 原生词表约定：每个词自带前导空格（" Hi"/" there,"）。
+    # 换成新的拼接逻辑后这条老约定也不能破坏——两种格式都得拼对。
+    words = [
+        {"word": " Hi", "start": 0.1, "end": 0.3},
+        {"word": " there,", "start": 0.35, "end": 0.5},
+        {"word": " David", "start": 0.6, "end": 0.8},
+    ]
+    check("faster-whisper 原生词表（自带前导空格）拼接结果不变，没有双空格",
+          _words_to_caption_text(words) == "Hi there, David",
+          _words_to_caption_text(words))
+
+
+def test_words_to_caption_text_no_spaces_between_cjk_characters():
+    # 中文词/字之间原生不加空格——不能因为改成"按字符集判断"就在中文里
+    # 引入这次修复本来要消灭的那类多余分隔符。
+    words = [{"word": w, "start": 0.0, "end": 0.1} for w in "你好，这是保险。"]
+    check("中日韩字符之间不会被强行插入空格",
+          _words_to_caption_text(words) == "你好，这是保险。",
+          _words_to_caption_text(words))
+
+
+def test_words_to_caption_text_mixed_cjk_and_latin_brand_name():
+    words = [{"word": w, "start": 0.0, "end": 0.1} for w in ["我", "们", "用"]] + \
+            [{"word": "WhatsApp", "start": 0.2, "end": 0.5}] + \
+            [{"word": w, "start": 0.6, "end": 0.7} for w in ["联", "系"]]
+    check("中文夹英文品牌名（WhatsApp）时不引入多余空格，跟旧约定行为一致",
+          _words_to_caption_text(words) == "我们用WhatsApp联系",
+          _words_to_caption_text(words))
+
+
+def test_build_caption_phrases_reproduces_real_job_f1eec580e3c7_fix():
+    # 同一句真实转写（job_f1eec580e3c7，"$1.5 million" 这句），端到端走一遍
+    # build_caption_phrases（不只是底层的拼接函数），确认短语级字幕本身也
+    # 是正常带空格的文本，不是回归测试只测到半路。
+    words = [
+        {"word": "Your", "start": 11.2, "end": 11.3}, {"word": "current", "start": 11.3, "end": 11.5},
+        {"word": "plan", "start": 11.5, "end": 11.7}, {"word": "covers", "start": 11.7, "end": 11.9},
+        {"word": "you", "start": 11.9, "end": 12.0}, {"word": "for", "start": 12.0, "end": 12.1},
+        {"word": "1.5", "start": 12.1, "end": 12.4}, {"word": "million", "start": 12.4, "end": 12.8},
+        {"word": "and", "start": 12.8, "end": 12.9}, {"word": "your", "start": 12.9, "end": 13.0},
+        {"word": "annual", "start": 13.0, "end": 13.3}, {"word": "premium", "start": 13.3, "end": 13.6},
+        {"word": "is", "start": 13.6, "end": 13.7}, {"word": "$8,400.", "start": 13.7, "end": 14.1},
+    ]
+    phrases = build_caption_phrases(words, [])
+    joined = " ".join(p["text"] for p in phrases)
+    check("端到端 build_caption_phrases 拼出的完整句子词间有正常空格，跟真实转写内容一致（不是连成一坨的长字符串）",
+          joined == "Your current plan covers you for 1.5 million and your annual premium is $8,400.",
+          joined)
+
+
 def main():
     test_shifts_below_floor_preserving_duration()
     test_before_after_second_reveal_frame_shifts_too()
@@ -436,6 +676,25 @@ def main():
     test_transition_hold_shrinking_arrives_early_and_holds()
     test_transition_hold_growing_stays_small_until_the_end()
     test_content_unchanged_ignores_derived_fields_but_detects_real_changes()
+    test_is_geometry_or_color_only_true_for_pure_framing_finding()
+    test_is_geometry_or_color_only_true_for_contrast_finding()
+    test_is_geometry_or_color_only_false_when_mixed_with_content_issue()
+    test_is_geometry_or_color_only_false_for_empty_findings()
+    test_correct_geometry_and_color_moves_crop_window_up_on_framing_issue()
+    test_correct_geometry_and_color_floors_y_at_10_percent()
+    test_correct_geometry_and_color_flips_color_mode_on_contrast_issue()
+    test_drop_intro_scrim_unfixable_findings_drops_intro_window_framing_only()
+    test_drop_intro_scrim_unfixable_findings_keeps_framing_finding_past_intro_window()
+    test_drop_intro_scrim_unfixable_findings_keeps_non_framing_finding_inside_intro_window()
+    test_drop_intro_scrim_unfixable_findings_drops_contrast_finding_in_stats_hook_intro()
+    test_drop_intro_scrim_unfixable_findings_drops_black_screen_finding_in_intro_window()
+    test_drop_intro_scrim_unfixable_findings_keeps_contrast_finding_past_intro_window()
+    test_major_vision_findings_reproduces_zero_findings_on_real_job_cb04960d9a48()
+    test_words_to_caption_text_handles_whisperx_words_with_no_leading_space()
+    test_words_to_caption_text_still_handles_legacy_leading_space_words()
+    test_words_to_caption_text_no_spaces_between_cjk_characters()
+    test_words_to_caption_text_mixed_cjk_and_latin_brand_name()
+    test_build_caption_phrases_reproduces_real_job_f1eec580e3c7_fix()
 
     print()
     if FAILED:
