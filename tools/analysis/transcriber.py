@@ -139,6 +139,7 @@ class Transcriber(BaseTool):
         diarize = inputs.get("diarize", False)
         output_dir = Path(inputs.get("output_dir", input_path.parent))
         hotwords = inputs.get("hotwords")
+        realign = inputs.get("realign", False)
 
         if not input_path.exists():
             return ToolResult(success=False, error=f"Input file not found: {input_path}")
@@ -217,6 +218,20 @@ class Transcriber(BaseTool):
             segments = self._apply_diarization(
                 str(input_path), segments, detected_language
             )
+
+        # Optional forced-alignment pass (whisperx, 2026-07-24) — faster-whisper's
+        # own word-level timestamps are attention-interpolated and can drift by
+        # a second or more on real audio (confirmed: "Cloud" reported as 1.56s
+        # when the actual word is ~0.5s). Only replaces word_timestamps when it
+        # actually produces a result; any failure (whisperx not installed, model
+        # download failed, unsupported language) silently keeps the original
+        # word_timestamps — this is a precision upgrade, not a requirement.
+        if realign and word_timestamps:
+            from whatsapp_mvp.forced_alignment import realign_word_timestamps
+
+            realigned = realign_word_timestamps(segments, str(input_path), detected_language)
+            if realigned:
+                word_timestamps = realigned
 
         elapsed = time.time() - start
 

@@ -1100,6 +1100,21 @@ def main():
     check("转写里实际说的数字（$8,400/$1.5M，含词面大数）不被标准 5 误报",
           not any("do not match ANY number" in f for f in f_correct), f_correct)
 
+    # 16f3. 标准 5（真实复现，job_5b0ec0b914ee，2026-07-27）——apply_style 自己
+    # 内部为字幕做的第二次转写（增强链之后重新跑一遍 faster-whisper，同一段
+    # 音频）把 "$1.5 million" 转写成了没有 $ 号的 "1.5 million"（同一模型，纯
+    # ASR 输出格式运行间抖动）。LLM 规划的 Coverage=1500000 完全正确，但当时
+    # 的提取逻辑只认 "$<数字>" 和纯词面数字（"one and a half million"）两种
+    # 形式，"<数字> million" 这种数字紧跟量级词、没有货币符号的第三种口语
+    # 形式两边都没覆盖，导致正确答案被反复误判为"编造"，烧光预算触发降级。
+    bare_scale_segments = [
+        {"start": 11.2, "end": 17.4, "text": "Your current plan covers you for 1.5 million "
+                                              "and your annual premium is $8,400."},
+    ]
+    f_bare_scale = _plan_quality_failures(correct_raw, correct_plan, 30.0, bare_scale_segments)
+    check("ASR 把 '$1.5 million' 转写成没有 $ 号的 '1.5 million' 时，正确的 Coverage 卡不被标准 5 误报",
+          not any("do not match ANY number" in f for f in f_bare_scale), f_bare_scale)
+
     # 16f1. 标准 6（新增，2026-07-23，真实 WhatsApp 交付的预览复现）——真实
     # segment 数据（job_452ef6c48100 的 _op_nofiller_transcript.json 原文，
     # "30 days on the 28th of July" 跟 "renewal in" 分属两个 ASR 分段，验证过
