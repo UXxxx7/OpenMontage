@@ -11,7 +11,10 @@
 
 设计决定(已拍板):
   - 兜底 = 落穿现有代码体,不实现独立 FallbackToArmA;本函数**永不抛异常**。
-  - 本期不接 SessionController/多轮、不接分镜的模型叙述(纯 derived 分镜)。
+  - 本期不接 SessionController/多轮。
+  - 分镜的模型叙述(画面设计描述):plan/revise 阶段**开启**(ARM_B_STORYBOARD_NARRATIVE
+    默认 1,让颜色/特效类改动能在计划里体现;每次 plan/revise 多一次 describe 调用,
+    设 0 可关);confirm 后 compose 内重出分镜**不再调**,纯 derived,避免重复计费。
   - 不改 config.py:开关/预算全走环境变量(与队友的 config 改动零冲突):
         ARM_B_ENABLED=1            总开关(默认 0=关)
         ARM_B_PERCENT=100          灰度百分比(按 job.id 稳定哈希;默认 100)
@@ -39,7 +42,7 @@ from pathlib import Path
 from .tsx_validator import validate_tsx
 from .render_qa import qa_render
 from .authored_renderer import render_authored
-from .scene_author import AuthorContext, author_scene, revise_scene
+from .scene_author import AuthorContext, author_scene, revise_scene, describe_scene
 from .storyboard_emitter import emit_storyboard, render_text
 from .compose_orchestrator import compose, ComposeBudget
 
@@ -152,6 +155,78 @@ def _style_refs() -> list:
     return [s for s in (x.strip() for x in raw.split(";")) if s and Path(s).exists()]
 
 
+def _tok(s: str) -> list:
+    import re
+    return [w for w in re.split(r"[^0-9a-z一-鿿]+", str(s or "").lower()) if w]
+
+
+def _match_tokens(label: str) -> list:
+    """用于 label↔转写匹配的词:英文≥3 字(滤 the/a 噪声),CJK≥2 字(中文双字词就算
+    有意义;原来一刀切 len>=3 把所有中文双字词砍光了)。"""
+    out = []
+    for w in _tok(label):
+        is_cjk = any("一" <= ch <= "鿿" for ch in w)
+        if (is_cjk and len(w) >= 2) or (not is_cjk and len(w) >= 3):
+            out.append(w)
+    return out
+
+
+def _assign_broll_windows(broll: list, segments: list, duration_s: float,
+                          fps: int = 30, win_len_s: float = 4.0, min_gap_s: float = 0.4) -> list:
+    """给**没有有效时间窗**(endFrame<=startFrame)的 b-roll 分配真实窗口——否则 props
+    里是 0/0 空窗,模型渲 0 帧=上传的 b-roll 根本不出现(author-first 目录兜底就是 0/0)。
+
+    先给每片算一个"期望中心":label 与转写分句词重叠命中→贴那句;否则均匀分布。
+    再按期望中心排序**贪心不重叠**放置(游标推进 = 上一窗尾 + min_gap),保证多段 b-roll
+    互不遮挡(修对抗审查发现的"同分句/间距不足→窗口重叠或相同"的病)。已带窗的不动。
+    就地补 startFrame/endFrame(int 帧)+ 标 auto_window,返回同一列表。"""
+    if duration_s <= 0:
+        return broll
+    windowless = [b for b in broll
+                  if not (int(b.get("endFrame") or 0) > int(b.get("startFrame") or 0))]
+    if not windowless:
+        return broll
+    n = len(windowless)
+    pad = min(1.0, duration_s * 0.05)
+    usable = max(0.0, duration_s - 2 * pad)
+    if usable <= 0:                        # 极短视频:整段给它们(退化但不崩/不越界)
+        for b in windowless:
+            b["startFrame"], b["endFrame"] = 0, max(1, int(round(duration_s * fps)))
+            b["auto_window"] = True
+        return broll
+    # 窗长:留出 (n-1) 个间隔,保证 n 段能塞进 usable 而不重叠;下限 1.0s
+    L = max(1.0, min(win_len_s, (usable - (n - 1) * min_gap_s) / n))
+
+    def _anchor_center(b, idx: int) -> float:
+        toks = _match_tokens(str(b.get("label", "")))
+        best, best_score = None, 0
+        for s in segments or []:
+            text = str(s.get("text", "")).lower()
+            score = sum(1 for t in toks if t in text)
+            if score > best_score:
+                best_score, best = score, s
+        if best is not None and best_score > 0:
+            try:
+                return float(best.get("start", 0.0)) + L / 2   # 分句起点 → 窗口中心
+            except (TypeError, ValueError):
+                pass
+        return pad + usable * (idx + 0.5) / n                   # 均匀分布中心
+
+    right = pad + usable
+    ordered = sorted(((_anchor_center(b, i), b) for i, b in enumerate(windowless)),
+                     key=lambda x: x[0])
+    cursor = pad
+    for center, b in ordered:
+        t0 = max(cursor, center - L / 2)   # 不早于游标(防重叠),尽量贴期望中心
+        t0 = max(pad, min(t0, right - L))  # 夹在 [pad, right-L]
+        t1 = min(right, t0 + L)
+        b["startFrame"] = int(round(t0 * fps))
+        b["endFrame"] = int(round(t1 * fps))
+        b["auto_window"] = True
+        cursor = t1 + min_gap_s
+    return broll
+
+
 # ─────────────────────────── 公共准备 ───────────────────────────
 
 def _prepare(job):
@@ -174,6 +249,9 @@ def _prepare(job):
     if duration <= 0:
         return None
     broll = _collect_broll(job)
+    # 给没窗的 b-roll(上传素材走目录兜底时窗=0/0)分配真实时间窗,模型才会真的合成它,
+    # 而不是渲 0 帧当它不存在(修"上传的 b-roll 没插进去")。
+    broll = _assign_broll_windows(broll, segments, duration)
     # 指令源:edit_request 才是真实字段(job.request 在 DB Job 上不存在,之前恒为空,
     # 等于模型从没拿到用户指令——2026-07-27 修)。
     instruction = str(getattr(job, "edit_request", "") or getattr(job, "request", "")
@@ -196,8 +274,18 @@ class _DraftResult:
         self.error = "" if self.ok else "scene_draft.tsx 为空"
 
 
-def _emit_storyboard_files(out_dir: Path, words: list, broll: list, duration: float) -> str:
-    sb = emit_storyboard(words, broll, duration)   # 本期纯 derived,无模型叙述
+def _scene_narrative(tsx=None, storyboard_skeleton=None) -> dict:
+    """emit_storyboard 的 narrative_fn 适配器:读当前 tsx → 画面设计描述 {summary,style}。
+    describe_scene 失败返回 {},M4 会自动降级为纯 derived 分镜。以模块级函数暴露,便于测试打桩。"""
+    return describe_scene(tsx) if tsx else {}
+
+
+def _emit_storyboard_files(out_dir: Path, words: list, broll: list, duration: float,
+                           tsx: str | None = None) -> str:
+    # 有 tsx 且开关未关 → 让模型描述画面设计(卡片颜色/特效/PIP 等),使颜色/样式类
+    # 改动也能在分镜文本里体现;否则纯 derived(时间轴+字幕+b-roll)。失败自动降级。
+    narr = _scene_narrative if (tsx and os.getenv("ARM_B_STORYBOARD_NARRATIVE", "1") == "1") else None
+    sb = emit_storyboard(words, broll, duration, narrative_fn=narr, tsx=tsx)
     (out_dir / "storyboard.json").write_text(
         json.dumps(sb, ensure_ascii=False, indent=1), encoding="utf-8")
     text = render_text(sb)
@@ -228,7 +316,7 @@ def plan_authored(job) -> dict | None:
             logger.warning(f"ArmB plan: author 未过({r.error}),落穿 L2 规划")
             return None
         (out_dir / "scene_draft.tsx").write_text(r.tsx, encoding="utf-8")
-        summary = _emit_storyboard_files(out_dir, p["words"], p["broll"], p["duration"])
+        summary = _emit_storyboard_files(out_dir, p["words"], p["broll"], p["duration"], tsx=r.tsx)
         logger.info(f"ArmB plan: 已现写 scene_draft.tsx({len(r.tsx)} 字符),分镜当方案")
         return {"arm_b": True, "summary": summary,
                 "edit_operations": [{"type": "authored_compose",
@@ -275,7 +363,7 @@ def revise_authored_plan(job, feedback: str) -> dict | None:
             logger.warning("ArmB revise: 修订后仍未过 M1,保留旧草稿,落穿 L2")
             return None
         draft.write_text(r.tsx, encoding="utf-8")   # 覆盖草稿 → confirm 后渲这版
-        summary = _emit_storyboard_files(out_dir, p["words"], p["broll"], p["duration"])
+        summary = _emit_storyboard_files(out_dir, p["words"], p["broll"], p["duration"], tsx=r.tsx)
         logger.info(f"ArmB revise: 已按反馈改草稿({len(r.tsx)} 字符),分镜当方案,未渲染")
         return {"arm_b": True, "summary": summary,
                 "edit_operations": [{"type": "authored_compose",
@@ -325,6 +413,8 @@ def _compose_authored_inner(job) -> dict | None:
                          evidence_dir=out_dir / "qa")
 
     def storyboard_fn(tsx: str):
+        # 渲染后(confirm 之后)重出分镜:不再调 describe(用户在 plan/revise 阶段已看过画面
+        # 描述,这里再调一次纯属重复消费,徒增一次 32000 预算调用)——纯 derived 即可。
         return {"summary": _emit_storyboard_files(out_dir, words, broll, duration)}
 
     # 补丁点③:规划阶段若已 author 出 scene_draft.tsx(author 先行),confirm 后直接

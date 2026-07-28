@@ -27,14 +27,20 @@ billable_out = total - prompt。与实验期口径一致,便于成本对比。
 from __future__ import annotations
 
 import base64
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+logger = logging.getLogger(__name__)
+
 MAX_TOKENS = 32000        # 思考型模型 thinking 与输出共用预算,8000 会被吃光截断(实测)
 TEMP_AUTHOR = 0.3
 TEMP_REVISE = 0.2         # 修订更保守,别乱发挥
+# describe 输出很短,但思考型模型 thinking 也吃这份预算 —— 必须给足,否则 thinking
+# 花光预算、真正输出为空 → JSON 解析失败被吞成 {}(离线本地测抓到)。与 author 同档。
+DESCRIBE_MAX_TOKENS = MAX_TOKENS
 
 # ─────────────────────────── 冻结的系统提示 ───────────────────────────
 
@@ -156,11 +162,23 @@ def build_author_messages(ctx: AuthorContext) -> list:
         if p.exists():
             content.append({"type": "text", "text": "REFERENCE IMAGE (imitate this look):"})
             content.append(_img_part(p))
+    if ctx.broll:
+        broll_block = (
+            f"B-ROLL clips available — these are REAL uploaded video files in prop `broll` "
+            f"({len(ctx.broll)} clip(s)). You MUST composite each one into its window with "
+            f"OffthreadVideo (src={{b.src}}) — do NOT replace an uploaded clip with a drawn "
+            f"card/graphic. The startFrame/endFrame below are suggested windows; keep them, or "
+            f"shift a clip to better match its label against the words being spoken:\n"
+            f"{_broll_desc(ctx.broll)}"
+        )
+    else:
+        broll_block = ("B-ROLL clips: (none uploaded) — do not fabricate video b-roll; "
+                       "any on-screen graphics must be drawn cards/text only.")
     user_text = (
         f"USER INSTRUCTION (primary intent — follow it):\n{ctx.instruction or '(none)'}\n\n"
         f"VIDEO: portrait {ctx.width}x{ctx.height}, {ctx.duration_s:.1f}s, "
         f"{ctx.duration_s * ctx.fps:.0f} frames @{ctx.fps}fps.\n"
-        f"B-ROLL clips available (prop `broll`):\n{_broll_desc(ctx.broll)}\n\n"
+        f"{broll_block}\n\n"
         f"TRANSCRIPT (with times; use for caption timing & where graphics belong):\n"
         f"{_transcript_text(ctx.segments)}\n\n"
         f"Now write AuthoredScene.tsx per the output contract. Return ONLY the .tsx content."
@@ -232,12 +250,54 @@ def _default_llm_call(messages: list, max_tokens: int, temperature: float) -> di
             "usage": data.get("usage") or {}}
 
 
+# ─────────────────────────── 429 退避重试 ───────────────────────────
+
+import time
+
+
+def _is_rate_limit(e: Exception) -> bool:
+    """判断异常是不是限流(Gemini/OpenAI 兼容端点的 429 / RESOURCE_EXHAUSTED)。"""
+    s = str(e)
+    return ("429" in s or "Too Many Requests" in s
+            or "RESOURCE_EXHAUSTED" in s or "rate limit" in s.lower())
+
+
+def _backoffs() -> list:
+    """429 退避秒序列。默认 5,15,30(跨过 Gemini 每分钟 RPM 窗口);env 可覆盖,
+    测试设 '0,0' 免真 sleep。总退避 ≤50s,落在 worker 的规划超时(默认 180s)内。"""
+    raw = os.getenv("AUTHOR_LLM_RETRY_BACKOFF", "5,15,30")
+    out = []
+    for x in raw.split(","):
+        try:
+            out.append(max(0.0, float(x.strip())))
+        except ValueError:
+            continue
+    return out or [5.0, 15.0, 30.0]
+
+
+def _invoke(llm_call: Callable | None, messages: list, max_tokens: int,
+            temperature: float) -> dict:
+    """调模型;**仅对 429/限流**做有限退避重试(必需的 author/revise 用)。
+    非限流异常立即抛出(不无谓重试);退避用尽仍限流则抛最后一次。"""
+    fn = llm_call or _default_llm_call
+    delays = _backoffs()
+    for i in range(len(delays) + 1):
+        try:
+            return fn(messages, max_tokens, temperature)
+        except Exception as e:  # noqa: BLE001
+            if i < len(delays) and _is_rate_limit(e):
+                logger.warning(f"限流(429),{delays[i]:.0f}s 后重试第 {i + 1} 次: {e}")
+                time.sleep(delays[i])
+                continue
+            raise
+
+
 # ─────────────────────────── 入口 ───────────────────────────
 
 def _call(messages: list, temperature: float,
           llm_call: Callable | None) -> AuthorResult:
     try:
-        raw = (llm_call or _default_llm_call)(messages, MAX_TOKENS, temperature)
+        raw = _invoke(llm_call, messages, MAX_TOKENS, temperature)
     except Exception as e:  # noqa: BLE001 —— 不外抛,返回值驱动
         return AuthorResult(ok=False, error=f"{type(e).__name__}: {e}")
     tsx = _strip_fences(raw.get("content", ""))
@@ -254,3 +314,64 @@ def author_scene(ctx: AuthorContext, llm_call: Callable | None = None) -> Author
 def revise_scene(tsx: str, defects: list, ctx: AuthorContext, notes: str = "",
                  llm_call: Callable | None = None) -> AuthorResult:
     return _call(build_revise_messages(tsx, defects, ctx, notes), TEMP_REVISE, llm_call)
+
+
+# ─────────────────────────── 画面设计描述(给分镜用)───────────────────────────
+
+DESCRIBE_SYSTEM_PROMPT = """You explain the VISUAL DESIGN of a Remotion video scene to a NON-TECHNICAL user, in Chinese.
+Given the scene's .tsx source, describe what the FINISHED video LOOKS like — card colors and shape, on-screen text/labels, picture-in-picture layout, captions, motion/effects. Describe the DESIGN the viewer sees, never the code or prop names.
+Return ONLY compact JSON (no markdown, no prose) of exactly this shape:
+{"summary": "<一两句总体画面风格>", "style": {"卡片": "<颜色/形状/特效>", "字幕": "<位置/样式>", "动效": "<入场/过渡>", "讲话人": "<铺底/PIP 布局>"}}
+Each value stays under ~20 Chinese characters. Omit any key whose element isn't present in the scene."""
+
+
+def build_describe_messages(tsx: str) -> list:
+    return [{"role": "system", "content": DESCRIBE_SYSTEM_PROMPT},
+            {"role": "user", "content": "SCENE .tsx:\n```tsx\n" + (tsx or "") +
+             "\n```\n\nReturn ONLY the JSON describing what the video looks like."}]
+
+
+def describe_scene(tsx: str, llm_call: Callable | None = None) -> dict:
+    """读 tsx → 给用户看的画面设计描述 {summary, style}。用于分镜的 narrative_fn。
+    非契约、纯描述;任何失败(未配模型/网络/解析)都返回 {} → 分镜降级为纯 derived。"""
+    if not (tsx or "").strip():
+        return {}
+    try:
+        raw = (llm_call or _default_llm_call)(build_describe_messages(tsx),
+                                              DESCRIBE_MAX_TOKENS, TEMP_REVISE)
+    except Exception as e:  # noqa: BLE001 —— 描述失败不外抛,但记因
+        logger.warning(f"describe_scene: 模型调用失败,分镜降级为纯 derived: {type(e).__name__}: {e}")
+        return {}
+    txt = _strip_fences(raw.get("content", ""))
+    if not txt.strip():
+        logger.warning("describe_scene: 模型返回空内容(思考型模型可能把预算吃光?)"
+                       f",usage={raw.get('usage')}")
+        return {}
+    import json
+    obj = None
+    try:
+        obj = json.loads(txt)
+    except Exception:  # noqa: BLE001 —— 容错:JSON 前后可能有噪声,截大括号再试
+        s, e = txt.find("{"), txt.rfind("}")
+        if 0 <= s < e:
+            try:
+                obj = json.loads(txt[s:e + 1])
+            except Exception:  # noqa: BLE001
+                obj = None
+    if isinstance(obj, list):            # 模型偶尔包一层数组 → 取第一个 dict
+        obj = next((x for x in obj if isinstance(x, dict)), None)
+    if not isinstance(obj, dict):
+        logger.warning(f"describe_scene: 无法解析成 JSON 对象,分镜降级。原文前 200 字: {txt[:200]!r}")
+        return {}
+    out: dict = {}
+    if isinstance(obj.get("summary"), str) and obj["summary"].strip():
+        out["summary"] = obj["summary"].strip()[:120]        # 防超长污染分镜文本
+    if isinstance(obj.get("style"), dict):
+        # value 只收标量并截断(模型可能突破"≤20 字"约束或塞进嵌套结构)
+        style = {str(k)[:20]: str(v).strip()[:40] for k, v in obj["style"].items()
+                 if isinstance(v, (str, int, float)) and str(v).strip()}
+        if style:
+            out["style"] = dict(list(style.items())[:8])      # 最多 8 项,防刷屏
+    if out:
+        logger.info(f"describe_scene: 画面描述已生成,usage={raw.get('usage')}")   # 成本可见
+    return out
