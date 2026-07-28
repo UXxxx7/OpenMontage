@@ -2680,16 +2680,47 @@ def _spoken_word_numbers(segments: list[dict]) -> list[float]:
     return found
 
 
+# 确认过的真实 bug（job_5b0ec0b914ee，2026-07-27）：同一句话
+# ("...covers you for $1.5 million and your annual premium is $8,400.")
+# 在 input_transcript.json（用于生成 script.json 的第一次转写）里带着 $
+# 号，但 apply_style 自己内部为字幕做的第二次转写（增强链之后重新跑一遍
+# faster-whisper）把同一段音频转成了没有 $ 号的 "1.5 million"——同一段音频、
+# 同一个模型，纯粹是 ASR 输出格式的运行间抖动。LLM 规划的 Coverage=1.5
+# 完全正确（转录里明明白白说了这个数），但 _ungrounded_count_up_rows 判定
+# "没有任何依据"——因为提取函数只认 "$<数字>" 和纯词面数字（"one and a
+# half million"）两种形式，"<数字> million" 这种数字紧跟量级词、没有货币
+# 符号的第三种口语形式两边都没覆盖。检查本身没错，是覆盖面不够；结果是
+# LLM 每一轮都被错误驳回，白白烧光 apply_style 一整段内容规划预算，最终
+# 触发降级交付——模板没套上，根因根本不在内容规划或视觉复审，而在这条
+# grounding 检查自己的正则覆盖不全。
+_DIGIT_SCALE_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s*(million|thousand|billion)\b", re.IGNORECASE)
+
+
+def _spoken_bare_scale_numbers(segments: list[dict]) -> list[float]:
+    """'1.5 million' / '500 thousand'（数字直接跟量级词，没有 $ 前缀，数字
+    本身也不是拼出来的词）——范围跟 `_spoken_word_numbers` 一样刻意收窄，
+    只处理这一种口语金融叙述里常见的混合形式，不是通用数字解析器。"""
+    found: list[float] = []
+    for seg in segments or []:
+        for m in _DIGIT_SCALE_RE.finditer(str(seg.get("text", ""))):
+            base = _num(m.group(1))
+            if base is not None:
+                found.append(base * _SCALE_WORDS[m.group(2).lower()])
+    return found
+
+
 def _grounded_spoken_values(segments: list[dict]) -> list[float]:
     """Every number actually spoken in the transcript, in the units a count_up
-    row's raw "value" would use — combines digit-form ('$8,400') and
-    word-form ('one and a half million') amounts."""
+    row's raw "value" would use — combines digit-form ('$8,400'), word-form
+    ('one and a half million'), and bare digit+scale-word ('1.5 million',
+    no currency symbol) amounts."""
     values: list[float] = []
     for amt in _spoken_dollar_amounts(segments):
         v = _dollar_amount_to_float(amt)
         if v is not None:
             values.append(v)
     values.extend(_spoken_word_numbers(segments))
+    values.extend(_spoken_bare_scale_numbers(segments))
     return values
 
 

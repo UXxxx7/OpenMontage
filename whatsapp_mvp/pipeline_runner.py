@@ -9,6 +9,7 @@ import difflib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -690,6 +691,48 @@ def calibrate_speaker_object_position(src: str, workdir: Path) -> str:
 _MAX_CAPTION_WORDS = 7
 _MAX_CAPTION_CHARS = 42
 
+# 确认过的真实 bug（2026-07-27，job_f1eec580e3c7 真实渲染出的成片）：整段字幕
+# 连成一坨（"Hithere,it'sDavidfromPacificLife."），逐词卡拉OK高亮完全消失。
+# 根因是拼接约定被打破，不是新 bug 的新写法——faster-whisper 原生词表每个
+# 词自带前导空格（" Hi"/" there,"），下面原来一直用 "".join(...) 直接拼接、
+# 靠这个前导空格分隔词与词；ElevenLabs 那条路径也刻意把 spacing token 的
+# 文本搬到下一个词头上维持同一约定（见上面 elevenlabs 转写函数的注释）。
+# 但今天默认开启的 WhisperX 强制对齐（forced_alignment.py，2026-07-24 加的
+# 精度优化）重新计算词级时间戳时，产出的词表是 whisperx 自己的干净分词，
+# **不带**前导空格——"".join(...) 因此把整句焊死成一个无空格字符串。
+# Captions.tsx 的逐词高亮完全靠 text.indexOf(" ", ...) 找词边界，没有空格
+# 就永远找不到，只能在整句结尾突然一次性点亮——用户看到的正是这个症状。
+#
+# 与其要求"以后任何词级时间戳的产出者都必须记得嵌入前导空格"这种容易被
+# 破坏的隐性约定（forced_alignment 这次已经证明了它会被破坏——而且破坏得
+# 很安静，没有任何测试或类型检查能拦住），不如让消费方自己彻底不依赖这个
+# 约定：先 strip 掉每个词 token 自带的任何空白，再按字符集自行判断该不该
+# 加空格——中日韩文字之间原生不加空格，其余按正常西文词间距处理。不管未来
+# 换成哪个转写/对齐后端、输出词表带不带前导空格，这里都能拼出正确文本。
+_CJK_CHAR_RE = re.compile(r"[一-鿿㐀-䶿豈-﫿぀-ヿ가-힯]")
+
+
+def _append_word_token(parts: list[str], token: str) -> None:
+    token = str(token).strip()
+    if not token:
+        return
+    if not parts:
+        parts.append(token)
+        return
+    prev_char = parts[-1][-1:]
+    cur_char = token[:1]
+    if _CJK_CHAR_RE.match(prev_char) or _CJK_CHAR_RE.match(cur_char):
+        parts.append(token)
+    else:
+        parts.append(" " + token)
+
+
+def _words_to_caption_text(ws: list[dict]) -> str:
+    parts: list[str] = []
+    for w in ws:
+        _append_word_token(parts, w.get("word", ""))
+    return "".join(parts).strip()
+
 
 def build_caption_phrases(words: list[dict], segments: list[dict]) -> list[dict]:
     """词级时间戳 -> 短语级字幕（≤7词/42字符或句读断句）。
@@ -709,7 +752,7 @@ def build_caption_phrases(words: list[dict], segments: list[dict]) -> list[dict]
     def flush():
         if not cur:
             return
-        text = "".join(w["word"] for w in cur).strip()
+        text = _words_to_caption_text(cur)
         if text:
             phrases.append({
                 "text": text,
@@ -720,7 +763,7 @@ def build_caption_phrases(words: list[dict], segments: list[dict]) -> list[dict]
 
     for w in words:
         cur.append(w)
-        text = "".join(x["word"] for x in cur).strip()
+        text = _words_to_caption_text(cur)
         ends_sentence = text.endswith((".", "?", "!", "。", "？", "！", ",", "，"))
         if len(cur) >= _MAX_CAPTION_WORDS or len(text) >= _MAX_CAPTION_CHARS or ends_sentence:
             flush()
@@ -1986,6 +2029,166 @@ def _visual_richness(props: dict) -> int:
     return score
 
 
+# 架构复审后新增（2026-07-27）：真实日志统计过（2026-07-13~27，22 个跑过
+# apply_style 的任务），6 个（27%）最终降级；把每一次降级前的视觉复审发现
+# 拉出来看，高严重度问题几乎全部是这两类："说话人取景不当/脸部被裁切"、
+# "对比度过低"。这两类完全由 speakerObjectPosition/colorMode 决定——两者都
+# 在 apply_style 一开始就算好一次（见 _op_apply_style 里 speaker_object_
+# position 的赋值），此后不管内容规划重试多少轮都不会再被碰——用"重新规划
+# 内容"去回应这两类问题，规划出来的内容因此每次都跟上一轮一字不差（反馈
+# 里说的东西它根本无权修改），白白烧光一整轮的时间预算才降级，"慢"和"没
+# 套上模板"是同一个根因的两个症状。
+#
+# 对症的做法：识别出高严重度问题**只**是这两类（没有掺杂真正的内容问题）
+# 时，跳过昂贵的内容重规划（零 LLM 调用），直接调整对应参数重渲染一次
+# 验证——取景问题把裁剪窗口往上移让出更多头顶空间，对比度问题切换明暗
+# 配色。混杂了其它类型问题时仍然走原来的内容重规划路径，不动那条路径的
+# 行为。
+_FRAMING_ISSUE_KEYWORDS = ("取景", "裁切", "贴边")
+_CONTRAST_ISSUE_KEYWORDS = ("对比度",)
+_GEOMETRY_COLOR_KEYWORDS = _FRAMING_ISSUE_KEYWORDS + _CONTRAST_ISSUE_KEYWORDS
+
+
+def _is_geometry_or_color_only(findings: list[dict]) -> bool:
+    """高严重度发现是否**全部**属于取景/对比度这类跟内容选择无关的几何或
+    配色问题——只要有一条不属于，就说明混杂了真正的内容问题，不适用这条
+    对症修复捷径，交回原来的内容重规划路径处理。"""
+    if not findings:
+        return False
+    return all(
+        any(kw in f.get("issue", "") for kw in _GEOMETRY_COLOR_KEYWORDS)
+        for f in findings
+    )
+
+
+def _correct_geometry_and_color(props: dict, findings: list[dict]) -> dict:
+    """直接调整 speakerObjectPosition/colorMode，不调用 LLM——这是真正对症
+    的修复，而不是像内容重规划那样反馈了个它管不了的问题。"""
+    corrected = dict(props)
+    issues_text = " ".join(f.get("issue", "") for f in findings)
+
+    if any(kw in issues_text for kw in _FRAMING_ISSUE_KEYWORDS):
+        pos = corrected.get("speakerObjectPosition") or "50% 50%"
+        try:
+            x_part, y_part = pos.replace("%", "").split()
+            # object-position 的 Y 值越小，裁剪窗口越往上（露出更多头顶）；
+            # 报告"脸部被裁切"说明当前窗口偏下，把 Y 往下调 15 个百分点、
+            # 下限钉在 10%（避免反过来把下巴/胸口裁没）。
+            new_y = max(10.0, float(y_part) - 15.0)
+            corrected["speakerObjectPosition"] = f"{x_part}% {new_y:.0f}%"
+            logger.info(
+                f"  apply_style: 取景问题——speakerObjectPosition 从 '{pos}' "
+                f"调整为 '{corrected['speakerObjectPosition']}'（露出更多头顶空间）"
+            )
+        except (ValueError, AttributeError):
+            logger.warning(f"  apply_style: speakerObjectPosition '{pos}' 格式无法解析，跳过取景修正")
+
+    if any(kw in issues_text for kw in _CONTRAST_ISSUE_KEYWORDS):
+        old_mode = corrected.get("colorMode", "warm")
+        corrected["colorMode"] = "dark" if old_mode == "warm" else "warm"
+        logger.info(
+            f"  apply_style: 对比度问题——colorMode 从 '{old_mode}' "
+            f"切换为 '{corrected['colorMode']}'"
+        )
+
+    return corrected
+
+
+# 验证上面这条捷径时发现的第二个、更根本的问题（2026-07-27，直接复现
+# job_cb04960d9a48）：真实触发降级的那条 finding（frame_index 0）实测根本
+# 不是裁剪窗口问题——它采样到的是 intro 标题卡（IntroTitle.tsx）还没淡出
+# 的那一帧（frame 28 < introOutFrame(80) + 12），那段时间整屏盖着深色渐变
+# 蒙层 + 大标题文字，说话人的脸本来就该被压暗/半遮挡，是设计如此。实测
+# speakerObjectPosition 从 51% 一路调到 25%（Y 方向移动了 26 个百分点）
+# 这条 finding 原样复现——不是修正力度不够，是这类 finding 根本不归
+# speakerObjectPosition 管，跟 Rule 14 那类"采样帧本来就不该被这条判断
+# 标准检查"是同一种 bug，只是这次不是"帧还没渲染任何东西"，是"帧本来就
+# 该长这样"。往内容重规划那条路径走一样无解——intro 蒙层是固定的渲染
+# 组件逻辑，不受 content_planner 的规划结果影响。
+# 对症做法：intro 蒙层仍在生效的窗口内、且 finding 是取景类问题的，直接
+# 认定"设计如此"丢弃，不进入任何重试/降级判断——不止在这条捷径分支生效，
+# 三处读取 major 的地方都要用同一个函数过滤（Rule 5/13 的教训：一个只在
+# 单个调用点生效的保证不是保证）。
+#
+# 同一晚验证时又实测复现了第二种、第三种同源问题（job_7a33f9a80af8，两轮
+# 独立尝试都踩中）：这次 intro 用的是 StatsHookIntro.tsx（"stats_hook"
+# 变体，跟 IntroTitle.tsx 是同一批"固定深色开场"组件的另一个），frame 28
+# 报"对比度过低"——`_correct_geometry_and_color` 照常把 colorMode 从
+# warm 切成 dark 去"修"，但 StatsHookIntro.tsx 第 77 行的背景色是
+# `colorMode === "warm" ? "#0D1117" : palette.bgDeep`，而 `palette.bgDeep`
+# 在 dark 主题下是 "#090C10"——两个分支都是近乎全黑，colorMode 根本不
+# 影响这个组件的背景色，是这两个 intro 组件共同的设计（"dark full-bleed
+# opener"，不管全片选的是哪个 colorMode，开场这几十帧本来就该是近黑背景
+# 配大字号高对比文字）。切换 colorMode 对这条 finding 完全是无效操作，
+# 还会把后面一整条视频的配色也带偏（colorMode 是全局属性，SpeakerCard/
+# 数据卡等其它组件都真的会跟着变）。同一次重试里，切换 colorMode 之后
+# 复审反而多冒出 4 条取景类 high 发现——大概率是同一个说话人视频取景本来
+# 就临界（这一晚另外两个 job 也是这个说话人、同一个 43% 51% 校准值，见
+# job_cb04960d9a48/job_5b0ec0b914ee 的调查记录），叠加上视觉模型本身的
+# 判断噪音，不是 colorMode 切换真的让画面变差了，但也没有证据证明切换
+# colorMode 帮上了忙——两轮独立尝试，"对比度过低"->切换->复审都变得更差，
+# 一次巧合可以理解成噪音，两次同源复现更像是这条捷径对这类 finding 从
+# 结构上就不该出手。同一帧也报了"画面为黑色，无任何内容"——StatsHookIntro
+# 的设计就是"深色满屏 + 居中大字号数字 + 一条细进度条 + 最多两行小标签"，
+# 本来就没有大面积"内容"可言（跟 IntroTitle 的深色蒙层是同一类"设计如此"，
+# 只是这次视觉模型换了个说法）。
+# 三类关键词一起在 intro 蒙层窗口内丢弃，不只丢取景类：取景/对比度/黑屏
+# 空画布，在这个窗口内都不是 speakerObjectPosition/colorMode/内容规划
+# 能真正修好的问题。
+_INTRO_SCRIM_TAIL_FRAMES = 12  # 对应 IntroTitle.tsx/StatsHookIntro.tsx: exit 的 interpolate 终点是 introOutFrame + 12
+_INTRO_UNFIXABLE_KEYWORDS = _GEOMETRY_COLOR_KEYWORDS + ("黑色", "纯黑", "无任何内容", "空画布")
+
+
+def _drop_intro_scrim_unfixable_findings(
+    findings: list[dict], stills: list[dict], intro_out_frame: int
+) -> list[dict]:
+    dropped = []
+    kept = []
+    for f in findings:
+        idx = f.get("frame_index")
+        frame_no = stills[idx]["frame"] if isinstance(idx, int) and 0 <= idx < len(stills) else None
+        in_scrim = frame_no is not None and frame_no <= intro_out_frame + _INTRO_SCRIM_TAIL_FRAMES
+        is_unfixable = any(kw in f.get("issue", "") for kw in _INTRO_UNFIXABLE_KEYWORDS)
+        if in_scrim and is_unfixable:
+            dropped.append(f)
+        else:
+            kept.append(f)
+    if dropped:
+        logger.info(
+            f"  apply_style: 忽略 intro 深色开场窗口内的取景/对比度/黑屏类发现（设计如此，非缺陷）: {dropped}"
+        )
+    return kept
+
+
+def _apply_geometry_color_shortcut(
+    props: dict, props_path: Path, major: list[dict], remotion_dir: Path, workdir: Path, duration: float
+) -> tuple[dict, list[dict]]:
+    """真正执行取景/对比度捷径修正 + 重新过一遍视觉复审，返回更新后的
+    (props, major)。两个调用点共享（第一次视觉复审 AND 内容重规划之后的
+    第二次视觉复审）——Rule 5/13 的教训：只在一个调用点生效的修正不是
+    真正的修正，内容重规划把"纯黑画面"这类真内容问题修好之后，剩下的
+    发现完全可能变成纯取景/对比度类，这时候一样该走这条捷径，不该直接
+    降级交付。"""
+    from .qa_stills import run_props_qa
+
+    issues = "; ".join(f"still #{f.get('frame_index')}: {f.get('issue', '')}" for f in major)[:500]
+    logger.warning(f"  apply_style: 视觉复审发现的问题都是取景/对比度类，跳过内容重规划直接调参重试: {issues}")
+    props = _correct_geometry_and_color(props, major)
+    props = _recompute_scenes_from_content(props, round(duration * 30))
+    props_path.write_text(json.dumps(props, ensure_ascii=False), encoding="utf-8")
+    qa_result = run_props_qa(props, props_path, remotion_dir, workdir / "qa_stills")
+    major = _major_vision_findings(qa_result, props)
+    return props, major
+
+
+def _major_vision_findings(qa_result: dict, props: dict) -> list[dict]:
+    vision_findings = (qa_result.get("vision_review") or {}).get("findings") or []
+    major = [f for f in vision_findings if f.get("severity") == "high"]
+    return _drop_intro_scrim_unfixable_findings(
+        major, qa_result.get("stills") or [], props.get("introOutFrame", 20)
+    )
+
+
 def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
     """转写 + 内容规划 + 用 Remotion 渲染 XiaojinEditorial（contract②）。
 
@@ -2601,15 +2804,22 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         from .qa_stills import run_props_qa
 
         qa_result = run_props_qa(props, props_path, remotion_dir, workdir / "qa_stills")
-        vision_findings = (qa_result.get("vision_review") or {}).get("findings") or []
-        major = [f for f in vision_findings if f.get("severity") == "high"]
+        major = _major_vision_findings(qa_result, props)
         if major and time.monotonic() >= content_deadline:
             logger.warning(
                 "  apply_style: 内容规划总预算已用完，跳过视觉复审触发的重规划，"
                 "直接走降级交付（不是新逻辑，跟重试后仍有问题走的是同一条路）"
             )
             raise RuntimeError(f"apply_style: 内容规划总预算已用完，视觉复审发现的问题未再尝试修复，触发降级交付: {major}")
-        if major:
+        if major and _is_geometry_or_color_only(major):
+            # 取景/对比度问题跟内容规划无关（speakerObjectPosition/colorMode
+            # 只算一次，任何重规划都碰不到它们）——走内容重规划必然原样复现
+            # 同一个问题，白白多花一轮 LLM + QA stills 还是没用。直接调参数、
+            # 重跑一次确定性保底（对齐 scenes）、重新过一遍视觉复审验证。
+            props, major = _apply_geometry_color_shortcut(props, props_path, major, remotion_dir, workdir, duration)
+            if major:
+                raise RuntimeError(f"apply_style: 取景/对比度修正后仍发现问题，触发降级交付: {major}")
+        elif major:
             feedback = "; ".join(f"still #{f.get('frame_index')}: {f.get('issue', '')}" for f in major)[:500]
             logger.warning(f"  apply_style: 视觉复审发现问题，重新规划一次: {feedback}")
             replanned = _apply_deterministic_guarantees(_build(feedback=feedback))
@@ -2631,8 +2841,14 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
             # 新调用点）。
             props_path.write_text(json.dumps(props, ensure_ascii=False), encoding="utf-8")
             qa_result = run_props_qa(props, props_path, remotion_dir, workdir / "qa_stills")
-            vision_findings = (qa_result.get("vision_review") or {}).get("findings") or []
-            major = [f for f in vision_findings if f.get("severity") == "high"]
+            major = _major_vision_findings(qa_result, props)
+            if major and _is_geometry_or_color_only(major):
+                # 内容重规划把真正的内容问题（比如上面反馈里带的"纯黑画面"）
+                # 修好之后，剩下的发现完全可能变成纯取景/对比度类——这时候
+                # 还有必要再走一次内容重规划吗？不需要，跟第一次检查同一条
+                # 捷径，同一个函数（Rule 5/13：只在一个调用点生效的修正不是
+                # 真正的修正）。
+                props, major = _apply_geometry_color_shortcut(props, props_path, major, remotion_dir, workdir, duration)
             if major:
                 raise RuntimeError(f"apply_style: 视觉复审重试后仍发现问题，触发降级交付: {major}")
 
