@@ -7,6 +7,13 @@
 # 验证：(1) 传了 broll 时正确落盘+登记进 job.assets，(2) 不传 broll 时跟
 # 改动前完全一样（向后兼容，覆盖 Node 网关现有的调用方式）。
 #
+# 不用 fastapi.testclient/httpx——CI 那台机器全新 resolve 依赖时装到的
+# starlette 版本强制要求装 httpx2 包（本机 .venv 里缓存的是能work的旧组合，
+# 本地跑没暴露，CI 上 collection 阶段直接 RuntimeError，整个套件跑不起来，
+# 实测复现过）。File()/Form() 只是 FastAPI 路由层的依赖注入默认值标记，
+# 直接当普通 Python 函数调用端点、自己构造 UploadFile，完全绕开真实 HTTP
+# 请求解析这层，不需要 TestClient，也就不需要 httpx。
+#
 # 不真的触发 HeyGen（要花钱、要等几分钟）——用 mock 顶掉 _run_in_background，
 # 只验证端点自己同步做的落盘/登记那部分。
 #
@@ -14,21 +21,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import unittest.mock as mock
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
+from starlette.datastructures import UploadFile
 
 import whatsapp_mvp.webhook as webhook
 from whatsapp_mvp.job_manager import get_assets, get_job, get_session
 from whatsapp_mvp.database import Job
 
 
-@pytest.fixture
-def client():
-    return TestClient(webhook.app)
+def _upload(filename: str, content: bytes) -> UploadFile:
+    return UploadFile(io.BytesIO(content), filename=filename)
 
 
 @pytest.fixture
@@ -50,26 +57,21 @@ def cleanup_jobs():
             session.close()
 
 
-def test_croll_registers_broll_assets(client, cleanup_jobs):
+def test_croll_registers_broll_assets(cleanup_jobs):
     with mock.patch.object(webhook, "_run_in_background") as fake_bg:
-        resp = client.post(
-            "/croll",
-            files=[
-                ("photo", ("photo.jpg", io.BytesIO(b"fake-jpeg"), "image/jpeg")),
-                ("broll", ("clip1.mp4", io.BytesIO(b"fake-mp4-bytes"), "video/mp4")),
-                ("broll", ("clip2.png", io.BytesIO(b"fake-png-bytes"), "image/png")),
-            ],
-            data={
-                "hint": "test hint",
-                "lang": "en",
-                "broll_labels": ["office shot", "logo closeup"],
-                "broll_kinds": ["", ""],
-            },
-        )
+        resp = asyncio.run(webhook.create_croll_endpoint(
+            photo=_upload("photo.jpg", b"fake-jpeg"),
+            hint="test hint",
+            lang="en",
+            pipeline="talking-head",
+            broll=[_upload("clip1.mp4", b"fake-mp4-bytes"), _upload("clip2.png", b"fake-png-bytes")],
+            broll_labels=["office shot", "logo closeup"],
+            broll_kinds=["", ""],
+        ))
 
-    assert resp.status_code == 200, resp.text
-    job_id = resp.json()["job_id"]
+    job_id = resp["job_id"]
     cleanup_jobs.append(job_id)
+    assert resp["status"] == "RECEIVED"
 
     # generate_croll 的调用签名不受这次改动影响——broll 处理完全是端点自己
     # 同步做的，跟后台生成流程解耦。
@@ -90,20 +92,28 @@ def test_croll_registers_broll_assets(client, cleanup_jobs):
     assert Path(assets[1]["local_path"]).read_bytes() == b"fake-png-bytes"
 
 
-def test_croll_without_broll_is_unchanged_from_before(client, cleanup_jobs):
+def test_croll_without_broll_is_unchanged_from_before(cleanup_jobs):
     """向后兼容：Node 网关今天调用 /croll 时不带 broll 参数——这个场景必须
     跟改动前的行为完全一样（不多注册任何资产，不影响 generate_croll 的
     调用方式）。"""
     with mock.patch.object(webhook, "_run_in_background") as fake_bg:
-        resp = client.post(
-            "/croll",
-            files={"photo": ("photo.jpg", io.BytesIO(b"fake-jpeg"), "image/jpeg")},
-            data={"hint": "", "lang": "zh", "pipeline": "talking-head"},
-        )
+        resp = asyncio.run(webhook.create_croll_endpoint(
+            photo=_upload("photo.jpg", b"fake-jpeg"),
+            hint="",
+            lang="zh",
+            pipeline="talking-head",
+            # 直接调用函数绕开了 FastAPI 的请求解析层——broll/broll_labels/
+            # broll_kinds 的 File()/Form() 默认值是路由层用的依赖注入标记，
+            # 不会像真实 HTTP 请求那样被框架解析成空列表，这里要显式传
+            # 空列表，才是"调用方没传 broll"这个场景真实对应的参数状态。
+            broll=[],
+            broll_labels=[],
+            broll_kinds=[],
+        ))
 
-    assert resp.status_code == 200, resp.text
-    job_id = resp.json()["job_id"]
+    job_id = resp["job_id"]
     cleanup_jobs.append(job_id)
+    assert resp["status"] == "RECEIVED"
 
     assert fake_bg.called
     job = get_job(job_id)
