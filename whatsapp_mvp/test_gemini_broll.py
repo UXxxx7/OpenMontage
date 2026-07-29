@@ -33,10 +33,41 @@ REAL_QUOTA_ERROR = (
 @pytest.fixture(autouse=True)
 def _isolated_cache_file(tmp_path, monkeypatch):
     """缓存文件走临时目录，不碰本机真实的 storage/_broll_generation_status.json，
-    也不用管上一条测试有没有清理干净。"""
+    也不用管上一条测试有没有清理干净。
+
+    真实 CI 失败复现过（2026-07-29）：check_broll_generation_availability()
+    先检查 GeminiOmniVideo().get_status()（有没有配置 API key），这一步在
+    本机 .venv 因为 .env 里配了 GOOGLE_API_KEY 会通过，但 CI 那台机器没有
+    任何密钥，永远走"未配置"分支直接返回 False——把下面这些专门测"缓存
+    逻辑"的用例全部误伤成"到底有没有配 key"这条完全不相关的判断。这里
+    统一把 key-配置检查钉成"总是配置了"，让这个文件里的测试只测缓存本身，
+    不受运行测试的机器有没有真实密钥影响。"""
     fake_path = tmp_path / "_broll_generation_status.json"
     monkeypatch.setattr(gemini_broll, "_quota_status_path", lambda: fake_path)
+
+    from tools.base_tool import ToolStatus
+    monkeypatch.setattr(
+        "tools.video.gemini_omni_video.GeminiOmniVideo.get_status",
+        lambda self: ToolStatus.AVAILABLE,
+    )
     return fake_path
+
+
+def test_availability_is_false_when_api_key_not_configured(tmp_path, monkeypatch):
+    """跟上面那条相反的真实场景——CI 环境本身没有配置任何密钥时，应该
+    正确报"不可用"（而不是被上面那个 autouse fixture 的 mock 掩盖掉）。
+    这条不用 _isolated_cache_file 的 mock，单独验证这条判断路径本身。"""
+    from tools.base_tool import ToolStatus
+    fake_path = tmp_path / "_broll_generation_status.json"
+    monkeypatch.setattr(gemini_broll, "_quota_status_path", lambda: fake_path)
+    monkeypatch.setattr(
+        "tools.video.gemini_omni_video.GeminiOmniVideo.get_status",
+        lambda self: ToolStatus.UNAVAILABLE,
+    )
+
+    available, reason = gemini_broll.check_broll_generation_availability()
+    assert available is False
+    assert "API key" in reason or "GEMINI_API_KEY" in reason
 
 
 def test_is_quota_error_recognizes_the_real_incident_text():
