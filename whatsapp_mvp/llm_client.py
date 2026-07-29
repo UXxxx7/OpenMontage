@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import time
 from typing import Optional
@@ -18,6 +19,41 @@ import requests
 from .config import get_config
 
 logger = logging.getLogger(__name__)
+
+# requests' own `timeout=` only bounds a single socket read, not the total
+# call duration — if the server dribbles bytes slowly enough that no single
+# read ever stalls past `timeout`, the countdown keeps getting reset and the
+# call can run far longer than the configured timeout ever implies. Confirmed
+# real cases (2026-07-27 investigation, DeepSeek): a call configured with
+# timeout=60 took ~17 minutes before finally erroring; 65 network errors
+# total in this deployment's log history, 19 in one evening alone. Enforce an
+# actual wall-clock cap by running the request in a worker thread and giving
+# up on waiting for it once `_HARD_CALL_DEADLINE_S` elapses — this does NOT
+# cancel the underlying request (Python threads can't be killed; the socket
+# call keeps running until the OS/remote eventually gives up on its own), it
+# just stops the caller from blocking on it, so a slow-trickling server can
+# no longer stall the whole pipeline for minutes past what `timeout=` implies.
+#
+# 2026-07-28 架构复审（延迟优化）：原来设的 90s 偏保守——call_llm_chat 自己的
+# docstring 早就记录过 DeepSeek 网关对非流式响应有 ~60s 硬时限（v4-flash
+# 实测 37s 完成，v4-pro 写不完长 JSON，60s 整被网关掐断）——也就是说任何
+# 真正会成功的单次调用，DeepSeek 自己最迟也就在 60s 左右给出结果或直接掐断，
+# 不存在"合法但需要 90s"的调用。留 15s 余量设到 75s：比原来的 90s 更快发现
+# 真正卡住的连接，同时不会比 DeepSeek 自己的硬时限更早误伤正常调用。
+_HARD_CALL_DEADLINE_S = 75
+_call_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="llm-http")
+
+# 同一进程内所有调用复用一个 Session——默认的 requests.post(...) 每次都会
+# 新开一条 TCP+TLS 连接，同一个 job 里对同一个 host（api.deepseek.com）的
+# 多次调用完全可以复用连接，省掉重复握手的延迟。纯性能优化，不改变任何
+# 重试/超时语义（Session 对象本身线程安全，可以跨 _call_executor 的多个
+# 工作线程共享）。
+_session = requests.Session()
+
+
+def _post_bounded(url: str, headers: dict, body: dict, timeout: int) -> requests.Response:
+    future = _call_executor.submit(_session.post, url, headers=headers, json=body, timeout=timeout)
+    return future.result(timeout=_HARD_CALL_DEADLINE_S)
 
 # A single flaky attempt was silently turning into "content_planner ships an
 # empty plan" for real jobs even though the same call succeeds moments later
@@ -42,11 +78,16 @@ def _post_with_retries(
     """
     for attempt in range(1, _MAX_ATTEMPTS + 1):
         try:
-            resp = requests.post(url, headers=headers, json=body, timeout=timeout)
+            resp = _post_bounded(url, headers, body, timeout)
         # ChunkedEncodingError（"Response ended prematurely"）不是 ConnectionError/
         # Timeout 的子类——响应体传输中途被切断时抛的是这个，之前漏抓，导致一次
         # 廉价的传输层抖动被迫升级成调用方（apply_style）整段重跑。
-        except (requests.ConnectionError, requests.Timeout, requests.exceptions.ChunkedEncodingError) as e:
+        # concurrent.futures.TimeoutError：_post_bounded 的硬性总耗时上限触发——
+        # 服务器间歇性挤字节导致 requests 自己的 timeout 一直没触发时兜底。
+        except (
+            requests.ConnectionError, requests.Timeout, requests.exceptions.ChunkedEncodingError,
+            concurrent.futures.TimeoutError,
+        ) as e:
             if attempt == _MAX_ATTEMPTS:
                 logger.error(f"{label} call failed after {attempt} attempts (network): {e}")
                 return None
@@ -196,18 +237,18 @@ def call_vision_chat(text_prompt: str, image_paths: list, timeout: int = 90):
     endpoint = config.vision_llm_base_url.rstrip("/") + "/chat/completions"
     for attempt in range(2):
         try:
-            resp = requests.post(
+            resp = _post_bounded(
                 endpoint,
-                headers={"Authorization": f"Bearer {config.vision_llm_api_key}",
-                         "Content-Type": "application/json"},
-                json={"model": config.vision_llm_model,
-                      "messages": [{"role": "user", "content": content}],
-                      "temperature": 0.2},
-                timeout=timeout,
+                {"Authorization": f"Bearer {config.vision_llm_api_key}",
+                 "Content-Type": "application/json"},
+                {"model": config.vision_llm_model,
+                 "messages": [{"role": "user", "content": content}],
+                 "temperature": 0.2},
+                timeout,
             )
             resp.raise_for_status()
             return resp.json()["choices"][0]["message"]["content"]
-        except requests.exceptions.RequestException as e:
+        except (requests.exceptions.RequestException, concurrent.futures.TimeoutError) as e:
             if attempt == 0:
                 import time as _time
                 logger.warning(f"视觉 LLM 连接层错误，5s 后重试: {e}")

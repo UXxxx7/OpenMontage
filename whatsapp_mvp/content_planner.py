@@ -441,8 +441,24 @@ def plan_content(segments: list[dict], duration: float, *, feedback: Optional[st
             f"content_planner: 第 {attempt}/{_PLAN_MAX_ATTEMPTS} 轮未达标（{len(failures)} 项）: "
             + " | ".join(failures)
         )
-        if best_failures is None or len(failures) < len(best_failures):
+        improved = best_failures is None or len(failures) < len(best_failures)
+        if improved:
             best_plan, best_raw, best_failures = plan, raw, failures
+        # 早退（架构复审后新增，2026-07-28，延迟优化）：跟 pipeline_runner 的
+        # props_lint 早退是同一个判断——本轮反馈喂回去之后，失败项数量没有
+        # 比已知最佳更少，说明 LLM 没有真正吸收反馈收敛，继续跑大概率是
+        # 确定性空转（真实案例：job_7a33f9a80af8 第 3 轮原样复现了第 1 轮的
+        # 失败项，第 2 轮已经换了别的失败项——第 3 轮没有新增任何价值，
+        # best-of 交付结果跟提前在第 2 轮结束完全一样，白烧了一整轮 LLM
+        # 调用，正是内容规划占掉整条流水线 70%+ 时间的主因之一）。best_plan
+        # 已经保留，交付版本不变，只省掉注定拿不到更好结果的后续调用；仍在
+        # 改进时（improved=True）不受影响，继续跑到轮数用尽或全部达标为止。
+        if not improved and attempt < _PLAN_MAX_ATTEMPTS:
+            logger.info(
+                f"content_planner: 第 {attempt} 轮重规划未改进（仍是 {len(failures)} 项失败，"
+                f"不少于已知最佳的 {len(best_failures)} 项）——提前结束重试，交付已知最佳版本"
+            )
+            break
         user_message = (
             "NOTE: your previous plan FAILED these quality criteria — you MUST fix ALL of them "
             "in this attempt (each one is checked mechanically, not judged):\n- "

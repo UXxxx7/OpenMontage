@@ -16,6 +16,7 @@ from whatsapp_mvp.pipeline_runner import (
     _is_geometry_or_color_only, _correct_geometry_and_color,
     _drop_intro_scrim_unfixable_findings, _major_vision_findings,
     build_caption_phrases, _words_to_caption_text,
+    _clamp_calibrated_object_position,
 )
 
 FAILED = []
@@ -36,6 +37,27 @@ def test_shifts_below_floor_preserving_duration():
     check("低于 floor 的图形被整体平移到 floor", items[0]["mountFrame"] == 120, items[0])
     check("平移保留原有停留时长（205 帧）", items[0]["endFrame"] - items[0]["mountFrame"] == 205, items[0])
     check("已经在 floor 之后的图形不受影响", items[1] == {"mountFrame": 500, "endFrame": 600}, items[1])
+
+
+# 架构复审后新增（2026-07-28，真实复现 job_5b0ec0b914ee）：CornerCard.tsx 自己
+# 的文档要求"section takeover/quote 期间绝不渲染"，但那条保护只覆盖
+# content_planner 认识的 sections/quote，intro（IntroTitle/StatsHookIntro）是
+# 下游 pipeline_runner 才算出来的独立窗口，corner_card 规划阶段完全不知道它
+# 的存在。真实观测：mountFrame=0 的聊天气泡卡片（"David from Pacific Life"）
+# 跟 intro 深色开场大标题同时出现，视觉复审判定文字"被截断"，是这个 job 最终
+# 降级交付的直接原因（qa_report 里唯一存活到降级判断的两条 high finding）。
+def test_floor_shift_graphics_pushes_corner_card_past_intro_window():
+    corner_cards = [
+        {"variant": "chat", "mountFrame": 0, "endFrame": 130,
+         "message": "David from Pacific Life", "appName": "Pacific Life"},
+    ]
+    intro_out = 80
+    mount_floor = intro_out + 20 + 20  # 跟 pipeline_runner 里真实的 _mount_floor 算法一致
+    _floor_shift_graphics(corner_cards, mount_floor)
+    check("真实复现的 mountFrame=0 聊天气泡被推到 intro 窗口之后",
+          corner_cards[0]["mountFrame"] == 120, corner_cards[0])
+    check("推移保留原有停留时长（130 帧）",
+          corner_cards[0]["endFrame"] - corner_cards[0]["mountFrame"] == 130, corner_cards[0])
 
 
 def test_before_after_second_reveal_frame_shifts_too():
@@ -650,8 +672,33 @@ def test_build_caption_phrases_reproduces_real_job_f1eec580e3c7_fix():
           joined)
 
 
+# 架构复审后新增（2026-07-28）：统计本机全部 33 次真实人脸校准记录，23 次
+# （70%）落在 Y=51-52% 附近——job_cb04960d9a48/job_5b0ec0b914ee/
+# job_7a33f9a80af8 三个当晚触发降级的 job 用的都是这个校准值。下面几条
+# 用的都是日志里原样摘录的真实校准输出。
+def test_clamp_calibrated_object_position_pulls_the_recurring_bad_cluster_into_range():
+    pos, was_clamped = _clamp_calibrated_object_position(43, 51)
+    check("真实反复复现的 43% 51% 校准值被钳制进 20-40% 的目标区间",
+          pos == "43% 40%" and was_clamped is True, pos)
+
+
+def test_clamp_calibrated_object_position_leaves_already_safe_values_untouched():
+    pos, was_clamped = _clamp_calibrated_object_position(53, 39)
+    check("已经在安全区间内的真实校准值（53% 39%）不受影响",
+          pos == "53% 39%" and was_clamped is False, pos)
+
+
+def test_clamp_calibrated_object_position_rescues_extreme_misdetection():
+    # 真实观测到的两次极端校准结果（92%/79-80%），明显是误检测（背景物体/
+    # 画面边角），不加边界会直接产出完全不能用的取景。
+    pos, was_clamped = _clamp_calibrated_object_position(92, 80)
+    check("真实观测到的误检测极端值（92% 80%）被钳制到合理边界，不再是不能用的取景",
+          pos == "70% 40%" and was_clamped is True, pos)
+
+
 def main():
     test_shifts_below_floor_preserving_duration()
+    test_floor_shift_graphics_pushes_corner_card_past_intro_window()
     test_before_after_second_reveal_frame_shifts_too()
     test_row_offsets_stay_relative_and_valid()
     test_zone_headers_shift_from_to_frame()
@@ -695,6 +742,9 @@ def main():
     test_words_to_caption_text_no_spaces_between_cjk_characters()
     test_words_to_caption_text_mixed_cjk_and_latin_brand_name()
     test_build_caption_phrases_reproduces_real_job_f1eec580e3c7_fix()
+    test_clamp_calibrated_object_position_pulls_the_recurring_bad_cluster_into_range()
+    test_clamp_calibrated_object_position_leaves_already_safe_values_untouched()
+    test_clamp_calibrated_object_position_rescues_extreme_misdetection()
 
     print()
     if FAILED:
