@@ -118,3 +118,68 @@ def test_croll_without_broll_is_unchanged_from_before(cleanup_jobs):
     assert fake_bg.called
     job = get_job(job_id)
     assert get_assets(job) == []
+
+
+# ─────────────────────────── POST /transcribe（语音消息转文字） ───────────────────────────
+#
+# 真实验证过（架构复审后新增，2026-07-29）：拿一段真实视频的音轨转成
+# WhatsApp 语音消息实际使用的编码（OGG/Opus），直接调用这个端点，转写结果
+# 跟已知内容完全一致——下面这几条是 mock 掉 Transcriber 之后的单元级测试，
+# 不需要在仓库里搭一份真实音频 fixture、也不需要 CI 环境装 whisper 模型；
+# 传输层/编码兼容性已经用真实调用确认过。
+
+class _FakeTranscribeResult:
+    def __init__(self, success, data=None, error=""):
+        self.success = success
+        self.data = data or {}
+        self.error = error
+
+
+def test_transcribe_endpoint_returns_joined_segment_text(tmp_path):
+    fake_result = _FakeTranscribeResult(True, data={
+        "segments": [{"text": "帮我把这段去掉"}, {"text": "然后加一段办公室的画面"}],
+        "language": "zh",
+    })
+    with mock.patch("tools.analysis.transcriber.Transcriber.execute", return_value=fake_result):
+        result = asyncio.run(webhook.transcribe_endpoint(audio=_upload("voice.ogg", b"fake-ogg-bytes")))
+
+    assert result["text"] == "帮我把这段去掉 然后加一段办公室的画面"
+    assert result["language"] == "zh"
+
+
+def test_transcribe_endpoint_returns_empty_text_on_failure_not_an_exception():
+    """转写失败（模型不可用/音频损坏）不能让整个 webhook 处理链路炸掉——
+    优雅返回空文本 + 错误信息，调用方（Node）按"没听清"处理。"""
+    fake_result = _FakeTranscribeResult(False, error="faster-whisper not available")
+    with mock.patch("tools.analysis.transcriber.Transcriber.execute", return_value=fake_result):
+        result = asyncio.run(webhook.transcribe_endpoint(audio=_upload("voice.ogg", b"fake-ogg-bytes")))
+
+    assert result["text"] == ""
+    assert result["error"]
+
+
+def test_transcribe_endpoint_cleans_up_its_temp_file():
+    """每次调用都会现写一个临时文件给 Transcriber 用——用完必须删掉，不能
+    每来一条语音消息就在 /tmp 底下攒一个文件，长期跑下去会把磁盘写满。"""
+    captured_path = {}
+
+    def fake_execute(self, inputs):
+        captured_path["path"] = inputs["input_path"]
+        assert Path(inputs["input_path"]).exists()  # 调用时文件必须存在
+        return _FakeTranscribeResult(True, data={"segments": [], "language": "en"})
+
+    with mock.patch("tools.analysis.transcriber.Transcriber.execute", fake_execute):
+        asyncio.run(webhook.transcribe_endpoint(audio=_upload("voice.ogg", b"fake-ogg-bytes")))
+
+    assert captured_path.get("path"), "Transcriber.execute 应该被调用过"
+    assert not Path(captured_path["path"]).exists(), "临时音频文件用完后应该被删除"
+
+
+def test_transcribe_endpoint_handles_empty_transcription_result():
+    """转写"成功"但完全没说话/听不清（segments 为空）——不应该报错，返回
+    空字符串就好，Node 侧会当成"没听清"友好提示。"""
+    fake_result = _FakeTranscribeResult(True, data={"segments": [], "language": None})
+    with mock.patch("tools.analysis.transcriber.Transcriber.execute", return_value=fake_result):
+        result = asyncio.run(webhook.transcribe_endpoint(audio=_upload("voice.ogg", b"fake-ogg-bytes")))
+
+    assert result["text"] == ""

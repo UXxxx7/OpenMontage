@@ -857,6 +857,18 @@ function formatPlanMessage(job, lang) {
     lines.push("", t(resolvedLang, "*将执行的操作：*", "*Operations:*"));
     ops.forEach((op, i) => lines.push(`${i + 1}. ${op.description || op.type || t(resolvedLang, "编辑", "Edit")}`));
   }
+  // 真实事故驱动（2026-07-29，job_9c671249eb76）：规划要求 AI 生成
+  // b-roll，但账号当时在免费档、对应模型配额是 0——用户直到确认、等生成
+  // 失败了才知道这段不会有。Python 侧（whatsapp_mvp/worker.py
+  // _send_confirmation）在写这条 planned_edit 之前已经检查过一次可用性
+  // （读最近一次真实失败留下的本地缓存，不产生新调用），命中就带上这个
+  // 字段——这里在确认*之前*就把话挑明，跟 previewReadyMessage 里"降级必须
+  // 发声"是同一个原则，只是提前到了确认这一步，而不是等生成完了才说。
+  if (plan.broll_generation_warning) {
+    lines.push("", t(resolvedLang,
+      `⚠️ 注意：${plan.broll_generation_warning}。确认后这一步大概率会失败并被跳过，其余步骤正常执行；如果有素材，回复描述"用我上传的视频/图片"改成上传素材代替。`,
+      `⚠️ Note: ${plan.broll_generation_warning}. This step will likely fail and be skipped after confirming — the rest of the plan will still run. If you have your own footage, reply describing "use my uploaded clip" instead.`));
+  }
   lines.push("", t(resolvedLang,
     "回复 *confirm* 开始，或 *cancel* 取消。",
     "Reply *confirm* to start, or *cancel* to stop."));

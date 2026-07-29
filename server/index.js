@@ -2,10 +2,13 @@
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 import crypto from "crypto";
+import fs from "fs";
+import os from "os";
 import express from "express";
 import { Queue } from "bullmq";
 import IORedis from "ioredis";
 import axios from "axios";
+import FormData from "form-data";
 import { resolveLang, t } from "./lang.js";
 
 config({ path: resolve(dirname(fileURLToPath(import.meta.url)), "../.env") });
@@ -115,8 +118,12 @@ app.post(["/webhook", "/webhook/whatsapp"], async (req, res) => {
 async function handleMessage(message) {
   const waNumber = message.from;
   const msgId = message.id;
-  const msgType = message.type;
-  const text = message.text?.body?.trim() || "";
+  // msgType/text 用 let，不用 const——语音消息转写完之后会把这两个变量
+  // 改写成 ("text", 转写文字)，直接落进下面已有的整套文字路由逻辑
+  // （收集态/等选臂/活跃任务确认/修改意见/问答……），不用为语音另外
+  // 写一份可能悄悄跟文字路由分叉的平行逻辑。
+  let msgType = message.type;
+  let text = message.text?.body?.trim() || "";
 
   if (!waNumber || !msgId) return;
 
@@ -146,6 +153,31 @@ async function handleMessage(message) {
   }
 
   console.log(`[webhook] from=${waNumber} type=${msgType}`);
+
+  // 语音消息：下载 + 转写成文字，然后原地把这条消息"变成"一条文字消息，
+  // 落进下面已有的整套文字路由逻辑——同一句话不管是打字还是说出来，理解
+  // 和路由方式完全一样。转写失败/没听清就按"没听清"礼貌回复，不当成
+  // 静默失败晾着用户（架构复审后新增，2026-07-29）。
+  if (msgType === "audio") {
+    const mediaId = message.audio?.id;
+    const lang = resolveLang(env("WA_DEFAULT_LANG", "zh"));
+    if (!mediaId) return;
+    let transcribed = "";
+    try {
+      transcribed = await downloadAndTranscribeVoice(mediaId);
+    } catch (err) {
+      console.warn(`[webhook] voice transcribe failed: ${err.message}`);
+    }
+    if (!transcribed) {
+      await gatewaySendText(waNumber, t(lang,
+        "抱歉，没听清这条语音消息，可以再说一遍或者直接打字。",
+        "Sorry, I couldn't make out that voice message — try again or type it instead."));
+      return;
+    }
+    console.log(`[webhook] voice transcribed: "${transcribed}"`);
+    msgType = "text";
+    text = transcribed;
+  }
 
   // 方案A:交互按钮回复(选臂)。仅在"待选臂"时有意义,否则忽略。
   if (msgType === "interactive") {
@@ -392,6 +424,38 @@ async function withTimeout(promise, ms, fallback) {
 
 function env(name, fallback = "") {
   return process.env[name] || fallback;
+}
+
+// 下载一条 WhatsApp 语音消息 + 转写成文字（架构复审后新增，2026-07-29）。
+// 语音消息通常几秒到一两分钟，直接留在内存里传给 Python 的 /transcribe，
+// 不落临时文件——不像 worker.js 那边处理的视频/图片素材，没有"文件可能
+// 很大、要流式落盘"的顾虑，也就不需要那边那一整套临时文件生命周期管理。
+async function downloadAndTranscribeVoice(mediaId) {
+  const token = env("WA_TOKEN", env("WHATSAPP_ACCESS_TOKEN"));
+  const info = await axios.get(
+    `https://graph.facebook.com/${env("WA_GRAPH_VERSION", "v21.0")}/${mediaId}`,
+    { headers: { Authorization: `Bearer ${token}` }, timeout: Number(env("WA_MEDIA_INFO_TIMEOUT_MS", "30000")) }
+  );
+  const mediaUrl = info.data.url;
+  if (!mediaUrl) throw new Error(`WhatsApp voice media ${mediaId} no download URL`);
+  const mime = info.data.mime_type || "";
+  // WhatsApp 语音消息固定是 audio/ogg; codecs=opus；万一遇到非语音的普通
+  // 音频附件（mime 不同），扩展名跟着 mime 走，Python 那边靠 ffmpeg 解码，
+  // 不挑格式。
+  const ext = mime.includes("ogg") ? "ogg" : mime.includes("mp4") || mime.includes("m4a") ? "m4a" : "ogg";
+  const audioResp = await axios.get(mediaUrl, {
+    headers: { Authorization: `Bearer ${token}` },
+    responseType: "arraybuffer",
+    timeout: Number(env("WA_MEDIA_DOWNLOAD_TIMEOUT_MS", "60000")),
+  });
+  const form = new FormData();
+  form.append("audio", Buffer.from(audioResp.data), { filename: `voice.${ext}`, contentType: mime || "audio/ogg" });
+  const resp = await axios.post(`${PYTHON_API_BASE}/transcribe`, form, {
+    headers: form.getHeaders(),
+    maxBodyLength: Infinity, maxContentLength: Infinity,
+    timeout: Number(env("WA_TRANSCRIBE_TIMEOUT_MS", "60000")),
+  });
+  return (resp.data?.text || "").trim();
 }
 
 async function gatewaySendText(waNumber, text) {

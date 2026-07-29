@@ -6,6 +6,7 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import List, Optional
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
@@ -502,6 +503,51 @@ async def qa_endpoint(text: str = Form(...)):
 
     answer = answer_question(text)
     return {"answer": answer}
+
+
+@app.post("/transcribe")
+async def transcribe_endpoint(audio: UploadFile = File(...)):
+    """WhatsApp 语音消息转写成文字（架构复审后新增，2026-07-29）——设计上
+    刻意不新建一整套"语音指令"路由：Node 网关下载语音、转写成文字之后，
+    直接把它当成一条普通文字消息，原样喂给 handleMessage 里那一整套已经
+    很成熟的上下文路由逻辑（收集态/等选臂/活跃任务确认/修改意见/问答……）
+    ——同一句话不管是打字还是说出来，理解和路由方式完全一样，不用为语音
+    另外维护一份行为可能悄悄分叉的平行逻辑。
+
+    跟 job 生命周期无关的纯工具调用，不建 job、不落库——复用
+    tools.analysis.transcriber.Transcriber（全项目统一的转写实现，语音消息
+    通常几秒到几十秒，不需要 apply_style 那条链路的缓存/校准这些重量级
+    机制）。转写失败（模型不可用/音频损坏等）返回空文本，Node 侧按"没听清"
+    处理，不阻断整个 webhook 处理流程。
+    """
+    import tempfile
+
+    from tools.analysis.transcriber import Transcriber
+
+    data = await audio.read()
+    ext = (os.path.splitext(audio.filename or "")[1].lstrip(".") or "ogg").lower()
+    with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as tmp:
+        tmp.write(data)
+        tmp_path = tmp.name
+
+    try:
+        result = Transcriber().execute({
+            "input_path": tmp_path,
+            "model_size": get_config().faster_whisper_model,
+        })
+    except Exception as e:
+        logger.warning(f"/transcribe: 转写异常: {e}")
+        return {"text": "", "error": str(e)}
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+    if not result.success:
+        logger.warning(f"/transcribe: 转写失败: {result.error}")
+        return {"text": "", "error": result.error}
+
+    segments = result.data.get("segments") or []
+    text = " ".join(s.get("text", "").strip() for s in segments if s.get("text", "").strip())
+    return {"text": text.strip(), "language": result.data.get("language")}
 
 
 @app.post("/croll")
