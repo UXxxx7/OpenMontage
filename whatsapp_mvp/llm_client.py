@@ -51,9 +51,18 @@ _call_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_nam
 _session = requests.Session()
 
 
-def _post_bounded(url: str, headers: dict, body: dict, timeout: int) -> requests.Response:
+def _post_bounded(
+    url: str, headers: dict, body: dict, timeout: int, hard_deadline_s: Optional[float] = None
+) -> requests.Response:
+    """hard_deadline_s：不传就用 `_HARD_CALL_DEADLINE_S`（按 DeepSeek 非流式
+    调用的实际时长调的，75s）——但不是每个调用方都是同一种工作量。scene_
+    author.py 现写/修订场景代码是明显更重的调用（大 token 输出、"思考型"
+    模型），硬套 75s 会把本该成功、只是本来就需要更久的调用提前误杀，这不
+    是这个硬上限机制原本要解决的问题（要解决的是"服务器挤牙膏导致的单次
+    调用无限期卡住"，不是"限制所有调用必须多快完成"）。调用方按自己实际
+    的合理调用时长传一个更大的值。"""
     future = _call_executor.submit(_session.post, url, headers=headers, json=body, timeout=timeout)
-    return future.result(timeout=_HARD_CALL_DEADLINE_S)
+    return future.result(timeout=hard_deadline_s if hard_deadline_s is not None else _HARD_CALL_DEADLINE_S)
 
 # A single flaky attempt was silently turning into "content_planner ships an
 # empty plan" for real jobs even though the same call succeeds moments later

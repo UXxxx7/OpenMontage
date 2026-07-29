@@ -510,6 +510,9 @@ async def create_croll_endpoint(
     hint: str = Form(""),
     lang: str = Form("zh"),
     pipeline: str = Form("talking-head"),
+    broll: List[UploadFile] = File(default=[]),
+    broll_labels: List[str] = Form(default=[]),
+    broll_kinds: List[str] = Form(default=[]),
 ):
     """C-roll：一张照片 -> AI 看图写文案 -> HeyGen 数字人说话视频 -> 接入常规
     剪辑管线（后续 confirm/export/retry 跟普通视频任务完全一样）。
@@ -518,6 +521,27 @@ async def create_croll_endpoint(
     input.mp4 的来源——那边是用户直接传视频，这边是后台生成出来的。生成
     这几步（看图写文案 + HeyGen 上传/生成/轮询）合起来能到 1-2 分钟，全部
     放进后台线程，立即返回 job_id，Node 侧照旧轮询 GET /jobs/{id}。
+
+    broll/broll_labels/broll_kinds：跟 POST /jobs 完全同一套参数形状、同一套
+    登记逻辑（架构复审后新增，2026-07-29）——之前这里没有这三个参数，图生
+    视频的 job 上永远不会有 role=="broll" 的资产，insert_broll 这一步因此永
+    远不会被 L2 规划器 emit，不是管线跑不通，是这个入口没给它素材可用。
+    HeyGen 生成完成后 generate_croll() 会把成品当 input.mp4 接入
+    process_incoming_message，从那一步起跟普通视频任务走的是完全同一条路
+    （转写/L2 规划/apply_style/insert_broll 一个都不用改）——L2 规划器读
+    job 上的资产列表（job_manager.get_assets，按 role=="broll" 过滤）来决定
+    要不要 emit insert_broll，这个判断跟 job 的主视频到底是用户直接传的还
+    是这里生成出来的完全无关，只要资产已经登记好、下载到本地即可。这里的
+    落盘/登记顺序特意跟 /jobs 的 broll 处理逐行对齐，避免两处各写一套、日后
+    行为悄悄分叉（Rule 5/13 的教训）。
+
+    注意：这个改动只打通了直接调用这个 API 的路径（比如脚本/未来的其它前
+    端）——Node 网关目前收到照片触发 C-roll 生成时，只会带上这一张照片本
+    身，还没有收集"这条消息之后用户还发了哪些 b-roll 素材"的逻辑（那是
+    server/worker.js 的 crollGenerate，需要照着现有视频上传流程的多消息收
+    集窗口另外接一遍，属于更大的一块改动，不在这次范围内）。WhatsApp 用户
+    今天直接发照片触发 C-roll，还是拿不到 b-roll 合成——这条路目前只对直
+    接打 API 的调用方生效。
     """
     user = get_or_create_user("api_user")
     job = create_job(user_id=user.id, pipeline=pipeline, input_caption=hint)
@@ -528,6 +552,26 @@ async def create_croll_endpoint(
     ext = (os.path.splitext(photo.filename or "")[1].lstrip(".") or "jpg").lower()
     photo_path = job_dir / f"source_photo.{ext}"
     photo_path.write_bytes(photo_data)
+
+    # b-roll 素材：跟 POST /jobs 逐行对齐的同一套登记逻辑（见上面 docstring）。
+    _IMAGE_EXTS = ("jpg", "jpeg", "png", "webp", "gif", "bmp")
+    if broll:
+        from .job_manager import set_asset_local_path
+        assets_dir = job_dir / "assets"
+        assets_dir.mkdir(parents=True, exist_ok=True)
+        for i, up in enumerate(broll):
+            data = await up.read()
+            broll_ext = (os.path.splitext(up.filename or "")[1].lstrip(".") or "mp4").lower()
+            dest = assets_dir / f"broll_{i}.{broll_ext}"
+            dest.write_bytes(data)
+            if i < len(broll_kinds) and broll_kinds[i]:
+                kind = broll_kinds[i]
+            else:
+                kind = "image" if broll_ext in _IMAGE_EXTS else "video"
+            label = broll_labels[i] if i < len(broll_labels) else ""
+            media_id = f"local_{i}"
+            append_asset(job.id, media_id, kind, label)          # role=broll, order=i
+            set_asset_local_path(job.id, media_id, str(dest))    # 标记已下载
 
     update_job_status(job.id, JobStatus.DOWNLOADING_MEDIA)
 
