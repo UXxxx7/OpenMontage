@@ -2,10 +2,13 @@
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 import crypto from "crypto";
+import fs from "fs";
+import os from "os";
 import express from "express";
 import { Queue } from "bullmq";
 import IORedis from "ioredis";
 import axios from "axios";
+import FormData from "form-data";
 import { resolveLang, t } from "./lang.js";
 
 config({ path: resolve(dirname(fileURLToPath(import.meta.url)), "../.env") });
@@ -115,8 +118,12 @@ app.post(["/webhook", "/webhook/whatsapp"], async (req, res) => {
 async function handleMessage(message) {
   const waNumber = message.from;
   const msgId = message.id;
-  const msgType = message.type;
-  const text = message.text?.body?.trim() || "";
+  // msgType/text 用 let，不用 const——语音消息转写完之后会把这两个变量
+  // 改写成 ("text", 转写文字)，直接落进下面已有的整套文字路由逻辑
+  // （收集态/等选臂/活跃任务确认/修改意见/问答……），不用为语音另外
+  // 写一份可能悄悄跟文字路由分叉的平行逻辑。
+  let msgType = message.type;
+  let text = message.text?.body?.trim() || "";
 
   if (!waNumber || !msgId) return;
 
@@ -147,13 +154,79 @@ async function handleMessage(message) {
 
   console.log(`[webhook] from=${waNumber} type=${msgType}`);
 
-  // 方案A:交互按钮回复(选臂)。仅在"待选臂"时有意义,否则忽略。
+  // 语音消息：下载 + 转写成文字，然后原地把这条消息"变成"一条文字消息，
+  // 落进下面已有的整套文字路由逻辑——同一句话不管是打字还是说出来，理解
+  // 和路由方式完全一样。转写失败/没听清就按"没听清"礼貌回复，不当成
+  // 静默失败晾着用户（架构复审后新增，2026-07-29）。
+  if (msgType === "audio") {
+    const mediaId = message.audio?.id;
+    const lang = resolveLang(env("WA_DEFAULT_LANG", "zh"));
+    if (!mediaId) return;
+    let transcribed = "";
+    try {
+      transcribed = await downloadAndTranscribeVoice(mediaId);
+    } catch (err) {
+      console.warn(`[webhook] voice transcribe failed: ${err.message}`);
+    }
+    if (!transcribed) {
+      await gatewaySendText(waNumber, t(lang,
+        "抱歉，没听清这条语音消息，可以再说一遍或者直接打字。",
+        "Sorry, I couldn't make out that voice message — try again or type it instead."));
+      return;
+    }
+    console.log(`[webhook] voice transcribed: "${transcribed}"`);
+    msgType = "text";
+    text = transcribed;
+  }
+
+  // 交互按钮回复：方案A选臂 / 方案确认(confirm/cancel) / 收集态(完成/取消)。
+  // 原则跟 armChoice 一致——按钮只是文字指令的快捷方式，命中哪个分支就走
+  // 跟对应文字指令完全相同的队列任务，不新增后端逻辑；状态已经过期/变化时
+  // 静默忽略（不报错也不追问），避免用户点了一条陈旧消息上的按钮却卡住。
   if (msgType === "interactive") {
     const btnId = message.interactive?.button_reply?.id || message.interactive?.list_reply?.id || "";
     const awaitArm = await withTimeout(
       redis.get(awaitArmKey(waNumber)), Number(env("WA_REDIS_OP_TIMEOUT_MS", "2000")), null);
     if (awaitArm) {
       await videoQueue.add("arm-choice", { waNumber, armId: btnId, msgId }, queueOptions(msgId));
+      return;
+    }
+    if (btnId === "job_confirm" || btnId === "job_cancel") {
+      const activeJobId = await withTimeout(
+        redis.get(activeJobKey(waNumber)), Number(env("WA_REDIS_OP_TIMEOUT_MS", "2000")), null);
+      if (activeJobId) {
+        if (btnId === "job_confirm") {
+          await videoQueue.add("confirm-job", { waNumber, jobId: activeJobId, msgId }, queueOptions(msgId));
+        } else {
+          await redis.del(activeJobKey(waNumber));
+          await videoQueue.add("cancel-job", { waNumber, jobId: activeJobId, msgId }, queueOptions(msgId));
+        }
+      }
+      return;
+    }
+    if (btnId === "collect_done" || btnId === "collect_cancel") {
+      const awaitingChoice = await withTimeout(
+        redis.get(awaitChoiceKey(waNumber)), Number(env("WA_REDIS_OP_TIMEOUT_MS", "2000")), null);
+      const pendingCount = await withTimeout(
+        redis.llen(collectKey(waNumber)), Number(env("WA_REDIS_OP_TIMEOUT_MS", "2000")), 0);
+      if (!awaitingChoice && !pendingCount) return; // 素材已清空/任务已开始，按钮已过期
+      if (btnId === "collect_cancel") {
+        let captionSignal;
+        try {
+          const items = (await redis.lrange(collectKey(waNumber), 0, -1)).map((s) => JSON.parse(s));
+          captionSignal = items.map((i) => i.caption).find((c) => c);
+        } catch {}
+        await redis.del(collectKey(waNumber));
+        await redis.del(awaitChoiceKey(waNumber));
+        await videoQueue.add("collect-cancel", { waNumber, text: "cancel", captionSignal, msgId }, queueOptions(msgId));
+      } else if (!awaitingChoice && pendingCount > 0) {
+        // “完成”按钮等价于文字 go；仅在真正的收集阶段生效——若这期间已经
+        // 进了“选主视频”阶段（awaitingChoice），文字路径本身也不认 go 为
+        // 收尾指令（会被当成对编号问题的文字回答），按钮跟着同样规则走，
+        // 不额外绕过必要的主视频消歧步骤。
+        await videoQueue.add("finalize-collection", { waNumber, text: "go", msgId }, queueOptions(msgId));
+      }
+      return;
     }
     return;
   }
@@ -215,6 +288,17 @@ async function handleMessage(message) {
       `可以继续发素材，也可以用文字补充说明。全部发完回复 *go* 开始，回复 *cancel* 取消。${queueNote}`,
       `Received item #${count}, ${noun}${note}.\n` +
       `Keep sending more assets, or add a text description. Reply *go* when done, or *cancel* to clear.${queueNote}`));
+    // 按钮是文字指令 go/cancel 的快捷方式，不是替代——先发的文字消息已经
+    // 完整可用，这条按钮消息发送失败（网络抖动等）静默忽略即可，不影响
+    // 用户继续用文字完成整个收集流程。
+    try {
+      await gatewaySendButtons(waNumber, t(lang, "素材收好了吗？", "Got everything you need?"), [
+        { id: "collect_done", title: t(lang, "✅ 完成，开始", "✅ Done, go") },
+        { id: "collect_cancel", title: t(lang, "❌ 取消", "❌ Cancel") },
+      ]);
+    } catch (err) {
+      console.warn(`[webhook] collect buttons failed (text ack already sent): ${err.message}`);
+    }
     return;
   }
 
@@ -394,6 +478,38 @@ function env(name, fallback = "") {
   return process.env[name] || fallback;
 }
 
+// 下载一条 WhatsApp 语音消息 + 转写成文字（架构复审后新增，2026-07-29）。
+// 语音消息通常几秒到一两分钟，直接留在内存里传给 Python 的 /transcribe，
+// 不落临时文件——不像 worker.js 那边处理的视频/图片素材，没有"文件可能
+// 很大、要流式落盘"的顾虑，也就不需要那边那一整套临时文件生命周期管理。
+async function downloadAndTranscribeVoice(mediaId) {
+  const token = env("WA_TOKEN", env("WHATSAPP_ACCESS_TOKEN"));
+  const info = await axios.get(
+    `https://graph.facebook.com/${env("WA_GRAPH_VERSION", "v21.0")}/${mediaId}`,
+    { headers: { Authorization: `Bearer ${token}` }, timeout: Number(env("WA_MEDIA_INFO_TIMEOUT_MS", "30000")) }
+  );
+  const mediaUrl = info.data.url;
+  if (!mediaUrl) throw new Error(`WhatsApp voice media ${mediaId} no download URL`);
+  const mime = info.data.mime_type || "";
+  // WhatsApp 语音消息固定是 audio/ogg; codecs=opus；万一遇到非语音的普通
+  // 音频附件（mime 不同），扩展名跟着 mime 走，Python 那边靠 ffmpeg 解码，
+  // 不挑格式。
+  const ext = mime.includes("ogg") ? "ogg" : mime.includes("mp4") || mime.includes("m4a") ? "m4a" : "ogg";
+  const audioResp = await axios.get(mediaUrl, {
+    headers: { Authorization: `Bearer ${token}` },
+    responseType: "arraybuffer",
+    timeout: Number(env("WA_MEDIA_DOWNLOAD_TIMEOUT_MS", "60000")),
+  });
+  const form = new FormData();
+  form.append("audio", Buffer.from(audioResp.data), { filename: `voice.${ext}`, contentType: mime || "audio/ogg" });
+  const resp = await axios.post(`${PYTHON_API_BASE}/transcribe`, form, {
+    headers: form.getHeaders(),
+    maxBodyLength: Infinity, maxContentLength: Infinity,
+    timeout: Number(env("WA_TRANSCRIBE_TIMEOUT_MS", "60000")),
+  });
+  return (resp.data?.text || "").trim();
+}
+
 async function gatewaySendText(waNumber, text) {
   const token = env("WA_TOKEN", env("WHATSAPP_ACCESS_TOKEN"));
   const phoneId = env("WA_PHONE_ID", env("WHATSAPP_PHONE_NUMBER_ID"));
@@ -407,6 +523,31 @@ async function gatewaySendText(waNumber, text) {
   } catch (err) {
     console.warn("[gateway] ack send failed:", err.message);
   }
+}
+
+// worker.js 里 sendButtons 的网关侧对应版本——网关(index.js)和 worker
+// 是两个独立进程，各自直连 Graph API 发消息，不共享函数（worker 那份用的
+// 是 worker.js 自己的 axios/鉴权封装，这里保持跟同文件里 gatewaySendText
+// 一致的最小实现，不引入跨文件依赖）。调用方需要自行 try/catch——这里不
+// 吞异常，因为按钮属于“先发文字、按钮是锦上添花”的场景，调用方要知道
+// 按钮到底发没发成功，才能决定要不要静默降级。
+async function gatewaySendButtons(waNumber, bodyText, buttons) {
+  const token = env("WA_TOKEN", env("WHATSAPP_ACCESS_TOKEN"));
+  const phoneId = env("WA_PHONE_ID", env("WHATSAPP_PHONE_NUMBER_ID"));
+  if (!token || !phoneId) return;
+  await axios.post(
+    `https://graph.facebook.com/${env("WA_GRAPH_VERSION", "v21.0")}/${phoneId}/messages`,
+    {
+      messaging_product: "whatsapp", recipient_type: "individual", to: waNumber,
+      type: "interactive",
+      interactive: {
+        type: "button",
+        body: { text: bodyText },
+        action: { buttons: buttons.map((b) => ({ type: "reply", reply: { id: b.id, title: b.title } })) },
+      },
+    },
+    { headers: { Authorization: `Bearer ${token}` }, timeout: 10000 }
+  );
 }
 
 function whatsappVerifyToken() {

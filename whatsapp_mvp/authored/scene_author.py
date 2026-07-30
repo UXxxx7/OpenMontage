@@ -221,9 +221,29 @@ def build_revise_messages(tsx: str, defects: list, ctx: AuthorContext,
 
 
 # ─────────────────────────── 默认传输层(requests)───────────────────────────
-
+#
+# 架构复审后新增（2026-07-29）：这里原来是自己重新写的一份 requests.post(
+# timeout=240)，跟同一晚在 llm_client.py 里整晚在修的 DeepSeek 传输层是完全
+# 独立的第二套实现，没有分享任何加固：
+#   - timeout=240 只保证单次 socket 读取不超时，服务器间歇挤字节的话照样能
+#     拖到几分钟甚至更久——跟 llm_client._post_with_retries 改之前一模一样
+#     的漏洞（真实事故：DeepSeek 侧同一类调用实测卡过 17 分钟）。
+#   - 每次都新开一条连接，没有复用。
+# 复用 llm_client._post_bounded（后台线程 + 硬性总耗时上限，不管服务器怎么
+# "挤牙膏"到点就不再等；同时带上模块级 Session 连接复用）——请求体构造/
+# AUTHOR_LLM_*/VISION_LLM_* 配置回退/响应解析都不动，纯传输层换血。
+#
+# 硬上限**没有**直接沿用 llm_client 自己的默认值（75s，是按 DeepSeek 非流式
+# 网关 ~60s 硬时限、纯 JSON 内容规划这类调用的实际时长调的）——这里的调用
+# 现写/修订的是真实场景代码（MAX_TOKENS=32000，思考型模型自带 thinking
+# token），明显是更重的调用，硬套一个为不同工作量调的数字，会把本该成功、
+# 只是本来就需要更久的调用提前误杀，那不是这个机制原本要防的问题（防的是
+# "服务器挤牙膏导致单次调用无限期卡住"，不是"限制所有调用必须多快完成"）。
+# 用 `_post_bounded` 新增的 `hard_deadline_s` 参数传回原来这里的 240，保留
+# 原作者对这类调用合理时长的判断，只是让它变成一个真正会生效的上限，而不
+# 是"配了但挤牙膏场景下形同虚设"的数字。
 def _default_llm_call(messages: list, max_tokens: int, temperature: float) -> dict:
-    import requests
+    from whatsapp_mvp.llm_client import _post_bounded
     base = os.getenv("AUTHOR_LLM_BASE_URL", "").rstrip("/")
     key = os.getenv("AUTHOR_LLM_API_KEY", "")
     model = os.getenv("AUTHOR_LLM_MODEL", "")
@@ -238,12 +258,20 @@ def _default_llm_call(messages: list, max_tokens: int, temperature: float) -> di
             pass
     if not (base and key and model):
         raise RuntimeError("未配置多模态模型(AUTHOR_LLM_* 或仓库 VISION_LLM_*)")
-    endpoint = base + ("/chat/completions" if base.endswith("/v1") else "/v1/chat/completions")
-    resp = requests.post(
-        endpoint, headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-        json={"model": model, "messages": messages,
-              "temperature": temperature, "max_tokens": max_tokens},
-        timeout=240)
+    # 修复上面这行硬套"/v1"的真实 bug（2026-07-29，用真实配置直接调用时复现）：
+    # 本机 VISION_LLM_BASE_URL 配的是 https://open.bigmodel.cn/api/paas/v4——
+    # 不以 "/v1" 结尾，走的是 else 分支拼出 ".../v4/v1/chat/completions"，
+    # 直接 404（智谱这个网关下根本没有这条路径，真实的是 ".../v4/chat/
+    # completions"，不带 /v1）。llm_client.call_vision_chat 对同一个
+    # VISION_LLM_BASE_URL 用的是不猜测、直接拼接的写法（这整晚一直在用、
+    # 确认工作正常），这里改成同一种写法——配置了什么 base 就在后面接
+    # "/chat/completions"，不再用"是否以 /v1 结尾"去猜要不要插一段 /v1。
+    endpoint = base + "/chat/completions"
+    resp = _post_bounded(
+        endpoint, {"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        {"model": model, "messages": messages,
+         "temperature": temperature, "max_tokens": max_tokens},
+        240, hard_deadline_s=240)
     resp.raise_for_status()
     data = resp.json()
     return {"content": data["choices"][0]["message"]["content"],
@@ -252,7 +280,10 @@ def _default_llm_call(messages: list, max_tokens: int, temperature: float) -> di
 
 # ─────────────────────────── 429 退避重试 ───────────────────────────
 
+import concurrent.futures
 import time
+
+import requests
 
 
 def _is_rate_limit(e: Exception) -> bool:
@@ -262,9 +293,26 @@ def _is_rate_limit(e: Exception) -> bool:
             or "RESOURCE_EXHAUSTED" in s or "rate limit" in s.lower())
 
 
+# 架构复审后新增（2026-07-29）：_invoke 原来只认限流异常可重试，网络层的
+# 连接中断/超时（"Response ended prematurely"这类，2026-07-27~28 在 DeepSeek
+# 那条路上反复实测过 65 次、单晚 19 次）会直接被当成"非限流异常"立即抛出、
+# 不重试——传输层换成 _post_bounded 之后这类失败会更快浮现（不用再等到
+# 240s），但"浮现得更快"不等于"变得可重试"，两者是独立的两件事，都要处理。
+# 传输层瞬时故障和限流是同一类"该多等一下再试"的失败，只是触发条件不同，
+# 复用同一套 _backoffs() 退避序列即可，不需要另开一条退避逻辑。
+def _is_transient_network_error(e: Exception) -> bool:
+    """判断异常是不是传输层瞬时故障（连接中断/超时/硬性总耗时上限触发），
+    不是调用方内容本身的问题（比如请求体格式错、鉴权失败），这类值得重试。"""
+    return isinstance(e, (
+        requests.ConnectionError, requests.Timeout,
+        requests.exceptions.ChunkedEncodingError, concurrent.futures.TimeoutError,
+    ))
+
+
 def _backoffs() -> list:
-    """429 退避秒序列。默认 5,15,30(跨过 Gemini 每分钟 RPM 窗口);env 可覆盖,
-    测试设 '0,0' 免真 sleep。总退避 ≤50s,落在 worker 的规划超时(默认 180s)内。"""
+    """429/网络重试退避秒序列。默认 5,15,30(跨过 Gemini 每分钟 RPM 窗口);
+    env 可覆盖,测试设 '0,0' 免真 sleep。总退避 ≤50s,落在 worker 的规划超时
+    (默认 180s)内。"""
     raw = os.getenv("AUTHOR_LLM_RETRY_BACKOFF", "5,15,30")
     out = []
     for x in raw.split(","):
@@ -277,8 +325,9 @@ def _backoffs() -> list:
 
 def _invoke(llm_call: Callable | None, messages: list, max_tokens: int,
             temperature: float) -> dict:
-    """调模型;**仅对 429/限流**做有限退避重试(必需的 author/revise 用)。
-    非限流异常立即抛出(不无谓重试);退避用尽仍限流则抛最后一次。"""
+    """调模型;**仅对 429/限流、传输层瞬时故障**做有限退避重试(必需的
+    author/revise 用)。其它异常立即抛出(不无谓重试);退避用尽仍失败则抛
+    最后一次。"""
     fn = llm_call or _default_llm_call
     delays = _backoffs()
     for i in range(len(delays) + 1):
@@ -287,6 +336,10 @@ def _invoke(llm_call: Callable | None, messages: list, max_tokens: int,
         except Exception as e:  # noqa: BLE001
             if i < len(delays) and _is_rate_limit(e):
                 logger.warning(f"限流(429),{delays[i]:.0f}s 后重试第 {i + 1} 次: {e}")
+                time.sleep(delays[i])
+                continue
+            if i < len(delays) and _is_transient_network_error(e):
+                logger.warning(f"传输层瞬时故障,{delays[i]:.0f}s 后重试第 {i + 1} 次: {e}")
                 time.sleep(delays[i])
                 continue
             raise

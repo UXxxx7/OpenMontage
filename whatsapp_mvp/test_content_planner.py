@@ -13,6 +13,67 @@ from whatsapp_mvp.content_planner import (
     _plan_gauge, _plan_process_timeline,
 )
 
+# 下面两个 pytest 原生（真 assert，非 check()/FAILED）测试针对 plan_content
+# 的 criterion loop 早退优化（架构复审后新增，2026-07-28）——这两个是真正
+# 被 pytest 收集执行的（这个文件其余内容都在 main() 一个函数体内，pytest
+# 不会自动收集，只能靠 `python -m` 跑）。
+import whatsapp_mvp.content_planner as content_planner
+from whatsapp_mvp.content_planner import plan_content
+
+
+def test_plan_content_stops_early_when_a_round_does_not_improve_on_the_best_known(monkeypatch):
+    """跟 pipeline_runner 的 props_lint 早退是同一个判断：本轮反馈喂回去
+    之后失败项数量没有比已知最佳更少，说明 LLM 没有真正吸收反馈收敛，
+    继续跑是确定性空转。真实案例：job_7a33f9a80af8 的第 3 轮原样复现了
+    第 1 轮的失败项（第 2 轮换了别的失败项，但数量同样是 1 项，不算
+    改进）——第 3 轮没有新增任何价值，白烧了一整轮 LLM 调用，正是内容
+    规划占掉整条流水线 70%+ 时间的主因之一。"""
+    call_count = {"n": 0}
+
+    def fake_call_llm_json(label, *a, **k):
+        call_count["n"] += 1
+        return {"data_points": [], "chapters": []}
+
+    # 轮1: 1 项失败；轮2: 换了个不同的失败，但同样只有 1 项——不算改进
+    failures_sequence = [["problem A"], ["problem B"]]
+
+    def fake_quality_failures(raw, plan, duration, segments):
+        return failures_sequence.pop(0) if failures_sequence else []
+
+    monkeypatch.setattr(content_planner, "_call_llm_json", fake_call_llm_json)
+    monkeypatch.setattr(content_planner, "_plan_quality_failures", fake_quality_failures)
+
+    plan_content([{"start": 0, "end": 1, "text": "hello"}], duration=30.0)
+
+    assert call_count["n"] == 2, (
+        f"应该只调用 2 轮就提前结束（第 3 轮是确定性空转），实际调用了 {call_count['n']} 轮"
+    )
+
+
+def test_plan_content_keeps_going_while_failures_keep_decreasing(monkeypatch):
+    """跟上面相反的情况：只要每一轮都比上一轮有改进，就不应该被提前叫停
+    ——早退只拦"没有改进"的空转，不能误伤真正在收敛的重规划。"""
+    call_count = {"n": 0}
+
+    def fake_call_llm_json(label, *a, **k):
+        call_count["n"] += 1
+        return {"data_points": [], "chapters": []}
+
+    failures_sequence = [["a", "b"], ["a"], []]  # 轮1: 2项 -> 轮2: 1项(改进) -> 轮3: 0项(全部通过)
+
+    def fake_quality_failures(raw, plan, duration, segments):
+        return failures_sequence.pop(0) if failures_sequence else []
+
+    monkeypatch.setattr(content_planner, "_call_llm_json", fake_call_llm_json)
+    monkeypatch.setattr(content_planner, "_plan_quality_failures", fake_quality_failures)
+
+    plan_content([{"start": 0, "end": 1, "text": "hello"}], duration=30.0)
+
+    assert call_count["n"] == 3, (
+        f"持续改进时应该跑满 3 轮直到全部通过，实际调用了 {call_count['n']} 轮"
+    )
+
+
 FAILED = []
 
 

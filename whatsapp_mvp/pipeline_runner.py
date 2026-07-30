@@ -663,6 +663,34 @@ def _safe_transcribe(src: str, workdir: Path, model_size: str, hotwords: str = _
 
 _DEFAULT_SPEAKER_OBJECT_POSITION = "50% 35%"
 
+# 架构复审后新增（2026-07-28）：统计过本机全部 33 次人脸校准记录，23 次
+# （70%）落在 Y=51-52% 附近——这个区间就是这一晚反复触发"脸部被裁切"降级
+# 的那个区间（job_cb04960d9a48/job_5b0ec0b914ee/job_7a33f9a80af8 三个 job
+# 都是这个校准值）。根因：compose-director.md 规定的公式（下面 docstring
+# 里那行）直接把人脸在**原始视频**里的位置占比，原样套用成卡片里的取景
+# 位置——这个换算只在"原视频里人脸的相对位置刚好也适合卡片"时凑巧成立，
+# 对着摄像头略低于视线拍摄（很常见的笔记本摄像头角度）的视频，人脸中心
+# 天然落在画面偏下的位置，直接套用就会让卡片的裁剪窗口偏下、把头顶切掉。
+# 极端情况更明显：还观测到两次 92%/79-80% 的校准结果，明显是误检测（背景
+# 里的物体/画面边角），不加边界的话这类误检测会直接产出完全不能用的取景。
+#
+# 钳制边界不是拍脑袋定的：qa_stills._VISION_CHECKLIST 第一条本来就明确写了
+# "脸应在其卡片顶部 20-40% 位置"——这是视觉复审自己拿来判断取景好坏的标准，
+# 直接拿来当校准结果的钳制区间，跟下游判断口径完全一致。X 方向的钳制只是
+# 防止误检测产生的极端值，观测到的正常范围都在 42-53% 附近，30-70% 给了
+# 足够宽的余量，不会影响任何正常校准结果。
+_CALIBRATION_Y_MIN, _CALIBRATION_Y_MAX = 20.0, 40.0
+_CALIBRATION_X_MIN, _CALIBRATION_X_MAX = 30.0, 70.0
+
+
+def _clamp_calibrated_object_position(raw_x_pct: float, raw_y_pct: float) -> tuple[str, bool]:
+    """纯函数，方便直接单测，不用 mock FaceTracker。返回 (钳制后的 CSS
+    object-position 字符串, 这次是否真的被钳制过)。"""
+    clamped_x = max(_CALIBRATION_X_MIN, min(raw_x_pct, _CALIBRATION_X_MAX))
+    clamped_y = max(_CALIBRATION_Y_MIN, min(raw_y_pct, _CALIBRATION_Y_MAX))
+    was_clamped = abs(clamped_x - raw_x_pct) > 0.5 or abs(clamped_y - raw_y_pct) > 0.5
+    return f"{round(clamped_x)}% {round(clamped_y)}%", was_clamped
+
 
 def calibrate_speaker_object_position(src: str, workdir: Path) -> str:
     """对源视频跑 face_tracker，取人脸中心中位数 -> CSS object-position。
@@ -670,6 +698,10 @@ def calibrate_speaker_object_position(src: str, workdir: Path) -> str:
     compose-director.md 的强制校准项：objPos ≈ face_center_y/source_height*100，
     不同源视频没有通用值。检测不到人脸/缺 opencv 时退回静态默认值。
     （注意本机 opencv-python 必须 <5：5.0 wheel 不带 Haar cascade。）
+
+    计算完原始公式后钳制到 [_CALIBRATION_X_MIN, _CALIBRATION_X_MAX] x
+    [_CALIBRATION_Y_MIN, _CALIBRATION_Y_MAX]——见上面模块级注释，这个区间
+    直接取自视觉复审自己的取景判断标准，不是新发明的口径。
     """
     try:
         from tools.analysis.face_tracker import FaceTracker
@@ -690,8 +722,15 @@ def calibrate_speaker_object_position(src: str, workdir: Path) -> str:
         centers_x = sorted(f["bbox"]["x"] + f["bbox"]["width"] / 2 for f in faces)
         centers_y = sorted(f["bbox"]["y"] + f["bbox"]["height"] / 2 for f in faces)
         mid = len(faces) // 2
-        obj_pos = f"{round(centers_x[mid] * 100)}% {round(centers_y[mid] * 100)}%"
-        logger.info(f"  apply_style: 人脸校准取景 -> {obj_pos}（{len(faces)}帧检出，取中位数）")
+        raw_x, raw_y = centers_x[mid] * 100, centers_y[mid] * 100
+        obj_pos, was_clamped = _clamp_calibrated_object_position(raw_x, raw_y)
+        if was_clamped:
+            logger.info(
+                f"  apply_style: 人脸校准取景原始值 {raw_x:.0f}% {raw_y:.0f}% 超出合理区间，"
+                f"钳制为 {obj_pos}（{len(faces)}帧检出，取中位数）"
+            )
+        else:
+            logger.info(f"  apply_style: 人脸校准取景 -> {obj_pos}（{len(faces)}帧检出，取中位数）")
         return obj_pos
     except Exception as e:
         logger.warning(f"  apply_style: face_tracker 调用异常，用默认取景: {e}")
@@ -2523,12 +2562,25 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
             # aren't assigned into props until further below, so reading them
             # back via props.get(...) here would silently no-op.
             _mount_floor = intro_out + 20 + 20  # intro_out+20(clamp) + TRANSITION_FRAMES(20)
+            # plan_corner_cards 加进这个列表是架构复审后新增（2026-07-28，真实
+            # 复现 job_5b0ec0b914ee）：这条地板线本来就覆盖了几乎所有图形类型，
+            # 唯独漏了 corner_cards——CornerCard.tsx 自己的文档明确写了"绝不在
+            # section takeover/quote 期间渲染，卡片被隐藏时渲染了也看不见"，但
+            # 那条保护只覆盖 content_planner 认识的 sections/quote takeover，intro
+            # 是下游 pipeline_runner 才算出来的独立窗口，content_planner 规划
+            # corner_card 时根本不知道它的存在。真实复现：mountFrame=0 的聊天
+            # 气泡卡片跟 intro 深色开场大标题同时出现在画面上，视觉复审判定其中
+            # 文字"被截断"（实际是卡片被挤到画布边缘、跟开场标题抢位置），
+            # 是这个 job 最终降级交付的直接原因。corner_card 渲染在 SpeakerCard
+            # 内部、不参与内容区堆叠，机制上跟这条地板线已覆盖的其它图形类型
+            # 完全一样，直接并入同一条地板线，不用另写一套逻辑。
             for _items in (data_cards, gauges, countdowns, calendar_events,
                            before_after, plan_quotes, plan_pills, plan_step_lists, plan_topic_cards,
                            plan_comparisons, plan_ranked_lists, plan_checklists,
                            plan_location_pins, plan_testimonials, plan_icon_clusters,
                            plan_progress_bars, plan_pros_cons, plan_milestone_tracks,
-                           plan_trust_badges, plan_bar_charts, plan_milestone_unlocks):
+                           plan_trust_badges, plan_bar_charts, plan_milestone_unlocks,
+                           plan_corner_cards):
                 _floor_shift_graphics(_items, _mount_floor)
             _floor_shift_zone_headers(plan_zone_headers, _mount_floor)
 

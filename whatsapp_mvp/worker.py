@@ -528,6 +528,18 @@ def _run_llm_planner(job: Any, wa: Any = None) -> None:
 # Phase 5: 发送确认消息
 # ---------------------------------------------------------------------------
 
+def _plan_needs_broll_generation(operations: list) -> bool:
+    """规划里有没有要求 AI 现生成 b-roll（gen_prompt，不是用户上传的
+    asset_ref）——只有这类才用得上 gemini_broll 的额度状态检测。"""
+    for op in operations or []:
+        if op.get("type") != "insert_broll":
+            continue
+        for item in op.get("items") or []:
+            if isinstance(item, dict) and item.get("gen_prompt") and not item.get("asset_ref"):
+                return True
+    return False
+
+
 def _send_confirmation(job: Any, wa: WhatsAppClient) -> None:
     """向用户发送编辑计划确认消息，等待批准。"""
     try:
@@ -547,6 +559,25 @@ def _send_confirmation(job: Any, wa: WhatsAppClient) -> None:
     summary = plan.get("summary", "编辑计划已生成")
     operations = plan.get("edit_operations", [])
 
+    # 架构复审后新增（2026-07-29，真实事故驱动，job_9c671249eb76）：规划里
+    # 要求 AI 生成 b-roll，但账号当时在 Gemini 免费档、对应模型配额是
+    # 0——用户直到确认、等生成失败了才知道这段不会有。这里在发确认消息
+    # *之前*就检查一次（不产生真实调用，读的是最近一次真实失败留下的本地
+    # 缓存），命中就把警示写进 plan 本身并重新持久化——Node 网关模式下这条
+    # 消息真正的文案是 Node 读 GET /jobs/{id} 的 planned_edit 自己拼的（这里
+    # 走 _safe_send 那份是直连模式用的，网关模式下是死代码），所以警示必须
+    # 落进 plan 字段本身，不能只加进下面这条本地拼的 msg_lines 里。
+    if _plan_needs_broll_generation(operations):
+        from .gemini_broll import check_broll_generation_availability
+        available, reason = check_broll_generation_availability()
+        if not available:
+            plan["broll_generation_warning"] = reason
+            update_job_fields(job.id, planned_edit=json.dumps(plan, ensure_ascii=False))
+            logger.warning(
+                f"任务 {job.id}: 规划要求 AI 生成 b-roll，但当前不可用（{reason}）"
+                "，已在确认消息里提前警示"
+            )
+
     msg_lines = [
         f"*视频编辑计划* 📋",
         f"",
@@ -558,6 +589,9 @@ def _send_confirmation(job: Any, wa: WhatsAppClient) -> None:
         for i, op in enumerate(operations, 1):
             desc = op.get("description", op.get("type", "未知操作"))
             msg_lines.append(f"  {i}. {desc}")
+
+    if plan.get("broll_generation_warning"):
+        msg_lines.extend(["", f"⚠️ AI 生成 b-roll 当前不可用：{plan['broll_generation_warning']}"])
 
     msg_lines.extend([
         "",
