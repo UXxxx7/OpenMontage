@@ -452,17 +452,27 @@ async function collectionChoice({ waNumber, choice }) {
 async function startWithMain(waNumber, items, mainItem, assign, lang) {
   const videos = items.filter((i) => i.kind === "video");
   const labels = (assign && assign.labels) || {};
-  const brollItems = items.filter((i) => i !== mainItem).map((i) => {
-    let label = i.caption || "";
-    if (i.kind === "video") {
-      const num = videos.indexOf(i) + 1;  // 该视频的上传编号（1 开始）
-      label = labels[String(num)] || labels[num] || i.caption || "";
-    }
-    return { ...i, label };
-  });
+  // 参考风格视频(可选,模块4):从 assign.reference_index(视频编号,1 开始)识别。
+  // 它既不是主视频、也不进 b-roll,单独抽出来透传给 Python 落成 style_ref.*。
+  let referenceItem = null;
+  const refNum = Number(assign && assign.reference_index);
+  if (refNum >= 1 && refNum <= videos.length) {
+    const cand = videos[refNum - 1];
+    if (cand && cand !== mainItem) referenceItem = cand;
+  }
+  const brollItems = items
+    .filter((i) => i !== mainItem && i !== referenceItem)
+    .map((i) => {
+      let label = i.caption || "";
+      if (i.kind === "video") {
+        const num = videos.indexOf(i) + 1;  // 该视频的上传编号（1 开始）
+        label = labels[String(num)] || labels[num] || i.caption || "";
+      }
+      return { ...i, label };
+    });
   const editRequest = (assign && assign.edit_request) || mainItem.caption || "";
   // 方案A:go 后先让用户点选臂(套模板 / AI 现写),不立即建 job;点选后由 armChoice 续跑。
-  await askArm(waNumber, { mainItem, brollItems, editRequest, lang });
+  await askArm(waNumber, { mainItem, brollItems, referenceItem, editRequest, lang });
 }
 
 // ── 方案A:选臂(Arm A 套模板 / Arm B AI 现写)──────────────────────────
@@ -523,7 +533,7 @@ async function armChoice({ waNumber, armId, armText }) {
   const claimed = await redis.del(armPendingKey(waNumber));
   if (!claimed) return;
   await redis.del(awaitArmKey(waNumber));
-  await runCollectionJob(waNumber, ctx.mainItem, ctx.brollItems, ctx.editRequest, lang, arm);
+  await runCollectionJob(waNumber, ctx.mainItem, ctx.brollItems, ctx.editRequest, lang, arm, ctx.referenceItem);
 }
 
 async function sendButtons(to, bodyText, buttons) {
@@ -572,7 +582,7 @@ async function postAssign(videoCount, notes) {
 }
 
 // 下载主视频 + 所有 b-roll → 一次性 POST /jobs → 设活跃任务 → 等方案 → 回方案
-async function runCollectionJob(waNumber, mainItem, brollItems, editRequest, lang, arm) {
+async function runCollectionJob(waNumber, mainItem, brollItems, editRequest, lang, arm, referenceItem) {
   const effLang = resolveLang(lang || DEFAULT_LANG, editRequest, mainItem.caption);
   if (!hasWACredentials()) {
     await sendText(waNumber, t(effLang,
@@ -602,10 +612,24 @@ async function runCollectionJob(waNumber, mainItem, brollItems, editRequest, lan
       tempPaths.push(p);
       brollPaths.push({ path: p, label: b.label || b.caption || "", kind: b.kind });
     }
+    // 参考风格视频(可选):下载后作为 reference 传给 Python，落成 job_dir/style_ref.*。
+    // 它只是"照这个风格剪"的 best-effort 输入,不是用户要的内容——下载失败绝不能
+    // 拖垮整单(此时 collectKey 已被认领删除,抛错会让重试空转、用户被迫重发全部素材)。
+    // 失败就降级为 null(不带参考风格),让主视频照常剪完。
+    let referencePayload = null;
+    if (referenceItem && referenceItem.mediaId) {
+      try {
+        const refPath = await downloadWhatsAppMedia(referenceItem.mediaId, referenceItem.kind || "video");
+        tempPaths.push(refPath);
+        referencePayload = { path: refPath, kind: referenceItem.kind || "video" };
+      } catch (err) {
+        console.warn(`[worker] reference download failed, proceeding without style ref: ${err.message}`);
+      }
+    }
     const created = await createPythonJobMulti(
       mainPath,
       editRequest || mainItem.caption || "Remove blank parts, add subtitles, and make it flow smoothly.",
-      brollPaths, arm);
+      brollPaths, arm, referencePayload);
     const jobId = created.job_id;
     await redis.set(activeJobKey(waNumber), jobId, "EX", Number(env("WA_ACTIVE_JOB_TTL", "86400")));
 
@@ -622,7 +646,7 @@ async function runCollectionJob(waNumber, mainItem, brollItems, editRequest, lan
   }
 }
 
-async function createPythonJobMulti(videoPath, editRequest, brollPaths, arm) {
+async function createPythonJobMulti(videoPath, editRequest, brollPaths, arm, reference) {
   const form = new FormData();
   form.append("video", fs.createReadStream(videoPath),
     { filename: "input.mp4", contentType: "video/mp4" });
@@ -637,6 +661,14 @@ async function createPythonJobMulti(videoPath, editRequest, brollPaths, arm) {
     form.append("broll_labels", b.label || "");
     form.append("broll_kinds", b.kind || "video");
   });
+  // 参考风格视频(可选,模块4):作为 reference 字段随表单上传，Python /jobs 落成 style_ref.*
+  if (reference && reference.path) {
+    const refExt = path.extname(reference.path) || (reference.kind === "image" ? ".jpg" : ".mp4");
+    const refCtype = reference.kind === "image" ? "image/jpeg" : "video/mp4";
+    form.append("reference", fs.createReadStream(reference.path),
+      { filename: `style_ref${refExt}`, contentType: refCtype });
+    form.append("reference_kind", reference.kind || "video");
+  }
   const resp = await axios.post(`${pythonApiBase}/jobs`, form, {
     headers: form.getHeaders(),
     maxBodyLength: Infinity, maxContentLength: Infinity,

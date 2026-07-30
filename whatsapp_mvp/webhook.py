@@ -454,11 +454,14 @@ _ASSIGN_SYSTEM = (
     "并用一段或多段文字描述这些视频要怎么剪。请判断：\n"
     "1. 哪个视频是“主视频”（出镜/口播、要加字幕或剪辑的主体）——返回它的编号（1 开始）；"
     "文字里说不清就返回 null。\n"
-    "2. 其余视频是 b-roll 补充素材，为每个 b-roll 提取插入说明（label，如“讲到 VS Code 时插入”）。\n"
-    "3. 提取对主视频的编辑要求 edit_request（如“加字幕、剪掉空白和自我打断”）。\n"
-    "只输出 JSON，不要多余文字：{\"main_index\": <int|null>, "
+    "2. 是否有某个视频是“参考风格视频”——用户想模仿它的剪辑风格/转场/节奏/特效/"
+    "色彩/字幕样式（如“参照这个视频的风格剪”“照这个的转场来”），它本身既不是要剪的"
+    "内容、也不是 b-roll 素材。有就返回它的编号（1 开始，且必须与主视频编号不同），没有返回 null。\n"
+    "3. 其余视频是 b-roll 补充素材，为每个 b-roll 提取插入说明（label，如“讲到 VS Code 时插入”）。\n"
+    "4. 提取对主视频的编辑要求 edit_request（如“加字幕、剪掉空白和自我打断”）。\n"
+    "只输出 JSON，不要多余文字：{\"main_index\": <int|null>, \"reference_index\": <int|null>, "
     "\"labels\": {\"<视频编号>\": \"<说明>\"}, \"edit_request\": \"<字符串>\"}。"
-    "labels 只含 b-roll 视频（不含主视频），键是视频编号的字符串；某段找不到说明就给空字符串。"
+    "labels 只含 b-roll 视频（不含主视频、不含参考风格视频），键是视频编号的字符串；某段找不到说明就给空字符串。"
 )
 
 
@@ -466,7 +469,7 @@ _ASSIGN_SYSTEM = (
 async def assign_endpoint(video_count: int = Form(...), notes: str = Form("")):
     """把“N 个视频（按上传顺序）+ 用户描述文字”解析成 {main_index, labels, edit_request}。
     解析失败或说不清主视频时 main_index=null，由 Node 侧回退到“问编号”。"""
-    result = {"main_index": None, "labels": {}, "edit_request": notes or ""}
+    result = {"main_index": None, "reference_index": None, "labels": {}, "edit_request": notes or ""}
     try:
         from .llm_client import call_llm_chat
         user_msg = (
@@ -485,6 +488,17 @@ async def assign_endpoint(video_count: int = Form(...), notes: str = Form("")):
                 result["main_index"] = int(mi)
             elif isinstance(mi, str) and mi.strip().isdigit():
                 result["main_index"] = int(mi.strip())
+            ri = data.get("reference_index")
+            if isinstance(ri, bool):
+                ri = None
+            if isinstance(ri, (int, float)):
+                result["reference_index"] = int(ri)
+            elif isinstance(ri, str) and ri.strip().isdigit():
+                result["reference_index"] = int(ri.strip())
+            # 参考视频不能同时是主视频（模型偶尔混淆）——冲突则丢弃参考判断
+            if (result["reference_index"] is not None
+                    and result["reference_index"] == result["main_index"]):
+                result["reference_index"] = None
             if isinstance(data.get("labels"), dict):
                 result["labels"] = {str(k): str(v) for k, v in data["labels"].items()}
             if data.get("edit_request"):
@@ -546,6 +560,8 @@ async def create_job_endpoint(
     broll_labels: List[str] = Form(default=[]),
     broll_kinds: List[str] = Form(default=[]),
     arm: str = Form(""),
+    reference: Optional[UploadFile] = File(default=None),
+    reference_kind: str = Form(""),
 ):
     config = get_config()
     user = get_or_create_user("api_user")
@@ -589,6 +605,16 @@ async def create_job_endpoint(
             media_id = f"local_{i}"
             append_asset(job.id, media_id, kind, label)          # role=broll, order=i
             set_asset_local_path(job.id, media_id, str(dest))    # 标记已下载
+
+    # 参考风格视频（可选，模块4）：模型读它的剪辑风格（转场/节奏/特效/色彩/字幕样式
+    # 等），落盘到 job_dir/style_ref.<ext>；authored 侧 _prepare 会 glob 到它并分析成
+    # style_spec。它既不是要剪的主视频、也不是要合成的 b-roll，故不进 job.assets。
+    if reference is not None:
+        ref_data = await reference.read()
+        if ref_data:
+            ref_ext = (os.path.splitext(reference.filename or "")[1].lstrip(".")
+                       or ("jpg" if (reference_kind or "").lower() == "image" else "mp4")).lower()
+            (job_dir / f"style_ref.{ref_ext}").write_bytes(ref_data)
 
     update_job_status(job.id, JobStatus.RECEIVED)
 
