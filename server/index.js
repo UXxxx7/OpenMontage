@@ -179,13 +179,54 @@ async function handleMessage(message) {
     text = transcribed;
   }
 
-  // 方案A:交互按钮回复(选臂)。仅在"待选臂"时有意义,否则忽略。
+  // 交互按钮回复：方案A选臂 / 方案确认(confirm/cancel) / 收集态(完成/取消)。
+  // 原则跟 armChoice 一致——按钮只是文字指令的快捷方式，命中哪个分支就走
+  // 跟对应文字指令完全相同的队列任务，不新增后端逻辑；状态已经过期/变化时
+  // 静默忽略（不报错也不追问），避免用户点了一条陈旧消息上的按钮却卡住。
   if (msgType === "interactive") {
     const btnId = message.interactive?.button_reply?.id || message.interactive?.list_reply?.id || "";
     const awaitArm = await withTimeout(
       redis.get(awaitArmKey(waNumber)), Number(env("WA_REDIS_OP_TIMEOUT_MS", "2000")), null);
     if (awaitArm) {
       await videoQueue.add("arm-choice", { waNumber, armId: btnId, msgId }, queueOptions(msgId));
+      return;
+    }
+    if (btnId === "job_confirm" || btnId === "job_cancel") {
+      const activeJobId = await withTimeout(
+        redis.get(activeJobKey(waNumber)), Number(env("WA_REDIS_OP_TIMEOUT_MS", "2000")), null);
+      if (activeJobId) {
+        if (btnId === "job_confirm") {
+          await videoQueue.add("confirm-job", { waNumber, jobId: activeJobId, msgId }, queueOptions(msgId));
+        } else {
+          await redis.del(activeJobKey(waNumber));
+          await videoQueue.add("cancel-job", { waNumber, jobId: activeJobId, msgId }, queueOptions(msgId));
+        }
+      }
+      return;
+    }
+    if (btnId === "collect_done" || btnId === "collect_cancel") {
+      const awaitingChoice = await withTimeout(
+        redis.get(awaitChoiceKey(waNumber)), Number(env("WA_REDIS_OP_TIMEOUT_MS", "2000")), null);
+      const pendingCount = await withTimeout(
+        redis.llen(collectKey(waNumber)), Number(env("WA_REDIS_OP_TIMEOUT_MS", "2000")), 0);
+      if (!awaitingChoice && !pendingCount) return; // 素材已清空/任务已开始，按钮已过期
+      if (btnId === "collect_cancel") {
+        let captionSignal;
+        try {
+          const items = (await redis.lrange(collectKey(waNumber), 0, -1)).map((s) => JSON.parse(s));
+          captionSignal = items.map((i) => i.caption).find((c) => c);
+        } catch {}
+        await redis.del(collectKey(waNumber));
+        await redis.del(awaitChoiceKey(waNumber));
+        await videoQueue.add("collect-cancel", { waNumber, text: "cancel", captionSignal, msgId }, queueOptions(msgId));
+      } else if (!awaitingChoice && pendingCount > 0) {
+        // “完成”按钮等价于文字 go；仅在真正的收集阶段生效——若这期间已经
+        // 进了“选主视频”阶段（awaitingChoice），文字路径本身也不认 go 为
+        // 收尾指令（会被当成对编号问题的文字回答），按钮跟着同样规则走，
+        // 不额外绕过必要的主视频消歧步骤。
+        await videoQueue.add("finalize-collection", { waNumber, text: "go", msgId }, queueOptions(msgId));
+      }
+      return;
     }
     return;
   }
@@ -247,6 +288,17 @@ async function handleMessage(message) {
       `可以继续发素材，也可以用文字补充说明。全部发完回复 *go* 开始，回复 *cancel* 取消。${queueNote}`,
       `Received item #${count}, ${noun}${note}.\n` +
       `Keep sending more assets, or add a text description. Reply *go* when done, or *cancel* to clear.${queueNote}`));
+    // 按钮是文字指令 go/cancel 的快捷方式，不是替代——先发的文字消息已经
+    // 完整可用，这条按钮消息发送失败（网络抖动等）静默忽略即可，不影响
+    // 用户继续用文字完成整个收集流程。
+    try {
+      await gatewaySendButtons(waNumber, t(lang, "素材收好了吗？", "Got everything you need?"), [
+        { id: "collect_done", title: t(lang, "✅ 完成，开始", "✅ Done, go") },
+        { id: "collect_cancel", title: t(lang, "❌ 取消", "❌ Cancel") },
+      ]);
+    } catch (err) {
+      console.warn(`[webhook] collect buttons failed (text ack already sent): ${err.message}`);
+    }
     return;
   }
 
@@ -471,6 +523,31 @@ async function gatewaySendText(waNumber, text) {
   } catch (err) {
     console.warn("[gateway] ack send failed:", err.message);
   }
+}
+
+// worker.js 里 sendButtons 的网关侧对应版本——网关(index.js)和 worker
+// 是两个独立进程，各自直连 Graph API 发消息，不共享函数（worker 那份用的
+// 是 worker.js 自己的 axios/鉴权封装，这里保持跟同文件里 gatewaySendText
+// 一致的最小实现，不引入跨文件依赖）。调用方需要自行 try/catch——这里不
+// 吞异常，因为按钮属于“先发文字、按钮是锦上添花”的场景，调用方要知道
+// 按钮到底发没发成功，才能决定要不要静默降级。
+async function gatewaySendButtons(waNumber, bodyText, buttons) {
+  const token = env("WA_TOKEN", env("WHATSAPP_ACCESS_TOKEN"));
+  const phoneId = env("WA_PHONE_ID", env("WHATSAPP_PHONE_NUMBER_ID"));
+  if (!token || !phoneId) return;
+  await axios.post(
+    `https://graph.facebook.com/${env("WA_GRAPH_VERSION", "v21.0")}/${phoneId}/messages`,
+    {
+      messaging_product: "whatsapp", recipient_type: "individual", to: waNumber,
+      type: "interactive",
+      interactive: {
+        type: "button",
+        body: { text: bodyText },
+        action: { buttons: buttons.map((b) => ({ type: "reply", reply: { id: b.id, title: b.title } })) },
+      },
+    },
+    { headers: { Authorization: `Bearer ${token}` }, timeout: 10000 }
+  );
 }
 
 function whatsappVerifyToken() {

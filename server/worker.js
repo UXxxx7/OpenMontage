@@ -200,10 +200,22 @@ async function createPythonCrollJob(photoPath, lang, hint) {
   return resp.data;
 }
 
+// Python /confirm 只接受 WAITING_CONFIRMATION（其余几个是"已经在跑/已完成"
+// 的幂等直通，见 webhook.py confirm_job_endpoint）；真正会被拒绝(400)的是
+// 任务还没走到能确认的阶段（比如 c-roll 生成中）——跟 reviseJob 同一个
+// 教训，提前用已取到的状态短路掉，不发"已确认"这种在这种情况下不真实的话。
+const CONFIRM_OK_STATUSES = ["WAITING_CONFIRMATION", "RUNNING_PIPELINE", "RENDERING", "PREVIEW_READY", "DONE"];
+
 async function confirmJob({ waNumber, jobId }) {
   await disarmIdle(waNumber); // 用户已确认，作废"等待确认"的超时
   const before = await getPythonJob(jobId).catch(() => null);
   const lang = resolveLang(DEFAULT_LANG, before?.edit_request);
+  if (!before || !CONFIRM_OK_STATUSES.includes(before.status)) {
+    await safeSendText(waNumber, t(lang,
+      "这一步还在处理中，暂时还不能确认。完成后会主动发消息给你，到时候再确认就行。",
+      "Still working on the current step — can't confirm yet. I'll message you once it's ready to confirm."));
+    return;
+  }
   await postPython(`/jobs/${encodeURIComponent(jobId)}/confirm`);
   await sendText(waNumber, t(lang,
     "已确认，正在剪辑视频（预计 3-10 分钟）...",
@@ -350,6 +362,27 @@ async function finalizeCollection({ waNumber, text }) {
   const captionSignal = items.map((i) => i.caption).find((c) => c);
   const lang = resolveLang(DEFAULT_LANG, text, captionSignal);
   if (videos.length === 0) {
+    // 只收到一张照片、从头到尾没有视频——在这个产品里唯一说得通的去处是
+    // "照片生成数字人说话视频"（c-roll），常规的"主视频 + b-roll"剪辑必须
+    // 有主视频，走不通。用户已经明确回复 go / 点了"完成，开始"按钮，等于
+    // 在说"这就是我这次要提交的全部素材了"，没有第二种合理解读。
+    //
+    // 原来 c-roll 只能靠图片自带的触发词 caption（"数字人"/"生成视频"等）
+    // 识别，且必须跟照片打包在同一条消息里——这对语音用户走不通：WhatsApp
+    // 不支持给照片配一段语音当 caption，只能先发照片、再单独发一条文字/
+    // 语音描述，触发词永远落不到 caption 上（真实反馈，2026-07-30：语音
+    // 配图发 c-roll 请求，图片被当成普通 b-roll 素材收走，得靠反复重发才
+    // 发现走不通）。这里不再要求触发词——finalize 这个时间点本身已经是
+    // 无歧义信号，不需要靠猜关键词。多于一张照片、仍然没视频的情况维持
+    // 原样提示：那种情况更可能是收错素材了，不擅自猜哪张才是要生成的那张。
+    if (items.length === 1 && items[0].kind === "image") {
+      const hint = await buildNotes(waNumber, items);
+      await redis.del(collectKey(waNumber));
+      await redis.del(notesKey(waNumber));
+      await redis.del(awaitChoiceKey(waNumber));
+      await crollGenerate({ waNumber, mediaId: items[0].mediaId, caption: hint });
+      return;
+    }
     await safeSendText(waNumber, t(lang,
       "还没有收到主视频。请先发送一段你要编辑的视频，再回复 *go*。",
       "No main video received yet. Send the video you want edited, then reply *go*."));
@@ -683,11 +716,28 @@ async function postPythonForm(pathname, text) {
   return resp.data;
 }
 
+// 方案/预览阶段以外都不该接受"修改意见"重规划（真实事故，2026-07-30，
+// job_64f2d7dd56dd）：c-roll 生成期间（HeyGen 还没跑完，视频还不存在）用户
+// 又发一句追加语音，被当成对当前任务的修改意见直接触发重规划，读到的是
+// 根本不存在的视频，规划出一份"时长 0 秒"的假方案，还把 job 状态提前改
+// 成了待确认——真正的 HeyGen 视频后来生成完成时，这份假方案已经污染了
+// job，用户确认时找不到真实视频文件。Python 侧 /revise 现在会拒绝（跟
+// /retry、/confirm 一样补了状态校验），这里用已经取到的 job 状态提前短路
+// 掉，避免真打一次才被拒——顺便避免"收到修改意见，正在重新规划"这句话
+// 在被拒绝时变成一句误导用户的假话。
+const REVISABLE_STATUSES = ["WAITING_CONFIRMATION", "PREVIEW_READY"];
+
 // 就地修订：用户在方案/预览阶段直接打字提意见 → Python 带反馈重规划 → 回新方案
 async function reviseJob({ waNumber, jobId, text }) {
   await disarmIdle(waNumber); // 用户发来修改意见＝有操作，作废旧超时；重规划后再计时
   const before = await getPythonJob(jobId).catch(() => null);
   const lang = resolveLang(DEFAULT_LANG, text, before?.edit_request);
+  if (!before || !REVISABLE_STATUSES.includes(before.status)) {
+    await safeSendText(waNumber, t(lang,
+      "这一步还在处理中，暂时改不了方案。等这步完成、收到下一条消息后，再把这条意见发一遍就行。",
+      "Still working on the current step — can't revise yet. Once it's done and you get the next message, resend this feedback then."));
+    return;
+  }
   await sendText(waNumber, t(lang, "收到修改意见，正在重新规划...", "Got your feedback, revising the plan..."));
   await postPythonForm(`/jobs/${encodeURIComponent(jobId)}/revise`, text);
   const status = await waitForStatus(jobId,
@@ -762,7 +812,25 @@ async function deliverStageResult(waNumber, jobId, status, lang) {
   }
   // WAITING_CONFIRMATION
   await sendText(waNumber, formatPlanMessage(status, jobLang) + idleHint(jobLang, "confirm"));
+  await sendConfirmButtons(waNumber, jobLang);
   await armIdle(waNumber, jobId, "confirm", jobLang);
+}
+
+// 方案确认按钮：文字版方案（含完整说明/操作列表/额度警示）已经先发出去了，
+// 这条只是附加的快捷点按方式——不能替代文字消息，因为方案正文经常超过
+// WhatsApp 交互消息 1024 字的 body 上限，塞不进按钮消息里。发送失败（网络
+// 抖动、账号未开交互消息权限等）不影响主流程：文字版的 "回复 confirm/
+// cancel" 路径本来就完整可用，这里静默降级，不重发一次纯文字兜底（避免
+// 同一条方案在弱网下刷两遍文字)。
+async function sendConfirmButtons(waNumber, lang) {
+  try {
+    await sendButtons(waNumber, t(lang, "准备好了吗？", "Ready to go?"), [
+      { id: "job_confirm", title: t(lang, "✅ 确认开始", "✅ Confirm") },
+      { id: "job_cancel", title: t(lang, "❌ 取消", "❌ Cancel") },
+    ]);
+  } catch (err) {
+    console.warn(`[worker] confirm buttons failed (text plan already sent): ${err.message}`);
+  }
 }
 
 // Resumed wait after a previous round's poll window ran out without the

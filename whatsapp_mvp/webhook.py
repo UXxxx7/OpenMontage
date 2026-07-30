@@ -875,6 +875,24 @@ async def revise_job_endpoint(job_id: str, text: str = Form("")):
     job = get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
+    # 幂等：已经在重新规划中，直接返回，避免 Node 队列重试触发双跑
+    if job.status == JobStatus.PLANNING:
+        return {"job_id": job_id, "status": job.status.value}
+    # 真实事故（2026-07-30，job_64f2d7dd56dd）：这个端点原来没有状态校验——
+    # C-roll 生成期间（HeyGen 还没跑完，input.mp4 还不存在，job.status 还是
+    # DOWNLOADING_MEDIA）用户又发来一条追加语音，被 Node 当成"对当前任务的
+    # 修改意见"直接打到这里、触发重规划：读到的是根本不存在的视频，规划出
+    # 一份"时长 0 秒"的假方案，还把 job 状态提前改成了 WAITING_CONFIRMATION。
+    # 等 HeyGen 真正生成完成、process_incoming_message 跑出本该正确的方案时，
+    # 已经被这次抢跑覆盖/污染，用户之后确认时 input_video_path 对不上真实
+    # 文件，报"找不到输入视频"。跟 /retry、/confirm 一样补上状态校验：只有
+    # 方案阶段或预览阶段才能修订，其余一律拒绝（Node 侧会在发起请求前用已
+    # 经取到的 job 状态提前短路掉，不会真的打到这条 400）。
+    if job.status not in (JobStatus.WAITING_CONFIRMATION, JobStatus.PREVIEW_READY):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Job is in {job.status.value}, cannot revise yet",
+        )
     update_job_status(job_id, JobStatus.PLANNING)
     # 后台带反馈重规划，立即返回；Node 轮询等待新方案（WAITING_CONFIRMATION）
     _run_in_background(_enqueue_revise, job_id, text)
