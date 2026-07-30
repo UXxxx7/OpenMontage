@@ -176,7 +176,7 @@ def call_llm_chat(system_prompt: str, user_message: str, *, temperature: float =
         if not base:
             logger.warning("LLM_PROVIDER=custom but no LLM_BASE_URL set")
             return None
-        endpoint = base + ("/chat/completions" if base.endswith("/v1") else "/v1/chat/completions")
+        endpoint = base + ("/chat/completions" if (base.endswith("/v1") or base.endswith("/openai")) else "/v1/chat/completions")
         api_key = config.llm_api_key
     else:
         logger.warning(f"Unknown LLM provider '{provider}'")

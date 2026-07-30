@@ -87,8 +87,9 @@ class AuthorContext:
     words: list                    # [{word, start, end}]
     duration_s: float
     instruction: str = ""
-    example_images: list = field(default_factory=list)   # 风格参考图路径
+    example_images: list = field(default_factory=list)   # 风格参考图路径(含参考素材代表帧)
     broll: list = field(default_factory=list)            # [{src,label,startFrame,endFrame}]
+    style_spec: dict = field(default_factory=dict)       # 参考素材风格谱(StyleReference,可空)
     width: int = 1080
     height: int = 1920
     fps: int = 30
@@ -174,12 +175,24 @@ def build_author_messages(ctx: AuthorContext) -> list:
     else:
         broll_block = ("B-ROLL clips: (none uploaded) — do not fabricate video b-roll; "
                        "any on-screen graphics must be drawn cards/text only.")
+    # 参考素材风格谱(StyleReference,模块3):有就加一段"参考风格"指令,冲突以参考为准、不抄内容。
+    style_block = ""
+    if getattr(ctx, "style_spec", None):
+        try:
+            try:
+                from .style_reference import render_style_reference_block
+            except ImportError:
+                from style_reference import render_style_reference_block
+            style_block = render_style_reference_block(ctx.style_spec)
+        except Exception:  # noqa: BLE001 —— 参考段渲染失败不拖垮现写
+            style_block = ""
     user_text = (
         f"USER INSTRUCTION (primary intent — follow it):\n{ctx.instruction or '(none)'}\n\n"
         f"VIDEO: portrait {ctx.width}x{ctx.height}, {ctx.duration_s:.1f}s, "
         f"{ctx.duration_s * ctx.fps:.0f} frames @{ctx.fps}fps.\n"
         f"{broll_block}\n\n"
-        f"TRANSCRIPT (with times; use for caption timing & where graphics belong):\n"
+        + (style_block + "\n" if style_block else "")
+        + f"TRANSCRIPT (with times; use for caption timing & where graphics belong):\n"
         f"{_transcript_text(ctx.segments)}\n\n"
         f"Now write AuthoredScene.tsx per the output contract. Return ONLY the .tsx content."
     )

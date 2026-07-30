@@ -155,6 +155,78 @@ def _style_refs() -> list:
     return [s for s in (x.strip() for x in raw.split(";")) if s and Path(s).exists()]
 
 
+def _resolve_reference(job_dir: Path):
+    """找 job 根目录下的参考素材 style_ref.*(模块4 由 /jobs 落盘)。返回 Path 或 None。"""
+    cands = sorted(p for p in Path(job_dir).glob("style_ref.*") if p.is_file())
+    return cands[0] if cands else None
+
+
+def _record_style_cost(job_dir, cost_usd) -> None:
+    """把参考分析花费按 pipeline 账本格式记进 job_dir/_generation_costs.json。
+    _read_generation_cost 汇总 → job.generation_cost_usd(预览"💰"行)。失败静默,不拖垮现写。"""
+    if not cost_usd:
+        return
+    try:
+        from ..pipeline_runner import _record_generation_cost   # lazy import 破循环
+        _record_generation_cost(Path(job_dir), "style_reference", float(cost_usd))
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"ArmB style: 参考分析记账失败(忽略): {type(e).__name__}: {e}")
+
+
+def _load_style_spec(job, job_dir: Path, out_dir: Path, instruction: str, feedback: str = ""):
+    """模块5:参考素材 style_ref.* → StyleSpec(供 scene_author 注入"参考风格"段)+ 代表帧。
+    返回 (style_spec, source_frames)。无参考 / 分析失败(空谱)→ (空谱, []),Arm B 照常出片。
+
+    维度由"原始指令 + 本轮修订反馈"共同决定:revise 想加/换风格维度(如"配色也照参考")
+    时能反映进 aspects,不被旧缓存钉死(对抗审查发现的静默丢维度问题)。
+
+    缓存按 aspects 指纹分文件 out_dir/style_spec_<hash>.json:同维度跨 plan/compose 多阶段
+    复用(分析是付费多模态调用,避免重复计费);维度变了自然 miss、按新维度重跑。
+    只缓存非空谱;空谱(失败/无风格)不落缓存,留给后续阶段重试。永不抛异常。"""
+    try:
+        try:
+            from .style_reference import parse_aspects, empty_style_spec, is_empty_style_spec
+            from .style_reference_analyzer import analyze_reference
+        except ImportError:
+            from style_reference import parse_aspects, empty_style_spec, is_empty_style_spec
+            from style_reference_analyzer import analyze_reference
+    except Exception as e:  # noqa: BLE001 —— 模块1/2 未就位:退化为"不参照"
+        logger.warning(f"ArmB style: 参考风格模块未就位,跳过参照: {type(e).__name__}: {e}")
+        return {}, []
+    try:
+        ref = _resolve_reference(job_dir)
+        if ref is None:
+            return empty_style_spec(), []
+        aspects = parse_aspects((str(instruction) + " " + str(feedback)).strip())
+        key = hashlib.md5(",".join(sorted(aspects)).encode("utf-8")).hexdigest()[:8]
+        cache = Path(out_dir) / f"style_spec_{key}.json"
+        if cache.exists():
+            try:
+                spec = json.loads(cache.read_text(encoding="utf-8"))
+                if isinstance(spec, dict) and not is_empty_style_spec(spec):
+                    return spec, [f for f in (spec.get("source_frames") or []) if f]
+            except Exception:  # noqa: BLE001 —— 缓存坏了就重算
+                pass
+        spec = analyze_reference(str(ref), aspects, out_dir=str(Path(out_dir) / ".style_ref"))
+        if not is_empty_style_spec(spec):
+            try:
+                tmp = cache.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(spec, ensure_ascii=False, indent=1), encoding="utf-8")
+                os.replace(str(tmp), str(cache))   # 原子落盘,防并发读到半截
+            except Exception:  # noqa: BLE001 —— 缓存写失败不影响本次使用
+                pass
+            # 记账:仅缓存 miss(真调了付费多模态模型)时记一次;命中缓存不再记。
+            _record_style_cost(job_dir, spec.get("cost_usd"))
+            logger.info(f"ArmB style: 参考风格谱已生成(mode={spec.get('analysis_mode')}, "
+                        f"cost=${float(spec.get('cost_usd') or 0):.4f}, aspects={spec.get('aspects')})")
+            return spec, [f for f in (spec.get("source_frames") or []) if f]
+        logger.info(f"ArmB style: 参考素材未得到可用风格谱,本次不参照(corrections={spec.get('corrections')})")
+        return spec, []
+    except Exception as e:  # noqa: BLE001 —— 参考分析绝不拖垮现写
+        logger.warning(f"ArmB style: 参考分析异常,跳过参照: {type(e).__name__}: {e}")
+        return {}, []
+
+
 def _tok(s: str) -> list:
     import re
     return [w for w in re.split(r"[^0-9a-z一-鿿]+", str(s or "").lower()) if w]
@@ -229,7 +301,7 @@ def _assign_broll_windows(broll: list, segments: list, duration_s: float,
 
 # ─────────────────────────── 公共准备 ───────────────────────────
 
-def _prepare(job):
+def _prepare(job, feedback: str = ""):
     """落 authored/ 目录、取转写、收 b-roll、建 AuthorContext。失败返回 None。
     plan_authored 与 compose_authored 共用,保证两处的 ctx 完全一致。"""
     from ..config import get_config
@@ -256,8 +328,14 @@ def _prepare(job):
     # 等于模型从没拿到用户指令——2026-07-27 修)。
     instruction = str(getattr(job, "edit_request", "") or getattr(job, "request", "")
                       or getattr(job, "instruction", "") or "")
+    # 模块5:参考素材 style_ref.*(模块4 落盘)→ StyleSpec + 代表帧。空谱等于"不参照",
+    # scene_author 见空谱不加"参考风格"段,照常出片。代表帧(抽帧/图片模式)并入参考图,
+    # 让模型除了文字风格谱外还能"看到"参考画面。
+    style_spec, source_frames = _load_style_spec(job, job_dir, out_dir, instruction, feedback)
+    example_images = _style_refs() + [f for f in source_frames if f and Path(f).exists()]
     ctx = AuthorContext(segments=segments, words=words, duration_s=duration,
-                        instruction=instruction, example_images=_style_refs(), broll=broll)
+                        instruction=instruction, example_images=example_images,
+                        broll=broll, style_spec=style_spec)
     return {"config": config, "job_dir": job_dir, "input_video": input_video,
             "out_dir": out_dir, "words": words, "duration": duration,
             "broll": broll, "ctx": ctx}
@@ -336,7 +414,7 @@ def revise_authored_plan(job, feedback: str) -> dict | None:
     返回 None 的情形(调用方落穿现有 L2 就地修订):无草稿(没走过 author 先行)、
     _prepare 失败、revise 未产出合法 tsx、或任何异常。"""
     try:
-        p = _prepare(job)
+        p = _prepare(job, feedback)   # 反馈并入风格维度解析(revise 可加/换参照维度)
         if p is None:
             return None
         ctx, out_dir = p["ctx"], p["out_dir"]
