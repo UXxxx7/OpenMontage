@@ -83,14 +83,27 @@ def upload_talking_photo(image_path: Path) -> Optional[str]:
         return None
 
 
-def generate_talking_video(talking_photo_id: str, script: str, lang: str = "zh",
-                           aspect: str = "9:16", voice_id: Optional[str] = None) -> Optional[str]:
-    """提交生成请求，成功返回 video_id（异步任务，还要轮询）。"""
+def generate_talking_video(talking_photo_id: str, script: Optional[str] = None, lang: str = "zh",
+                           aspect: str = "9:16", voice_id: Optional[str] = None,
+                           audio_url: Optional[str] = None) -> Optional[str]:
+    """提交生成请求，成功返回 video_id（异步任务，还要轮询）。
+
+    默认走 HeyGen 自己的 TTS（voice.type=text，库存声音，script 必填）。传
+    audio_url 时切到音频对口型模式（voice.type=audio）——HeyGen 不再合成语音，
+    直接把照片对口型对齐到这段音频上，script 被忽略。这条路径是给
+    voice_clone.py 用的：script 先用 ElevenLabs 克隆音色合成好、传一个公网可
+    访问的 URL 过来（HeyGen 服务端自己去抓这个 URL，不是我们上传文件），这样
+    出来的视频用的是艺人真实克隆的声音，不是 HeyGen 库存声音。
+    """
     key = _api_key()
     if not key:
         return None
-    resolved_voice = voice_id or _DEFAULT_VOICE_ID.get(lang, _DEFAULT_VOICE_ID["en"])
     w, h = (720, 1280) if aspect == "9:16" else (1280, 720)
+    if audio_url:
+        voice_payload = {"type": "audio", "audio_url": audio_url}
+    else:
+        resolved_voice = voice_id or _DEFAULT_VOICE_ID.get(lang, _DEFAULT_VOICE_ID["en"])
+        voice_payload = {"type": "text", "input_text": script, "voice_id": resolved_voice}
     body = {
         "video_inputs": [{
             "character": {
@@ -98,11 +111,7 @@ def generate_talking_video(talking_photo_id: str, script: str, lang: str = "zh",
                 "talking_photo_id": talking_photo_id,
                 "scale": 1.0,
             },
-            "voice": {
-                "type": "text",
-                "input_text": script,
-                "voice_id": resolved_voice,
-            },
+            "voice": voice_payload,
         }],
         "dimension": {"width": w, "height": h},
     }

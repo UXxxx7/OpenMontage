@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenMontage — Studio</title>
+<meta property="og:title" content="OpenMontage Studio — your social content is ready">
+<meta property="og:type" content="website">
+<style>
+  :root {
+    --bg: #f5f3ef; --card: #ffffff; --text: #1a1a1a; --muted: #6b6b6b;
+    --accent: #d97757; --accent-ink: #ffffff; --border: #e5e0d8;
+    --pill-bg: color-mix(in srgb, var(--accent) 12%, transparent);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17161a; --card: #211f24; --text: #f2f0ec; --muted: #a3a0a8;
+      --accent: #e3906a; --accent-ink: #17161a; --border: #35323a;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #17161a; --card: #211f24; --text: #f2f0ec; --muted: #a3a0a8;
+    --accent: #e3906a; --accent-ink: #17161a; --border: #35323a;
+  }
+  :root[data-theme="light"] {
+    --bg: #f5f3ef; --card: #ffffff; --text: #1a1a1a; --muted: #6b6b6b;
+    --accent: #d97757; --accent-ink: #ffffff; --border: #e5e0d8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    padding: 32px 16px 64px;
+  }
+  .wrap { max-width: 920px; margin: 0 auto; }
+  .badge {
+    display: inline-block; background: var(--pill-bg); color: var(--accent);
+    font-size: 13px; font-weight: 600; padding: 6px 14px; border-radius: 999px;
+    margin-bottom: 18px;
+  }
+  h1 { font-size: 28px; line-height: 1.25; margin: 0 0 10px; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); font-size: 15px; line-height: 1.55; margin: 0 0 32px; max-width: 60ch; }
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+  @media (max-width: 860px) { .grid { grid-template-columns: 1fr 1fr; } }
+  @media (max-width: 560px) { .grid { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 18px;
+    padding: 0; overflow: hidden; display: flex; flex-direction: column;
+  }
+  .card-media {
+    background: #000; aspect-ratio: 9 / 16; display: flex; align-items: center;
+    justify-content: center; overflow: hidden;
+  }
+  .card-media.feed { aspect-ratio: 1 / 1; }
+  .card-media video, .card-media img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .card-body { padding: 18px 18px 20px; display: flex; flex-direction: column; gap: 12px; flex: 1; }
+  .platform-label {
+    font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em;
+    color: var(--accent);
+  }
+  .caption { font-size: 14.5px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+  .hashtags { display: flex; flex-wrap: wrap; gap: 6px; }
+  .hashtag {
+    background: var(--pill-bg); color: var(--accent); font-size: 12.5px; font-weight: 600;
+    padding: 3px 10px; border-radius: 999px;
+  }
+  .card-actions { display: flex; gap: 8px; margin-top: auto; padding-top: 4px; }
+  button.action, a.action {
+    flex: 1; text-align: center; border: 1px solid var(--border); background: transparent;
+    color: var(--text); border-radius: 10px; padding: 9px 10px; font-size: 13px;
+    font-weight: 600; cursor: pointer; text-decoration: none; font-family: inherit;
+  }
+  button.action:hover, a.action:hover { border-color: var(--accent); color: var(--accent); }
+  button.action.copied { border-color: var(--accent); background: var(--pill-bg); color: var(--accent); }
+  .status-note {
+    padding: 40px 18px; text-align: center; color: var(--muted); font-size: 14px;
+  }
+  .empty, .error { color: var(--muted); font-size: 15px; padding: 40px 0; text-align: center; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <span class="badge">🎬 Studio Preview</span>
+  <h1 id="title">Loading your content…</h1>
+  <p class="sub" id="subtitle"></p>
+  <div class="grid" id="grid"></div>
+</div>
+<script>
+const PLATFORM_LABELS = {
+  instagram_feed: "IG Feed",
+  instagram_reel: "IG Reel / TikTok",
+  instagram_story: "IG Story",
+};
+const TERMINAL = new Set(["DONE", "ERROR"]);
+
+function batchIdFromPath() {
+  const parts = location.pathname.split("/").filter(Boolean);
+  return parts[parts.length - 1];
+}
+
+function cardHtml(v) {
+  const label = PLATFORM_LABELS[v.platform] || v.platform;
+  if (v.status !== "DONE") {
+    const msg = v.status === "ERROR" ? "This variant didn't generate — sorry." : "Still generating…";
+    return `<div class="card"><div class="status-note">${label}<br><br>${msg}</div></div>`;
+  }
+  const fileUrl = `/files/${encodeURIComponent(v.job_id)}/${encodeURIComponent(v.filename)}`;
+  const mediaClass = v.platform === "instagram_feed" ? "card-media feed" : "card-media";
+  const media = v.asset_kind === "video"
+    ? `<video src="${fileUrl}" controls playsinline muted loop></video>`
+    : `<img src="${fileUrl}" alt="${label}">`;
+  const hashtagsHtml = v.hashtags.length
+    ? `<div class="hashtags">${v.hashtags.map((h) => `<span class="hashtag">#${escapeHtml(h)}</span>`).join("")}</div>`
+    : "";
+  const captionForCopy = escapeAttr(
+    v.hashtags.length ? `${v.caption}\n\n${v.hashtags.map((h) => "#" + h).join(" ")}` : v.caption
+  );
+  return `
+    <div class="card">
+      <div class="${mediaClass}">${media}</div>
+      <div class="card-body">
+        <div class="platform-label">${label}</div>
+        <div class="caption">${escapeHtml(v.caption)}</div>
+        ${hashtagsHtml}
+        <div class="card-actions">
+          <button class="action" data-copy="${captionForCopy}">Copy caption</button>
+          <a class="action" href="${fileUrl}" download>Download</a>
+        </div>
+      </div>
+    </div>`;
+}
+
+function escapeHtml(s) {
+  return (s || "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function escapeAttr(s) { return escapeHtml(s).replace(/\n/g, "&#10;"); }
+
+function wireCopyButtons() {
+  document.querySelectorAll("button.action[data-copy]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const text = btn.getAttribute("data-copy")
+        .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&#10;/g, "\n");
+      try {
+        await navigator.clipboard.writeText(text);
+        btn.textContent = "Copied!";
+        btn.classList.add("copied");
+        setTimeout(() => { btn.textContent = "Copy caption"; btn.classList.remove("copied"); }, 1800);
+      } catch (e) {
+        btn.textContent = "Copy failed";
+      }
+    });
+  });
+}
+
+async function load() {
+  const batchId = batchIdFromPath();
+  const grid = document.getElementById("grid");
+  const title = document.getElementById("title");
+  const subtitle = document.getElementById("subtitle");
+  try {
+    const resp = await fetch(`/api/batches/${encodeURIComponent(batchId)}`);
+    if (!resp.ok) {
+      title.textContent = "Batch not found";
+      grid.innerHTML = `<div class="error">This link may have expired or the content isn't ready yet.</div>`;
+      return;
+    }
+    const data = await resp.json();
+    const variants = data.variants || [];
+    const doneCount = variants.filter((v) => v.status === "DONE").length;
+    title.textContent = doneCount > 0 ? "Your content is ready" : "Generating your content…";
+    subtitle.textContent = `${doneCount}/${variants.length} platform versions ready. `
+      + "Copy a caption, download the file, and post it yourself — nothing here auto-publishes anywhere.";
+    grid.innerHTML = variants.map(cardHtml).join("");
+    wireCopyButtons();
+    if (!variants.every((v) => TERMINAL.has(v.status))) {
+      setTimeout(load, 5000); // 还有变体没到终态，5s 后再拉一次
+    }
+  } catch (e) {
+    title.textContent = "Something went wrong";
+    grid.innerHTML = `<div class="error">Couldn't load this batch. Try refreshing the page.</div>`;
+  }
+}
+
+load();
+</script>
+</body>
+</html>

@@ -67,6 +67,7 @@ def test_croll_registers_broll_assets(cleanup_jobs):
             broll=[_upload("clip1.mp4", b"fake-mp4-bytes"), _upload("clip2.png", b"fake-png-bytes")],
             broll_labels=["office shot", "logo closeup"],
             broll_kinds=["", ""],
+            wa_number="api_user",
         ))
 
     job_id = resp["job_id"]
@@ -109,6 +110,7 @@ def test_croll_without_broll_is_unchanged_from_before(cleanup_jobs):
             broll=[],
             broll_labels=[],
             broll_kinds=[],
+            wa_number="api_user",
         ))
 
     job_id = resp["job_id"]

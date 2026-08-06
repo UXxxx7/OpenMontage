@@ -57,6 +57,8 @@ const worker = new Worker(queueName, async (job) => {
     switch (job.name) {
       case "edit-video": return editVideo(job.data);
       case "croll-generate": return crollGenerate(job.data);
+      case "social-batch-generate": return socialBatchGenerate(job.data);
+      case "voice-clone-create": return voiceCloneCreate(job.data);
       case "confirm-job": return confirmJob(job.data);
       case "render-job": return renderJob(job.data);
       case "cancel-job": return cancelJob(job.data);
@@ -74,6 +76,7 @@ const worker = new Worker(queueName, async (job) => {
       case "idle-warn": return idleWarn(job.data);
       case "idle-cancel": return idleCancel(job.data);
       case "await-continue": return awaitContinue(job.data);
+      case "await-batch-continue": return awaitBatchContinue(job.data);
       default: throw new Error(`Unknown job type: ${job.name}`);
     }
   } catch (err) {
@@ -166,7 +169,7 @@ async function crollGenerate({ waNumber, mediaId, caption }) {
     "Photo received. Generating your script and talking-head video (usually 3-8 min)..."));
   const tempPath = await downloadWhatsAppMedia(mediaId, "image");
   try {
-    const created = await createPythonCrollJob(tempPath, lang, caption);
+    const created = await createPythonCrollJob(tempPath, lang, caption, waNumber);
     const jobId = created.job_id;
     await redis.set(activeJobKey(waNumber), jobId, "EX",
       Number(env("WA_ACTIVE_JOB_TTL", "86400")));
@@ -184,7 +187,7 @@ async function crollGenerate({ waNumber, mediaId, caption }) {
   }
 }
 
-async function createPythonCrollJob(photoPath, lang, hint) {
+async function createPythonCrollJob(photoPath, lang, hint, waNumber) {
   const form = new FormData();
   const ext = path.extname(photoPath) || ".jpg";
   form.append("photo", fs.createReadStream(photoPath),
@@ -192,12 +195,106 @@ async function createPythonCrollJob(photoPath, lang, hint) {
   form.append("hint", hint || "");
   form.append("lang", lang);
   form.append("pipeline", "talking-head");
+  form.append("wa_number", waNumber || "api_user");
   const resp = await axios.post(`${pythonApiBase}/croll`, form, {
     headers: form.getHeaders(),
     maxBodyLength: Infinity, maxContentLength: Infinity,
     timeout: Number(env("WA_PYTHON_CREATE_TIMEOUT_MS", "180000")),
   });
   return resp.data;
+}
+
+// 社媒批次：一张照片 -> Python 那边生成一批多平台变体（IG Feed/Reel·TikTok/
+// Story，见 whatsapp_mvp/social_batch.py）。跟 crollGenerate 同一个形状，
+// 区别是这里等的不是单条 job 的状态，是一整批——用 waitForBatchDone 而不是
+// waitForStatus，完成条件是"每个变体都到终态（DONE/ERROR）"而不是某个状态
+// 集合命中。就绪后不发文件链接，发 Studio 预览页链接，纯预览 MVP 范围：
+// 艺人自己在网页上看、复制文案、下载素材，手动去各平台发——不接真实的
+// Instagram/TikTok 发布 API（那是另一块工作，见对话记录里的产品讨论）。
+async function socialBatchGenerate({ waNumber, mediaId, caption }) {
+  const lang = resolveLang(DEFAULT_LANG, caption);
+  if (!hasWACredentials()) {
+    await sendText(waNumber, t(lang,
+      "服务正在启动，请稍后重新发送照片。",
+      "Service is starting up. Please send your photo again in a moment."));
+    throw new Error("WhatsApp credentials not configured");
+  }
+  const tempPath = await downloadWhatsAppMedia(mediaId, "image");
+  try {
+    const created = await createPythonSocialBatchJob(tempPath, lang, caption, waNumber);
+    const batchId = created.batch_id;
+
+    const variants = await waitForBatchDone(batchId,
+      Number(env("WA_SOCIAL_BATCH_TIMEOUT_MS", "1200000")), { waNumber, lang });
+    if (!variants) return; // 超时已经排了续等任务，见 waitForBatchDone 自己的说明
+
+    const readyCount = variants.filter((v) => v.status === "DONE").length;
+    if (readyCount === 0) {
+      await sendText(waNumber, t(lang,
+        "抱歉，这批内容没能生成成功，可以再试一次。",
+        "Sorry, this batch didn't generate successfully — please try again."));
+      return;
+    }
+    await sendText(waNumber, t(lang,
+      `内容已经准备好（${readyCount}/${variants.length} 个平台版本）！点这里查看和复制文案：\n${studioUrl(batchId)}`,
+      `Your content is ready (${readyCount}/${variants.length} platform versions)! View and copy captions here:\n${studioUrl(batchId)}`));
+  } finally {
+    await fs.promises.rm(tempPath, { force: true });
+  }
+}
+
+async function createPythonSocialBatchJob(photoPath, lang, hint, waNumber) {
+  const form = new FormData();
+  const ext = path.extname(photoPath) || ".jpg";
+  form.append("photo", fs.createReadStream(photoPath),
+    { filename: `photo${ext}`, contentType: ext === ".png" ? "image/png" : "image/jpeg" });
+  form.append("hint", hint || "");
+  form.append("lang", lang);
+  form.append("wa_number", waNumber || "api_user");
+  const resp = await axios.post(`${pythonApiBase}/social-batch`, form, {
+    headers: form.getHeaders(),
+    maxBodyLength: Infinity, maxContentLength: Infinity,
+    timeout: Number(env("WA_PYTHON_CREATE_TIMEOUT_MS", "180000")),
+  });
+  return resp.data;
+}
+
+async function getPythonBatch(batchId) {
+  const resp = await axios.get(`${pythonApiBase}/batches/${encodeURIComponent(batchId)}`, {
+    timeout: Number(env("WA_PYTHON_GET_TIMEOUT_MS", "30000")),
+  });
+  return resp.data.variants;
+}
+
+// 跟 waitForStatus 同一个轮询骨架（心跳提示 + 超时后排续等任务，而不是
+// 报"失败"——同样的"后端没报错只是比预期慢"教训），区别是完成条件看的是
+// "每个变体都到终态"，不是某个状态集合命中任意一个。
+async function waitForBatchDone(batchId, timeoutMs, ctx) {
+  const deadline = Date.now() + timeoutMs;
+  const heartbeatAt = ctx?.waNumber ? Date.now() + Number(env("WA_HEARTBEAT_AFTER_MS", "300000")) : null;
+  let heartbeatSent = false;
+  const TERMINAL = new Set(["DONE", "ERROR"]);
+  while (Date.now() < deadline) {
+    const variants = await getPythonBatch(batchId);
+    if (variants.length > 0 && variants.every((v) => TERMINAL.has(v.status))) return variants;
+    if (ctx?.waNumber && !heartbeatSent && Date.now() >= heartbeatAt) {
+      heartbeatSent = true;
+      await sendText(ctx.waNumber, t(ctx.lang,
+        "还在处理中，这一步比预计慢一点，请再耐心等一下，马上就好。",
+        "Still working on it — taking a bit longer than usual, hang tight, almost there.")).catch(() => {});
+    }
+    await delay(Number(env("WA_STATUS_POLL_MS", "3000")));
+  }
+  // 跟 waitForStatus 同一个理由：Python 那边没报错，只是批次比这一轮轮询
+  // 窗口慢（HeyGen 生成本身就要几分钟），不能说"失败"——排一个续等任务
+  // 继续等同样的终态，轮数封顶见 awaitBatchContinue，不会无限续等下去。
+  if (ctx && ctx.waNumber) {
+    const round = (ctx.round || 0) + 1;
+    await timers.add("await-batch-continue",
+      { waNumber: ctx.waNumber, batchId, lang: ctx.lang, round },
+      { removeOnComplete: true, removeOnFail: true });
+  }
+  return null;
 }
 
 // Python /confirm 只接受 WAITING_CONFIRMATION（其余几个是"已经在跑/已完成"
@@ -886,6 +983,68 @@ async function awaitContinue({ waNumber, jobId, wanted, lang, round }) {
   await deliverStageResult(waNumber, jobId, status, lang);
 }
 
+// waitForBatchDone 超时后的续等——跟 awaitContinue 同一个"轮数封顶、超了
+// 就让用户手动 retry"的设计,只是完成条件换成"批次里每个变体都到终态"。
+async function awaitBatchContinue({ waNumber, batchId, lang, round }) {
+  const maxRounds = Number(env("WA_AWAIT_CONTINUE_MAX_ROUNDS", "6"));
+  if (round > maxRounds) {
+    await safeSendText(waNumber, t(lang || DEFAULT_LANG,
+      `这批内容处理时间远超预期。可以重新发一次照片再试，或稍后再看。`,
+      `This batch is taking far longer than expected. Try sending the photo again, or check back later.`));
+    return;
+  }
+  const variants = await waitForBatchDone(batchId,
+    Number(env("WA_SOCIAL_BATCH_TIMEOUT_MS", "1200000")), { waNumber, lang, round });
+  if (!variants) return; // still going — waitForBatchDone already queued the next round
+  const readyCount = variants.filter((v) => v.status === "DONE").length;
+  if (readyCount === 0) {
+    await sendText(waNumber, t(lang,
+      "抱歉，这批内容没能生成成功，可以再试一次。",
+      "Sorry, this batch didn't generate successfully — please try again."));
+    return;
+  }
+  await sendText(waNumber, t(lang,
+    `内容已经准备好（${readyCount}/${variants.length} 个平台版本）！点这里查看和复制文案：\n${studioUrl(batchId)}`,
+    `Your content is ready (${readyCount}/${variants.length} platform versions)! View and copy captions here:\n${studioUrl(batchId)}`));
+}
+
+// 声音克隆入驻：一段原始语音样本 -> Python /voice-clone -> ElevenLabs Instant
+// Voice Clone -> voice_id 存进这个艺人的 User 行。同步等 Python 做完再回复
+// （IVC 是秒级操作，不用像 croll/social-batch 那样搭轮询）。
+async function voiceCloneCreate({ waNumber, mediaId }) {
+  const lang = resolveLang(DEFAULT_LANG);
+  const tempPath = await downloadWhatsAppMedia(mediaId, "audio");
+  try {
+    await createPythonVoiceClone(tempPath, waNumber);
+    await sendText(waNumber, t(lang,
+      "搞定！你的专属声音已经注册好了，之后生成的数字人视频会用你的真实声音。",
+      "All set! Your voice is registered — future digital-human videos will sound like you."));
+  } catch (err) {
+    console.error(`[voice-clone] failed for ${waNumber}:`, err.message);
+    await safeSendText(waNumber, t(lang,
+      "抱歉，声音注册没成功，可以稍后再试一次（换个更安静的环境录一遍效果更好）。",
+      "Sorry, voice registration didn't work — try again later, ideally in a quieter spot."));
+  } finally {
+    await fs.promises.rm(tempPath, { force: true });
+  }
+}
+
+async function createPythonVoiceClone(audioPath, waNumber) {
+  const form = new FormData();
+  const ext = path.extname(audioPath) || ".ogg";
+  form.append("audio", fs.createReadStream(audioPath),
+    { filename: `voice${ext}`, contentType: ext === ".m4a" ? "audio/mp4" : "audio/ogg" });
+  form.append("wa_number", waNumber);
+  const resp = await axios.post(`${pythonApiBase}/voice-clone`, form, {
+    headers: form.getHeaders(),
+    maxBodyLength: Infinity, maxContentLength: Infinity,
+    // IVC 本身几秒钟就好，但留够余量给网络抖动——不跟其它"要等 HeyGen
+    // 生成视频"的超时混用，这个操作量级完全不同。
+    timeout: Number(env("WA_VOICE_CLONE_TIMEOUT_MS", "60000")),
+  });
+  return resp.data;
+}
+
 async function downloadWhatsAppMedia(mediaId, kind = "video") {
   const token = whatsappToken();
   const info = await axios.get(`${graphBase}/${mediaId}`, {
@@ -897,6 +1056,10 @@ async function downloadWhatsAppMedia(mediaId, kind = "video") {
   const mime = info.data.mime_type || "";
   const ext = kind === "image"
     ? (mime.includes("png") ? "png" : mime.includes("webp") ? "webp" : "jpg")
+    // WhatsApp 语音消息固定 audio/ogg;codecs=opus，同 index.js 的
+    // downloadAndTranscribeVoice 那份扩展名判断逻辑保持一致。
+    : kind === "audio"
+    ? (mime.includes("ogg") ? "ogg" : mime.includes("mp4") || mime.includes("m4a") ? "m4a" : "ogg")
     : "mp4";
   const outPath = path.join(os.tmpdir(), `openmontage-wa-${mediaId}.${ext}`);
   const resp = await axios.get(mediaUrl, {
@@ -1025,6 +1188,13 @@ function clarificationMessage(lang, status) {
 function fileUrl(jobId, filename) {
   const base = env("PUBLIC_BASE_URL", pythonApiBase).replace(/\/$/, "");
   return `${base}/files/${encodeURIComponent(jobId)}/${filename}`;
+}
+
+// Studio 预览页链接。跟 fileUrl 用同一个 PUBLIC_BASE_URL，但路径是 Node
+// 网关自己的路由（/studio/:batchId），不是代理到 Python 的 /files。
+function studioUrl(batchId) {
+  const base = env("PUBLIC_BASE_URL", pythonApiBase).replace(/\/$/, "");
+  return `${base}/studio/${encodeURIComponent(batchId)}`;
 }
 
 function activeJobKey(waNumber) {

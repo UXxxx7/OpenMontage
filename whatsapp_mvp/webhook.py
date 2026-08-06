@@ -573,6 +573,7 @@ async def create_croll_endpoint(
     broll: List[UploadFile] = File(default=[]),
     broll_labels: List[str] = Form(default=[]),
     broll_kinds: List[str] = Form(default=[]),
+    wa_number: str = Form("api_user"),
 ):
     """C-roll：一张照片 -> AI 看图写文案 -> HeyGen 数字人说话视频 -> 接入常规
     剪辑管线（后续 confirm/export/retry 跟普通视频任务完全一样）。
@@ -602,8 +603,15 @@ async def create_croll_endpoint(
     集窗口另外接一遍，属于更大的一块改动，不在这次范围内）。WhatsApp 用户
     今天直接发照片触发 C-roll，还是拿不到 b-roll 合成——这条路目前只对直
     接打 API 的调用方生效。
+
+    wa_number：真实 WhatsApp 号，不传就退回旧的共享 "api_user"（兼容还没升级
+    的调用方）。2026-08 之前这里硬编码 "api_user"，导致所有艺人在 Python 侧
+    共享同一个 User 行——上线 voice_clone.py 后这是真 bug 不只是"不精确"：
+    User.elevenlabs_voice_id 存在共享行上，等于所有人共用同一个克隆音色，
+    艺人 A 的声音会出现在艺人 B 的视频里。Node 网关这边已经把真实 waNumber
+    传进来了，见 server/worker.js 的 createPythonCrollJob。
     """
-    user = get_or_create_user("api_user")
+    user = get_or_create_user(wa_number)
     job = create_job(user_id=user.id, pipeline=pipeline, input_caption=hint)
 
     job_dir = job.job_dir
@@ -639,6 +647,110 @@ async def create_croll_endpoint(
     _run_in_background(generate_croll, job.id, str(photo_path), lang, hint)
 
     return {"job_id": job.id, "status": job.status.value}
+
+
+@app.post("/social-batch")
+async def create_social_batch_endpoint(
+    photo: UploadFile = File(...),
+    hint: str = Form(""),
+    lang: str = Form("zh"),
+    wa_number: str = Form("api_user"),
+):
+    """一张照片 -> 一批多平台社媒内容（IG Feed/Reel·TikTok/Story），每个变体
+    各自的文案+hashtag，见 social_batch.py 的设计说明。跟 /croll 的形状类似
+    （立即返回、后台线程跑生成），区别是这里一次产出一批 job（共享 batch_id），
+    不是单条——调用方轮询 GET /batches/{batch_id} 而不是 GET /jobs/{id}。
+
+    wa_number：真实 WhatsApp 号——见 /croll 端点同一处注释，这里同理，是
+    voice_clone.py 能"找对艺人本人的克隆音色"的前提，不是可选的精确化。
+    """
+    import uuid as _uuid
+
+    user = get_or_create_user(wa_number)
+    batch_id = f"batch_{_uuid.uuid4().hex[:12]}"
+
+    # 照片先落到一个临时目录（不属于任何单条 job——这批要生成好几条 job，
+    # 各自的 job_dir 要等 create_job 才存在）。social_batch.generate_batch
+    # 内部会把这张原图复制/裁切进每个变体自己的 job_dir。
+    tmp_dir = Path(get_config().jobs_dir) / f"_batch_upload_{batch_id}"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    photo_data = await photo.read()
+    ext = (os.path.splitext(photo.filename or "")[1].lstrip(".") or "jpg").lower()
+    photo_path = tmp_dir / f"source_photo.{ext}"
+    photo_path.write_bytes(photo_data)
+
+    from .social_batch import generate_batch
+
+    def _run():
+        try:
+            generate_batch(batch_id, user.id, str(photo_path), lang=lang, hint=hint)
+        finally:
+            import shutil as _shutil
+            _shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    _run_in_background(_run)
+    return {"batch_id": batch_id}
+
+
+@app.get("/batches/{batch_id}")
+def get_batch_endpoint(batch_id: str):
+    """Studio 预览页读这个接口拿一批内容的全部变体状态。"""
+    from .job_manager import get_jobs_by_batch
+
+    jobs = get_jobs_by_batch(batch_id)
+    if not jobs:
+        raise HTTPException(status_code=404, detail="Batch not found")
+
+    variants = []
+    for job in jobs:
+        filename = Path(job.final_path).name if job.final_path else None
+        try:
+            hashtags = json.loads(job.social_hashtags) if job.social_hashtags else []
+        except (ValueError, TypeError):
+            hashtags = []
+        variants.append({
+            "job_id": job.id,
+            "platform": job.platform,
+            "status": job.status.value,
+            "caption": job.social_caption or "",
+            "hashtags": hashtags,
+            "filename": filename,
+            "asset_kind": "video" if (filename or "").endswith(".mp4") else "image",
+        })
+    return {"batch_id": batch_id, "variants": variants}
+
+
+@app.post("/voice-clone")
+async def create_voice_clone_endpoint(
+    audio: UploadFile = File(...),
+    wa_number: str = Form(...),
+):
+    """艺人一次性声音入驻：一段语音样本 -> ElevenLabs Instant Voice Clone ->
+    voice_id 存到这个艺人（按真实 wa_number 识别）的 User 行上。之后每次
+    generate_croll/social_batch.generate_batch 都会读这个字段，找到了就用
+    真实克隆音色（走 HeyGen 的音频对口型模式），没有就照旧退回 HeyGen 库存声音。
+
+    跟 /croll、/social-batch 不一样：这个同步做完再返回（IVC 本身就是秒级
+    操作，不像 HeyGen 视频生成要 1-2 分钟，没必要为此再搭一套后台线程+轮询）。
+    """
+    from .voice_clone import create_instant_voice_clone
+
+    user = get_or_create_user(wa_number)
+    audio_data = await audio.read()
+    tmp_path = Path(get_config().jobs_dir) / f"_voice_sample_{user.id}.mp3"
+    tmp_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path.write_bytes(audio_data)
+    try:
+        voice_id = create_instant_voice_clone(tmp_path, name=f"artist_{wa_number}")
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    if not voice_id:
+        raise HTTPException(status_code=502, detail="voice clone creation failed")
+
+    from .job_manager import set_user_voice_clone
+    set_user_voice_clone(user.id, voice_id)
+    return {"voice_id": voice_id}
 
 
 @app.post("/jobs")
@@ -950,5 +1062,14 @@ def serve_file(job_id: str, filename: str):
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
 
-    media_type = "video/mp4" if filename.endswith(".mp4") else "application/octet-stream"
+    if filename.endswith(".mp4"):
+        media_type = "video/mp4"
+    elif filename.endswith(".jpg") or filename.endswith(".jpeg"):
+        media_type = "image/jpeg"  # social_batch.py 的 Feed 静态图变体
+    elif filename.endswith(".png"):
+        media_type = "image/png"
+    elif filename.endswith(".mp3"):
+        media_type = "audio/mpeg"  # voice_clone.py 合成的克隆音色音频，HeyGen 靠这个 URL 抓取
+    else:
+        media_type = "application/octet-stream"
     return FileResponse(str(file_path), media_type=media_type)
