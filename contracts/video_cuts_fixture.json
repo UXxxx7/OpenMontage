@@ -1,0 +1,291 @@
+{
+  "_note": "Ground truth generated from remotion-composer/src/cuts.ts (the TS reference implementation). whatsapp_mvp/test_video_cuts.py asserts video_cuts.py reproduces every value here exactly. Regenerate by running cuts.ts's normalizeCuts/sourceToOutput/outputToSource/computeOutputDuration against these same inputs if cuts.ts's behavior ever changes.",
+  "testCuts": [
+    {
+      "fromFrame": 100,
+      "toFrame": 200
+    },
+    {
+      "fromFrame": 500,
+      "toFrame": 550
+    }
+  ],
+  "normalizeCases": [
+    {
+      "input": {
+        "cuts": [
+          {
+            "fromFrame": 100,
+            "toFrame": 200
+          },
+          {
+            "fromFrame": 0,
+            "toFrame": 100
+          },
+          {
+            "fromFrame": 250,
+            "toFrame": 300
+          }
+        ],
+        "srcLen": 1000
+      },
+      "output": [
+        {
+          "fromFrame": 0,
+          "toFrame": 200
+        },
+        {
+          "fromFrame": 250,
+          "toFrame": 300
+        }
+      ]
+    },
+    {
+      "input": {
+        "cuts": [
+          {
+            "fromFrame": -50,
+            "toFrame": 2000
+          }
+        ],
+        "srcLen": 1000
+      },
+      "output": [
+        {
+          "fromFrame": 0,
+          "toFrame": 1000
+        }
+      ]
+    },
+    {
+      "input": {
+        "cuts": [
+          {
+            "fromFrame": 50,
+            "toFrame": 50
+          },
+          {
+            "fromFrame": 100,
+            "toFrame": 90
+          }
+        ],
+        "srcLen": 1000
+      },
+      "output": []
+    },
+    {
+      "input": {
+        "cuts": null,
+        "srcLen": 1000
+      },
+      "output": []
+    },
+    {
+      "input": {
+        "cuts": [
+          {
+            "fromFrame": 0,
+            "toFrame": 60
+          }
+        ],
+        "srcLen": 900
+      },
+      "output": [
+        {
+          "fromFrame": 0,
+          "toFrame": 60
+        }
+      ]
+    },
+    {
+      "input": {
+        "cuts": [
+          {
+            "fromFrame": 400.7,
+            "toFrame": 450.2
+          }
+        ],
+        "srcLen": 900
+      },
+      "output": [
+        {
+          "fromFrame": 401,
+          "toFrame": 450
+        }
+      ]
+    },
+    {
+      "input": {
+        "cuts": [
+          {
+            "fromFrame": 0,
+            "toFrame": 50
+          },
+          {
+            "fromFrame": 50,
+            "toFrame": 120
+          },
+          {
+            "fromFrame": 800,
+            "toFrame": 850
+          }
+        ],
+        "srcLen": 900
+      },
+      "output": [
+        {
+          "fromFrame": 0,
+          "toFrame": 120
+        },
+        {
+          "fromFrame": 800,
+          "toFrame": 850
+        }
+      ]
+    }
+  ],
+  "mappingCases": [
+    {
+      "srcFrame": 0,
+      "outFrame": 0
+    },
+    {
+      "srcFrame": 50,
+      "outFrame": 50
+    },
+    {
+      "srcFrame": 99,
+      "outFrame": 99
+    },
+    {
+      "srcFrame": 100,
+      "outFrame": 100
+    },
+    {
+      "srcFrame": 150,
+      "outFrame": 100
+    },
+    {
+      "srcFrame": 199,
+      "outFrame": 100
+    },
+    {
+      "srcFrame": 200,
+      "outFrame": 100
+    },
+    {
+      "srcFrame": 250,
+      "outFrame": 150
+    },
+    {
+      "srcFrame": 499,
+      "outFrame": 399
+    },
+    {
+      "srcFrame": 500,
+      "outFrame": 400
+    },
+    {
+      "srcFrame": 525,
+      "outFrame": 400
+    },
+    {
+      "srcFrame": 549,
+      "outFrame": 400
+    },
+    {
+      "srcFrame": 550,
+      "outFrame": 400
+    },
+    {
+      "srcFrame": 600,
+      "outFrame": 450
+    },
+    {
+      "srcFrame": 999,
+      "outFrame": 849
+    }
+  ],
+  "inverseCases": [
+    {
+      "outFrame": 0,
+      "srcFrame": 0
+    },
+    {
+      "outFrame": 50,
+      "srcFrame": 50
+    },
+    {
+      "outFrame": 100,
+      "srcFrame": 200
+    },
+    {
+      "outFrame": 150,
+      "srcFrame": 250
+    },
+    {
+      "outFrame": 349,
+      "srcFrame": 449
+    },
+    {
+      "outFrame": 399,
+      "srcFrame": 499
+    },
+    {
+      "outFrame": 400,
+      "srcFrame": 550
+    },
+    {
+      "outFrame": 449,
+      "srcFrame": 599
+    }
+  ],
+  "durationCases": [
+    {
+      "input": {
+        "props": {
+          "durationSeconds": 10
+        }
+      },
+      "output": 300
+    },
+    {
+      "input": {
+        "props": {
+          "durationSeconds": 10,
+          "videoCuts": [
+            {
+              "fromFrame": 0,
+              "toFrame": 30
+            }
+          ]
+        }
+      },
+      "output": 270
+    },
+    {
+      "input": {
+        "props": {
+          "durationSeconds": 33.4,
+          "videoCuts": [
+            {
+              "fromFrame": 100,
+              "toFrame": 200
+            },
+            {
+              "fromFrame": 900,
+              "toFrame": 1002
+            }
+          ]
+        }
+      },
+      "output": 800
+    },
+    {
+      "input": {
+        "props": {}
+      },
+      "output": 30
+    }
+  ]
+}

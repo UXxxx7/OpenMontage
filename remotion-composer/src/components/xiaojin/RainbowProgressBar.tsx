@@ -8,7 +8,21 @@
 import { useCurrentFrame, useVideoConfig } from "remotion";
 import { PROGRESS, RAINBOW, W } from "./theme";
 
-export const RainbowProgressBar: React.FC = () => {
+export interface RainbowProgressBarProps {
+  /** Editor-only position override — omit for the default pinned-bottom,
+   *  full-width sliver (PROGRESS.y/.h / W from theme.ts). */
+  x?: number;
+  y?: number;
+  width?: number;
+  height?: number;
+}
+
+export const RainbowProgressBar: React.FC<RainbowProgressBarProps> = ({
+  x = 0,
+  y = PROGRESS.y,
+  width = W,
+  height = PROGRESS.h,
+}) => {
   const frame = useCurrentFrame();
   const { durationInFrames } = useVideoConfig();
   const pct = Math.min(1, frame / (durationInFrames - 1));
@@ -16,14 +30,14 @@ export const RainbowProgressBar: React.FC = () => {
     <div
       style={{
         position: "absolute",
-        left: 0,
-        top: PROGRESS.y,
-        width: W,
-        height: PROGRESS.h,
+        left: x,
+        top: y,
+        width,
+        height,
         background: "rgba(0,0,0,0.10)",
       }}
     >
-      <div style={{ width: W * pct, height: "100%", background: RAINBOW }} />
+      <div style={{ width: width * pct, height: "100%", background: RAINBOW }} />
     </div>
   );
 };

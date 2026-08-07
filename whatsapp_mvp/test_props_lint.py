@@ -139,6 +139,56 @@ def test_element_overlap_detected_and_not_false_positive():
           not any(f["check"] == "element_overlap" for f in findings2), findings2)
 
 
+def test_element_overlap_is_layer_aware():
+    """Phase E: two items on DIFFERENT explicit `layer` values overlapping
+    on purpose (real z-order stacking) must not be flagged — but only once
+    the user has actually touched `layer` on at least one of the pair.
+    Absent `layer` on both must behave exactly as before (every job before
+    this field existed): still flags, regardless of section defaults."""
+    same_layer_explicit = {
+        "durationSeconds": 20.0,
+        "topicCards": [
+            {"headline": "A", "x": 60, "y": 1040, "width": 960, "mountFrame": 0, "endFrame": 100, "layer": 5},
+        ],
+        "gauges": [
+            {"title": "G", "leftLabel": "L", "rightLabel": "R", "value": 0.5,
+             "x": 60, "y": 1040, "width": 960, "mountFrame": 50, "endFrame": 150, "layer": 5},
+        ],
+    }
+    findings = lint_props(same_layer_explicit)
+    check("显式设成同一个 layer、矩形也重叠——仍然报 element_overlap",
+          any(f["check"] == "element_overlap" for f in findings), findings)
+
+    different_layer_explicit = {
+        "durationSeconds": 20.0,
+        "topicCards": [
+            {"headline": "A", "x": 60, "y": 1040, "width": 960, "mountFrame": 0, "endFrame": 100, "layer": 5},
+        ],
+        "gauges": [
+            {"title": "G", "leftLabel": "L", "rightLabel": "R", "value": 0.5,
+             "x": 60, "y": 1040, "width": 960, "mountFrame": 50, "endFrame": 150, "layer": 10},
+        ],
+    }
+    findings2 = lint_props(different_layer_explicit)
+    check("显式设成不同 layer 的两个元素——即使矩形重叠也不报（有意堆叠）",
+          not any(f["check"] == "element_overlap" for f in findings2), findings2)
+
+    no_layer_field_at_all = {
+        "durationSeconds": 20.0,
+        "topicCards": [
+            {"headline": "A", "x": 60, "y": 1040, "width": 960, "mountFrame": 0, "endFrame": 100},
+        ],
+        "gauges": [
+            {"title": "G", "leftLabel": "L", "rightLabel": "R", "value": 0.5,
+             "x": 60, "y": 1040, "width": 960, "mountFrame": 50, "endFrame": 150},
+        ],
+    }
+    findings3 = lint_props(no_layer_field_at_all)
+    check("两边都没碰过 layer 字段——即使不同 section（不同默认层）也照样报，"
+          "不因为 Phase E 悄悄放过存量 job 的真实重叠",
+          any(f["check"] == "element_overlap" for f in findings3), findings3)
+
+
 def test_element_mounts_during_card_transition():
     """Fix C7：卡片正在两个 scene 关键帧之间变形(w/h 改变)时，不应该有新元素
     挂载——即使矩形完全不重叠，两个动画同时发生本身就是问题（CLAUDE-v2.md
@@ -297,14 +347,78 @@ def test_intro_lead_dead_space():
           lint_props(no_elements_props))
 
 
+def test_hidden_budget_uses_output_duration_when_cuts_present():
+    """P6: a cut removing VISIBLE runtime elsewhere shrinks the video's real
+    (OUTPUT) duration without touching the hidden span itself — so the same
+    hidden time is a BIGGER fraction of what a viewer actually sits through.
+    The old code divided by the raw SOURCE durationSeconds*FPS and would have
+    silently missed this (it never even looks at videoCuts)."""
+    base_props = {
+        "durationSeconds": 40.0,  # 1200 source frames
+        "opacityKeyframes": [
+            {"frame": 0, "opacity": 1.0}, {"frame": 100, "opacity": 1.0},
+            {"frame": 101, "opacity": 0.0}, {"frame": 400, "opacity": 0.0},
+            {"frame": 401, "opacity": 1.0},
+        ],  # hidden (101, 401) = 300 frames
+    }
+    without_cuts = dict(base_props)
+    check(
+        "隐藏 300/1200=25% 时不超预算（无 cuts）",
+        "facecam_hidden_budget_exceeded" not in {f["check"] for f in lint_props(without_cuts)},
+        lint_props(without_cuts),
+    )
+
+    # Cut away [800, 1200) — 400 frames of VISIBLE content well after the
+    # hidden span (101, 401) ends. Real delivered length: 800 frames. Same
+    # 300 hidden frames are now 300/800=37.5% of what's actually shown.
+    with_cuts = {**base_props, "videoCuts": [{"fromFrame": 800, "toFrame": 1200}]}
+    findings = lint_props(with_cuts)
+    budget_finding = next((f for f in findings if f["check"] == "facecam_hidden_budget_exceeded"), None)
+    check("同样的隐藏区间，剪掉后面无关的可见内容后占比超预算（有 cuts）", budget_finding is not None, findings)
+    if budget_finding:
+        check("duration_frames 汇报的是裁剪后的真实时长(800)，不是源视频时长(1200)",
+              budget_finding["duration_frames"] == 800, budget_finding)
+
+
+def test_facecam_never_restored_respects_cuts():
+    """P6: a cut removing everything AFTER the point the speaker comes back
+    means the video's real end now sits right where the old (never-hidden-
+    again) tail used to be — evaluated against the raw SOURCE duration this
+    would stay silent forever, since 401 is nowhere near source frame 1199."""
+    hidden_then_restored = {
+        "durationSeconds": 40.0,
+        "opacityKeyframes": [
+            {"frame": 0, "opacity": 1.0}, {"frame": 100, "opacity": 1.0},
+            {"frame": 101, "opacity": 0.0}, {"frame": 400, "opacity": 0.0},
+            {"frame": 401, "opacity": 1.0},
+        ],
+    }
+    check(
+        "源视频里说话人第 401 帧就已恢复，远早于第 1200 帧的片尾——不应该报 never_restored",
+        "facecam_never_restored" not in {f["check"] for f in lint_props(hidden_then_restored)},
+        lint_props(hidden_then_restored),
+    )
+
+    cut_after_restore = {**hidden_then_restored, "videoCuts": [{"fromFrame": 401, "toFrame": 1200}]}
+    findings = lint_props(cut_after_restore)
+    check(
+        "剪掉恢复之后的全部内容后，交付视频实际在恢复的那一刻结束——应该报 never_restored",
+        any(f["check"] == "facecam_never_restored" for f in findings),
+        findings,
+    )
+
+
 def main():
     test_real_buggy_props_flags_all_three_known_bugs()
     test_clean_props_no_findings()
     test_element_overlap_detected_and_not_false_positive()
+    test_element_overlap_is_layer_aware()
     test_element_mounts_during_card_transition()
     test_low_visual_richness()
     test_section_takeover_lacks_content()
     test_intro_lead_dead_space()
+    test_hidden_budget_uses_output_duration_when_cuts_present()
+    test_facecam_never_restored_respects_cuts()
 
     print()
     if FAILED:

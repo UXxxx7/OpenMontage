@@ -19,7 +19,9 @@
  * from the pipeline side without recompiling the bundle.
  */
 import React from "react";
-import { AbsoluteFill, OffthreadVideo, useCurrentFrame } from "remotion";
+import { AbsoluteFill, useCurrentFrame } from "remotion";
+import { keptSegments, normalizeCuts, type VideoCut } from "../../cuts";
+import { CutVideo } from "./CutVideo";
 
 export interface PresenterWindow {
   fromFrame: number;
@@ -36,6 +38,9 @@ export interface PresenterProps {
   radius?: number;
   objectPosition?: string;
   colorMode?: "warm" | "dark";
+  /** Same cuts as the main SpeakerCard video — this source shares the composition's original (pre-cut) timeline, per this file's own doc comment. */
+  videoCuts?: VideoCut[];
+  sourceDurationFrames: number;
 }
 
 const FADE = 8; // frames of fade in/out around each window
@@ -50,8 +55,18 @@ export const Presenter: React.FC<PresenterProps> = ({
   radius = 28,
   objectPosition = "50% 50%",
   colorMode = "warm",
+  videoCuts,
+  sourceDurationFrames,
 }) => {
   const frame = useCurrentFrame();
+  // `windows` arrives already mapped to OUTPUT frames (XiaojinEditorial.tsx
+  // maps the whole `presenter` object via mapPropsForCuts before spreading
+  // it here) — `frame` from useCurrentFrame() is output-space too, so the
+  // fade/opacity math below is untouched. The VIDEO ITSELF needs the
+  // opposite: trimBefore/trimAfter are SOURCE-frame values, so segments are
+  // derived from the raw (source-space) cuts, not the mapped windows.
+  const cuts = normalizeCuts(videoCuts, sourceDurationFrames);
+  const segments = keptSegments(cuts, sourceDurationFrames);
 
   // Visible ONLY strictly inside a b-roll window, with the fade kept INSIDE the
   // window (fade in over the first FADE frames, out over the last FADE frames).
@@ -89,8 +104,10 @@ export const Presenter: React.FC<PresenterProps> = ({
           background: "#000",
         }}
       >
-        <OffthreadVideo
+        <CutVideo
           src={src}
+          segments={segments}
+          sourceDurationFrames={sourceDurationFrames}
           muted
           style={{
             width: "100%",

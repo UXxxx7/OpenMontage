@@ -1,0 +1,1342 @@
+/* OpenMontage editor — dark NLE theme.
+ *
+ * 之前整个编辑器是 ~120 个内联 style={{}} 对象，没有任何 .css 文件，因此
+ * hover/focus/active/disabled 这些状态在技术上根本无法表达（内联样式写不了
+ * 伪类），配色也是散落各处的魔法字面量。这个文件是唯一的样式来源：所有颜色/
+ * 间距/圆角走 CSS 变量，组件只用 className。
+ *
+ * 深色主题是刻意的：预览是一段明亮的 9:16 竖屏视频，深色外壳能让画面本身跳
+ * 出来——所有专业剪辑软件（Premiere/DaVinci/CapCut/Final Cut）都是这个道理。
+ */
+
+:root {
+  /* Surfaces — 从最深到最浅，数字越大越靠近用户 */
+  --bg-0: #0e1013;   /* app background */
+  --bg-1: #16191e;   /* panels */
+  --bg-2: #1e222a;   /* raised: toolbar, inspector cards */
+  --bg-3: #272c36;   /* inputs, hovered rows */
+  --bg-4: #333945;   /* borders on raised surfaces */
+
+  /* Text */
+  --fg-0: #e8eaed;   /* primary */
+  --fg-1: #a8aeb8;   /* secondary / labels */
+  --fg-2: #6f7681;   /* tertiary / hints */
+
+  /* Accent + semantic */
+  --accent: #4c8dff;
+  --accent-hover: #649dff;
+  --accent-dim: rgba(76, 141, 255, 0.18);
+  --danger: #ff5f56;
+  --danger-dim: rgba(255, 95, 86, 0.15);
+  --warn: #ffb020;
+  --warn-dim: rgba(255, 176, 32, 0.14);
+  --ok: #3ecf8e;
+
+  /* Lane colours — one per SECTION_GROUP, so a clip's colour tells you what
+   * kind of thing it is without reading the label. */
+  --lane-structure: #7c6cff;
+  --lane-captions: #3ecf8e;
+  --lane-data: #4c8dff;
+  --lane-cards: #ff9f43;
+  --lane-lists: #f368e0;
+  --lane-other: #8895a7;
+
+  --border: #2a2f3a;
+  --radius: 6px;
+  --radius-sm: 4px;
+
+  /* Layout */
+  --toolbar-h: 52px;
+  --inspector-w: 340px;
+  --timeline-h: 260px;
+  --library-w: 220px;
+  --ruler-h: 26px;
+  --lane-row-h: 24px;
+  --lane-label-w: 132px;
+
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg-0);
+  color: var(--fg-0);
+  font-family: var(--font);
+  font-size: 13px;
+  line-height: 1.45;
+  overflow: hidden; /* the app owns its own scroll regions */
+}
+
+/* ── App shell ─────────────────────────────────────────────────────────── */
+
+.app {
+  display: grid;
+  grid-template-columns: var(--library-w) 1fr var(--inspector-w);
+  /* The 6px "resizeh" row hosts .app__resize-h — --timeline-h itself is
+   * read/written live by useResizablePanel.ts (Phase 7), so this is the
+   * only place the row's height needs to change to resize the timeline. */
+  grid-template-rows: var(--toolbar-h) 1fr 6px var(--timeline-h);
+  grid-template-areas:
+    "toolbar   toolbar   toolbar"
+    "library   preview   inspector"
+    "resizeh   resizeh   resizeh"
+    "timeline  timeline  timeline";
+  height: 100vh;
+  height: 100dvh;
+}
+
+.app__toolbar   { grid-area: toolbar; }
+.app__inspector { grid-area: inspector; }
+.app__timeline  { grid-area: timeline; }
+.app__library   { grid-area: library; }
+
+/* Phase 7 — drag-to-resize the timeline against the preview above it. */
+.app__resize-h {
+  grid-area: resizeh;
+  position: relative;
+  cursor: row-resize;
+  touch-action: none;
+}
+.app__resize-h:hover, .app__resize-h:active { background: var(--accent); }
+/* The visible row is a thin 6px sliver, but the actual grabbable area is
+ * enlarged (a bare 6px target is well under the 44px touch-target minimum
+ * used everywhere else) via a transparent ::before rather than making the
+ * row itself taller, which would visibly eat into the preview/timeline. */
+.app__resize-h::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: -6px;
+  bottom: -6px;
+}
+
+.app__center {
+  /* .app__preview used to hold this grid-area, but no element in App.tsx
+   * actually carries that class — .app__center (the real preview wrapper)
+   * was landing in the "preview" cell purely by auto-placement, which any
+   * new explicitly-placed area added before it in DOM order would have
+   * silently displaced. Explicit now, matching every other grid child. */
+  grid-area: preview;
+  display: grid;
+  /* Was `place-items: center`, which shrink-wraps the grid item (.preview)
+   * to its content's max-content size. That worked before Phase A because
+   * .preview__player derived a definite width from height+aspect-ratio, so
+   * .preview always had a real size to hug. Now .preview__viewport uses
+   * `width:100%`, which needs its ANCESTOR chain to already be definite —
+   * under shrink-to-fit that's circular and resolves to 0, the same class
+   * of collapse .preview__player's own comment documents. `stretch` (grid's
+   * own default, restated explicitly here) makes .preview fill the cell,
+   * giving .preview__viewport's 100%/calc() sizing a real, non-circular
+   * basis; .preview__viewport's own overflow:auto + margin:auto on
+   * .preview__player still centers the actual video box within it. */
+  place-items: stretch;
+  padding: 24px;
+  min-height: 0;   /* lets the player shrink inside a grid row */
+  overflow: hidden;
+  background: var(--bg-0);
+}
+
+/* ── Toolbar ───────────────────────────────────────────────────────────── */
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 14px;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--border);
+}
+
+.toolbar__title {
+  font-weight: 600;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.toolbar__meta {
+  font-size: 11px;
+  color: var(--fg-2);
+  font-family: var(--mono);
+}
+
+.toolbar__spacer { flex: 1; }
+
+.toolbar__group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* ── Buttons ───────────────────────────────────────────────────────────── */
+
+.btn {
+  appearance: none;
+  border: 1px solid var(--bg-4);
+  background: var(--bg-3);
+  color: var(--fg-0);
+  border-radius: var(--radius-sm);
+  padding: 6px 11px;
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s, opacity 0.12s;
+  white-space: nowrap;
+}
+.btn:hover:not(:disabled) { background: var(--bg-4); }
+.btn:active:not(:disabled) { transform: translateY(1px); }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.btn--primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+.btn--primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+
+.btn--ghost { background: transparent; border-color: transparent; color: var(--fg-1); }
+.btn--ghost:hover:not(:disabled) { background: var(--bg-3); color: var(--fg-0); }
+
+.btn--danger { color: var(--danger); }
+.btn--danger:hover:not(:disabled) { background: var(--danger-dim); border-color: var(--danger); }
+
+.btn--icon { padding: 6px 8px; font-size: 13px; line-height: 1; }
+.btn--sm { padding: 3px 7px; font-size: 11px; }
+
+/* ── Preview ───────────────────────────────────────────────────────────── */
+
+.preview {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  max-height: 100%;
+  min-height: 0;
+}
+
+.preview__viewport {
+  /* Owns the definite size that used to live on .preview__player directly
+   * (see that rule's comment below for why "definite" matters here — the
+   * 0x0 collapse bug this box's sizing model was built to avoid). Phase A
+   * (zoom) needs a real, measurable box: PreviewPane's ResizeObserver reads
+   * this element's contentRect to compute "Fit" zoom, then sets an explicit
+   * pixel width/height on .preview__player from JS. This element's own job
+   * is just to be a definite-sized, scrollable window onto that child. */
+  align-self: stretch;
+  width: 100%;
+  height: calc(100vh - var(--toolbar-h) - var(--timeline-h) - 90px);
+  /* dvh accounts for mobile browser chrome (the URL bar) that vh ignores —
+   * .app itself already does this vh-then-dvh fallback pair; this rule and
+   * .center-msg's below were still vh-only, so on a phone this box could be
+   * taller than the actually-visible viewport while the URL bar is shown. */
+  height: calc(100dvh - var(--toolbar-h) - var(--timeline-h) - 90px);
+  overflow: auto;
+  border-radius: var(--radius);
+  background: var(--bg-0);
+  /* flex centering, not margin:auto on the child — margin:auto only
+   * centers a normal-flow block child HORIZONTALLY (per spec, auto
+   * top/bottom margins resolve to 0, they don't center vertically). This
+   * composition is portrait (1080x1920): whenever this viewport ends up
+   * width-constrained rather than height-constrained (a very plausible
+   * shape for this box), a margin:auto child would pin to the top with
+   * dead space below instead of centering — flex here centers correctly
+   * on both axes regardless of which dimension is the constraint.
+   * `safe` is load-bearing, not decoration: bare `center` on an overflowing
+   * flex child clips content symmetrically and makes roughly HALF of the
+   * overflow unreachable via scroll (confirmed live: at 100% zoom on a
+   * short viewport, scrollHeight came back far less than the real 1920px
+   * content height — the top of the frame was unscrollable-to). `safe
+   * center` tells the browser to fall back to start-alignment once content
+   * overflows, so panning/scrolling can always reach every edge. */
+  display: flex;
+  align-items: safe center;
+  justify-content: safe center;
+}
+
+.preview__player {
+  /* Pre-measurement / no-JS fallback only — PreviewPane sets explicit
+   * inline width/height in pixels once its ResizeObserver has measured
+   * .preview__viewport (synchronously, in a layout effect, before the first
+   * paint — see PreviewPane.tsx), and inline styles win over these rules.
+   * height:100% here is intentionally a PERCENTAGE, not `max-height` and not
+   * a bare `height:auto` — .preview__viewport above now provides the
+   * definite parent height this needs to resolve against without a repeat
+   * of the confirmed 0x0 collapse (max-height / no definite parent) this
+   * component's history already ran into once. */
+  height: 100%;
+  aspect-ratio: 1080 / 1920;
+  /* AuthoredPreview.tsx (Arm B) relies on this fallback sizing directly,
+   * unlike PreviewPane.tsx's JS-measured inline width/height — a height
+   * that resolves wider than the actual available width (an unusually
+   * wide/short viewport, e.g. a landscape phone) would otherwise overflow
+   * horizontally with nothing to clamp it. */
+  max-width: 100%;
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: #000;
+  box-shadow: 0 6px 28px rgba(0, 0, 0, 0.5);
+  flex-shrink: 0;
+  /* Positioned ancestor for .preview-overlay's `inset:0` (Phase B) — without
+   * this, an absolutely-positioned child anchors to the next positioned
+   * ancestor up the tree (.preview__viewport doesn't have one either), not
+   * to this exact box, and the overlay's scale math (its own measured width
+   * ÷ 1080) would silently stop matching the actual rendered video. */
+  position: relative;
+}
+
+.preview-overlay__box {
+  border: 2px solid var(--accent, #6c63ff);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.4);
+  cursor: move;
+  box-sizing: border-box;
+}
+
+/* Selected static element (chrome bars, intro/outro, facecam, …) that
+ * doesn't support dragging (yet, or ever) — same accent color as
+ * .preview-overlay__box so "this is selected" reads consistently, but a
+ * solid (not dashed) fill-less outline with no `cursor:move` so it doesn't
+ * imply an affordance that isn't there. */
+.preview-overlay__static-selection {
+  border: 2px solid var(--accent, #6c63ff);
+  box-sizing: border-box;
+  border-radius: 2px;
+}
+
+/* What a click would grab (Phase 6, F1c) — dashed, no fill, never intercepts
+ * pointer events itself (see PreviewOverlay.tsx's own inline pointerEvents:
+ * "none" on this element — the hit-test that produces it already happened
+ * in the same handler that would otherwise receive this element's events). */
+.preview-overlay__hover {
+  border: 2px dashed rgba(255, 255, 255, 0.6);
+  box-sizing: border-box;
+  border-radius: 2px;
+}
+
+/* Phase 8 — Arm B's AuthoredOverlay reuses this class for EVERY currently-
+ * visible manifest element (not just the one under the cursor), since with
+ * no fixed card vocabulary there's otherwise no visual hint anything here
+ * is clickable. This variant is the one actually under the pointer right
+ * now — brighter, so it doesn't get lost among the other outlines. */
+.preview-overlay__hover--active {
+  border-color: var(--accent, #6c63ff);
+  background: rgba(108, 99, 255, 0.08);
+}
+
+.preview-overlay__handle {
+  position: absolute;
+  right: -5px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 10px;
+  height: 28px;
+  background: var(--accent, #6c63ff);
+  border-radius: 3px;
+  cursor: ew-resize;
+  pointer-events: auto;
+}
+
+/* Phase 8 — Arm B's AuthoredOverlay resizes w AND h from one bottom-right
+ * corner handle (manifest elements have both, unlike Arm A's width-only
+ * draggable cards), not a width-only edge handle. */
+.preview-overlay__handle--corner {
+  right: -6px;
+  top: auto;
+  bottom: -6px;
+  transform: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  cursor: nwse-resize;
+}
+
+.preview-overlay__hud {
+  position: absolute;
+  background: rgba(20, 20, 24, 0.92);
+  color: #fff;
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 3px 7px;
+  border-radius: 4px;
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 5;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .preview-overlay__box { touch-action: none; }
+}
+
+.preview__transport {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--fg-1);
+}
+
+.preview__time { min-width: 116px; text-align: center; }
+
+.preview__zoom { display: flex; align-items: center; gap: 4px; margin-left: 10px; }
+.preview__zoom-label { min-width: 42px; text-align: center; }
+
+/* ── Arm B (AI-authored) editor shell (Phase 8) ───────────────────────────
+ * AuthoredEditor.tsx has a preview + Inspector + Timeline (P8.7 final pass)
+ * but no library panel — Arm B has no fixed vocabulary of addable card
+ * types (see its own top-of-file comment), so there's nothing to browse to
+ * add. Reusing .app's 3-column grid as-is would leave the library column
+ * permanently empty; override to a 2-column layout with its own timeline
+ * row underneath, mirroring .app's own toolbar/center/inspector/timeline
+ * area names. .preview/.preview__viewport/.preview__player/.timeline* are
+ * all reused unmodified — only the outer shell/grid differs. */
+
+.authored-app {
+  grid-template-columns: 1fr var(--inspector-w);
+  grid-template-rows: var(--toolbar-h) 1fr var(--timeline-h);
+  grid-template-areas:
+    "toolbar    toolbar"
+    "center     inspector"
+    "timeline   timeline";
+}
+
+.authored-app__center {
+  grid-area: center;
+  display: grid;
+  place-items: stretch;
+  padding: 24px;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--bg-0);
+}
+
+.authored-app__inspector { grid-area: inspector; }
+.authored-app__timeline { grid-area: timeline; }
+
+.authored-app__viewport {
+  /* Same budget shape as .preview__viewport's own calc() (toolbar + timeline
+   * come out of the available height), just without Arm A's extra
+   * --library-w-driven column concerns — this shell only has 2 columns. */
+  height: calc(100vh - var(--toolbar-h) - var(--timeline-h) - 90px);
+  height: calc(100dvh - var(--toolbar-h) - var(--timeline-h) - 90px);
+}
+
+.authored-app__player {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.authored-app__fallback {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 16px;
+  text-align: center;
+}
+
+.authored-app__compile-note {
+  font-size: 11px;
+  color: var(--fg-2);
+  max-width: 320px;
+}
+.authored-app__compile-note details { margin-top: 6px; text-align: left; }
+.authored-app__compile-note summary { cursor: pointer; color: var(--fg-1); }
+
+/* ── Inspector ─────────────────────────────────────────────────────────── */
+
+.inspector {
+  background: var(--bg-1);
+  border-left: 1px solid var(--border);
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.inspector__header {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--border);
+  padding: 10px 14px;
+}
+
+.inspector__title {
+  font-weight: 600;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.inspector__kind {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--fg-2);
+}
+
+.inspector__badge {
+  color: var(--warn, #c98a2c);
+  text-transform: none;
+  letter-spacing: normal;
+  cursor: help;
+}
+
+.inspector__body { padding: 12px 14px 40px; }
+
+.inspector__empty {
+  padding: 28px 18px;
+  color: var(--fg-2);
+  font-size: 12px;
+  text-align: center;
+  line-height: 1.6;
+}
+
+.inspector__actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.section {
+  margin-bottom: 18px;
+}
+.section__title {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--fg-2);
+  margin: 0 0 8px;
+  font-weight: 600;
+}
+
+/* ── Form controls ─────────────────────────────────────────────────────── */
+
+.field { margin-bottom: 10px; }
+
+.field__label {
+  display: block;
+  font-size: 11px;
+  color: var(--fg-1);
+  margin-bottom: 3px;
+}
+.field__label--req::after { content: " *"; color: var(--accent); }
+
+.field__hint { font-size: 10px; color: var(--fg-2); margin-top: 2px; }
+
+.volume-row { display: flex; align-items: center; gap: 8px; }
+.volume-row input[type="range"] { flex: 1; accent-color: var(--accent); }
+.volume-row__value { min-width: 36px; text-align: right; font-family: var(--mono); font-size: 11px; color: var(--fg-1); }
+
+.field__error {
+  font-size: 10px;
+  color: var(--danger);
+  margin-top: 3px;
+}
+
+.input, .select {
+  width: 100%;
+  background: var(--bg-3);
+  color: var(--fg-0);
+  border: 1px solid var(--bg-4);
+  border-radius: var(--radius-sm);
+  padding: 5px 8px;
+  font-size: 12px;
+  font-family: inherit;
+  transition: border-color 0.12s, background 0.12s;
+}
+.input:hover, .select:hover { border-color: #3f4756; }
+.input:focus, .select:focus {
+  outline: none;
+  border-color: var(--accent);
+  background: var(--bg-2);
+}
+.input--invalid { border-color: var(--danger); }
+.input--num { width: 92px; font-family: var(--mono); }
+.input--time { width: 106px; font-family: var(--mono); }
+
+.input:read-only, .input--pinned {
+  background: var(--bg-2);
+  color: var(--fg-2);
+  cursor: not-allowed;
+}
+
+.checkbox { width: 15px; height: 15px; accent-color: var(--accent); }
+
+/* Nested object / array containers in the schema form */
+.nest {
+  border-left: 2px solid var(--border);
+  padding-left: 10px;
+  margin-top: 4px;
+}
+
+.arrayitem {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px;
+  margin-bottom: 8px;
+  background: var(--bg-2);
+  position: relative;
+}
+.arrayitem__bar {
+  display: flex;
+  justify-content: flex-end;
+  gap: 3px;
+  margin-bottom: 6px;
+}
+
+.disclosure {
+  background: none;
+  border: none;
+  color: var(--fg-1);
+  font-size: 11px;
+  padding: 3px 0;
+  cursor: pointer;
+}
+.disclosure:hover { color: var(--fg-0); }
+
+/* Nudge row — the touch-friendly alternative to dragging */
+.nudge {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  margin-top: 3px;
+  flex-wrap: wrap;
+}
+
+/* ── Timeline ──────────────────────────────────────────────────────────── */
+
+.timeline {
+  background: var(--bg-1);
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.timeline__bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-2);
+  flex: 0 0 auto;
+}
+
+.timeline__viewtoggle { display: flex; gap: 2px; }
+.timeline__viewtoggle .btn[aria-selected="true"] {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.timeline__scroll {
+  flex: 1;
+  overflow: auto;
+  position: relative;
+  min-height: 0;
+  /* Keeps native single-finger scrolling on both axes (this container
+   * scrolls vertically when there are more lanes than fit, horizontally
+   * always) while withholding the browser's own pinch-to-zoom/double-tap
+   * gestures — those two fingers are claimed by usePinchZoom.ts instead
+   * (Phase 6, F3b). Listing both pan-x and pan-y (rather than just pan-x)
+   * is what actually withholds pinch here; omitting one axis wouldn't. */
+  touch-action: pan-x pan-y;
+}
+
+/* The scrolling content is as wide as the zoomed video plus the sticky label
+ * gutter, so lanes and ruler scroll together in one shared coordinate space. */
+.timeline__canvas {
+  position: relative;
+  min-height: 100%;
+}
+
+/* Wraps <Ruler> — the playhead-scrub pointerdown/move/up handlers
+ * (usePlayheadScrub.ts) live here, not on .timeline__scroll (which stays
+ * `pan-x pan-y` for native scrolling/usePinchZoom's pinch gesture).
+ * `touch-action: none` is scoped to just this narrow band so a single-
+ * finger drag here scrubs instead of also scrolling the page. */
+.timeline__ruler-wrap {
+  touch-action: none;
+}
+
+.ruler {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  height: var(--ruler-h);
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+}
+
+.ruler__tick {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border-left: 1px solid var(--bg-4);
+  padding-left: 4px;
+  font-size: 9px;
+  color: var(--fg-2);
+  font-family: var(--mono);
+  user-select: none;
+  pointer-events: none;
+}
+
+.lane {
+  position: relative;
+  border-bottom: 1px solid var(--border);
+}
+.lane:hover { background: rgba(255, 255, 255, 0.015); }
+
+.lane__label {
+  position: sticky;
+  left: 0;
+  z-index: 2;
+  width: var(--lane-label-w);
+  padding: 3px 8px;
+  font-size: 10px;
+  color: var(--fg-1);
+  background: var(--bg-1);
+  border-right: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  height: 100%;
+  pointer-events: none;
+}
+
+.lane__swatch {
+  width: 3px;
+  height: 12px;
+  border-radius: 2px;
+  flex: 0 0 auto;
+}
+
+.lane__count { color: var(--fg-2); font-family: var(--mono); }
+
+.lane__track {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: var(--lane-label-w);
+  right: 0;
+}
+
+/* Clips */
+.clip {
+  position: absolute;
+  height: calc(var(--lane-row-h) - 5px);
+  border-radius: 3px;
+  font-size: 10px;
+  line-height: 1;
+  padding: 0 5px;
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+  white-space: nowrap;
+  color: #fff;
+  cursor: pointer;
+  border: 1px solid transparent;
+  min-width: 3px;
+  user-select: none;
+  transition: filter 0.1s, border-color 0.1s;
+}
+/* touch-action:none is only needed to stop the page scrolling under a
+ * pointer-drag on desktop; on touch, drag is disabled entirely (see
+ * Timeline.tsx's isTouch/dragEnabled) and this same rule was instead
+ * swallowing a finger-swipe that starts on the full-width Video/Audio bar,
+ * blocking the whole timeline from scrolling on a phone. Scope to the same
+ * capability query App.tsx's detectDesktopPointer() already uses. */
+@media (hover: hover) and (pointer: fine) {
+  .clip { touch-action: none; }
+}
+.clip:hover { filter: brightness(1.18); }
+.clip--selected {
+  border-color: #fff;
+  box-shadow: 0 0 0 1px var(--accent), 0 2px 8px rgba(0, 0, 0, 0.5);
+  z-index: 1;
+  /* Unconditional (not scoped to the hover/pointer-fine query above): on
+   * touch the selected clip becomes draggable (Phase 6, F3a), and without
+   * this a finger-drag on it is swallowed by the page's own scroll instead
+   * of reaching useClipDrag/useLayerDrag's pointermove handler. */
+  touch-action: none;
+}
+.clip--invalid { box-shadow: inset 0 0 0 2px var(--danger); }
+
+/* Brief highlight right after this clip is revealed by an external
+ * selection — clicking the matching card on the video preview (Phase 6,
+ * F1d). Self-clears after ~600ms (Timeline.tsx's own timer); the animation
+ * duration here is intentionally shorter than that so it settles before
+ * the class is removed, rather than being cut off mid-pulse. */
+@keyframes clip-reveal-pulse {
+  0%, 100% { box-shadow: 0 0 0 3px var(--accent); }
+  50% { box-shadow: 0 0 0 3px transparent; }
+}
+.clip--revealed { animation: clip-reveal-pulse 0.5s ease-in-out; }
+.marker--revealed { animation: clip-reveal-pulse 0.5s ease-in-out; }
+
+@media (prefers-reduced-motion: reduce) {
+  .clip--revealed, .marker--revealed { animation: none; box-shadow: 0 0 0 3px var(--accent); }
+}
+
+/* Open-ended clips (no endFrame) stay on screen until the video ends. The
+ * old timeline drew these as 1-second bars, which is why cards appeared to
+ * pile up for no reason — the fade-out edge + ∞ badge make it visible. */
+.clip--openended {
+  -webkit-mask-image: linear-gradient(to right, #000 60%, rgba(0, 0, 0, 0.25) 100%);
+  mask-image: linear-gradient(to right, #000 60%, rgba(0, 0, 0, 0.25) 100%);
+}
+.clip__inf {
+  margin-left: auto;
+  padding-left: 6px;
+  opacity: 0.85;
+  font-weight: 700;
+}
+
+.clip__handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 6px;
+  cursor: ew-resize;
+}
+.clip__handle--l { left: 0; }
+.clip__handle--r { right: 0; }
+.clip__handle:hover { background: rgba(255, 255, 255, 0.4); }
+
+/* Video/Audio synthetic lanes (Phase 4) — not schema-driven, so they don't
+ * go through Clip.tsx's ClipItem model; a single full-width bar each. */
+.clip--video {
+  padding: 0;
+  display: flex;
+  align-items: stretch;
+  background: #14181f;
+}
+.clip--video img {
+  flex: 1 1 0;
+  min-width: 0;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  pointer-events: none;
+}
+.clip--waveform {
+  padding: 0;
+  background-color: #14181f;
+  background-repeat: no-repeat;
+  background-position: center;
+  background-size: 100% 70%;
+}
+
+/* Cut splice markers — a cut collapses to one OUTPUT frame (its start and
+ * end map to the same point, see src/cuts.ts), drawn as a thin red line
+ * over the Video/Audio lanes so an existing cut is visible without opening
+ * the Inspector's cuts list. */
+.splice-marker {
+  position: absolute;
+  width: 2px;
+  background: var(--danger, #e5484d);
+  pointer-events: none;
+  z-index: 1;
+}
+
+/* Point-in-time markers (chapters, scenes, opacityKeyframes) — these have no
+ * duration, so a bar would be a lie; a diamond reads as an instant. */
+.marker {
+  position: absolute;
+  width: 11px;
+  height: 11px;
+  transform: translateX(-50%) rotate(45deg);
+  border-radius: 2px;
+  cursor: pointer;
+  border: 1px solid rgba(0, 0, 0, 0.45);
+}
+/* touch-action:none is only needed to stop page scroll under a
+ * pointer-drag on desktop — same history as .clip's own rule above. This
+ * used to be unconditional, which meant a finger-swipe starting on ANY
+ * chapter diamond couldn't scroll the timeline at all, selected or not.
+ * .marker--selected keeps it (Phase 6, F3a — a selected marker becomes
+ * touch-draggable), everything else falls back to normal touch scrolling. */
+@media (hover: hover) and (pointer: fine) {
+  .marker { touch-action: none; }
+}
+.marker:hover { filter: brightness(1.25); }
+.marker--selected { box-shadow: 0 0 0 2px #fff; touch-action: none; }
+
+/* 11px reads fine for a mouse cursor but is under half the 44px touch-target
+ * minimum — enlarged via a transparent ::before rather than the diamond
+ * itself, which would look oversized next to the clips around it. */
+@media (max-width: 860px) {
+  .marker::before {
+    content: "";
+    position: absolute;
+    inset: -15px;
+  }
+}
+
+.playhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--danger);
+  pointer-events: none;
+  z-index: 4;
+  will-change: transform;
+}
+.playhead::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: -5px;
+  border-left: 6px solid transparent;
+  border-right: 6px solid transparent;
+  border-top: 7px solid var(--danger);
+}
+
+/* Grabbable drag surface for the playhead (usePlayheadScrub.ts) — a
+ * separate element from `.playhead` itself (which stays pointer-events:none
+ * so it never steals clicks from clip resize handles it happens to sit
+ * over). Confined to the ruler band only, not the full track height, or
+ * dragging the line would compete with clip drags everywhere it crosses
+ * one. Wider than the visible 2px line so it's actually easy to grab. */
+.playhead__grip {
+  position: absolute;
+  top: 0;
+  left: -5px;
+  width: 12px;
+  height: var(--ruler-h);
+  pointer-events: auto;
+  cursor: ew-resize;
+  touch-action: none;
+}
+
+/* Live readout during a drag — avoids thrashing the inspector inputs. */
+.draghud {
+  position: absolute;
+  z-index: 6;
+  background: var(--bg-0);
+  border: 1px solid var(--accent);
+  color: var(--fg-0);
+  font-family: var(--mono);
+  font-size: 10px;
+  padding: 3px 6px;
+  border-radius: var(--radius-sm);
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+/* ── Toast / banners ───────────────────────────────────────────────────── */
+
+.toast {
+  position: fixed;
+  bottom: 18px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--bg-2);
+  border: 1px solid var(--bg-4);
+  color: var(--fg-0);
+  padding: 9px 15px;
+  border-radius: var(--radius);
+  font-size: 12px;
+  z-index: 50;
+  box-shadow: 0 6px 22px rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.banner {
+  padding: 8px 11px;
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  margin-bottom: 10px;
+  line-height: 1.5;
+}
+.banner--warn { background: var(--warn-dim); color: var(--warn); }
+.banner--error { background: var(--danger-dim); color: var(--danger); }
+.banner--ok { background: rgba(62, 207, 142, 0.13); color: var(--ok); }
+.banner ul { margin: 5px 0 0; padding-left: 16px; }
+
+.statusdot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  display: inline-block;
+  flex: 0 0 auto;
+}
+.statusdot--dirty { background: var(--warn); }
+.statusdot--clean { background: var(--ok); }
+.statusdot--busy  { background: var(--accent); animation: pulse 1.1s ease-in-out infinite; }
+
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+.center-msg {
+  display: grid;
+  place-items: center;
+  height: 100vh;
+  height: 100dvh;
+  color: var(--fg-1);
+  padding: 24px;
+  text-align: center;
+}
+
+/* ── Library (Phase D animation gallery) ──────────────────────────────── */
+
+.library {
+  background: var(--bg-1);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.library__header {
+  padding: 12px 14px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--fg-1);
+}
+
+.library__body { flex: 1; overflow-y: auto; padding: 0 10px 12px; }
+
+.library__group { margin-bottom: 14px; }
+.library__group-title {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--fg-2);
+  padding: 4px 4px 6px;
+}
+
+.library__grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+/* Phase 6, F3c: the tile is a plain positioning wrapper now, not itself a
+ * button — on touch it hosts TWO controls (preview-toggle + a separate
+ * "+ Add" overlay), and a <button> can't validly contain another <button>. */
+.library-tile {
+  position: relative;
+  overflow: hidden;
+  border-radius: var(--radius);
+}
+
+.library-tile__preview-btn {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0;
+  cursor: pointer;
+  overflow: hidden;
+  touch-action: manipulation;
+  text-align: left;
+  color: var(--fg-1);
+  font: inherit;
+}
+.library-tile__preview-btn:hover { border-color: var(--accent); }
+.library-tile__preview-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.library-tile--active .library-tile__preview-btn { border-color: var(--accent); }
+
+.library-tile__preview {
+  width: 100%;
+  aspect-ratio: 1080 / 1920;
+  background: #000;
+  overflow: hidden;
+  pointer-events: none; /* the preview button itself handles the click/hover, not the iframe-like player */
+}
+
+.library-tile__label {
+  font-size: 10px;
+  padding: 4px 6px 6px;
+  color: var(--fg-1);
+  line-height: 1.25;
+}
+
+/* Touch-only overlay (Phase 6, F3c) — appears once the preview is toggled
+ * on, so committing is a deliberate second tap, not a side effect of
+ * previewing. Sized to the 44px touch-target minimum from the start since
+ * this control only ever exists on touch. */
+.library-tile__add {
+  position: absolute;
+  left: 6px;
+  right: 6px;
+  bottom: 6px;
+  min-height: 44px;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+/* ── Phone (shared width-based tuning — applies inside BOTH shells) ──────── *
+ * The real problem on a 390px screen isn't panel count — it's that the
+ * composition is 1080x1920 portrait, so a full-width preview is ~693px tall
+ * and eats the whole viewport. The phone shell (.phone-app, below) is the
+ * primary answer to that now; these rules also apply if `?ui=desktop`
+ * forces the desktop tree onto a narrow viewport for testing.            */
+
+@media (max-width: 860px) {
+  /* Phase 7 — .preview__viewport used to have its own fixed 40vh/40dvh
+   * height here, completely independent of its ancestors. That was fine
+   * before .phone-app__preview was resizable (both shells' actual
+   * available height happened to already be bounded by something else at
+   * this breakpoint), but a FIXED height here would now silently ignore
+   * useResizablePanel.ts's whole point — dragging the handle would resize
+   * .phone-app__preview's box without the video inside it ever actually
+   * changing size. .preview needs an explicit height (not just its base
+   * rule's max-height) for .preview__viewport's 100% to resolve against a
+   * real number rather than collapsing to 0 — both shells' immediate
+   * ancestor here (.phone-app__preview's flex-basis, .app__center's grid
+   * stretch) is already definite at this breakpoint, so 100% is safe in
+   * either shell. */
+  .preview { height: 100%; }
+  .preview__viewport { height: 100%; }
+
+  /* Bigger touch targets */
+  :root { --lane-row-h: 36px; --lane-label-w: 96px; }
+  .clip { min-width: 12px; font-size: 11px; }
+  .toolbar { gap: 6px; padding: 0 8px; }
+  .toolbar__meta { display: none; }
+
+  /* Phase 6, F4 — every interactive control here was under the 44px
+   * touch-target minimum, .btn--sm and .checkbox especially so (24px and
+   * 15px respectively). min-height (not height) so a control with more
+   * content than its padding implies — a wrapped .nudge row's buttons,
+   * say — still grows instead of clipping. */
+  .btn, .btn--icon, .btn--sm {
+    min-height: 44px;
+    padding: 8px 12px;
+    touch-action: manipulation;
+  }
+  .btn--icon { min-width: 44px; padding: 8px; }
+
+  /* The checkbox itself stays visually small (a 44px native checkbox next
+   * to an 11px label would look broken) — the hit area is enlarged
+   * separately via a transparent ::before, same technique as .marker's
+   * own below. Needs `position: relative` since it's normally static. */
+  .checkbox { position: relative; }
+  .checkbox::before {
+    content: "";
+    position: absolute;
+    inset: -15px;
+  }
+
+  /* iOS Safari force-zooms the page on focusing any input with a
+   * computed font-size under 16px, and never zooms back out — the single
+   * most disruptive of the touch bugs found in the Phase 6 audit. */
+  .input, .select { font-size: 16px; }
+}
+
+/* ── Phone shell (Phase 6, F2) ────────────────────────────────────────────
+ * A dedicated portrait layout, not the desktop grid squeezed down: top bar /
+ * preview / timeline / bottom action bar, stacked in a plain column flex —
+ * deliberately NOT `.app`'s CSS grid, so this has zero coupling to desktop
+ * layout changes. `dvh` throughout (not `vh`) so sizing accounts for the
+ * mobile browser chrome (URL bar) that `vh` alone ignores. */
+
+.phone-app {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+  overflow: hidden;
+  background: var(--bg-0);
+}
+
+.phone-app__preview {
+  /* --phone-preview-h is read/written live by useResizablePanel.ts
+   * (Phase 7) — the var() fallback (40dvh, matching this rule's old fixed
+   * value) only ever applies for the one frame before that hook's
+   * useLayoutEffect runs, since JS always sets an explicit px value
+   * immediately after (default or remembered) before first paint. */
+  flex: 0 0 var(--phone-preview-h, 40dvh);
+  padding: 8px;
+  min-height: 0;
+}
+
+/* Phase 7 — drag-to-resize the preview against the timeline below it.
+ * Visually mirrors .phone-sheet__handle/__grip's own drag-affordance
+ * convention on purpose, so the same "this strip is grabbable" language
+ * reads consistently across the shell. */
+.phone-app__resize-h {
+  flex: 0 0 auto;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 6px 0;
+  cursor: row-resize;
+  touch-action: none;
+}
+.phone-app__resize-grip { width: 36px; height: 4px; border-radius: 2px; background: var(--bg-4); }
+.phone-app__resize-h:hover .phone-app__resize-grip,
+.phone-app__resize-h:active .phone-app__resize-grip { background: var(--accent); }
+
+.phone-app__timeline {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+}
+.phone-app__timeline .timeline { flex: 1 1 auto; min-height: 0; }
+
+/* ── Phone top bar ─────────────────────────────────────────────────────── */
+
+.phone-topbar {
+  flex: 0 0 auto;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--border);
+  padding-top: env(safe-area-inset-top, 0px);
+}
+
+.phone-topbar__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+}
+
+.phone-topbar__title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--fg-1);
+}
+
+.phone-topbar__menu { position: relative; }
+
+.phone-topbar__menu-popup {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  z-index: 20;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px;
+  min-width: 180px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* ── Phone action bar ──────────────────────────────────────────────────── */
+
+.phone-actionbar {
+  flex: 0 0 auto;
+  display: flex;
+  background: var(--bg-2);
+  border-top: 1px solid var(--border);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+.phone-actionbar__btn {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  padding: 8px 4px;
+  min-height: 52px;
+  background: transparent;
+  border: none;
+  color: var(--fg-1);
+  font-family: inherit;
+  touch-action: manipulation;
+}
+.phone-actionbar__btn[aria-selected="true"] { color: var(--accent); background: var(--bg-3); }
+.phone-actionbar__icon { font-size: 18px; line-height: 1; }
+.phone-actionbar__label { font-size: 10px; }
+
+/* ── Phone bottom sheet ────────────────────────────────────────────────── */
+
+.phone-sheet {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  align-items: flex-end;
+}
+
+.phone-sheet__backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+}
+
+.phone-sheet__panel {
+  position: relative;
+  width: 100%;
+  max-height: 75dvh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-1);
+  border-radius: 14px 14px 0 0;
+  box-shadow: 0 -8px 28px rgba(0, 0, 0, 0.5);
+}
+
+.phone-sheet__handle {
+  flex: 0 0 auto;
+  display: flex;
+  justify-content: center;
+  padding: 8px 0 4px;
+  cursor: grab;
+  /* Claims the drag-to-close gesture on just this strip — everything below
+   * (the sheet's own scrollable body) keeps normal touch scrolling. */
+  touch-action: none;
+}
+.phone-sheet__grip { width: 36px; height: 4px; border-radius: 2px; background: var(--bg-4); }
+
+.phone-sheet__header {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 14px 10px;
+  border-bottom: 1px solid var(--border);
+}
+.phone-sheet__title { font-size: 14px; font-weight: 600; }
+
+.phone-sheet__body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 12px 14px calc(14px + env(safe-area-inset-bottom, 0px));
+}
+/* Nested inside the sheet's own scroll region — the divider/background that
+ * make sense as the desktop's left COLUMN read as stray clutter here. */
+.phone-sheet__body .library { border-right: none; background: transparent; padding: 0; }
+.phone-sheet__body .library__body { padding: 0; }

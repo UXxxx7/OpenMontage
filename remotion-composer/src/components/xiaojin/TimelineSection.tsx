@@ -92,10 +92,22 @@ export const TimelineSection: React.FC<TimelineSectionProps> = ({
   // Fill-line height builds progressively: holds flat, then grows to the
   // next cumulative height in the GROW_WINDOW frames right before each
   // node's own reveal frame, so the line "arrives" as the dot pops.
+  //
+  // Built defensively, not trusting revealFrame spacing: once a video cut
+  // (src/cuts.ts) can shift these frames, two nodes can end up close enough
+  // together that `revealFrame - GROW_WINDOW` for the later one lands at or
+  // before an already-pushed frame — interpolate() hard-throws on a
+  // non-strictly-increasing input range. Clamping every pushed frame to at
+  // least `prev + 1` guarantees strictly increasing regardless of how tight
+  // the spacing gets (a cut landing between two nodes is exactly this case,
+  // and mapKeyframes' own collapse-dedupe only catches EXACT ties, not
+  // "too close together").
   const fillFrames: number[] = [nodes[0].revealFrame];
   const fillHeights: number[] = [0];
   for (let i = 1; i < nodes.length; i++) {
-    fillFrames.push(nodes[i].revealFrame - GROW_WINDOW, nodes[i].revealFrame);
+    const growStart = Math.max(fillFrames[fillFrames.length - 1] + 1, nodes[i].revealFrame - GROW_WINDOW);
+    const growEnd = Math.max(growStart + 1, nodes[i].revealFrame);
+    fillFrames.push(growStart, growEnd);
     fillHeights.push(step * (i - 1), step * i);
   }
   const fillHeight = interpolate(frame, fillFrames, fillHeights, {

@@ -20,6 +20,11 @@ export interface ChapterNavProps {
   colorMode?: ColorMode;
   headingFont?: string;
   labelFont?: string;
+  /** Editor-only position override — omit for the default pinned-top,
+   *  full-width placement (NAV.h from theme.ts stays the height regardless). */
+  x?: number;
+  y?: number;
+  width?: number;
 }
 
 export const ChapterNav: React.FC<ChapterNavProps> = ({
@@ -28,6 +33,9 @@ export const ChapterNav: React.FC<ChapterNavProps> = ({
   colorMode = "warm",
   headingFont = "inherit",
   labelFont = "inherit",
+  x = 0,
+  y = 0,
+  width = W,
 }) => {
   const frame = useCurrentFrame();
   const palette = PALETTES[colorMode];
@@ -48,9 +56,9 @@ export const ChapterNav: React.FC<ChapterNavProps> = ({
     <div
       style={{
         position: "absolute",
-        top: 0,
-        left: 0,
-        width: W,
+        top: y,
+        left: x,
+        width,
         height: NAV.h,
         opacity,
         background:

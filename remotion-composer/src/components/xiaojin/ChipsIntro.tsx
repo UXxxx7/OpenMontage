@@ -20,6 +20,11 @@ export interface ChipsIntroProps {
   introOutFrame: number;
   colorMode?: ColorMode;
   labelFont?: string;
+  /** Editor-only position override, read from the shared `intro` object's
+   *  own x/y (meaningful for this variant only — see the schema's own
+   *  description on intro.x/intro.y). Omit for the default top-left stack. */
+  x?: number;
+  y?: number;
 }
 
 const CHIP_STAGGER_FRAMES = 6;
@@ -30,6 +35,8 @@ export const ChipsIntro: React.FC<ChipsIntroProps> = ({
   introOutFrame,
   colorMode = "warm",
   labelFont = "inherit",
+  x = 96,
+  y = 420,
 }) => {
   const frame = useCurrentFrame();
   const palette = PALETTES[colorMode];
@@ -48,8 +55,8 @@ export const ChipsIntro: React.FC<ChipsIntroProps> = ({
     <div
       style={{
         position: "absolute",
-        left: 96,
-        top: 420,
+        left: x,
+        top: y,
         display: "flex",
         flexDirection: "column",
         gap: 14,

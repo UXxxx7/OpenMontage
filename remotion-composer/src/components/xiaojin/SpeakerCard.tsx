@@ -12,7 +12,9 @@
  * reason, not hardcoded. There is no default that works across different
  * source videos; the caller must supply a calibrated value.
  */
-import { OffthreadVideo, interpolate, staticFile, useCurrentFrame } from "remotion";
+import { interpolate, useCurrentFrame } from "remotion";
+import { keptSegments, normalizeCuts, type VideoCut } from "../../cuts";
+import { CutVideo } from "./CutVideo";
 import { APPLE, ColorMode, PALETTES } from "./theme";
 
 export interface SpeakerCardScene {
@@ -41,6 +43,12 @@ export interface SpeakerCardProps {
   colorMode?: ColorMode;
   /** Frames for the first-appearance rise-in. Default 26 (matches the reference build). */
   enterFrames?: number;
+  /** Editor-authored razor cuts (source-video frames) — see ../../cuts.ts. Absent/empty plays the full, untrimmed source. */
+  videoCuts?: VideoCut[];
+  /** Full untrimmed source length in frames — required to derive kept segments from videoCuts. */
+  sourceDurationFrames: number;
+  /** Passed straight to CutVideo/OffthreadVideo. Absent/undefined = full volume (unchanged from every job before this field existed). */
+  videoVolume?: number;
   /**
    * Rendered inside the card's own positioned div (e.g. CornerCard) — so an
    * overlay anchored here travels/scales/hides with the card automatically
@@ -78,6 +86,37 @@ function withHoldKeyframes(scenes: SpeakerCardScene[]): SpeakerCardScene[] {
   return expanded;
 }
 
+export interface SpeakerRect { x: number; y: number; w: number; h: number }
+
+/**
+ * Pure: the facecam's on-screen rect at a given frame, including the
+ * synthetic hold keyframes withHoldKeyframes() inserts — this IS the exact
+ * math the component below renders with (extracted, not reimplemented), so
+ * a caller gets a byte-exact rect rather than an approximation. Exists for
+ * the editor's preview click/select overlay (state/staticElements.ts) to
+ * make the facecam and anything anchored to it (CornerCard) selectable
+ * without duplicating this interpolation.
+ *
+ * Returns null when there are no scenes — nothing to compute, matches the
+ * component's own `if (scenes.length === 0) return null`.
+ */
+export function speakerRectAt(scenes: SpeakerCardScene[], frame: number): SpeakerRect | null {
+  if (scenes.length === 0) return null;
+  const opts = {
+    extrapolateLeft: "clamp" as const,
+    extrapolateRight: "clamp" as const,
+    easing: APPLE,
+  };
+  const holdScenes = withHoldKeyframes(scenes);
+  const frames = holdScenes.map((s) => s.frame);
+  return {
+    x: interpolate(frame, frames, holdScenes.map((s) => s.x), opts),
+    y: interpolate(frame, frames, holdScenes.map((s) => s.y), opts),
+    w: interpolate(frame, frames, holdScenes.map((s) => s.w), opts),
+    h: interpolate(frame, frames, holdScenes.map((s) => s.h), opts),
+  };
+}
+
 export const SpeakerCard: React.FC<SpeakerCardProps> = ({
   videoSrc,
   scenes,
@@ -85,25 +124,29 @@ export const SpeakerCard: React.FC<SpeakerCardProps> = ({
   objectPosition = "50% 35%",
   colorMode = "warm",
   enterFrames = 26,
+  videoCuts,
+  sourceDurationFrames,
+  videoVolume,
   children,
 }) => {
   const frame = useCurrentFrame();
   const palette = PALETTES[colorMode];
+  // Never trust that props.videoCuts arrived already sorted/merged/clamped
+  // — normalize here too, at the point of use, same "guarantee it where the
+  // value is actually consumed" discipline this codebase already applies
+  // elsewhere (see whatsapp_mvp/CLAUDE.md's Rule 22).
+  const cuts = normalizeCuts(videoCuts, sourceDurationFrames);
+  const segments = keptSegments(cuts, sourceDurationFrames);
 
-  if (scenes.length === 0) return null;
+  const rect = speakerRectAt(scenes, frame);
+  if (!rect) return null;
+  const { x: cx, y: cy, w: cw, h: ch } = rect;
 
   const opts = {
     extrapolateLeft: "clamp" as const,
     extrapolateRight: "clamp" as const,
     easing: APPLE,
   };
-
-  const holdScenes = withHoldKeyframes(scenes);
-  const frames = holdScenes.map((s) => s.frame);
-  const cx = interpolate(frame, frames, holdScenes.map((s) => s.x), opts);
-  const cy = interpolate(frame, frames, holdScenes.map((s) => s.y), opts);
-  const cw = interpolate(frame, frames, holdScenes.map((s) => s.w), opts);
-  const ch = interpolate(frame, frames, holdScenes.map((s) => s.h), opts);
 
   const cardOpacity = opacityKeyframes && opacityKeyframes.length > 0
     ? interpolate(
@@ -141,8 +184,11 @@ export const SpeakerCard: React.FC<SpeakerCardProps> = ({
         background: "#000",
       }}
     >
-      <OffthreadVideo
-        src={videoSrc.startsWith("http") ? videoSrc : staticFile(videoSrc)}
+      <CutVideo
+        src={videoSrc}
+        segments={segments}
+        sourceDurationFrames={sourceDurationFrames}
+        volume={videoVolume}
         style={{
           width: "100%",
           height: "100%",

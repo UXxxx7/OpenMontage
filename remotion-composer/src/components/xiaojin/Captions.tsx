@@ -30,6 +30,12 @@ export interface CaptionsProps {
   maxWidth?: number;
   /** Phrases shorter than this are fully highlighted immediately, no sweep. */
   noSweepBelowMs?: number;
+  /** Editor-set override for where the caption box sits (props.captionPosition[0]
+   *  — a single-entry array so the editor's existing per-item x/y/width drag
+   *  overlay works on it unmodified, see positioning.ts/geometry.ts). Absent
+   *  (every job the editor hasn't touched) keeps the original centered-bottom
+   *  layout below, byte-identical to before this prop existed. */
+  position?: { x: number; y: number; width?: number };
 }
 
 export const Captions: React.FC<CaptionsProps> = ({
@@ -40,6 +46,7 @@ export const Captions: React.FC<CaptionsProps> = ({
   fontSize = 42,
   maxWidth = 960,
   noSweepBelowMs = 200,
+  position,
 }) => {
   const frame = useCurrentFrame();
   const { fps } = useVideoConfig();
@@ -86,14 +93,16 @@ export const Captions: React.FC<CaptionsProps> = ({
   }
 
   const chars = active.text.split("");
+  const boxWidth = position?.width ?? maxWidth;
 
   return (
     <div
       style={{
         position: "absolute",
-        left: (W - maxWidth) / 2,
-        bottom: CAPTION_BOTTOM,
-        width: maxWidth,
+        left: position ? position.x : (W - maxWidth) / 2,
+        top: position ? position.y : undefined,
+        bottom: position ? undefined : CAPTION_BOTTOM,
+        width: boxWidth,
         display: "flex",
         justifyContent: "center",
         pointerEvents: "none",
@@ -104,7 +113,7 @@ export const Captions: React.FC<CaptionsProps> = ({
           background: palette.captionBg,
           borderRadius: palette.captionBg === "transparent" ? 0 : 14,
           padding: palette.captionBg === "transparent" ? 0 : "14px 28px",
-          maxWidth,
+          maxWidth: boxWidth,
           textAlign: "center",
           lineHeight: 1.3,
         }}

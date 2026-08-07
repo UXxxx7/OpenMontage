@@ -103,6 +103,19 @@ storage/
 remotion-composer/build
 remotion-composer/.bundle-cache
 remotion-composer/.bundle.lock
+# Arm A editor SPA's own build output (vite build --config editor/vite.config.ts)
+remotion-composer/editor-dist/
+remotion-composer/.build.tmp-*
+# Arm B: per-job scratch dir authored_renderer.py compiles each AI-authored
+# scene's generated TSX into before rendering — runtime cache, not source.
+remotion-composer/src/.armb/
+
+# SQLite WAL sidecar files (*.db itself is already ignored above)
+*.db-shm
+*.db-wal
+
+# Redis dump (local dev only)
+dump.rdb
 
 # runtime logs (file handler in main.py)
 logs/

@@ -19,6 +19,11 @@ export interface ComplianceBarProps {
   insurer: string;
   colorMode?: ColorMode;
   font?: string;
+  /** Editor-only position override — omit for the default pinned-bottom,
+   *  full-width placement (COMPLIANCE.y / W from theme.ts). */
+  x?: number;
+  y?: number;
+  width?: number;
 }
 
 export const ComplianceBar: React.FC<ComplianceBarProps> = ({
@@ -28,15 +33,18 @@ export const ComplianceBar: React.FC<ComplianceBarProps> = ({
   licenseNo,
   insurer,
   font = "inherit",
+  x = 0,
+  y = COMPLIANCE.y,
+  width = W,
 }) => {
   return (
     <AbsoluteFill style={{ pointerEvents: "none" }}>
       <div
         style={{
           position: "absolute",
-          left: 0,
-          top: COMPLIANCE.y,
-          width: W,
+          left: x,
+          top: y,
+          width,
           height: COMPLIANCE.h,
           background: "rgba(13,17,23,0.94)",
           display: "flex",
