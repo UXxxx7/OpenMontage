@@ -144,6 +144,9 @@ def _collect_broll(job) -> list:
         # Phase 1 就已下载到 assets/。计划里收不到时直接扫目录——Arm B 本来就
         # 不依赖规划器的方案,时间窗给 0/0 交给模型按转写内容自己定。
         for p in sorted(assets_dir.glob("broll_*.*")):
+            _st = p.stem
+            if _st.startswith("broll_gen") and _st[9:10].isdigit():
+                continue   # Arm B 生成型(broll_gen<数字>)由 _gen_broll_entries 登记,勿重复计
             if p.suffix.lower() in (".mp4", ".mov", ".webm", ".mkv", ".avi"):
                 out.append({"src": str(p), "label": p.stem,
                             "startFrame": 0, "endFrame": 0})
@@ -161,70 +164,142 @@ def _resolve_reference(job_dir: Path):
     return cands[0] if cands else None
 
 
-def _record_style_cost(job_dir, cost_usd) -> None:
+def _record_style_cost(job_dir, cost_usd, source: str = "style_reference") -> None:
     """把参考分析花费按 pipeline 账本格式记进 job_dir/_generation_costs.json。
-    _read_generation_cost 汇总 → job.generation_cost_usd(预览"💰"行)。失败静默,不拖垮现写。"""
+    _read_generation_cost 汇总 → job.generation_cost_usd(预览"💰"行)。失败静默,不拖垮现写。
+    source 区分整体(style_reference)与聚焦(style_reference_focus)两层花费。"""
     if not cost_usd:
         return
     try:
         from ..pipeline_runner import _record_generation_cost   # lazy import 破循环
-        _record_generation_cost(Path(job_dir), "style_reference", float(cost_usd))
+        _record_generation_cost(Path(job_dir), str(source), float(cost_usd))
     except Exception as e:  # noqa: BLE001
         logger.warning(f"ArmB style: 参考分析记账失败(忽略): {type(e).__name__}: {e}")
 
 
-def _load_style_spec(job, job_dir: Path, out_dir: Path, instruction: str, feedback: str = ""):
-    """模块5:参考素材 style_ref.* → StyleSpec(供 scene_author 注入"参考风格"段)+ 代表帧。
-    返回 (style_spec, source_frames)。无参考 / 分析失败(空谱)→ (空谱, []),Arm B 照常出片。
-
-    维度由"原始指令 + 本轮修订反馈"共同决定:revise 想加/换风格维度(如"配色也照参考")
-    时能反映进 aspects,不被旧缓存钉死(对抗审查发现的静默丢维度问题)。
-
-    缓存按 aspects 指纹分文件 out_dir/style_spec_<hash>.json:同维度跨 plan/compose 多阶段
-    复用(分析是付费多模态调用,避免重复计费);维度变了自然 miss、按新维度重跑。
-    只缓存非空谱;空谱(失败/无风格)不落缓存,留给后续阶段重试。永不抛异常。"""
+def _author_frames(job_dir, out_dir, spec) -> list:
+    """给现写模型看的参考帧——分析抽多少就【全给】(帧数已按参考时长自适应)。
+    分析产出的帧优先;native/无帧时为现写单独抽(纯 ffmpeg,自适应帧数)。
+    决定"像不像"的关键——文字风格谱丢掉视觉感受(尤其配色),让模型直接看参考画面最有效。"""
+    src = [f for f in ((spec or {}).get("source_frames") or []) if f and Path(f).exists()]
+    if src:
+        return src
+    ref = _resolve_reference(job_dir)
+    if ref is None:
+        return []
+    adir = Path(out_dir) / ".style_ref_author"
+    have = sorted(adir.glob("frame_*.jpg")) if adir.exists() else []
+    if have:
+        return [str(p) for p in have]
     try:
         try:
-            from .style_reference import parse_aspects, empty_style_spec, is_empty_style_spec
-            from .style_reference_analyzer import analyze_reference
+            from .style_reference_analyzer import sample_reference_frames
         except ImportError:
-            from style_reference import parse_aspects, empty_style_spec, is_empty_style_spec
-            from style_reference_analyzer import analyze_reference
-    except Exception as e:  # noqa: BLE001 —— 模块1/2 未就位:退化为"不参照"
+            from style_reference_analyzer import sample_reference_frames
+        return sample_reference_frames(str(ref), str(adir))   # count=None → 按参考时长自适应
+    except Exception as e:  # noqa: BLE001 —— 抽帧失败不拖垮现写
+        logger.warning(f"ArmB style: 现写参考帧抽取失败(忽略): {type(e).__name__}: {e}")
+        return []
+
+
+def _analyze_style_layer(job_dir, out_dir, ref, aspects, *, window=None,
+                         focus_hint=None, cache_prefix="style_spec",
+                         cost_source="style_reference"):
+    """跑一层分析(整体或聚焦)→ (spec, frames)。带 aspects(+window)指纹缓存、原子落盘、
+    仅缓存 miss 记账(按 cost_source 区分两层)。失败/空谱 → (空谱, [])。永不抛。"""
+    try:
+        from .style_reference import empty_style_spec, is_empty_style_spec
+        from .style_reference_analyzer import analyze_reference
+    except ImportError:
+        from style_reference import empty_style_spec, is_empty_style_spec
+        from style_reference_analyzer import analyze_reference
+    # 缓存键 = 维度 +(有窗时)窗;窗不同 → 不同缓存文件,整体/聚焦互不污染。
+    key_src = ",".join(sorted(aspects))
+    if window is not None:
+        try:
+            key_src += f"|w={float(window[0]):.2f}-{float(window[1]):.2f}"
+        except (TypeError, ValueError, IndexError):
+            pass
+    key = hashlib.md5(key_src.encode("utf-8")).hexdigest()[:8]
+    cache = Path(out_dir) / f"{cache_prefix}_{key}.json"
+    if cache.exists():
+        try:
+            spec = json.loads(cache.read_text(encoding="utf-8"))
+            if isinstance(spec, dict) and not is_empty_style_spec(spec):
+                return spec, [f for f in (spec.get("source_frames") or []) if f]
+        except Exception:  # noqa: BLE001 —— 缓存坏了就重算
+            pass
+    sub = ".style_focus" if window is not None else ".style_ref"
+    spec = analyze_reference(str(ref), aspects, out_dir=str(Path(out_dir) / sub),
+                             window=window, focus_hint=focus_hint)
+    if not is_empty_style_spec(spec):
+        try:
+            tmp = cache.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(spec, ensure_ascii=False, indent=1), encoding="utf-8")
+            os.replace(str(tmp), str(cache))   # 原子落盘,防并发读到半截
+        except Exception:  # noqa: BLE001 —— 缓存写失败不影响本次使用
+            pass
+        _record_style_cost(job_dir, spec.get("cost_usd"), source=cost_source)
+        logger.info(f"ArmB style[{cost_source}]: 谱已生成(mode={spec.get('analysis_mode')}, "
+                    f"cost=${float(spec.get('cost_usd') or 0):.4f}, aspects={spec.get('aspects')}, "
+                    f"window={window})")
+        return spec, [f for f in (spec.get("source_frames") or []) if f]
+    logger.info(f"ArmB style[{cost_source}]: 未得可用谱(corrections={spec.get('corrections')})")
+    return spec, []
+
+
+def _load_style_specs(job, job_dir: Path, out_dir: Path, instruction: str, feedback: str = ""):
+    """块④:参考素材 style_ref.* → 整体谱 +(可选)聚焦谱。返回 dict:
+        global_on/global_spec/global_frames, focus_spec/focus_frames, focus_window。
+    用 plan_style_analysis 编排(见模块1):
+      · 无窗 → 只整体(等价旧行为)。
+      · 有窗 → 必做聚焦(只喂参考的那一小段);rest 表达"也要整体风格"时叠加整体。
+    整体/聚焦各自独立缓存、各自记账。维度由"原始指令 + 本轮修订反馈"共同决定。永不抛。"""
+    empty = {"global_on": False, "global_spec": {}, "global_frames": [],
+             "focus_spec": {}, "focus_frames": [], "focus_window": None}
+    try:
+        try:
+            from .style_reference import plan_style_analysis, empty_style_spec
+        except ImportError:
+            from style_reference import plan_style_analysis, empty_style_spec
+    except Exception as e:  # noqa: BLE001 —— 模块1 未就位:退化为"不参照"
         logger.warning(f"ArmB style: 参考风格模块未就位,跳过参照: {type(e).__name__}: {e}")
-        return {}, []
+        return empty
     try:
         ref = _resolve_reference(job_dir)
         if ref is None:
-            return empty_style_spec(), []
-        aspects = parse_aspects((str(instruction) + " " + str(feedback)).strip())
-        key = hashlib.md5(",".join(sorted(aspects)).encode("utf-8")).hexdigest()[:8]
-        cache = Path(out_dir) / f"style_spec_{key}.json"
-        if cache.exists():
+            return {"global_on": True, "global_spec": empty_style_spec(), "global_frames": [],
+                    "focus_spec": {}, "focus_frames": [], "focus_window": None}
+        plan = plan_style_analysis((str(instruction) + " " + str(feedback)).strip())
+        out = {"global_on": bool(plan.get("global_on")),
+               "global_spec": empty_style_spec(), "global_frames": [],
+               "focus_spec": {}, "focus_frames": [], "focus_window": plan.get("window")}
+        if plan.get("global_on"):
+            gspec, gframes = _analyze_style_layer(
+                job_dir, out_dir, ref, plan["global_aspects"],
+                cache_prefix="style_spec", cost_source="style_reference")
+            out["global_spec"], out["global_frames"] = gspec, gframes
+        if plan.get("focus_on") and plan.get("window") is not None:
+            win = plan["window"]
             try:
-                spec = json.loads(cache.read_text(encoding="utf-8"))
-                if isinstance(spec, dict) and not is_empty_style_spec(spec):
-                    return spec, [f for f in (spec.get("source_frames") or []) if f]
-            except Exception:  # noqa: BLE001 —— 缓存坏了就重算
-                pass
-        spec = analyze_reference(str(ref), aspects, out_dir=str(Path(out_dir) / ".style_ref"))
-        if not is_empty_style_spec(spec):
-            try:
-                tmp = cache.with_suffix(".json.tmp")
-                tmp.write_text(json.dumps(spec, ensure_ascii=False, indent=1), encoding="utf-8")
-                os.replace(str(tmp), str(cache))   # 原子落盘,防并发读到半截
-            except Exception:  # noqa: BLE001 —— 缓存写失败不影响本次使用
-                pass
-            # 记账:仅缓存 miss(真调了付费多模态模型)时记一次;命中缓存不再记。
-            _record_style_cost(job_dir, spec.get("cost_usd"))
-            logger.info(f"ArmB style: 参考风格谱已生成(mode={spec.get('analysis_mode')}, "
-                        f"cost=${float(spec.get('cost_usd') or 0):.4f}, aspects={spec.get('aspects')})")
-            return spec, [f for f in (spec.get("source_frames") or []) if f]
-        logger.info(f"ArmB style: 参考素材未得到可用风格谱,本次不参照(corrections={spec.get('corrections')})")
-        return spec, []
+                hint = f"t={float(win[0]):.0f}-{float(win[1]):.0f}s"
+            except (TypeError, ValueError, IndexError):
+                hint = None
+            fspec, fframes = _analyze_style_layer(
+                job_dir, out_dir, ref, plan["focus_aspects"], window=win,
+                focus_hint=hint, cache_prefix="style_focus",
+                cost_source="style_reference_focus")
+            out["focus_spec"], out["focus_frames"] = fspec, fframes
+        return out
     except Exception as e:  # noqa: BLE001 —— 参考分析绝不拖垮现写
         logger.warning(f"ArmB style: 参考分析异常,跳过参照: {type(e).__name__}: {e}")
-        return {}, []
+        return empty
+
+
+def _load_style_spec(job, job_dir: Path, out_dir: Path, instruction: str, feedback: str = ""):
+    """向后兼容薄封装:只返回整体层 (spec, frames)。新代码请用 _load_style_specs。"""
+    s = _load_style_specs(job, job_dir, out_dir, instruction, feedback)
+    return s["global_spec"], s["global_frames"]
 
 
 def _tok(s: str) -> list:
@@ -299,9 +374,206 @@ def _assign_broll_windows(broll: list, segments: list, duration_s: float,
     return broll
 
 
+# ─────────────────────────── 生成型 b-roll(方案B)───────────────────────────
+# 让 AI 现写路径也能"生成一段 b-roll":plan/revise 抽意图(成功后才持久化),compose 才真生成。
+
+# 关键词门:同时命中"生成类动词 + b-roll类词"才调 LLM。刻意收紧,避免"提亮画面/加素材"
+# 这类普通指令误触发一次付费 LLM 调用(对抗审查 MEDIUM #4)。
+_GEN_VERBS = ("生成", "新做", "新生成", "重新生成", "generate")
+_BROLL_WORDS = ("broll", "b-roll", "b roll", "空镜", "空镜头", "footage", "视频片段")
+
+
+def _gen_broll_enabled() -> bool:
+    return os.getenv("ARM_B_GEN_BROLL", "1").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _gen_broll_json(out_dir):
+    return Path(out_dir) / "gen_broll.json"
+
+
+def _read_gen_broll(out_dir) -> list:
+    p = _gen_broll_json(out_dir)
+    if not p.exists():
+        return []
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _write_gen_broll(out_dir, reqs) -> None:
+    """现写/修订成功后才落盘 gen_broll.json(bail 时不动它 → 旧草稿与旧 json 保持一致)。"""
+    try:
+        _gen_broll_json(out_dir).write_text(
+            json.dumps(reqs or [], ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"ArmB gen-broll: 持久化失败(忽略): {type(e).__name__}: {e}")
+
+
+_GEN_BROLL_SYS = (
+    "You extract requests to GENERATE brand-new b-roll footage with AI from a video-editing "
+    "instruction. ONLY extract explicit requests to CREATE/GENERATE new footage (e.g. '生成一段…的"
+    "b-roll', 'AI 做一段空镜', 'generate a clip of …'). Do NOT extract references to clips the user "
+    "ALREADY uploaded (e.g. '视频3是b-roll', 'insert the uploaded clip') — those are not generation. "
+    "For each generation request output:\n"
+    "  prompt = a concise ENGLISH text-to-video generation prompt describing the desired footage;\n"
+    "  cue    = the words/topic the speaker is saying when this b-roll should appear (copy the "
+    "relevant phrase from the instruction or transcript).\n"
+    "Return ONLY a JSON array (possibly empty []), no prose, of shape "
+    "[{\"prompt\": \"...\", \"cue\": \"...\"}]."
+)
+
+
+def _extract_gen_broll(instruction, segments, llm_call=None) -> list:
+    """从指令抽"要 AI 生成新 b-roll"的请求(方案B)。返回 [{prompt, cue, provider}]。
+    只有指令里同时出现"生成类动词 + b-roll类词"才调 LLM;永不抛,失败/无意图/开关关/未配
+    模型 → []。上限 ARM_B_GEN_BROLL_MAX。"""
+    if not _gen_broll_enabled():
+        return []
+    text = str(instruction or "").strip()
+    tl = text.lower()
+    if not (any(v in tl for v in _GEN_VERBS) and any(w in tl for w in _BROLL_WORDS)):
+        return []
+    try:
+        try:
+            from .scene_author import _default_llm_call
+        except ImportError:
+            from scene_author import _default_llm_call
+        fn = llm_call or _default_llm_call
+    except Exception:  # noqa: BLE001
+        return []
+    seg_txt = "\n".join(
+        f"[{float(s.get('start', 0) or 0):.1f}s] {str(s.get('text', '')).strip()}"
+        for s in (segments or [])[:80])
+    user = (f"USER INSTRUCTION:\n{text}\n\nTRANSCRIPT (for cue matching):\n{seg_txt}\n\n"
+            "Return ONLY the JSON array.")
+    try:
+        raw = fn([{"role": "system", "content": _GEN_BROLL_SYS},
+                  {"role": "user", "content": user}], 4000, 0.2)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"ArmB gen-broll: 抽取调用失败(忽略): {type(e).__name__}: {e}")
+        return []
+    txt = str((raw or {}).get("content", "")).strip()
+    if txt.startswith("```"):
+        txt = txt.split("\n", 1)[1] if "\n" in txt else txt
+        if txt.rstrip().endswith("```"):
+            txt = txt.rstrip()[:-3]
+    obj = None
+    try:
+        obj = json.loads(txt)
+    except Exception:  # noqa: BLE001 —— 截中括号再试
+        s, e = txt.find("["), txt.rfind("]")
+        if 0 <= s < e:
+            try:
+                obj = json.loads(txt[s:e + 1])
+            except Exception:  # noqa: BLE001
+                obj = None
+    if not isinstance(obj, list):
+        return []
+    out = []
+    prov = os.getenv("ARM_B_GEN_BROLL_PROVIDER", "omni")
+    for it in obj:
+        if isinstance(it, dict) and str(it.get("prompt", "")).strip():
+            out.append({"prompt": str(it["prompt"]).strip()[:500],
+                        "cue": str(it.get("cue", "")).strip()[:200],
+                        "provider": prov})
+    try:
+        cap = int(os.getenv("ARM_B_GEN_BROLL_MAX", "2"))
+    except ValueError:
+        cap = 2
+    return out[:max(0, cap)]
+
+
+def _gen_broll_entries(job_dir, reqs) -> list:
+    """把抽取到的 reqs 列表登记成 b-roll 待生成条目(文件此刻可能还不在)。窗给 0/0,交
+    _assign_broll_windows 按 label(cue) 匹配转写定位。key=gen<i> → assets/broll_gen<i>.mp4。"""
+    out = []
+    for i, it in enumerate(reqs or []):
+        if not isinstance(it, dict) or not str(it.get("prompt", "")).strip():
+            continue
+        key = f"gen{i}"
+        out.append({
+            "src": str(Path(job_dir) / "assets" / f"broll_{key}.mp4"),
+            "label": str(it.get("cue") or it.get("prompt"))[:120],
+            "startFrame": 0, "endFrame": 0,
+            "_gen_prompt": str(it["prompt"]),
+            "_gen_provider": str(it.get("provider") or os.getenv("ARM_B_GEN_BROLL_PROVIDER", "omni")),
+            "_gen_key": key,
+        })
+    return out
+
+
+def _gen_broll_retry_backoffs() -> list:
+    """gen-broll 生成失败(尤其 provider 瞬时 500 "high demand" / 429 限流)的退避重试秒序列。
+    默认 5,15,30(共 3 次重试);env ARM_B_GEN_BROLL_RETRY 覆盖,设 "" 或 "0" 关闭真 sleep。
+    总退避落在 compose 阶段的长超时预算内。"""
+    raw = os.getenv("ARM_B_GEN_BROLL_RETRY", "5,15,30")
+    out = []
+    for x in str(raw).split(","):
+        try:
+            v = float(x.strip())
+        except ValueError:
+            continue
+        if v >= 0:
+            out.append(v)
+    return out
+
+
+def _materialize_gen_broll(broll, job_dir):
+    """compose 阶段(confirm 后)真正生成待办 b-roll。对每条带 _gen_prompt 且文件不在的 →
+    generate_broll_via 落文件 + 记账(broll_gen[key]);已存在则复用(revise 不重复生成)。
+    失败按 _gen_broll_retry_backoffs 退避重试(扛 provider 瞬时 500/限流);最终仍失败 →
+    从列表摘掉该条(现写 tsx 遇无 b-roll 会画占位卡)并计入 failed(供上层告知用户)。
+    返回 (存活列表, 最终失败的生成条目列表)。永不抛。"""
+    import time
+    if not _gen_broll_enabled():
+        return ([b for b in (broll or []) if not b.get("_gen_prompt")], [])
+    out, failed = [], []
+    delays = _gen_broll_retry_backoffs()
+    for b in broll or []:
+        prompt = b.get("_gen_prompt")
+        if not prompt:
+            out.append(b)
+            continue
+        src = Path(b.get("src", ""))
+        if src.exists() and src.stat().st_size > 0:
+            out.append(b)                          # 缓存命中,不重生成
+            continue
+        res = None
+        for attempt in range(len(delays) + 1):     # 首次 + len(delays) 次重试
+            try:
+                try:
+                    from ..broll_providers import generate_broll_via
+                except ImportError:
+                    from broll_providers import generate_broll_via
+                src.parent.mkdir(parents=True, exist_ok=True)
+                aspect = str(b.get("_gen_aspect") or "9:16")
+                res = generate_broll_via(b.get("_gen_provider", "omni"), str(prompt), str(src), aspect=aspect)
+            except Exception as e:  # noqa: BLE001 —— 生成绝不拖垮现写
+                logger.warning(f"ArmB gen-broll: 生成异常: {type(e).__name__}: {e}")
+                res = None
+            if res and src.exists() and src.stat().st_size > 0:
+                break
+            if attempt < len(delays):
+                logger.warning(f"ArmB gen-broll: 生成失败,{delays[attempt]:.0f}s 后重试第 {attempt + 1} 次"
+                               f"(key={b.get('_gen_key', '?')})")
+                if delays[attempt] > 0:
+                    time.sleep(delays[attempt])
+        if res and src.exists() and src.stat().st_size > 0:
+            _record_style_cost(job_dir, (res or {}).get("cost_usd"),
+                               source=f"broll_gen[{b.get('_gen_key', '?')}]")
+            logger.info(f"ArmB gen-broll: 已生成 {src.name}(cost=${float((res or {}).get('cost_usd') or 0):.4f})")
+            out.append(b)
+        else:
+            logger.warning(f"ArmB gen-broll: 生成最终失败,该段降级为占位(prompt={str(prompt)[:40]!r})")
+            failed.append(b)
+    return (out, failed)
+
+
 # ─────────────────────────── 公共准备 ───────────────────────────
 
-def _prepare(job, feedback: str = ""):
+def _prepare(job, feedback: str = "", *, extract_gen: bool = False):
     """落 authored/ 目录、取转写、收 b-roll、建 AuthorContext。失败返回 None。
     plan_authored 与 compose_authored 共用,保证两处的 ctx 完全一致。"""
     from ..config import get_config
@@ -320,25 +592,37 @@ def _prepare(job, feedback: str = ""):
     duration = float(t.get("duration_seconds") or 0) or _probe_duration(input_video)
     if duration <= 0:
         return None
-    broll = _collect_broll(job)
-    # 给没窗的 b-roll(上传素材走目录兜底时窗=0/0)分配真实时间窗,模型才会真的合成它,
-    # 而不是渲 0 帧当它不存在(修"上传的 b-roll 没插进去")。
-    broll = _assign_broll_windows(broll, segments, duration)
-    # 指令源:edit_request 才是真实字段(job.request 在 DB Job 上不存在,之前恒为空,
-    # 等于模型从没拿到用户指令——2026-07-27 修)。
+    # 指令源(提前到收 b-roll 前:生成型 b-roll 抽取要用它)。edit_request 才是真实字段
+    # (job.request 在 DB Job 上不存在,之前恒为空 → 模型从没拿到指令,2026-07-27 修)。
     instruction = str(getattr(job, "edit_request", "") or getattr(job, "request", "")
                       or getattr(job, "instruction", "") or "")
+    broll = _collect_broll(job)
+    # 生成型 b-roll(方案B):plan/revise(extract_gen=True)抽意图 → 内存 reqs;compose
+    # (extract_gen=False)读上次成功落盘的 gen_broll.json。reqs 随 ctx 返回,由调用方在
+    # 现写/修订【成功后】才 _write_gen_broll(避免 revise 失败保留旧草稿、却已改写 json)。
+    gen_reqs = (_extract_gen_broll((instruction + " " + (feedback or "")).strip(), segments)
+                if extract_gen else _read_gen_broll(out_dir))
+    broll = broll + _gen_broll_entries(job_dir, gen_reqs)
+    # 给没窗的 b-roll(上传/生成走 0/0)分配真实时间窗,模型才会真的合成它。
+    broll = _assign_broll_windows(broll, segments, duration)
     # 模块5:参考素材 style_ref.*(模块4 落盘)→ StyleSpec + 代表帧。空谱等于"不参照",
     # scene_author 见空谱不加"参考风格"段,照常出片。代表帧(抽帧/图片模式)并入参考图,
     # 让模型除了文字风格谱外还能"看到"参考画面。
-    style_spec, source_frames = _load_style_spec(job, job_dir, out_dir, instruction, feedback)
-    example_images = _style_refs() + [f for f in source_frames if f and Path(f).exists()]
+    # 块④:两层编排——整体谱 + (可选)聚焦谱。plan_style_analysis 决定是否/怎么分层。
+    specs = _load_style_specs(job, job_dir, out_dir, instruction, feedback)
+    style_spec = specs["global_spec"]
+    # 整体参考帧只在"做了整体分析"时给;focus-only 模式不给整段参考帧(免得又去模仿整体)。
+    author_frames = _author_frames(job_dir, out_dir, style_spec) if specs["global_on"] else []
+    example_images = _style_refs() + [f for f in author_frames if f and Path(f).exists()]
+    focus_images = [f for f in specs["focus_frames"] if f and Path(f).exists()]
     ctx = AuthorContext(segments=segments, words=words, duration_s=duration,
                         instruction=instruction, example_images=example_images,
-                        broll=broll, style_spec=style_spec)
+                        broll=broll, style_spec=style_spec,
+                        focus_spec=specs["focus_spec"], focus_images=focus_images,
+                        focus_window=specs["focus_window"])
     return {"config": config, "job_dir": job_dir, "input_video": input_video,
             "out_dir": out_dir, "words": words, "duration": duration,
-            "broll": broll, "ctx": ctx}
+            "broll": broll, "ctx": ctx, "gen_reqs": gen_reqs}
 
 
 class _DraftResult:
@@ -377,7 +661,7 @@ def plan_authored(job) -> dict | None:
     planned_edit 的 dict;失败返回 None → 调用方落穿现有 L2 规划(Arm A)。
     不渲染——渲染留到 confirm 之后由 compose_authored 认草稿来做。"""
     try:
-        p = _prepare(job)
+        p = _prepare(job, extract_gen=True)
         if p is None:
             return None
         ctx, out_dir = p["ctx"], p["out_dir"]
@@ -394,6 +678,7 @@ def plan_authored(job) -> dict | None:
             logger.warning(f"ArmB plan: author 未过({r.error}),落穿 L2 规划")
             return None
         (out_dir / "scene_draft.tsx").write_text(r.tsx, encoding="utf-8")
+        _write_gen_broll(out_dir, p.get("gen_reqs"))   # 现写成功才落盘 → compose 读到与草稿一致
         summary = _emit_storyboard_files(out_dir, p["words"], p["broll"], p["duration"], tsx=r.tsx)
         logger.info(f"ArmB plan: 已现写 scene_draft.tsx({len(r.tsx)} 字符),分镜当方案")
         return {"arm_b": True, "summary": summary,
@@ -414,7 +699,7 @@ def revise_authored_plan(job, feedback: str) -> dict | None:
     返回 None 的情形(调用方落穿现有 L2 就地修订):无草稿(没走过 author 先行)、
     _prepare 失败、revise 未产出合法 tsx、或任何异常。"""
     try:
-        p = _prepare(job, feedback)   # 反馈并入风格维度解析(revise 可加/换参照维度)
+        p = _prepare(job, feedback, extract_gen=True)   # 反馈并入风格维度解析 + 生成型 b-roll 抽取
         if p is None:
             return None
         ctx, out_dir = p["ctx"], p["out_dir"]
@@ -441,6 +726,7 @@ def revise_authored_plan(job, feedback: str) -> dict | None:
             logger.warning("ArmB revise: 修订后仍未过 M1,保留旧草稿,落穿 L2")
             return None
         draft.write_text(r.tsx, encoding="utf-8")   # 覆盖草稿 → confirm 后渲这版
+        _write_gen_broll(out_dir, p.get("gen_reqs"))   # 修订成功才落盘 → 与新草稿一致
         summary = _emit_storyboard_files(out_dir, p["words"], p["broll"], p["duration"], tsx=r.tsx)
         logger.info(f"ArmB revise: 已按反馈改草稿({len(r.tsx)} 字符),分镜当方案,未渲染")
         return {"arm_b": True, "summary": summary,
@@ -468,6 +754,11 @@ def _compose_authored_inner(job) -> dict | None:
     config, job_dir, input_video = p["config"], p["job_dir"], p["input_video"]
     out_dir, words, duration, broll, ctx = (
         p["out_dir"], p["words"], p["duration"], p["broll"], p["ctx"])
+
+    # confirm 后:真正生成待办 b-roll(几分钟,落在本阶段的长超时里);失败的摘掉,
+    # 现写 tsx 遇无 b-roll 会画占位卡。ctx.broll 同步更新,渲染 props 与之一致。
+    broll, _gen_failed = _materialize_gen_broll(broll, job_dir)
+    ctx.broll = broll
 
     rc_dir = Path(config.openmontage_root) / "remotion-composer"
     timeout_s = _env_int("ARM_B_RENDER_TIMEOUT_S", 600)
@@ -536,10 +827,15 @@ def _compose_authored_inner(job) -> dict | None:
     logger.info(f"=== ArmB 出片: {job.id} → {preview} "
                 f"(status={rep.status}, rounds={rep.rounds}, cost=${rep.cost_usd:.4f}) ===")
     # 返回与 Arm A 主返回同构的关键字段;验收时如发现下游还消费其它键,在此补齐
+    # 生成型 b-roll 若重试后仍失败,通过 degraded_operations 告知用户:worker.js 的
+    # previewReadyMessage 会渲染 ⚠️「AI b-roll」这一步执行失败、当前预览不含该效果、
+    # 可回复 retry 重跑。与 Arm A 同键(status.degraded_operations)。
+    _degraded = ["AI b-roll"] if _gen_failed else []
     return {"preview_path": str(preview),
             "duration_seconds": duration,
             "applied": ["authored_compose"],
-            "degraded": [],
+            "degraded": _degraded,
+            "degraded_operations": _degraded,
             "compose_arm": "arm_b",
             "authored_report": report}
 

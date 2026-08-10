@@ -50,7 +50,7 @@ You are NOT filling a template or a fixed schema. You decide the layout, the ani
 
 OUTPUT CONTRACT — the file you write MUST:
 1. Be a single valid .tsx file, default-exporting a React component named `AuthoredScene`.
-2. Import only from "react" and "remotion" (AbsoluteFill, OffthreadVideo, Sequence, useCurrentFrame, useVideoConfig, interpolate, spring, staticFile, Img). Do NOT import any project-local components or external libraries — everything self-contained, inline styles only.
+2. Import only from "react" and "remotion" (AbsoluteFill, OffthreadVideo, Sequence, useCurrentFrame, useVideoConfig, interpolate, spring, staticFile, Img). Do NOT import any project-local components or external libraries — everything self-contained, inline styles only. Every identifier you reference MUST be declared before use (no undefined identifiers / no typos in variable names — a single undeclared name like a mis-typed spring makes the whole render NaN/blank).
 3. Read everything it needs from a single props object of THIS exact shape (already provided at render time — do not invent other props):
    type Props = {
      videoSrc: string;
@@ -61,8 +61,8 @@ OUTPUT CONTRACT — the file you write MUST:
      width: number; height: number;
    };
    The component signature is: `export const AuthoredScene: React.FC<Props> = (props) => { ... }` plus `export default AuthoredScene;`.
-4. Render the person video full-timeline as the base (OffthreadVideo src={videoSrc}). During a b-roll window, show that b-roll prominently — landscape b-roll must NOT be side-cropped; contain it and fill the rest with a blurred copy of the same frame.
-5. Burn in captions from `words`, grouped into short readable phrases in sync with the spoken words. Keep them legible (safe-area bottom third, high contrast).
+4. Render the person video full-timeline as the base (OffthreadVideo src={videoSrc}). During a b-roll window, show that b-roll prominently — landscape b-roll must NOT be side-cropped; contain it and fill the rest with a blurred copy of the same frame. B-ROLL PLAYBACK TIMING (critical): a b-roll clip must play from ITS OWN first frame when its window opens. Wrap every b-roll <OffthreadVideo> in <Sequence from={startFrame} durationInFrames={endFrame - startFrame}> (Sequence is already allowed from "remotion") so its internal clock resets to 0 at the window start. Do NOT put a b-roll <OffthreadVideo> bare on the timeline: a bare OffthreadVideo is mapped to the ABSOLUTE composition frame, so any clip shorter than the window's start time freezes on its last frame. The person/base video is the ONLY video that stays bare (it intentionally plays full-timeline from frame 0).
+5. Burn in captions from `words`, grouped into short readable phrases in sync with the spoken words. Keep them legible (safe-area bottom third, high contrast). CAPTION STABILITY (critical, recurring bug): FIRST build a FIXED array of phrase groups by splitting `words` at pauses (gap > ~0.35s between consecutive words) or every ~6-8 words; THEN for each group display its FULL joined text continuously from the group's first-word start frame to its last-word end frame. NEVER recompute the caption each frame by filtering `words` to the one(s) whose [start,end] contains the current instant — that makes the subtitle flicker word-by-word. The visible caption text MUST stay constant within a phrase and change only at phrase boundaries.
 6. Add a few — not many — on-screen graphic beats ONLY where the transcript genuinely warrants one, anchored to the words being spoken. Match the reference image's aesthetic.
 7. Use spring()/interpolate() for entrances; nothing pops in hard. Everything deterministic from `frame` (no Date/random).
 8. WHOLE-TIMELINE VALIDITY (critical, general): every visual state must be correct across the ENTIRE duration, not only inside the window it was designed for. For any element whose state changes around a b-roll window (e.g. the person shrinking into a PiP inset), explicitly define its state for BEFORE, DURING, and AFTER that window. An inset/PiP that shrinks the person MUST default to person-fills-the-card whenever no b-roll is active — never leave a card or container showing only its (black) background. Concretely: do NOT gate a transition on a single spring whose value before its trigger frame yields the wrong state (e.g. `1 - spring(frame - endFrame)` is 1 before the window starts). Prefer building progress as (enterSpring at windowStart − exitSpring at windowEnd) so it is 0 before, 1 during, 0 after. Mentally trace frame 0, mid-clip, and the final frame and confirm every region shows real content.
@@ -74,8 +74,8 @@ REVISION_SYSTEM_PROMPT = """You are a senior motion-graphics engineer REVISING a
 RULES:
 1. KEEP everything that already works (layout, colors, captions, the reference look). Change ONLY what the defects show to be broken. Do not restyle or re-theme.
 2. The frames are ground truth. A common bug: a state/animation gate is inverted or only handles the AFTER case, so a section (e.g. BEFORE a b-roll window) shows a blank/black card or a mis-sized element. For BEFORE/DURING/AFTER each window, reason what each region SHOULD show. A PiP that shrinks the person must default to person-fills-the-card when no b-roll is active — `1 - spring(frame - endFrame)` is 1 before the window and wrongly shrinks the person from frame 0; rebuild as (enterSpring at start − exitSpring at end). Treat each machine-flagged region as a confirmed defect.
-3. The Props contract is UNCHANGED and fixed. `export const AuthoredScene: React.FC<Props>` + `export default AuthoredScene;`. Import only from "react" and "remotion". Self-contained, deterministic from `frame`.
-4. Landscape b-roll never side-cropped (contain + blurred fill). Person video plays full timeline. Captions stay in sync from `words`.
+3. The Props contract is UNCHANGED and fixed. `export const AuthoredScene: React.FC<Props>` + `export default AuthoredScene;`. Import only from "react" and "remotion". Self-contained, deterministic from `frame`. B-ROLL PLAYBACK TIMING: every b-roll <OffthreadVideo> MUST be wrapped in <Sequence from={startFrame} durationInFrames={endFrame - startFrame}> so the clip plays from its own start, never the absolute composition frame (a bare b-roll OffthreadVideo freezes on its last frame once the window starts past the clip length); only the person/base video stays bare.
+4. Landscape b-roll never side-cropped (contain + blurred fill). Person video plays full timeline. Captions stay in sync from `words`. Preserve the timing, windows, and transitions of EXISTING b-roll inserts unless a flagged defect or the user's notes require changing them — do NOT restyle, re-time, or flatten working b-roll as a side effect of another fix.
 5. Return ONLY the full corrected .tsx file content — the entire file, not a diff, no markdown fences, no prose."""
 
 
@@ -90,6 +90,9 @@ class AuthorContext:
     example_images: list = field(default_factory=list)   # 风格参考图路径(含参考素材代表帧)
     broll: list = field(default_factory=list)            # [{src,label,startFrame,endFrame}]
     style_spec: dict = field(default_factory=dict)       # 参考素材风格谱(StyleReference,可空)
+    focus_spec: dict = field(default_factory=dict)       # 聚焦(时间窗)风格谱,可空(附加复刻)
+    focus_images: list = field(default_factory=list)     # 聚焦帧路径(单独标注 FOCUS,与整体参考帧分开)
+    focus_window: tuple = None                           # 聚焦时间窗 (start_s,end_s) 或 None
     width: int = 1080
     height: int = 1920
     fps: int = 30
@@ -158,11 +161,21 @@ def cost_usd(usage: dict, price_in: float, price_out: float) -> float:
 
 def build_author_messages(ctx: AuthorContext) -> list:
     content: list = []
+    _has_ref_images = False
     for ip in ctx.example_images:
         p = Path(ip)
         if p.exists():
             content.append({"type": "text", "text": "REFERENCE IMAGE (imitate this look):"})
             content.append(_img_part(p))
+            _has_ref_images = True
+    _has_focus_frames = False
+    for ip in getattr(ctx, "focus_images", None) or []:
+        p = Path(ip)
+        if p.exists():
+            content.append({"type": "text",
+                            "text": "FOCUS FRAME (the specific effect the user singled out — reproduce it):"})
+            content.append(_img_part(p))
+            _has_focus_frames = True
     if ctx.broll:
         broll_block = (
             f"B-ROLL clips available — these are REAL uploaded video files in prop `broll` "
@@ -183,15 +196,28 @@ def build_author_messages(ctx: AuthorContext) -> list:
                 from .style_reference import render_style_reference_block
             except ImportError:
                 from style_reference import render_style_reference_block
-            style_block = render_style_reference_block(ctx.style_spec)
+            style_block = render_style_reference_block(ctx.style_spec, _has_ref_images)
         except Exception:  # noqa: BLE001 —— 参考段渲染失败不拖垮现写
             style_block = ""
+    # 附加聚焦(块③):用户单独点名的那一小段效果,整体风格之外额外复刻。
+    focus_block = ""
+    if getattr(ctx, "focus_spec", None):
+        try:
+            try:
+                from .style_reference import render_focus_reference_block
+            except ImportError:
+                from style_reference import render_focus_reference_block
+            focus_block = render_focus_reference_block(
+                ctx.focus_spec, getattr(ctx, "focus_window", None), _has_focus_frames)
+        except Exception:  # noqa: BLE001 —— 聚焦段渲染失败不拖垮现写
+            focus_block = ""
     user_text = (
         f"USER INSTRUCTION (primary intent — follow it):\n{ctx.instruction or '(none)'}\n\n"
         f"VIDEO: portrait {ctx.width}x{ctx.height}, {ctx.duration_s:.1f}s, "
         f"{ctx.duration_s * ctx.fps:.0f} frames @{ctx.fps}fps.\n"
         f"{broll_block}\n\n"
         + (style_block + "\n" if style_block else "")
+        + (focus_block + "\n" if focus_block else "")
         + f"TRANSCRIPT (with times; use for caption timing & where graphics belong):\n"
         f"{_transcript_text(ctx.segments)}\n\n"
         f"Now write AuthoredScene.tsx per the output contract. Return ONLY the .tsx content."
@@ -210,6 +236,25 @@ def build_revise_messages(tsx: str, defects: list, ctx: AuthorContext,
         if p.exists():
             content.append({"type": "text", "text": "TARGET STYLE REFERENCE (keep this look):"})
             content.append(_img_part(p))
+    _has_focus_frames = False
+    for ip in getattr(ctx, "focus_images", None) or []:
+        p = Path(ip)
+        if p.exists():
+            content.append({"type": "text",
+                            "text": "FOCUS FRAME (keep reproducing this specific effect):"})
+            content.append(_img_part(p))
+            _has_focus_frames = True
+    focus_block = ""
+    if getattr(ctx, "focus_spec", None):
+        try:
+            try:
+                from .style_reference import render_focus_reference_block
+            except ImportError:
+                from style_reference import render_focus_reference_block
+            focus_block = render_focus_reference_block(
+                ctx.focus_spec, getattr(ctx, "focus_window", None), _has_focus_frames)
+        except Exception:  # noqa: BLE001
+            focus_block = ""
     defect_lines = []
     for d in defects or []:
         t0, t1 = d.get("t0", 0), d.get("t1", 0)
@@ -225,7 +270,8 @@ def build_revise_messages(tsx: str, defects: list, ctx: AuthorContext,
         + (f"\n\nUSER NOTES:\n{notes}" if notes else "")
         + f"\n\nVIDEO: portrait {ctx.width}x{ctx.height}, {ctx.duration_s:.1f}s @{ctx.fps}fps.\n"
         f"TRANSCRIPT:\n{_transcript_text(ctx.segments)}\n\n"
-        "CURRENT AuthoredScene.tsx (fix in place, keep what works):\n"
+        + (focus_block + "\n" if focus_block else "")
+        + "CURRENT AuthoredScene.tsx (fix in place, keep what works):\n"
         "```tsx\n" + tsx + "\n```\n\nReturn ONLY the full corrected .tsx."
     )
     content.append({"type": "text", "text": user_text})
