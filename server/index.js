@@ -134,6 +134,13 @@ app.get("/upgrade", (_req, res) => {
   res.sendFile(resolve(dirname(fileURLToPath(import.meta.url)), "upgrade.html"));
 });
 
+// 发布流程原型用的样例素材（真实生成过的内容，固定文件，不依赖数据库里的
+// 某条 job——纯粹给"假设接了 API 之后长什么样"这个原型演示用）。
+app.use("/samples", express.static(resolve(dirname(fileURLToPath(import.meta.url)), "samples")));
+app.get("/publish-flow-demo", (_req, res) => {
+  res.sendFile(resolve(dirname(fileURLToPath(import.meta.url)), "publish-flow-demo.html"));
+});
+
 app.get(["/webhook", "/webhook/whatsapp"], (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];

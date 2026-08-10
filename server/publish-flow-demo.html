@@ -1,0 +1,510 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenMontage — Publish Flow Prototype</title>
+<meta property="og:title" content="OpenMontage — what auto-publish would look like">
+<style>
+  :root {
+    --bg: #f5f3ef; --card: #ffffff; --text: #1a1a1a; --muted: #6b6b6b;
+    --accent: #d97757; --accent-ink: #ffffff; --border: #e5e0d8;
+    --pill-bg: color-mix(in srgb, var(--accent) 12%, transparent);
+    --nav-bg: #ffffff; --ok: #3a7d5c; --bad: #b8483e;
+    --overlay: rgba(0,0,0,0.55);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17161a; --card: #211f24; --text: #f2f0ec; --muted: #a3a0a8;
+      --accent: #e3906a; --accent-ink: #17161a; --border: #35323a; --nav-bg: #1c1b1f;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #17161a; --card: #211f24; --text: #f2f0ec; --muted: #a3a0a8;
+    --accent: #e3906a; --accent-ink: #17161a; --border: #35323a; --nav-bg: #1c1b1f;
+  }
+  :root[data-theme="light"] {
+    --bg: #f5f3ef; --card: #ffffff; --text: #1a1a1a; --muted: #6b6b6b;
+    --accent: #d97757; --accent-ink: #ffffff; --border: #e5e0d8; --nav-bg: #ffffff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  nav {
+    background: var(--nav-bg); border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between; padding: 12px 20px;
+  }
+  .brand { font-weight: 800; font-size: 15px; }
+  .brand span { color: var(--accent); }
+  .navlinks a {
+    text-decoration: none; color: var(--muted); font-size: 13.5px; font-weight: 600;
+    padding: 7px 14px; border-radius: 8px;
+  }
+  .navlinks a.active { color: var(--text); background: var(--pill-bg); }
+  .wrap { max-width: 960px; margin: 0 auto; padding: 32px 20px 80px; }
+  .eyebrow {
+    display: inline-block; background: var(--pill-bg); color: var(--accent);
+    font-size: 12.5px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
+    padding: 5px 12px; border-radius: 999px; margin-bottom: 14px;
+  }
+  h1 { font-size: 26px; margin: 0 0 8px; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); font-size: 14.5px; line-height: 1.6; max-width: 68ch; margin: 0 0 12px; }
+  .note-box {
+    background: var(--pill-bg); border: 1px solid var(--accent); border-radius: 12px;
+    padding: 14px 18px; font-size: 13.5px; line-height: 1.55; margin: 20px 0 36px; max-width: 70ch;
+  }
+  .note-box b { color: var(--accent); }
+
+  /* ── Connected accounts panel ── */
+  .accounts-panel {
+    background: var(--card); border: 1px solid var(--border); border-radius: 14px;
+    padding: 18px 20px; margin-bottom: 36px;
+  }
+  .accounts-panel h3 { margin: 0 0 12px; font-size: 14px; }
+  .account-row {
+    display: flex; align-items: center; gap: 12px; padding: 9px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .account-row:last-child { border-bottom: none; }
+  .account-icon {
+    width: 32px; height: 32px; border-radius: 9px; display: flex; align-items: center;
+    justify-content: center; font-size: 15px; flex-shrink: 0; color: #fff;
+  }
+  .account-icon.instagram { background: linear-gradient(45deg, #f09433, #e6683c, #dc2743, #cc2366, #bc1888); }
+  .account-icon.tiktok { background: #000; }
+  .account-icon.facebook { background: #1877f2; }
+  .account-name { font-size: 13.5px; font-weight: 600; flex: 1; }
+  .account-status { font-size: 12px; color: var(--muted); }
+  .account-status.connected { color: var(--ok); }
+  .account-row button {
+    border: 1px solid var(--border); background: transparent; color: var(--text);
+    border-radius: 8px; padding: 6px 14px; font-size: 12.5px; font-weight: 600; cursor: pointer;
+    font-family: inherit;
+  }
+  .account-row button.disconnect { border-color: var(--bad); color: var(--bad); }
+
+  /* ── Sample generated cards (source content to publish) ── */
+  .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
+  @media (max-width: 640px) { .grid { grid-template-columns: 1fr; } }
+  .src-card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 14px; overflow: hidden;
+  }
+  .src-media { background: #000; aspect-ratio: 9/16; }
+  .src-media.feed { aspect-ratio: 1/1; }
+  .src-media video, .src-media img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .src-body { padding: 14px 16px 16px; }
+  .src-label { font-size: 11.5px; font-weight: 700; text-transform: uppercase; color: var(--accent); margin-bottom: 6px; }
+  .src-caption { font-size: 13px; line-height: 1.5; color: var(--muted); max-height: 60px; overflow-y: auto; margin-bottom: 10px; }
+  .publish-btn {
+    width: 100%; border: none; background: var(--accent); color: var(--accent-ink);
+    border-radius: 9px; padding: 10px; font-size: 13.5px; font-weight: 700; cursor: pointer;
+    font-family: inherit;
+  }
+
+  /* ── Modal ── */
+  .modal-backdrop {
+    position: fixed; inset: 0; background: var(--overlay); display: none;
+    align-items: center; justify-content: center; z-index: 50; padding: 20px;
+  }
+  .modal-backdrop.show { display: flex; }
+  .modal {
+    background: var(--card); border-radius: 18px; max-width: 380px; width: 100%;
+    max-height: 88vh; overflow-y: auto; padding: 22px;
+  }
+  .modal h2 { font-size: 17px; margin: 0 0 6px; }
+  .modal .modal-sub { font-size: 13px; color: var(--muted); margin: 0 0 16px; line-height: 1.5; }
+  .modal-actions { display: flex; gap: 8px; margin-top: 18px; }
+  .modal-actions button {
+    flex: 1; border-radius: 10px; padding: 11px; font-size: 13.5px; font-weight: 700;
+    cursor: pointer; font-family: inherit; border: 1px solid var(--border);
+  }
+  .modal-actions .primary { background: var(--accent); color: var(--accent-ink); border: none; }
+  .modal-actions .secondary { background: transparent; color: var(--text); }
+  .connect-input {
+    width: 100%; border: 1px solid var(--border); background: var(--bg); color: var(--text);
+    border-radius: 9px; padding: 10px 12px; font-size: 13.5px; font-family: inherit; margin-bottom: 4px;
+  }
+  .schedule-row {
+    display: flex; align-items: center; gap: 8px; font-size: 13px; margin-top: 14px;
+    padding-top: 14px; border-top: 1px solid var(--border);
+  }
+
+  /* ── Spinner / status states ── */
+  .status-center { text-align: center; padding: 20px 0 6px; }
+  .spinner-lg {
+    width: 34px; height: 34px; border-radius: 50%; border: 3px solid var(--border);
+    border-top-color: var(--accent); animation: spin 0.8s linear infinite; margin: 0 auto 16px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .status-icon { font-size: 40px; margin-bottom: 10px; }
+  .status-icon.ok { color: var(--ok); }
+  .status-icon.bad { color: var(--bad); }
+  .live-link {
+    display: inline-block; margin-top: 4px; color: var(--accent); font-size: 13px; font-weight: 600;
+    text-decoration: none;
+  }
+  .error-detail {
+    background: color-mix(in srgb, var(--bad) 10%, transparent); border-radius: 8px;
+    padding: 10px 12px; font-size: 12px; color: var(--bad); margin-top: 10px; text-align: left;
+  }
+
+  /* ── Realistic platform post mockups (rendered inside confirm step + "live" view) ── */
+  .ig-post { background: var(--card); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+  .ig-header { display: flex; align-items: center; gap: 8px; padding: 10px 12px; }
+  .ig-avatar {
+    width: 30px; height: 30px; border-radius: 50%;
+    background: linear-gradient(45deg, #f09433, #e6683c, #dc2743, #cc2366, #bc1888);
+    display: flex; align-items: center; justify-content: center; color: #fff; font-size: 12px; font-weight: 700;
+  }
+  .ig-username { font-size: 12.5px; font-weight: 700; }
+  .ig-media { background: #000; }
+  .ig-media video, .ig-media img { width: 100%; display: block; }
+  .ig-actions { display: flex; gap: 12px; padding: 10px 12px 4px; font-size: 18px; }
+  .ig-likes { padding: 2px 12px; font-size: 12.5px; font-weight: 700; }
+  .ig-caption { padding: 2px 12px 12px; font-size: 12.5px; line-height: 1.5; }
+  .ig-caption b { margin-right: 5px; }
+  .ig-hashtags { color: #3897f0; }
+  .ig-time { padding: 0 12px 12px; font-size: 10.5px; color: var(--muted); text-transform: uppercase; }
+
+  .reel-mock {
+    position: relative; background: #000; border-radius: 12px; overflow: hidden; aspect-ratio: 9/16; max-width: 220px; margin: 0 auto;
+  }
+  .reel-mock video { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .reel-overlay {
+    position: absolute; inset: 0; background: linear-gradient(to top, rgba(0,0,0,0.75) 0%, rgba(0,0,0,0.1) 35%, transparent 55%);
+    display: flex; flex-direction: column; justify-content: flex-end; padding: 10px;
+  }
+  .reel-user { color: #fff; font-size: 11px; font-weight: 700; margin-bottom: 4px; }
+  .reel-caption { color: #fff; font-size: 10.5px; line-height: 1.4; max-height: 44px; overflow: hidden; }
+  .reel-side {
+    position: absolute; right: 8px; bottom: 60px; display: flex; flex-direction: column;
+    align-items: center; gap: 14px; color: #fff; font-size: 17px;
+  }
+  .reel-side .count { font-size: 9px; margin-top: -8px; }
+
+  .story-mock {
+    position: relative; background: #000; border-radius: 12px; overflow: hidden; aspect-ratio: 9/16; max-width: 220px; margin: 0 auto;
+  }
+  .story-mock video, .story-mock img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .story-progress { position: absolute; top: 6px; left: 8px; right: 8px; height: 2px; background: rgba(255,255,255,0.35); border-radius: 2px; overflow: hidden; }
+  .story-progress::after { content: ""; display: block; width: 60%; height: 100%; background: #fff; }
+  .story-top { position: absolute; top: 14px; left: 8px; display: flex; align-items: center; gap: 6px; }
+  .story-top .ig-avatar { width: 22px; height: 22px; font-size: 9px; }
+  .story-top span { color: #fff; font-size: 10.5px; font-weight: 600; }
+  .story-caption {
+    position: absolute; bottom: 16px; left: 8px; right: 8px; color: #fff; font-size: 11px;
+    background: rgba(0,0,0,0.35); padding: 6px 8px; border-radius: 8px; text-align: center;
+  }
+</style>
+</head>
+<body>
+<nav>
+  <div class="brand">OpenMontage <span>Dashboard</span></div>
+  <div class="navlinks">
+    <a href="/dashboard">Dashboard</a>
+    <a href="/publish-flow-demo" class="active">Publish Flow</a>
+    <a href="/upgrade">Upgrade</a>
+  </div>
+</nav>
+<div class="wrap">
+  <span class="eyebrow">🧪 Prototype — not live</span>
+  <h1>What auto-publish would look like</h1>
+  <p class="sub">A clickable walkthrough of the full flow once the real Instagram/TikTok/Facebook APIs are
+  connected: connect an account → confirm → publish → see the result as it'd actually render on the
+  platform. The photo/video below are real AI-generated output from an actual test run — the connect/
+  publish steps are simulated (no real API call happens).</p>
+  <div class="note-box">
+    <b>How to read this page:</b> click "Connect" on an account below (or just hit Publish — it'll prompt
+    you to connect first), then hit Publish on a card. You'll see the exact confirm → loading → result
+    sequence a real integration would show, including what a failure looks like (there's a "simulate
+    failure" option in the confirm step).
+  </div>
+
+  <div class="accounts-panel">
+    <h3>Connected accounts</h3>
+    <div id="accountsList"></div>
+  </div>
+
+  <div class="grid" id="sourceGrid"></div>
+</div>
+
+<div class="modal-backdrop" id="modalBackdrop">
+  <div class="modal" id="modalBody"></div>
+</div>
+
+<script>
+const PLATFORM_META = {
+  instagram: { name: "Instagram", icon: "instagram", color: "#dc2743" },
+  tiktok: { name: "TikTok", icon: "tiktok", color: "#000" },
+  facebook: { name: "Facebook", icon: "facebook", color: "#1877f2" },
+};
+
+// 真实生成过的内容(2026-08-07 一次真实测试)，样例展示固定用这两条，不重新花钱生成。
+const SAMPLES = [
+  {
+    id: "reel", targetPlatforms: ["instagram", "tiktok"], assetKind: "video",
+    mediaUrl: "/samples/demo-reel.mp4",
+    caption: "Backstage after the show, feeling amazing! 🎤❤️✨ Just finished an incredible performance and I'm so grateful for every single one of you.",
+    hashtags: ["BackstageLife", "LiveMusic", "TourDiaries"],
+    label: "IG Reel / TikTok",
+  },
+  {
+    id: "feed", targetPlatforms: ["instagram", "facebook"], assetKind: "image",
+    mediaUrl: "/samples/demo-feed.jpg",
+    caption: "Just wrapped up another incredible show! The energy in the room was electric, and I'm still buzzing from it all. Thank you for an unforgettable night 🎤✨",
+    hashtags: [],
+    label: "IG Feed",
+  },
+];
+
+function getConnected() {
+  try { return JSON.parse(localStorage.getItem("om_connected_accounts") || "{}"); }
+  catch (e) { return {}; }
+}
+function setConnected(obj) { localStorage.setItem("om_connected_accounts", JSON.stringify(obj)); }
+
+function renderAccounts() {
+  const connected = getConnected();
+  const list = document.getElementById("accountsList");
+  list.innerHTML = Object.entries(PLATFORM_META).map(([key, meta]) => {
+    const username = connected[key];
+    return `
+      <div class="account-row">
+        <div class="account-icon ${meta.icon}">${meta.name[0]}</div>
+        <div class="account-name">${meta.name}</div>
+        <div class="account-status ${username ? "connected" : ""}">${username ? "@" + username : "Not connected"}</div>
+        ${username
+          ? `<button class="disconnect" onclick="disconnectAccount('${key}')">Disconnect</button>`
+          : `<button onclick="connectAccount('${key}')">Connect</button>`}
+      </div>`;
+  }).join("");
+}
+
+function connectAccount(platform) {
+  const meta = PLATFORM_META[platform];
+  const username = prompt(`Simulated OAuth — in the real integration this would redirect to ${meta.name}'s login page. For this prototype, just type a fake @username to "connect":`);
+  if (!username) return;
+  const connected = getConnected();
+  connected[platform] = username.replace(/^@/, "").trim();
+  setConnected(connected);
+  renderAccounts();
+}
+function disconnectAccount(platform) {
+  const connected = getConnected();
+  delete connected[platform];
+  setConnected(connected);
+  renderAccounts();
+}
+window.connectAccount = connectAccount;
+window.disconnectAccount = disconnectAccount;
+
+function renderSourceGrid() {
+  const grid = document.getElementById("sourceGrid");
+  grid.innerHTML = SAMPLES.map((s) => {
+    const mediaClass = s.assetKind === "image" ? "src-media feed" : "src-media";
+    const media = s.assetKind === "video"
+      ? `<video src="${s.mediaUrl}" controls playsinline muted loop></video>`
+      : `<img src="${s.mediaUrl}">`;
+    return `
+      <div class="src-card">
+        <div class="${mediaClass}">${media}</div>
+        <div class="src-body">
+          <div class="src-label">${s.label}</div>
+          <div class="src-caption">${escapeHtml(s.caption)}</div>
+          <button class="publish-btn" onclick="startPublish('${s.id}')">Publish…</button>
+        </div>
+      </div>`;
+  }).join("");
+}
+
+function escapeHtml(s) {
+  return (s || "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function sampleById(id) { return SAMPLES.find((s) => s.id === id); }
+
+function openModal(html) {
+  document.getElementById("modalBody").innerHTML = html;
+  document.getElementById("modalBackdrop").classList.add("show");
+}
+function closeModal() { document.getElementById("modalBackdrop").classList.remove("show"); }
+window.closeModal = closeModal;
+
+// ── Step 1: pick a platform (only ones this sample supports + connection state) ──
+function startPublish(sampleId) {
+  const sample = sampleById(sampleId);
+  const connected = getConnected();
+  const rows = sample.targetPlatforms.map((p) => {
+    const meta = PLATFORM_META[p];
+    const isConnected = !!connected[p];
+    return `
+      <div class="account-row" style="cursor:pointer" onclick="pickPlatform('${sampleId}','${p}')">
+        <div class="account-icon ${meta.icon}">${meta.name[0]}</div>
+        <div class="account-name">${meta.name}</div>
+        <div class="account-status ${isConnected ? "connected" : ""}">${isConnected ? "@" + connected[p] : "Not connected — will prompt"}</div>
+      </div>`;
+  }).join("");
+  openModal(`
+    <h2>Publish to…</h2>
+    <p class="modal-sub">Choose where this goes. ${sample.label} supports: ${sample.targetPlatforms.map((p) => PLATFORM_META[p].name).join(", ")}.</p>
+    ${rows}
+    <div class="modal-actions"><button class="secondary" onclick="closeModal()">Cancel</button></div>
+  `);
+}
+window.startPublish = startPublish;
+
+function pickPlatform(sampleId, platform) {
+  const connected = getConnected();
+  if (!connected[platform]) {
+    closeModal();
+    connectAccount(platform);
+    // 连完账号后回到确认步骤（如果用户真填了用户名再继续，否则就停在这）
+    if (getConnected()[platform]) showConfirm(sampleId, platform);
+    return;
+  }
+  showConfirm(sampleId, platform);
+}
+window.pickPlatform = pickPlatform;
+
+// ── Step 2: confirm — shows the actual rendered post exactly as it'd appear ──
+function showConfirm(sampleId, platform) {
+  const sample = sampleById(sampleId);
+  const connected = getConnected();
+  const username = connected[platform];
+  const meta = PLATFORM_META[platform];
+  const postHtml = platform === "facebook" || (platform === "instagram" && sample.assetKind === "image")
+    ? renderIgFeedPost(sample, username)
+    : renderVerticalPost(sample, username);
+  openModal(`
+    <h2>Confirm post</h2>
+    <p class="modal-sub">This is exactly what will go live on ${meta.name} as @${username}.</p>
+    ${postHtml}
+    <label class="schedule-row">
+      <input type="checkbox" id="simulateFail"> Simulate a failure instead (shows what an error looks like)
+    </label>
+    <div class="modal-actions">
+      <button class="secondary" onclick="closeModal()">Cancel</button>
+      <button class="primary" onclick="doPublish('${sampleId}','${platform}')">Post Now</button>
+    </div>
+  `);
+}
+
+function renderIgFeedPost(sample, username) {
+  const media = sample.assetKind === "video"
+    ? `<video src="${sample.mediaUrl}" controls playsinline muted loop></video>`
+    : `<img src="${sample.mediaUrl}">`;
+  const hashtagsHtml = sample.hashtags.length
+    ? ` <span class="ig-hashtags">${sample.hashtags.map((h) => "#" + h).join(" ")}</span>` : "";
+  return `
+    <div class="ig-post">
+      <div class="ig-header">
+        <div class="ig-avatar">${username[0].toUpperCase()}</div>
+        <div class="ig-username">${username}</div>
+      </div>
+      <div class="ig-media">${media}</div>
+      <div class="ig-actions">❤️ 💬 ✈️</div>
+      <div class="ig-likes">1,204 likes</div>
+      <div class="ig-caption"><b>${username}</b>${escapeHtml(sample.caption)}${hashtagsHtml}</div>
+      <div class="ig-time">Just now</div>
+    </div>`;
+}
+
+function renderVerticalPost(sample, username) {
+  const hashtagsHtml = sample.hashtags.length ? " " + sample.hashtags.map((h) => "#" + h).join(" ") : "";
+  return `
+    <div class="reel-mock">
+      <video src="${sample.mediaUrl}" autoplay muted loop playsinline></video>
+      <div class="reel-overlay">
+        <div class="reel-user">@${username}</div>
+        <div class="reel-caption">${escapeHtml(sample.caption)}${hashtagsHtml}</div>
+      </div>
+      <div class="reel-side">
+        <div>❤️<div class="count">1.2K</div></div>
+        <div>💬<div class="count">86</div></div>
+        <div>↗️<div class="count">Share</div></div>
+      </div>
+    </div>`;
+}
+
+// ── Step 3: publishing (loading) → step 4: result ──
+function doPublish(sampleId, platform) {
+  const shouldFail = document.getElementById("simulateFail")?.checked;
+  const meta = PLATFORM_META[platform];
+  openModal(`
+    <div class="status-center">
+      <div class="spinner-lg"></div>
+      <h2>Publishing to ${meta.name}…</h2>
+      <p class="modal-sub">Uploading media and creating the post. This usually takes a few seconds to a couple of minutes depending on video length.</p>
+    </div>
+  `);
+  setTimeout(() => {
+    shouldFail ? showFailure(sampleId, platform) : showSuccess(sampleId, platform);
+  }, 2200);
+}
+window.doPublish = doPublish;
+
+function showSuccess(sampleId, platform) {
+  const meta = PLATFORM_META[platform];
+  const connected = getConnected();
+  openModal(`
+    <div class="status-center">
+      <div class="status-icon ok">✅</div>
+      <h2>Posted to ${meta.name}!</h2>
+      <p class="modal-sub">It's live on @${connected[platform]}'s account right now.</p>
+      <a class="live-link" href="#" onclick="viewLive('${sampleId}','${platform}'); return false;">View the live post →</a>
+    </div>
+    <div class="modal-actions"><button class="secondary" onclick="closeModal()">Done</button></div>
+  `);
+}
+
+function showFailure(sampleId, platform) {
+  const meta = PLATFORM_META[platform];
+  const isVideo = sampleById(sampleId).assetKind === "video";
+  // 图文帖和视频帖会真的踩到不同类型的平台错误——不能共用一条文案，不然
+  // 图片帖报"视频时长超限"这种驴唇不对马嘴的错误，反而让这个原型显得假。
+  const errors = {
+    instagram: isVideo
+      ? "Media processing failed: video duration (36.6s) exceeds Reels limit for this account tier."
+      : "Media processing failed: image resolution is below Instagram's minimum (needs at least 320px on the shortest side).",
+    tiktok: "Upload rejected: access token expired — reconnect the account and try again.",
+    facebook: isVideo
+      ? "Rate limited: this Page has hit its video posting quota for the hour. Try again later."
+      : "Rate limited: this Page has hit its posting quota for the hour. Try again later.",
+  };
+  openModal(`
+    <div class="status-center">
+      <div class="status-icon bad">⚠️</div>
+      <h2>Couldn't post to ${meta.name}</h2>
+      <p class="modal-sub">The platform rejected the request. Nothing was published.</p>
+      <div class="error-detail">${errors[platform] || "Unknown error from the platform API."}</div>
+    </div>
+    <div class="modal-actions">
+      <button class="secondary" onclick="closeModal()">Close</button>
+      <button class="primary" onclick="closeModal()">Try Again</button>
+    </div>
+  `);
+}
+
+function viewLive(sampleId, platform) {
+  const sample = sampleById(sampleId);
+  const connected = getConnected();
+  const username = connected[platform];
+  const postHtml = platform === "facebook" || (platform === "instagram" && sample.assetKind === "image")
+    ? renderIgFeedPost(sample, username)
+    : renderVerticalPost(sample, username);
+  openModal(`
+    <h2>Live on ${PLATFORM_META[platform].name}</h2>
+    <p class="modal-sub">🧪 Simulated — this is what the real live post would look like, rendered with the actual generated media.</p>
+    ${postHtml}
+    <div class="modal-actions"><button class="secondary" onclick="closeModal()">Close</button></div>
+  `);
+}
+window.viewLive = viewLive;
+
+renderAccounts();
+renderSourceGrid();
+</script>
+</body>
+</html>
