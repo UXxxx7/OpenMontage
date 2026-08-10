@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "openmontage/contracts/authored_manifest",
+  "title": "Arm B — Authored Scene Manifest",
+  "description": "Emitted by whatsapp_mvp/authored/scene_author.py alongside its generated AuthoredScene.tsx (Phase 8) — NOT a render props file like render_props.schema.json. render_props.schema.json describes a FIXED vocabulary of card sections that XiaojinEditorial always renders; this describes a PER-JOB, model-chosen list of the specific elements in THIS generated scene that a human is allowed to tweak afterward. Everything not listed here stays entirely under the model's control (layout, animation, b-roll timing choices not exposed as a window, etc). Every field listed against an element MUST be read in the generated TSX as `props.overrides?.[id]?.<field> ?? <authored default>` — tsx_validator.py's contract_overrides_used/manifest-id-wired checks enforce that this isn't decorative.",
+  "type": "array",
+  "items": { "$ref": "#/$defs/element" },
+  "$defs": {
+    "element": {
+      "type": "object",
+      "required": ["id", "kind", "layer", "x", "y", "w", "h"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9_-]*$",
+          "description": "Stable within this scene — must appear verbatim in the TSX as an overrides lookup key (e.g. props.overrides?.['stat-1'])."
+        },
+        "kind": {
+          "type": "string",
+          "enum": ["text_block", "stat_card", "image_swap", "broll_window"]
+        },
+        "layer": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Paint/z-order — same role as remotion-composer/editor/state/layers.ts's DEFAULT_CONTENT_LAYER for Arm A. Higher paints on top; used for topmost-first click-to-select."
+        },
+        "x": { "type": "number", "description": "Composition px, 1080x1920 space (same convention as render_props.schema.json's card x/y)." },
+        "y": { "type": "number" },
+        "w": { "type": "number", "exclusiveMinimum": 0 },
+        "h": { "type": "number", "exclusiveMinimum": 0 }
+      },
+      "allOf": [
+        { "if": { "properties": { "kind": { "const": "text_block" } } }, "then": { "$ref": "#/$defs/textBlockFields" } },
+        { "if": { "properties": { "kind": { "const": "stat_card" } } }, "then": { "$ref": "#/$defs/statCardFields" } },
+        { "if": { "properties": { "kind": { "const": "image_swap" } } }, "then": { "$ref": "#/$defs/imageSwapFields" } },
+        { "if": { "properties": { "kind": { "const": "broll_window" } } }, "then": { "$ref": "#/$defs/brollWindowFields" } }
+      ]
+    },
+
+    "textBlockFields": {
+      "description": "An on-screen text/caption-style graphic beat (NOT the burned-in word-level captions themselves, which stay model-only — only discrete graphic text the model chose to add).",
+      "type": "object",
+      "required": ["text", "mountFrame"],
+      "properties": {
+        "text": { "type": "string", "maxLength": 200 },
+        "color": { "type": "string", "pattern": "^#[0-9a-fA-F]{6}$" },
+        "mountFrame": { "type": "integer", "minimum": 0 },
+        "endFrame": { "type": "integer", "minimum": 0 }
+      }
+    },
+
+    "statCardFields": {
+      "description": "A discrete data/number graphic beat (countdown, gauge, data-card equivalent, model's own design — not one of Arm A's fixed card types, just editable the same way).",
+      "type": "object",
+      "required": ["headline", "value", "mountFrame"],
+      "properties": {
+        "headline": { "type": "string", "maxLength": 80 },
+        "value": { "type": ["string", "number"] },
+        "color": { "type": "string", "pattern": "^#[0-9a-fA-F]{6}$" },
+        "mountFrame": { "type": "integer", "minimum": 0 },
+        "endFrame": { "type": "integer", "minimum": 0 }
+      }
+    },
+
+    "imageSwapFields": {
+      "description": "A still image the model placed (not a b-roll video window — see broll_window for that).",
+      "type": "object",
+      "required": ["src", "mountFrame"],
+      "properties": {
+        "src": { "type": "string", "description": "Path relative to remotion-composer/public/, same convention as render_props.schema.json's videoSrc." },
+        "mountFrame": { "type": "integer", "minimum": 0 },
+        "endFrame": { "type": "integer", "minimum": 0 }
+      }
+    },
+
+    "brollWindowFields": {
+      "description": "One of the b-roll insert windows scene_author.py's prompt already asks the model to place — made editable so a human can nudge its timing or swap the clip without a full re-author.",
+      "type": "object",
+      "required": ["src", "mountFrame", "endFrame"],
+      "properties": {
+        "src": { "type": "string" },
+        "label": { "type": "string", "maxLength": 60 },
+        "mountFrame": { "type": "integer", "minimum": 0 },
+        "endFrame": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

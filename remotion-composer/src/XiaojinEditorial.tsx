@@ -24,9 +24,11 @@
  * component's own doc comment for what did NOT get ported, and why).
  */
 import Ajv2020 from "ajv/dist/2020";
+import { useMemo } from "react";
 import { loadFont as loadInter } from "@remotion/google-fonts/Inter";
 import { loadFont as loadNotoSansTC } from "@remotion/google-fonts/NotoSansTC";
-import { AbsoluteFill, CalculateMetadataFunction } from "remotion";
+import { AbsoluteFill, CalculateMetadataFunction, getRemotionEnvironment } from "remotion";
+import { computeOutputDuration, mapPropsForCuts, normalizeCuts } from "./cuts";
 import renderPropsSchema from "../../contracts/render_props.schema.json";
 
 // headingFont/labelFont defaulted to CSS "inherit" (no font loaded at all)
@@ -38,19 +40,20 @@ import renderPropsSchema from "../../contracts/render_props.schema.json";
 // video-studio's vell-renewal-fresh reference uses — tc (includes latin) for
 // headings so both languages render correctly, inter for the small
 // UPPERCASE labels/eyebrows, matching how the reference assigns them.
-const { fontFamily: _defaultHeadingFont } = loadNotoSansTC("normal", {
-  weights: ["500", "700", "800"],
-  subsets: ["chinese-traditional", "latin"],
-});
-const { fontFamily: _defaultLabelFont } = loadInter("normal", {
-  weights: ["400", "500", "600", "700", "800"],
-  subsets: ["latin"],
-});
+//
+// getInfo().fontFamily for NotoSansTC is always literally "Noto Sans TC"
+// regardless of which weights/subsets get loaded, so the default prop
+// value doesn't need the loadFont() call itself — that side effect (which
+// registers the actual font-face glyphs) is triggered separately below,
+// inside the component, not at module scope.
+const _defaultHeadingFont = "Noto Sans TC";
+const _defaultLabelFont = "Inter";
 import { BrandBar } from "./components/xiaojin/BrandBar";
 import { BudgetRevealSection, BudgetRevealSectionProps } from "./components/xiaojin/BudgetRevealSection";
 import { Calendar, CalendarProps } from "./components/xiaojin/Calendar";
 import { Captions, CaptionPhrase } from "./components/xiaojin/Captions";
 import { ChapterNav, Chapter } from "./components/xiaojin/ChapterNav";
+import { Layer, contentZ, DEFAULT_CONTENT_LAYER } from "./components/xiaojin/Layer";
 import { ComplianceBar } from "./components/xiaojin/ComplianceBar";
 import { ContentBeat, ContentZone } from "./components/xiaojin/ContentZone";
 import { CornerCard, CornerCardProps } from "./components/xiaojin/CornerCard";
@@ -92,11 +95,19 @@ export interface ComplianceInfo {
   titleZh: string;
   licenseNo: string;
   insurer: string;
+  /** Editor-only position override — see ComplianceBar.tsx's own defaults. */
+  x?: number;
+  y?: number;
+  width?: number;
 }
 
 export interface BrandInfo {
   company: string;
   label: string;
+  /** Editor-only position override — see BrandBar.tsx's own defaults. */
+  x?: number;
+  y?: number;
+  width?: number;
 }
 
 export interface IntroInfo {
@@ -113,38 +124,61 @@ export interface IntroInfo {
   variant?: "title_card" | "stats_hook" | "title_impact" | "chips";
   /** Only used by variant "title_impact" — top-right brand chip. Omit to skip it. */
   brandLabel?: string;
+  /** Editor-only position override, "chips" variant only — see
+   *  ChipsIntro.tsx's own defaults. */
+  x?: number;
+  y?: number;
 }
 
+export interface ChapterNavPosition {
+  x?: number;
+  y?: number;
+  width?: number;
+}
+
+export interface RainbowBarPosition {
+  x?: number;
+  y?: number;
+  width?: number;
+  height?: number;
+}
+
+// `& { layer?: number }` on each: Phase E's optional stacking-order override
+// (contracts/render_props.schema.json's per-item `layer` field). Purely a
+// type-level addition — these fields already flow through {...item} spreads
+// at runtime regardless of this annotation; this just lets XiaojinEditorial
+// read `item.layer` before spreading. QRContact/CornerCardItem deliberately
+// excluded — they're not in the content z-order band (see Layer.tsx).
 /** Matches contract②'s dataCards item shape exactly — colorMode/fonts come from the parent. */
-export type DataCard = Omit<InfoCardProps, "colorMode" | "headingFont" | "labelFont">;
-export type Gauge = Omit<RiskGaugeProps, "colorMode" | "headingFont" | "labelFont">;
-export type BeforeAfter = Omit<BudgetRevealSectionProps, "headingFont" | "labelFont">;
-export type Countdown = Omit<CountdownRingProps, "colorMode" | "headingFont" | "labelFont">;
-export type CalendarEvent = Omit<CalendarProps, "colorMode" | "headingFont" | "labelFont">;
-export type Pill = Omit<AccentPillProps, "colorMode" | "headingFont">;
+export type DataCard = Omit<InfoCardProps, "colorMode" | "headingFont" | "labelFont"> & { layer?: number };
+export type Gauge = Omit<RiskGaugeProps, "colorMode" | "headingFont" | "labelFont"> & { layer?: number };
+export type BeforeAfter = Omit<BudgetRevealSectionProps, "headingFont" | "labelFont"> & { layer?: number };
+export type Countdown = Omit<CountdownRingProps, "colorMode" | "headingFont" | "labelFont"> & { layer?: number };
+export type CalendarEvent = Omit<CalendarProps, "colorMode" | "headingFont" | "labelFont"> & { layer?: number };
+export type Pill = Omit<AccentPillProps, "colorMode" | "headingFont"> & { layer?: number };
 export type QRContact = Omit<QRContactCardProps, "colorMode" | "headingFont" | "labelFont">;
-export type Quote = Omit<QuoteCardProps, "colorMode" | "headingFont" | "labelFont">;
-export type ZoneHeaderItem = Omit<ZoneHeaderProps, "colorMode" | "headingFont" | "labelFont">;
-export type StepListItem = Omit<StepListProps, "colorMode" | "headingFont" | "labelFont">;
-export type TopicCardItem = Omit<TopicCardProps, "colorMode" | "headingFont" | "labelFont">;
+export type Quote = Omit<QuoteCardProps, "colorMode" | "headingFont" | "labelFont"> & { layer?: number };
+export type ZoneHeaderItem = Omit<ZoneHeaderProps, "colorMode" | "headingFont" | "labelFont"> & { layer?: number };
+export type StepListItem = Omit<StepListProps, "colorMode" | "headingFont" | "labelFont"> & { layer?: number };
+export type TopicCardItem = Omit<TopicCardProps, "colorMode" | "headingFont" | "labelFont"> & { layer?: number };
 export type CornerCardItem = CornerCardProps;
 // "CardItem" (not "Item") suffix deliberately, matching CornerCardItem — these
 // are the outer per-card props for the props array, and Ranked/Checklist/
 // IconCluster each already export their OWN per-row "...Item" type from their
 // own component file (RankedListItem/ChecklistItem/IconClusterItem); reusing
 // that exact name here for the outer card type would shadow-confuse the two.
-export type ComparisonCardItem = Omit<ComparisonCardProps, "colorMode" | "headingFont" | "labelFont">;
-export type RankedListCardItem = Omit<RankedListCardProps, "colorMode" | "headingFont" | "labelFont">;
-export type ChecklistCardItem = Omit<ChecklistCardProps, "colorMode" | "headingFont" | "labelFont">;
-export type LocationPinCardItem = Omit<LocationPinCardProps, "colorMode" | "headingFont" | "labelFont">;
-export type TestimonialCardItem = Omit<TestimonialCardProps, "colorMode" | "headingFont" | "labelFont">;
-export type IconClusterCardItem = Omit<IconClusterCardProps, "colorMode" | "headingFont" | "labelFont">;
-export type ProgressBarCardItem = Omit<ProgressBarCardProps, "colorMode" | "headingFont" | "labelFont">;
-export type ProsConsCardItem = Omit<ProsConsCardProps, "colorMode" | "headingFont" | "labelFont">;
-export type MilestoneTrackCardItem = Omit<MilestoneTrackCardProps, "colorMode" | "headingFont" | "labelFont">;
-export type TrustBadgeCardItem = Omit<TrustBadgeCardProps, "colorMode" | "headingFont" | "labelFont">;
-export type BarChartCardItem = Omit<BarChartCardProps, "colorMode" | "headingFont" | "labelFont">;
-export type MilestoneUnlockCardItem = Omit<MilestoneUnlockCardProps, "colorMode" | "headingFont" | "labelFont">;
+export type ComparisonCardItem = Omit<ComparisonCardProps, "colorMode" | "headingFont" | "labelFont"> & { layer?: number };
+export type RankedListCardItem = Omit<RankedListCardProps, "colorMode" | "headingFont" | "labelFont"> & { layer?: number };
+export type ChecklistCardItem = Omit<ChecklistCardProps, "colorMode" | "headingFont" | "labelFont"> & { layer?: number };
+export type LocationPinCardItem = Omit<LocationPinCardProps, "colorMode" | "headingFont" | "labelFont"> & { layer?: number };
+export type TestimonialCardItem = Omit<TestimonialCardProps, "colorMode" | "headingFont" | "labelFont"> & { layer?: number };
+export type IconClusterCardItem = Omit<IconClusterCardProps, "colorMode" | "headingFont" | "labelFont"> & { layer?: number };
+export type ProgressBarCardItem = Omit<ProgressBarCardProps, "colorMode" | "headingFont" | "labelFont"> & { layer?: number };
+export type ProsConsCardItem = Omit<ProsConsCardProps, "colorMode" | "headingFont" | "labelFont"> & { layer?: number };
+export type MilestoneTrackCardItem = Omit<MilestoneTrackCardProps, "colorMode" | "headingFont" | "labelFont"> & { layer?: number };
+export type TrustBadgeCardItem = Omit<TrustBadgeCardProps, "colorMode" | "headingFont" | "labelFont"> & { layer?: number };
+export type BarChartCardItem = Omit<BarChartCardProps, "colorMode" | "headingFont" | "labelFont"> & { layer?: number };
+export type MilestoneUnlockCardItem = Omit<MilestoneUnlockCardProps, "colorMode" | "headingFont" | "labelFont"> & { layer?: number };
 
 export interface OutroInfo {
   kicker: string;
@@ -159,8 +193,12 @@ export interface OutroInfo {
 
 export interface XiaojinEditorialProps extends Record<string, unknown> {
   videoSrc: string;
-  /** Drives calculateXiaojinEditorialMetadata's durationInFrames — must match videoSrc's real length. */
+  /** Full SOURCE asset duration — always the untrimmed length; see videoCuts. */
   durationSeconds: number;
+  /** Editor-authored razor cuts (source-video frames). Absent/empty = untrimmed. See ./cuts.ts. */
+  videoCuts?: import("./cuts").VideoCut[];
+  /** Speaker video playback volume, 0-1. Absent/undefined = full volume (every job before this field existed is unaffected). Does not affect the music bed — that's mixed post-render, see whatsapp_mvp/pipeline_runner.py's musicVolume handling. */
+  videoVolume?: number;
   colorMode: ColorMode;
   /** Calibrated per source video — see SpeakerCard's doc comment. Required, no safe default. */
   speakerObjectPosition: string;
@@ -169,6 +207,10 @@ export interface XiaojinEditorialProps extends Record<string, unknown> {
   chapters: Chapter[];
   introOutFrame: number;
   captions: CaptionPhrase[];
+  /** Optional editor override for where captions render — single-entry array,
+   *  see Captions.tsx's own doc comment. Omit for the original centered-bottom
+   *  position. */
+  captionPosition?: { x: number; y: number; width?: number }[];
   /** The graphic content side opposite the speaker card. Omit for a chrome-only build. */
   contentBeats?: ContentBeat[];
   /** Full-canvas chapter takeovers (background + header + icon) — see SectionLayer. */
@@ -236,6 +278,12 @@ export interface XiaojinEditorialProps extends Record<string, unknown> {
   brand?: BrandInfo;
   /** presenter mode: speaker inset in the lower zone during b-roll windows. */
   presenter?: PresenterProps;
+  /** Editor-only position override for the top chapter-nav bar. Not
+   *  authored by the pipeline. */
+  chapterNav?: ChapterNavPosition;
+  /** Editor-only position override for the bottom progress bar. Not
+   *  authored by the pipeline. */
+  rainbowBar?: RainbowBarPosition;
   headingFont?: string;
   labelFont?: string;
 }
@@ -267,58 +315,99 @@ export const calculateXiaojinEditorialMetadata: CalculateMetadataFunction<
   }
 
   const fps = 30;
+  // Single source of truth (src/cuts.ts) — do not hand-recompute this
+  // formula here. durationSeconds keeps meaning "full source asset
+  // duration" (stays server-pinned) and is untouched; with no videoCuts
+  // this is a strict no-op against the pre-cuts formula (ceil(durationSeconds*fps)).
+  const durationInFrames = computeOutputDuration(props);
   return {
-    durationInFrames: Math.max(1, Math.ceil((props.durationSeconds || 1) * fps)),
+    durationInFrames,
     fps,
     width: 1080,
     height: 1920,
   };
 };
 
-export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = ({
-  videoSrc,
-  colorMode,
-  speakerObjectPosition,
-  scenes,
-  opacityKeyframes,
-  chapters,
-  introOutFrame,
-  captions,
-  contentBeats,
-  sections,
-  quotes,
-  pills,
-  dataCards,
-  beforeAfter,
-  gauges,
-  countdowns,
-  calendarEvents,
-  zoneHeaders,
-  stepLists,
-  topicCards,
-  cornerCards,
-  comparisons,
-  rankedLists,
-  checklists,
-  locationPins,
-  testimonials,
-  iconClusters,
-  progressBars,
-  prosCons,
-  milestoneTracks,
-  trustBadges,
-  barCharts,
-  milestoneUnlocks,
-  qrContact,
-  intro,
-  outro,
-  compliance,
-  brand,
-  presenter,
-  headingFont = _defaultHeadingFont,
-  labelFont = _defaultLabelFont,
-}) => {
+export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = (rawProps) => {
+  const sourceDurationFrames = Math.max(1, Math.ceil((rawProps.durationSeconds || 1) * 30));
+  const cuts = normalizeCuts(rawProps.videoCuts, sourceDurationFrames);
+  // Map every time-bearing field from SOURCE to OUTPUT coordinates once,
+  // here, before any card destructures/renders — so none of the ~40
+  // individual card components below need to know cuts exist at all; they
+  // just see already-correct mountFrame/endFrame/etc. values. With no cuts
+  // this is a strict, reference-preserving no-op (see mapPropsForCuts's own
+  // doc comment) — every job before this feature existed renders unchanged.
+  const props = mapPropsForCuts(rawProps, cuts);
+  const {
+    videoSrc,
+    videoVolume,
+    colorMode,
+    speakerObjectPosition,
+    scenes,
+    opacityKeyframes,
+    chapters,
+    introOutFrame,
+    captions,
+    captionPosition,
+    contentBeats,
+    sections,
+    quotes,
+    pills,
+    dataCards,
+    beforeAfter,
+    gauges,
+    countdowns,
+    calendarEvents,
+    zoneHeaders,
+    stepLists,
+    topicCards,
+    cornerCards,
+    comparisons,
+    rankedLists,
+    checklists,
+    locationPins,
+    testimonials,
+    iconClusters,
+    progressBars,
+    prosCons,
+    milestoneTracks,
+    trustBadges,
+    barCharts,
+    milestoneUnlocks,
+    qrContact,
+    intro,
+    outro,
+    compliance,
+    brand,
+    presenter,
+    chapterNav,
+    rainbowBar,
+    headingFont = _defaultHeadingFont,
+    labelFont = _defaultLabelFont,
+  } = props;
   const bg = colorMode === "warm" ? "#F2EBE0" : "#0D1117";
+
+  // Deliberately called here, not at module scope: getRemotionEnvironment()
+  // only reports isPlayer correctly once <Player>'s own component body has
+  // run and set window.remotion_isPlayer — which happens before this
+  // component renders (parent-before-child) but NOT before this module's
+  // top-level code runs at import time. A module-scope loadFont() call
+  // always saw isPlayer as false (confirmed live — it still fired all 306
+  // chinese-traditional requests even with an isPlayer branch in place),
+  // which is why this moved down into the component instead. loadFont()'s
+  // own internal cache makes the useMemo a nicety, not a correctness
+  // requirement — repeated calls with the same weights/subsets are free.
+  useMemo(() => {
+    const { isPlayer } = getRemotionEnvironment();
+    loadNotoSansTC("normal", {
+      weights: isPlayer ? ["700"] : ["500", "700", "800"],
+      subsets: isPlayer ? ["latin"] : ["chinese-traditional", "latin"],
+    });
+    loadInter("normal", {
+      weights: ["400", "500", "600", "700", "800"],
+      subsets: ["latin"],
+    });
+  }, []);
 
   return (
     <AbsoluteFill style={{ background: bg }}>
@@ -338,6 +427,9 @@ export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = ({
         opacityKeyframes={opacityKeyframes}
         objectPosition={speakerObjectPosition}
         colorMode={colorMode}
+        videoVolume={videoVolume}
+        videoCuts={cuts}
+        sourceDurationFrames={sourceDurationFrames}
       >
         {cornerCards?.map((card, i) => (
           <CornerCard key={i} {...card} />
@@ -358,104 +450,142 @@ export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = ({
       */}
       {contentBeats ? <ContentZone beats={contentBeats} /> : null}
       {zoneHeaders?.map((header, i) => (
-        <ZoneHeader key={i} {...header} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+        <Layer key={i} z={contentZ(header.layer, DEFAULT_CONTENT_LAYER.zoneHeaders)}>
+          <ZoneHeader {...header} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+        </Layer>
       ))}
       {quotes?.map((q, i) => (
-        <QuoteCard key={`q${i}`} {...q} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+        <Layer key={`q${i}`} z={contentZ(q.layer, DEFAULT_CONTENT_LAYER.quotes)}>
+          <QuoteCard {...q} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+        </Layer>
       ))}
       {dataCards?.map((card, i) => (
-        <InfoCard
-          key={i}
-          {...card}
-          colorMode={colorMode}
-          headingFont={headingFont}
-          labelFont={labelFont}
-        />
+        <Layer key={i} z={contentZ(card.layer, DEFAULT_CONTENT_LAYER.dataCards)}>
+          <InfoCard
+            {...card}
+            colorMode={colorMode}
+            headingFont={headingFont}
+            labelFont={labelFont}
+          />
+        </Layer>
       ))}
       {beforeAfter?.map((reveal, i) => (
-        <BudgetRevealSection
-          key={i}
-          {...reveal}
-          headingFont={headingFont}
-          labelFont={labelFont}
-        />
+        <Layer key={i} z={contentZ(reveal.layer, DEFAULT_CONTENT_LAYER.beforeAfter)}>
+          <BudgetRevealSection
+            {...reveal}
+            headingFont={headingFont}
+            labelFont={labelFont}
+          />
+        </Layer>
       ))}
       {gauges?.map((gauge, i) => (
-        <RiskGauge
-          key={i}
-          {...gauge}
-          colorMode={colorMode}
-          headingFont={headingFont}
-          labelFont={labelFont}
-        />
+        <Layer key={i} z={contentZ(gauge.layer, DEFAULT_CONTENT_LAYER.gauges)}>
+          <RiskGauge
+            {...gauge}
+            colorMode={colorMode}
+            headingFont={headingFont}
+            labelFont={labelFont}
+          />
+        </Layer>
       ))}
       {countdowns?.map((countdown, i) => (
-        <CountdownRing
-          key={i}
-          {...countdown}
-          colorMode={colorMode}
-          headingFont={headingFont}
-          labelFont={labelFont}
-        />
+        <Layer key={i} z={contentZ(countdown.layer, DEFAULT_CONTENT_LAYER.countdowns)}>
+          <CountdownRing
+            {...countdown}
+            colorMode={colorMode}
+            headingFont={headingFont}
+            labelFont={labelFont}
+          />
+        </Layer>
       ))}
       {calendarEvents?.map((event, i) => (
-        <Calendar
-          key={i}
-          {...event}
-          colorMode={colorMode}
-          headingFont={headingFont}
-          labelFont={labelFont}
-        />
+        <Layer key={i} z={contentZ(event.layer, DEFAULT_CONTENT_LAYER.calendarEvents)}>
+          <Calendar
+            {...event}
+            colorMode={colorMode}
+            headingFont={headingFont}
+            labelFont={labelFont}
+          />
+        </Layer>
       ))}
       {pills?.map((pill, i) => (
-        <AccentPill
-          key={i}
-          {...pill}
-          colorMode={colorMode}
-          headingFont={headingFont}
-        />
+        <Layer key={i} z={contentZ(pill.layer, DEFAULT_CONTENT_LAYER.pills)}>
+          <AccentPill
+            {...pill}
+            colorMode={colorMode}
+            headingFont={headingFont}
+          />
+        </Layer>
       ))}
       {stepLists?.map((list, i) => (
-        <StepList key={i} {...list} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+        <Layer key={i} z={contentZ(list.layer, DEFAULT_CONTENT_LAYER.stepLists)}>
+          <StepList {...list} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+        </Layer>
       ))}
       {topicCards?.map((card, i) => (
-        <TopicCard key={i} {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+        <Layer key={i} z={contentZ(card.layer, DEFAULT_CONTENT_LAYER.topicCards)}>
+          <TopicCard {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+        </Layer>
       ))}
       {comparisons?.map((card, i) => (
-        <ComparisonCard key={i} {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+        <Layer key={i} z={contentZ(card.layer, DEFAULT_CONTENT_LAYER.comparisons)}>
+          <ComparisonCard {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+        </Layer>
       ))}
       {rankedLists?.map((card, i) => (
-        <RankedListCard key={i} {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+        <Layer key={i} z={contentZ(card.layer, DEFAULT_CONTENT_LAYER.rankedLists)}>
+          <RankedListCard {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+        </Layer>
       ))}
       {checklists?.map((card, i) => (
-        <ChecklistCard key={i} {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+        <Layer key={i} z={contentZ(card.layer, DEFAULT_CONTENT_LAYER.checklists)}>
+          <ChecklistCard {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+        </Layer>
       ))}
       {locationPins?.map((card, i) => (
-        <LocationPinCard key={i} {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+        <Layer key={i} z={contentZ(card.layer, DEFAULT_CONTENT_LAYER.locationPins)}>
+          <LocationPinCard {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+        </Layer>
       ))}
       {testimonials?.map((card, i) => (
-        <TestimonialCard key={i} {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+        <Layer key={i} z={contentZ(card.layer, DEFAULT_CONTENT_LAYER.testimonials)}>
+          <TestimonialCard {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+        </Layer>
       ))}
       {iconClusters?.map((card, i) => (
-        <IconClusterCard key={i} {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+        <Layer key={i} z={contentZ(card.layer, DEFAULT_CONTENT_LAYER.iconClusters)}>
+          <IconClusterCard {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+        </Layer>
       ))}
       {progressBars?.map((card, i) => (
-        <ProgressBarCard key={i} {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+        <Layer key={i} z={contentZ(card.layer, DEFAULT_CONTENT_LAYER.progressBars)}>
+          <ProgressBarCard {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+        </Layer>
       ))}
       {prosCons?.map((card, i) => (
-        <ProsConsCard key={i} {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+        <Layer key={i} z={contentZ(card.layer, DEFAULT_CONTENT_LAYER.prosCons)}>
+          <ProsConsCard {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+        </Layer>
       ))}
       {milestoneTracks?.map((card, i) => (
-        <MilestoneTrackCard key={i} {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+        <Layer key={i} z={contentZ(card.layer, DEFAULT_CONTENT_LAYER.milestoneTracks)}>
+          <MilestoneTrackCard {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+        </Layer>
       ))}
       {trustBadges?.map((card, i) => (
-        <TrustBadgeCard key={i} {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+        <Layer key={i} z={contentZ(card.layer, DEFAULT_CONTENT_LAYER.trustBadges)}>
+          <TrustBadgeCard {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+        </Layer>
       ))}
       {barCharts?.map((card, i) => (
-        <BarChartCard key={i} {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+        <Layer key={i} z={contentZ(card.layer, DEFAULT_CONTENT_LAYER.barCharts)}>
+          <BarChartCard {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+        </Layer>
       ))}
       {milestoneUnlocks?.map((card, i) => (
-        <MilestoneUnlockCard key={i} {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+        <Layer key={i} z={contentZ(card.layer, DEFAULT_CONTENT_LAYER.milestoneUnlocks)}>
+          <MilestoneUnlockCard {...card} colorMode={colorMode} headingFont={headingFont} labelFont={labelFont} />
+        </Layer>
       ))}
       {/* outro renders BEFORE qrContact (not the other way around): OutroSection
           paints an opaque full-canvas background (y=88 to H-72). Rendering
@@ -514,6 +644,8 @@ export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = ({
           introOutFrame={introOutFrame}
           colorMode={colorMode}
           labelFont={labelFont}
+          x={intro.x}
+          y={intro.y}
         />
       ) : intro ? (
         <IntroTitle
@@ -526,26 +658,42 @@ export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = ({
           labelFont={labelFont}
         />
       ) : null}
-      {presenter ? <Presenter {...presenter} colorMode={colorMode} /> : null}
+      {presenter ? (
+        <Presenter
+          {...presenter}
+          colorMode={colorMode}
+          videoCuts={cuts}
+          sourceDurationFrames={sourceDurationFrames}
+        />
+      ) : null}
       <ChapterNav
         chapters={chapters}
         introOutFrame={introOutFrame}
         colorMode={colorMode}
         headingFont={headingFont}
         labelFont={labelFont}
+        x={chapterNav?.x}
+        y={chapterNav?.y}
+        width={chapterNav?.width}
       />
       <Captions
         captions={captions}
         introOutFrame={introOutFrame}
         colorMode={colorMode}
         font={headingFont}
+        position={captionPosition?.[0]}
       />
       {compliance ? (
         <ComplianceBar {...compliance} font={headingFont} />
       ) : brand ? (
         <BrandBar {...brand} colorMode={colorMode} font={headingFont} />
       ) : null}
-      <RainbowProgressBar />
+      <RainbowProgressBar
+        x={rainbowBar?.x}
+        y={rainbowBar?.y}
+        width={rainbowBar?.width}
+        height={rainbowBar?.height}
+      />
     </AbsoluteFill>
   );
 };

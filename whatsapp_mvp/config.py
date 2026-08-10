@@ -30,6 +30,12 @@ class Config:
     whatsapp_app_secret: str = field(
         default_factory=lambda: os.getenv("WHATSAPP_APP_SECRET", "")
     )
+    # 预览编辑器私有链接的签名密钥（editor_token.py）。没单独设置时退回
+    # whatsapp_app_secret——两者都没配置属于部署错误，editor_token.py 会
+    # fail closed（拒绝签发/校验任何 token），不会静默用空字符串当密钥。
+    editor_token_secret: str = field(
+        default_factory=lambda: os.getenv("EDITOR_TOKEN_SECRET", "")
+    )
 
     # Redis / Queue
     redis_url: str = field(

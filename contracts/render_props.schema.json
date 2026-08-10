@@ -23,34 +23,95 @@
     "presenter": {
       "type": "object",
       "description": "[presenter mode] speaker inset shown in the lower zone during b-roll windows; the card shows b-roll full-bleed. Written by the pipeline when insert_broll + apply_style co-occur.",
-      "required": ["src", "windows"],
+      "required": [
+        "src",
+        "windows"
+      ],
       "additionalProperties": false,
       "properties": {
-        "src": { "type": "string" },
+        "src": {
+          "type": "string"
+        },
         "windows": {
           "type": "array",
           "items": {
             "type": "object",
-            "required": ["fromFrame", "toFrame"],
+            "required": [
+              "fromFrame",
+              "toFrame"
+            ],
             "additionalProperties": false,
             "properties": {
-              "fromFrame": { "type": "integer", "minimum": 0 },
-              "toFrame": { "type": "integer", "minimum": 0 }
+              "fromFrame": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "toFrame": {
+                "type": "integer",
+                "minimum": 0
+              }
             }
           }
         },
-        "x": { "type": "number" },
-        "y": { "type": "number" },
-        "w": { "type": "number" },
-        "h": { "type": "number" },
-        "radius": { "type": "number" },
-        "objectPosition": { "type": "string" }
+        "x": {
+          "type": "number"
+        },
+        "y": {
+          "type": "number"
+        },
+        "w": {
+          "type": "number"
+        },
+        "h": {
+          "type": "number"
+        },
+        "radius": {
+          "type": "number"
+        },
+        "objectPosition": {
+          "type": "string"
+        }
       }
     },
     "durationSeconds": {
       "type": "number",
       "exclusiveMinimum": 0,
-      "description": "Output length; P3 uses it in calculateMetadata: durationInFrames = ceil(durationSeconds*30)"
+      "description": "Full SOURCE asset duration; server-pinned, not user-editable. Always the untrimmed length — see videoCuts for the editor-authored cut list that derives the shorter OUTPUT duration (src/cuts.ts's computeOutputDuration)."
+    },
+    "videoCuts": {
+      "type": "array",
+      "description": "Editor-authored razor cuts: REMOVED regions in SOURCE-video frames, half-open [fromFrame, toFrame). Absent/empty = untrimmed (strict no-op — every other frame/ms field in these props, and every existing job with no videoCuts, is unaffected). Every other time-bearing field in these props stays expressed in SOURCE coordinates forever, mapped to OUTPUT coordinates at render/preview time by src/cuts.ts — trimming the head is just a cut [0,N]; trimming the tail is [M, ceil(durationSeconds*30)]; a middle cut is any [A,B]. Server normalizes (sorts, merges overlapping/touching, clamps to the real source duration, drops empties) on save — see pipeline_runner._clamp_video_cuts.",
+      "items": {
+        "type": "object",
+        "required": [
+          "fromFrame",
+          "toFrame"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "fromFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "toFrame": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      }
+    },
+    "videoVolume": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 1,
+      "description": "Playback volume of the source speaker video, 0-1. Absent or 1 = unchanged — every job before this field existed rendered at full volume, and this is a no-op default. Live in the editor Player (a real <OffthreadVideo volume> prop). Does not affect the background music bed — see musicVolume, which is mixed post-render by ffmpeg and NOT audible in the editor preview."
+    },
+    "musicVolume": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 0.4,
+      "description": "Background music level for the editor save path, 0-0.4. Absent = leave the content-planning pipeline's own music choice untouched. 0 = drop the music bed entirely. Mixed post-render by ffmpeg (whatsapp_mvp/pipeline_runner.py's _op_add_music), so it is NOT audible in the editor's live preview — the editor UI must say so explicitly."
     },
     "colorMode": {
       "type": "string",
@@ -177,6 +238,33 @@
       },
       "description": "Per-phrase captions (milliseconds). Karaoke sweep is interpolated inside the component."
     },
+    "captionPosition": {
+      "type": "array",
+      "maxItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "x",
+          "y"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "x": {
+            "type": "number",
+            "default": 60
+          },
+          "y": {
+            "type": "number",
+            "default": 1670
+          },
+          "width": {
+            "type": "number",
+            "default": 960
+          }
+        }
+      },
+      "description": "Optional override for where burned-in captions render, as a single-entry array so the editor's existing x/y/width drag overlay works unmodified (same shape every other positioned card uses). Absent (the default for every job the editor hasn't touched) means Captions.tsx keeps its original centered-bottom position -- adding this field changes nothing for jobs that never set it."
+    },
     "dataCards": {
       "type": "array",
       "description": "[P3 NEW capability] count-up data cards. Mapped from content_planner's info_cards.",
@@ -270,6 +358,12 @@
           "warn": {
             "type": "boolean",
             "description": "Warning card — red accents (reference's lapse-warning styling)"
+          },
+          "layer": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 99,
+            "description": "Stacking order within the content band -- higher draws on top of other content-zone cards. Absent = this section's default paint order (the order XiaojinEditorial.tsx has always rendered sections in), so every job before this field existed renders with byte-identical z-order. Clamped into the content band at render time -- a card can never be pushed behind the speaker card or above the intro/outro/caption chrome, regardless of this value."
           }
         }
       }
@@ -352,6 +446,12 @@
           "width": {
             "type": "number",
             "default": 920
+          },
+          "layer": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 99,
+            "description": "Stacking order within the content band -- higher draws on top of other content-zone cards. Absent = this section's default paint order (the order XiaojinEditorial.tsx has always rendered sections in), so every job before this field existed renders with byte-identical z-order. Clamped into the content band at render time -- a card can never be pushed behind the speaker card or above the intro/outro/caption chrome, regardless of this value."
           }
         }
       }
@@ -416,6 +516,12 @@
             "type": "integer",
             "minimum": 0,
             "description": "Fixed card width (e.g. the full 960px content-zone lane). Omit for content-sized."
+          },
+          "layer": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 99,
+            "description": "Stacking order within the content band -- higher draws on top of other content-zone cards. Absent = this section's default paint order (the order XiaojinEditorial.tsx has always rendered sections in), so every job before this field existed renders with byte-identical z-order. Clamped into the content band at render time -- a card can never be pushed behind the speaker card or above the intro/outro/caption chrome, regardless of this value."
           }
         }
       }
@@ -479,6 +585,12 @@
             "type": "integer",
             "minimum": 0,
             "description": "Fixed card width (e.g. the full 960px content-zone lane). Omit for content-sized."
+          },
+          "layer": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 99,
+            "description": "Stacking order within the content band -- higher draws on top of other content-zone cards. Absent = this section's default paint order (the order XiaojinEditorial.tsx has always rendered sections in), so every job before this field existed renders with byte-identical z-order. Clamped into the content band at render time -- a card can never be pushed behind the speaker card or above the intro/outro/caption chrome, regardless of this value."
           }
         }
       }
@@ -539,6 +651,12 @@
             "type": "integer",
             "minimum": 0,
             "description": "Card width (default 720, was 460 — biggened per user feedback to fill more of the content-zone lane)."
+          },
+          "layer": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 99,
+            "description": "Stacking order within the content band -- higher draws on top of other content-zone cards. Absent = this section's default paint order (the order XiaojinEditorial.tsx has always rendered sections in), so every job before this field existed renders with byte-identical z-order. Clamped into the content band at render time -- a card can never be pushed behind the speaker card or above the intro/outro/caption chrome, regardless of this value."
           }
         }
       }
@@ -601,10 +719,25 @@
         },
         "variant": {
           "type": "string",
-          "enum": ["title_card", "stats_hook", "title_impact", "chips"]
+          "enum": [
+            "title_card",
+            "stats_hook",
+            "title_impact",
+            "chips"
+          ]
         },
         "brandLabel": {
           "type": "string"
+        },
+        "x": {
+          "type": "number",
+          "default": 96,
+          "description": "Only read by the 'chips' variant (ChipsIntro.tsx) — the other 3 variants render full-bleed and ignore this."
+        },
+        "y": {
+          "type": "number",
+          "default": 420,
+          "description": "Only read by the 'chips' variant (ChipsIntro.tsx) — the other 3 variants render full-bleed and ignore this."
         }
       }
     },
@@ -657,6 +790,20 @@
         },
         "insurer": {
           "type": "string"
+        },
+        "x": {
+          "type": "number",
+          "minimum": 0,
+          "default": 0
+        },
+        "y": {
+          "type": "number",
+          "default": 1824
+        },
+        "width": {
+          "type": "number",
+          "minimum": 100,
+          "default": 1080
         }
       },
       "$comment": "compliance and brand are mutually exclusive"
@@ -670,6 +817,70 @@
         },
         "label": {
           "type": "string"
+        },
+        "x": {
+          "type": "number",
+          "minimum": 0,
+          "default": 0
+        },
+        "y": {
+          "type": "number",
+          "default": 1848
+        },
+        "width": {
+          "type": "number",
+          "minimum": 100,
+          "default": 1080
+        }
+      }
+    },
+    "chapterNav": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional position override for the persistent top chapter-nav bar (ChapterNav.tsx) — omit entirely for the default pinned-top-full-width placement. Not authored by the pipeline; editor-only.",
+      "properties": {
+        "x": {
+          "type": "number",
+          "minimum": 0,
+          "default": 0
+        },
+        "y": {
+          "type": "number",
+          "minimum": 0,
+          "default": 0
+        },
+        "width": {
+          "type": "number",
+          "minimum": 100,
+          "default": 1080
+        }
+      }
+    },
+    "rainbowBar": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional position override for the bottom-edge progress bar (RainbowProgressBar.tsx) — omit entirely for the default pinned-bottom-full-width placement. Not authored by the pipeline; editor-only.",
+      "properties": {
+        "x": {
+          "type": "number",
+          "minimum": 0,
+          "default": 0
+        },
+        "y": {
+          "type": "number",
+          "minimum": 0,
+          "default": 1912
+        },
+        "width": {
+          "type": "number",
+          "minimum": 100,
+          "default": 1080
+        },
+        "height": {
+          "type": "number",
+          "minimum": 2,
+          "maximum": 40,
+          "default": 8
         }
       }
     },
@@ -816,6 +1027,12 @@
           },
           "width": {
             "type": "number"
+          },
+          "layer": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 99,
+            "description": "Stacking order within the content band -- higher draws on top of other content-zone cards. Absent = this section's default paint order (the order XiaojinEditorial.tsx has always rendered sections in), so every job before this field existed renders with byte-identical z-order. Clamped into the content band at render time -- a card can never be pushed behind the speaker card or above the intro/outro/caption chrome, regardless of this value."
           }
         }
       }
@@ -861,6 +1078,12 @@
           "width": {
             "type": "integer",
             "minimum": 0
+          },
+          "layer": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 99,
+            "description": "Stacking order within the content band -- higher draws on top of other content-zone cards. Absent = this section's default paint order (the order XiaojinEditorial.tsx has always rendered sections in), so every job before this field existed renders with byte-identical z-order. Clamped into the content band at render time -- a card can never be pushed behind the speaker card or above the intro/outro/caption chrome, regardless of this value."
           }
         }
       }
@@ -898,6 +1121,12 @@
           },
           "y": {
             "type": "number"
+          },
+          "layer": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 99,
+            "description": "Stacking order within the content band -- higher draws on top of other content-zone cards. Absent = this section's default paint order (the order XiaojinEditorial.tsx has always rendered sections in), so every job before this field existed renders with byte-identical z-order. Clamped into the content band at render time -- a card can never be pushed behind the speaker card or above the intro/outro/caption chrome, regardless of this value."
           }
         }
       }
@@ -968,6 +1197,12 @@
           "width": {
             "type": "number",
             "default": 960
+          },
+          "layer": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 99,
+            "description": "Stacking order within the content band -- higher draws on top of other content-zone cards. Absent = this section's default paint order (the order XiaojinEditorial.tsx has always rendered sections in), so every job before this field existed renders with byte-identical z-order. Clamped into the content band at render time -- a card can never be pushed behind the speaker card or above the intro/outro/caption chrome, regardless of this value."
           }
         }
       }
@@ -1019,6 +1254,12 @@
           "width": {
             "type": "number",
             "default": 960
+          },
+          "layer": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 99,
+            "description": "Stacking order within the content band -- higher draws on top of other content-zone cards. Absent = this section's default paint order (the order XiaojinEditorial.tsx has always rendered sections in), so every job before this field existed renders with byte-identical z-order. Clamped into the content band at render time -- a card can never be pushed behind the speaker card or above the intro/outro/caption chrome, regardless of this value."
           }
         }
       }
@@ -1106,7 +1347,11 @@
                 },
                 "accent": {
                   "type": "string",
-                  "enum": ["good", "bad", "neutral"]
+                  "enum": [
+                    "good",
+                    "bad",
+                    "neutral"
+                  ]
                 },
                 "items": {
                   "type": "array",
@@ -1138,6 +1383,12 @@
           "width": {
             "type": "number",
             "default": 960
+          },
+          "layer": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 99,
+            "description": "Stacking order within the content band -- higher draws on top of other content-zone cards. Absent = this section's default paint order (the order XiaojinEditorial.tsx has always rendered sections in), so every job before this field existed renders with byte-identical z-order. Clamped into the content band at render time -- a card can never be pushed behind the speaker card or above the intro/outro/caption chrome, regardless of this value."
           }
         }
       }
@@ -1212,6 +1463,12 @@
           "width": {
             "type": "number",
             "default": 960
+          },
+          "layer": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 99,
+            "description": "Stacking order within the content band -- higher draws on top of other content-zone cards. Absent = this section's default paint order (the order XiaojinEditorial.tsx has always rendered sections in), so every job before this field existed renders with byte-identical z-order. Clamped into the content band at render time -- a card can never be pushed behind the speaker card or above the intro/outro/caption chrome, regardless of this value."
           }
         }
       }
@@ -1277,6 +1534,12 @@
           "width": {
             "type": "number",
             "default": 960
+          },
+          "layer": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 99,
+            "description": "Stacking order within the content band -- higher draws on top of other content-zone cards. Absent = this section's default paint order (the order XiaojinEditorial.tsx has always rendered sections in), so every job before this field existed renders with byte-identical z-order. Clamped into the content band at render time -- a card can never be pushed behind the speaker card or above the intro/outro/caption chrome, regardless of this value."
           }
         }
       }
@@ -1323,6 +1586,12 @@
           "width": {
             "type": "number",
             "default": 960
+          },
+          "layer": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 99,
+            "description": "Stacking order within the content band -- higher draws on top of other content-zone cards. Absent = this section's default paint order (the order XiaojinEditorial.tsx has always rendered sections in), so every job before this field existed renders with byte-identical z-order. Clamped into the content band at render time -- a card can never be pushed behind the speaker card or above the intro/outro/caption chrome, regardless of this value."
           }
         }
       }
@@ -1374,6 +1643,12 @@
           "width": {
             "type": "number",
             "default": 960
+          },
+          "layer": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 99,
+            "description": "Stacking order within the content band -- higher draws on top of other content-zone cards. Absent = this section's default paint order (the order XiaojinEditorial.tsx has always rendered sections in), so every job before this field existed renders with byte-identical z-order. Clamped into the content band at render time -- a card can never be pushed behind the speaker card or above the intro/outro/caption chrome, regardless of this value."
           }
         }
       }
@@ -1407,7 +1682,14 @@
               "properties": {
                 "icon": {
                   "type": "string",
-                  "enum": ["chat", "camera", "play", "star", "bolt", "heart"]
+                  "enum": [
+                    "chat",
+                    "camera",
+                    "play",
+                    "star",
+                    "bolt",
+                    "heart"
+                  ]
                 },
                 "label": {
                   "type": "string",
@@ -1439,6 +1721,12 @@
           "width": {
             "type": "number",
             "default": 960
+          },
+          "layer": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 99,
+            "description": "Stacking order within the content band -- higher draws on top of other content-zone cards. Absent = this section's default paint order (the order XiaojinEditorial.tsx has always rendered sections in), so every job before this field existed renders with byte-identical z-order. Clamped into the content band at render time -- a card can never be pushed behind the speaker card or above the intro/outro/caption chrome, regardless of this value."
           }
         }
       }
@@ -1448,18 +1736,56 @@
       "description": "[xiaojin arsenal round 3] A straight linear completion bar (ProgressBarCard). New content_planner visual type 'progress_bar'. Distinct from gauges (risk-framed) and countdowns (time-remaining framed).",
       "items": {
         "type": "object",
-        "required": ["label", "percent", "mountFrame"],
+        "required": [
+          "label",
+          "percent",
+          "mountFrame"
+        ],
         "additionalProperties": false,
         "properties": {
-          "title": { "type": "string", "maxLength": 40 },
-          "label": { "type": "string", "maxLength": 40 },
-          "percent": { "type": "number", "minimum": 0, "maximum": 100 },
-          "subtext": { "type": "string", "maxLength": 60 },
-          "mountFrame": { "type": "integer", "minimum": 0 },
-          "endFrame": { "type": "integer", "minimum": 0 },
-          "x": { "type": "number", "default": 60 },
-          "y": { "type": "number", "default": 1040 },
-          "width": { "type": "number", "default": 960 }
+          "title": {
+            "type": "string",
+            "maxLength": 40
+          },
+          "label": {
+            "type": "string",
+            "maxLength": 40
+          },
+          "percent": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 100
+          },
+          "subtext": {
+            "type": "string",
+            "maxLength": 60
+          },
+          "mountFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "endFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "x": {
+            "type": "number",
+            "default": 60
+          },
+          "y": {
+            "type": "number",
+            "default": 1040
+          },
+          "width": {
+            "type": "number",
+            "default": 960
+          },
+          "layer": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 99,
+            "description": "Stacking order within the content band -- higher draws on top of other content-zone cards. Absent = this section's default paint order (the order XiaojinEditorial.tsx has always rendered sections in), so every job before this field existed renders with byte-identical z-order. Clamped into the content band at render time -- a card can never be pushed behind the speaker card or above the intro/outro/caption chrome, regardless of this value."
+          }
         }
       }
     },
@@ -1468,19 +1794,69 @@
       "description": "[xiaojin arsenal round 3] Polarized two-column pros/cons with baked-in good/bad framing (ProsConsCard). New content_planner visual type 'pros_cons'. Distinct from comparisons, which are neutral labeled columns.",
       "items": {
         "type": "object",
-        "required": ["prosLabel", "consLabel", "pros", "cons", "mountFrame"],
+        "required": [
+          "prosLabel",
+          "consLabel",
+          "pros",
+          "cons",
+          "mountFrame"
+        ],
         "additionalProperties": false,
         "properties": {
-          "title": { "type": "string", "maxLength": 40 },
-          "prosLabel": { "type": "string", "maxLength": 16 },
-          "consLabel": { "type": "string", "maxLength": 16 },
-          "pros": { "type": "array", "maxItems": 4, "items": { "type": "string", "maxLength": 60 } },
-          "cons": { "type": "array", "maxItems": 4, "items": { "type": "string", "maxLength": 60 } },
-          "mountFrame": { "type": "integer", "minimum": 0 },
-          "endFrame": { "type": "integer", "minimum": 0 },
-          "x": { "type": "number", "default": 60 },
-          "y": { "type": "number", "default": 900 },
-          "width": { "type": "number", "default": 960 }
+          "title": {
+            "type": "string",
+            "maxLength": 40
+          },
+          "prosLabel": {
+            "type": "string",
+            "maxLength": 16
+          },
+          "consLabel": {
+            "type": "string",
+            "maxLength": 16
+          },
+          "pros": {
+            "type": "array",
+            "maxItems": 4,
+            "items": {
+              "type": "string",
+              "maxLength": 60
+            }
+          },
+          "cons": {
+            "type": "array",
+            "maxItems": 4,
+            "items": {
+              "type": "string",
+              "maxLength": 60
+            }
+          },
+          "mountFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "endFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "x": {
+            "type": "number",
+            "default": 60
+          },
+          "y": {
+            "type": "number",
+            "default": 900
+          },
+          "width": {
+            "type": "number",
+            "default": 960
+          },
+          "layer": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 99,
+            "description": "Stacking order within the content band -- higher draws on top of other content-zone cards. Absent = this section's default paint order (the order XiaojinEditorial.tsx has always rendered sections in), so every job before this field existed renders with byte-identical z-order. Clamped into the content band at render time -- a card can never be pushed behind the speaker card or above the intro/outro/caption chrome, regardless of this value."
+          }
         }
       }
     },
@@ -1489,29 +1865,64 @@
       "description": "[xiaojin arsenal round 3] A lightweight inline history dot-track for 2-4 key dates (MilestoneTrackCard). New content_planner visual type 'milestone_track'. Distinct from sections.timeline, the full-canvas process takeover.",
       "items": {
         "type": "object",
-        "required": ["milestones", "mountFrame"],
+        "required": [
+          "milestones",
+          "mountFrame"
+        ],
         "additionalProperties": false,
         "properties": {
-          "title": { "type": "string", "maxLength": 40 },
+          "title": {
+            "type": "string",
+            "maxLength": 40
+          },
           "milestones": {
             "type": "array",
             "minItems": 2,
             "maxItems": 4,
             "items": {
               "type": "object",
-              "required": ["label"],
+              "required": [
+                "label"
+              ],
               "additionalProperties": false,
               "properties": {
-                "label": { "type": "string", "maxLength": 20 },
-                "sublabel": { "type": "string", "maxLength": 16 }
+                "label": {
+                  "type": "string",
+                  "maxLength": 20
+                },
+                "sublabel": {
+                  "type": "string",
+                  "maxLength": 16
+                }
               }
             }
           },
-          "mountFrame": { "type": "integer", "minimum": 0 },
-          "endFrame": { "type": "integer", "minimum": 0 },
-          "x": { "type": "number", "default": 60 },
-          "y": { "type": "number", "default": 900 },
-          "width": { "type": "number", "default": 960 }
+          "mountFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "endFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "x": {
+            "type": "number",
+            "default": 60
+          },
+          "y": {
+            "type": "number",
+            "default": 900
+          },
+          "width": {
+            "type": "number",
+            "default": 960
+          },
+          "layer": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 99,
+            "description": "Stacking order within the content band -- higher draws on top of other content-zone cards. Absent = this section's default paint order (the order XiaojinEditorial.tsx has always rendered sections in), so every job before this field existed renders with byte-identical z-order. Clamped into the content band at render time -- a card can never be pushed behind the speaker card or above the intro/outro/caption chrome, regardless of this value."
+          }
         }
       }
     },
@@ -1520,30 +1931,75 @@
       "description": "[xiaojin arsenal round 3] Icon + credential/stat rows building the speaker's own authority (TrustBadgeCard). New content_planner visual type 'trust_badge'. Distinct from testimonials, which quote a third party.",
       "items": {
         "type": "object",
-        "required": ["badges", "mountFrame"],
+        "required": [
+          "badges",
+          "mountFrame"
+        ],
         "additionalProperties": false,
         "properties": {
-          "title": { "type": "string", "maxLength": 40 },
+          "title": {
+            "type": "string",
+            "maxLength": 40
+          },
           "badges": {
             "type": "array",
             "minItems": 1,
             "maxItems": 3,
             "items": {
               "type": "object",
-              "required": ["icon", "primary", "secondary"],
+              "required": [
+                "icon",
+                "primary",
+                "secondary"
+              ],
               "additionalProperties": false,
               "properties": {
-                "icon": { "type": "string", "enum": ["shield", "star", "award", "clock"] },
-                "primary": { "type": "string", "maxLength": 28 },
-                "secondary": { "type": "string", "maxLength": 32 }
+                "icon": {
+                  "type": "string",
+                  "enum": [
+                    "shield",
+                    "star",
+                    "award",
+                    "clock"
+                  ]
+                },
+                "primary": {
+                  "type": "string",
+                  "maxLength": 28
+                },
+                "secondary": {
+                  "type": "string",
+                  "maxLength": 32
+                }
               }
             }
           },
-          "mountFrame": { "type": "integer", "minimum": 0 },
-          "endFrame": { "type": "integer", "minimum": 0 },
-          "x": { "type": "number", "default": 60 },
-          "y": { "type": "number", "default": 900 },
-          "width": { "type": "number", "default": 960 }
+          "mountFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "endFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "x": {
+            "type": "number",
+            "default": 60
+          },
+          "y": {
+            "type": "number",
+            "default": 900
+          },
+          "width": {
+            "type": "number",
+            "default": 960
+          },
+          "layer": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 99,
+            "description": "Stacking order within the content band -- higher draws on top of other content-zone cards. Absent = this section's default paint order (the order XiaojinEditorial.tsx has always rendered sections in), so every job before this field existed renders with byte-identical z-order. Clamped into the content band at render time -- a card can never be pushed behind the speaker card or above the intro/outro/caption chrome, regardless of this value."
+          }
         }
       }
     },
@@ -1552,30 +2008,67 @@
       "description": "[xiaojin arsenal round 3] A real axis-based column chart for genuinely chart-shaped multi-value data (BarChartCard). New content_planner visual type 'bar_chart'. Distinct from rankedLists, which imply a ranking, not just magnitude comparison.",
       "items": {
         "type": "object",
-        "required": ["items", "mountFrame"],
+        "required": [
+          "items",
+          "mountFrame"
+        ],
         "additionalProperties": false,
         "properties": {
-          "title": { "type": "string", "maxLength": 40 },
+          "title": {
+            "type": "string",
+            "maxLength": 40
+          },
           "items": {
             "type": "array",
             "minItems": 2,
             "maxItems": 4,
             "items": {
               "type": "object",
-              "required": ["label", "value"],
+              "required": [
+                "label",
+                "value"
+              ],
               "additionalProperties": false,
               "properties": {
-                "label": { "type": "string", "maxLength": 16 },
-                "value": { "type": "number" },
-                "displayValue": { "type": "string" }
+                "label": {
+                  "type": "string",
+                  "maxLength": 16
+                },
+                "value": {
+                  "type": "number"
+                },
+                "displayValue": {
+                  "type": "string"
+                }
               }
             }
           },
-          "mountFrame": { "type": "integer", "minimum": 0 },
-          "endFrame": { "type": "integer", "minimum": 0 },
-          "x": { "type": "number", "default": 60 },
-          "y": { "type": "number", "default": 900 },
-          "width": { "type": "number", "default": 960 }
+          "mountFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "endFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "x": {
+            "type": "number",
+            "default": 60
+          },
+          "y": {
+            "type": "number",
+            "default": 900
+          },
+          "width": {
+            "type": "number",
+            "default": 960
+          },
+          "layer": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 99,
+            "description": "Stacking order within the content band -- higher draws on top of other content-zone cards. Absent = this section's default paint order (the order XiaojinEditorial.tsx has always rendered sections in), so every job before this field existed renders with byte-identical z-order. Clamped into the content band at render time -- a card can never be pushed behind the speaker card or above the intro/outro/caption chrome, regardless of this value."
+          }
         }
       }
     },
@@ -1584,19 +2077,63 @@
       "description": "[xiaojin arsenal round 3] A celebratory single-number reveal reserved for a genuine scale/achievement moment (MilestoneUnlockCard). New content_planner visual type 'milestone_unlock'. Distinct from a routine dataCards count_up row.",
       "items": {
         "type": "object",
-        "required": ["value", "label", "mountFrame"],
+        "required": [
+          "value",
+          "label",
+          "mountFrame"
+        ],
         "additionalProperties": false,
         "properties": {
-          "value": { "type": "number" },
-          "prefix": { "type": "string", "maxLength": 4 },
-          "suffix": { "type": "string", "maxLength": 4 },
-          "label": { "type": "string", "maxLength": 28 },
-          "icon": { "type": "string", "enum": ["award", "star", "heart", "bolt"] },
-          "mountFrame": { "type": "integer", "minimum": 0 },
-          "endFrame": { "type": "integer", "minimum": 0 },
-          "x": { "type": "number", "default": 60 },
-          "y": { "type": "number", "default": 900 },
-          "width": { "type": "number", "default": 960 }
+          "value": {
+            "type": "number"
+          },
+          "prefix": {
+            "type": "string",
+            "maxLength": 4
+          },
+          "suffix": {
+            "type": "string",
+            "maxLength": 4
+          },
+          "label": {
+            "type": "string",
+            "maxLength": 28
+          },
+          "icon": {
+            "type": "string",
+            "enum": [
+              "award",
+              "star",
+              "heart",
+              "bolt"
+            ]
+          },
+          "mountFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "endFrame": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "x": {
+            "type": "number",
+            "default": 60
+          },
+          "y": {
+            "type": "number",
+            "default": 900
+          },
+          "width": {
+            "type": "number",
+            "default": 960
+          },
+          "layer": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 99,
+            "description": "Stacking order within the content band -- higher draws on top of other content-zone cards. Absent = this section's default paint order (the order XiaojinEditorial.tsx has always rendered sections in), so every job before this field existed renders with byte-identical z-order. Clamped into the content band at render time -- a card can never be pushed behind the speaker card or above the intro/outro/caption chrome, regardless of this value."
+          }
         }
       }
     }

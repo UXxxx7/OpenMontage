@@ -17,6 +17,11 @@ export interface BrandBarProps {
   label: string;
   colorMode?: ColorMode;
   font?: string;
+  /** Editor-only position override — omit for the default pinned-bottom,
+   *  full-width placement (BRAND.y / W from theme.ts). */
+  x?: number;
+  y?: number;
+  width?: number;
 }
 
 export const BrandBar: React.FC<BrandBarProps> = ({
@@ -24,15 +29,18 @@ export const BrandBar: React.FC<BrandBarProps> = ({
   label,
   colorMode = "warm",
   font = "inherit",
+  x = 0,
+  y = BRAND.y,
+  width = W,
 }) => {
   const palette = PALETTES[colorMode];
   return (
     <div
       style={{
         position: "absolute",
-        left: 0,
-        top: BRAND.y,
-        width: W,
+        left: x,
+        top: y,
+        width,
         height: BRAND.h,
         background: colorMode === "warm" ? "rgba(242,235,224,0.92)" : "rgba(13,17,23,0.92)",
         borderTop: `1px solid ${palette.line}`,

@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from .video_cuts import compute_output_duration, normalize_cuts, source_to_output
+
 FPS = 30
 
 # Fix D 的强制上限，这里同时作为事后复核的兜底（万一 Fix D 的裁剪逻辑本身有
@@ -115,6 +117,25 @@ def _opacity_at(keyframes: list[dict], frame: float) -> float:
     return prev["opacity"]
 
 
+# Mirrors editor/state/layers.ts's DEFAULT_CONTENT_LAYER and
+# src/components/xiaojin/Layer.tsx's DEFAULT_CONTENT_LAYER exactly, by hand
+# (same situation as src/cuts.ts's own hand-maintained field registry) —
+# translated from schema section names to this file's own "kind" strings
+# (see _collect_elements's add() calls below for the kind<->section mapping).
+_DEFAULT_CONTENT_LAYER = {
+    "zoneHeader": 0, "quote": 1, "dataCard": 2, "beforeAfter": 3, "gauge": 4,
+    "countdown": 5, "calendar": 6, "pill": 7, "stepList": 8, "topicCard": 9,
+    "comparison": 10, "rankedList": 11, "checklist": 12, "locationPin": 13,
+    "testimonial": 14, "iconCluster": 15, "progressBar": 16, "prosCons": 17,
+    "milestoneTrack": 18, "trustBadge": 19, "barChart": 20, "milestoneUnlock": 21,
+}
+
+
+def _effective_layer(kind: str, raw_layer: Any) -> int:
+    raw = raw_layer if isinstance(raw_layer, (int, float)) else _DEFAULT_CONTENT_LAYER.get(kind, 0)
+    return max(0, min(99, round(raw)))
+
+
 def _rects_intersect(a: tuple, b: tuple) -> bool:
     ax, ay, aw, ah = a
     bx, by, bw, bh = b
@@ -140,6 +161,10 @@ def _collect_elements(props: dict) -> list[dict]:
                 "kind": kind,
                 "label": e.get("title") or e.get("text") or e.get("headline") or kind,
                 "mount": mount, "end": end,
+                # Raw value (possibly absent) — element_overlap needs to know
+                # whether the USER explicitly set this, not just its
+                # effective (possibly-defaulted) value. See _effective_layer.
+                "layer": e.get("layer"),
             }
             if "x" in e and "y" in e:
                 item["x"] = e["x"]
@@ -240,6 +265,23 @@ def lint_props(props: dict) -> list[dict]:
             a, b = rect_elements[i], rect_elements[j]
             if a["mount"] < b["end"] and b["mount"] < a["end"]:
                 if _rects_intersect((a["x"], a["y"], a["w"], a["h"]), (b["x"], b["y"], b["w"], b["h"])):
+                    # Phase E: overlapping on purpose (different stacking
+                    # layers) is a legitimate composition, not a bug — but
+                    # ONLY once the user has actually touched `layer` on at
+                    # least one of this pair. If neither ever set it, this
+                    # behaves exactly as before (every job before this
+                    # field existed): every rect+time overlap still flags,
+                    # regardless of section — sections have different
+                    # DEFAULT layers, and skipping on default-alone would
+                    # silently stop catching the common accidental-overlap
+                    # case this check exists for.
+                    a_explicit = isinstance(a.get("layer"), (int, float))
+                    b_explicit = isinstance(b.get("layer"), (int, float))
+                    if a_explicit or b_explicit:
+                        a_z = _effective_layer(a["kind"], a.get("layer"))
+                        b_z = _effective_layer(b["kind"], b.get("layer"))
+                        if a_z != b_z:
+                            continue
                     findings.append({
                         "check": "element_overlap",
                         "detail": f"{a['kind']}({a['label']!r}) 跟 {b['kind']}({b['label']!r}) 时间和矩形都重叠",
@@ -290,16 +332,37 @@ def lint_props(props: dict) -> list[dict]:
                 })
 
     # 3) facecam 隐藏时长：最长连续隐藏区间 + 总隐藏占比
+    #
+    # Cuts (P6): hidden_spans itself stays SOURCE-space (opacityKeyframes are
+    # never rebased — see remotion-composer/src/cuts.ts's header comment) and
+    # is reused below by the dead-space (#5) and outro (#7) checks, which
+    # compare it directly against other SOURCE-space fields — left untouched
+    # on purpose. But "budget exceeded" / "never restored" are inherently
+    # claims about the DELIVERED video (what a viewer actually sits through),
+    # so they need the spans mapped through cuts first: a hidden span a cut
+    # removed entirely collapses to zero-width (source_to_output(s) ==
+    # source_to_output(e)) and correctly stops counting against a budget the
+    # viewer will never see, same as `mapWindow` does on the TS side.
+    # Currently unreachable in production (`render_props_directly`, the only
+    # save path that can put `videoCuts` in props, skips props_lint entirely
+    # — see that function's own docstring) but fixed anyway per this repo's
+    # own Rule 13: a guarantee only covers the paths it's actually wired
+    # into, and this file shouldn't carry a latent source/output mismatch
+    # for whenever it does become reachable.
     hidden_spans = _hidden_spans(opacity_kf, duration_frames)
-    total_hidden = sum(e - s for s, e in hidden_spans)
-    longest_hidden = max((e - s for s, e in hidden_spans), default=0)
-    if duration_frames > 0:
-        frac = total_hidden / duration_frames
+    raw_cuts = props.get("videoCuts")
+    cuts = normalize_cuts(raw_cuts if isinstance(raw_cuts, list) else None, duration_frames)
+    output_duration_frames = compute_output_duration(props, fps=FPS)
+    output_hidden_spans = [(source_to_output(s, cuts), source_to_output(e, cuts)) for s, e in hidden_spans]
+    total_hidden = sum(e - s for s, e in output_hidden_spans)
+    longest_hidden = max((e - s for s, e in output_hidden_spans), default=0)
+    if output_duration_frames > 0:
+        frac = total_hidden / output_duration_frames
         if frac > _MAX_HIDDEN_FRACTION:
             findings.append({
                 "check": "facecam_hidden_budget_exceeded",
                 "detail": f"说话人被隐藏的总时长占比 {frac:.1%}，超过 {_MAX_HIDDEN_FRACTION:.0%} 的上限",
-                "total_hidden_frames": total_hidden, "duration_frames": duration_frames,
+                "total_hidden_frames": total_hidden, "duration_frames": output_duration_frames,
             })
         if longest_hidden > _MAX_CONTINUOUS_HIDDEN_FRAMES:
             findings.append({
@@ -310,7 +373,7 @@ def lint_props(props: dict) -> list[dict]:
             })
 
     # 4) facecam 是否在片尾之前恢复
-    if hidden_spans and duration_frames > 0 and hidden_spans[-1][1] >= duration_frames - 1:
+    if output_hidden_spans and output_duration_frames > 0 and output_hidden_spans[-1][1] >= output_duration_frames - 1:
         findings.append({
             "check": "facecam_never_restored",
             "detail": f"说话人从第 {hidden_spans[-1][0]} 帧起被隐藏，直到片尾都没有恢复",
@@ -406,10 +469,10 @@ def lint_props(props: dict) -> list[dict]:
     # 等其它检查一样是诊断/安全网：这条 finding 的 detail 文本会被喂回
     # content_planner 重新规划（见 pipeline_runner._op_apply_style 的
     # props_lint 循环），直接提示 LLM 加内容，而不是含糊地说"再试一次"。
-    if duration_frames > 0:
+    if output_duration_frames > 0:
         richness = sum(len(props.get(f) or []) for f in _RICHNESS_FIELDS)
         richness += sum(1 for s in (props.get("sections") or []) if s.get("timeline"))
-        duration_s = duration_frames / FPS
+        duration_s = output_duration_frames / FPS
         min_required = max(1, round(duration_s / _SECONDS_PER_RICHNESS_UNIT))
         if richness < min_required:
             findings.append({
