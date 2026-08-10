@@ -169,27 +169,6 @@ def revise_plan(job_id: str, feedback: str) -> None:
     config = get_config()
     wa = WhatsAppClient(config)
     try:
-        # ── Arm B:确认前改草稿(补丁点②)──
-        # 命中 arm_b 且有 scene_draft.tsx → 按反馈改草稿(不渲染),回 WAITING_CONFIRMATION。
-        # 返回 None(未命中 / 无草稿 / 修订失败)→ 落穿下面的 L2 就地修订(Arm A)。
-        try:
-            from .authored import arm_b_enabled, revise_authored_plan
-            if arm_b_enabled(job):
-                _pe = revise_authored_plan(job, feedback)
-                if _pe is not None:
-                    update_job_fields(
-                        job_id,
-                        edit_request=f"{job.edit_request}。补充：{feedback}",
-                        planned_edit=json.dumps(_pe, ensure_ascii=False),
-                    )
-                    job = get_job(job_id)
-                    _send_confirmation(job, wa)
-                    logger.info("ArmB 就地修订完成(改草稿,未渲染,已回 WAITING_CONFIRMATION)")
-                    return
-                logger.info("ArmB revise_authored_plan 落穿 → 走 L2 就地修订(Arm A)")
-        except Exception as _e:  # noqa: BLE001 —— 修订分支绝不拖垮主流程
-            logger.warning(f"ArmB 修订分支异常,落穿 L2: {type(_e).__name__}: {_e}")
-
         try:
             prev = json.loads(job.planned_edit) if job.planned_edit else {}
         except (json.JSONDecodeError, TypeError):
@@ -244,14 +223,8 @@ def generate_croll(job_id: str, photo_path: str, lang: str = "zh", hint: str = "
     if job is None:
         return
 
-    from . import heygen_croll
-
-    # 标准档账号只给 3 个 photo avatar 名额，用完必须清理——2026-07-17 实测撞过：
-    # 连续测 3 次直接把配额堵死，第 4 次上传直接 400。放 finally 里保证无论后面
-    # 生成成功/超时/异常都会清理，因为上传这一步本身就已经占了名额，不清理的话
-    # 即使后续步骤失败，这个名额也白白浪费掉。（合并自 PR #39，2026-07-20）
-    talking_photo_id: Optional[str] = None
     try:
+        from . import heygen_croll
         from .croll_script import write_script
 
         if not heygen_croll.is_available():
@@ -261,11 +234,6 @@ def generate_croll(job_id: str, photo_path: str, lang: str = "zh", hint: str = "
         if not script:
             raise RuntimeError("看图写文案失败（视觉 LLM 不可用或未返回内容）")
         logger.info(f"  C-roll 文案（{job_id}）: {script[:80]}")
-        # HeyGen 数字人念的就是这段文字，逐字保证准确——存下来给后面的
-        # transcribe_segments 用来纠正 ASR 听错的同音字/含糊音（而不是让
-        # ASR 重新"猜"一遍这段本来就 100% 已知的文本，见 pipeline_runner.py
-        # _correct_transcript_against_script 的说明）。
-        (job.job_dir / "croll_script.txt").write_text(script, encoding="utf-8")
 
         talking_photo_id = heygen_croll.upload_talking_photo(Path(photo_path))
         if not talking_photo_id:
@@ -306,9 +274,6 @@ def generate_croll(job_id: str, photo_path: str, lang: str = "zh", hint: str = "
     except Exception as e:
         logger.exception(f"C-roll 生成出错 {job_id}: {e}")
         update_job_status(job_id, JobStatus.ERROR, str(e))
-    finally:
-        if talking_photo_id:
-            heygen_croll.delete_talking_photo(talking_photo_id)
 
 
 # ---------------------------------------------------------------------------
@@ -454,22 +419,6 @@ def _run_llm_planner(job: Any, wa: Any = None) -> None:
     agent 出错时回退到 L1.5 关键词/结构化规划器，保证任务不中断。
     传入 wa 时会在转录/规划两个较慢阶段前回传进度消息（进度预览）。
     """
-    # ── Arm B:author 先行(补丁点①)──
-    # 路由命中 arm_b 时,规划阶段就现写 tsx + 出分镜当方案,短路 L2。
-    # plan_authored 返回 None(未命中 / author 失败)→ 落穿下面的 L2 规划(Arm A)。
-    try:
-        from .authored import arm_b_enabled, plan_authored
-        if arm_b_enabled(job):
-            update_job_status(job.id, JobStatus.PLANNING)
-            _pe = plan_authored(job)
-            if _pe is not None:
-                update_job_fields(job.id, planned_edit=json.dumps(_pe, ensure_ascii=False))
-                logger.info("ArmB 规划完成(author 先行,已短路 L2)")
-                return
-            logger.info("ArmB plan_authored 落穿 → 走 L2 规划(Arm A)")
-    except Exception as _e:  # noqa: BLE001 —— 规划分支绝不拖垮主流程
-        logger.warning(f"ArmB 规划分支异常,落穿 L2: {type(_e).__name__}: {_e}")
-
     # 零指令：给 agent 一句明确的默认需求描述而不是空串（SYSTEM_BASE 定义了
     # 零指令默认方案：remove_filler → apply_style）
     request = job.edit_request or "（用户没有文字指令）按默认方案出一条模板成片"

@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 
 # Project root is two levels up from this file
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(_PROJECT_ROOT / ".env", override=True)
+load_dotenv(_PROJECT_ROOT / ".env")
 
 
 @dataclass
@@ -106,20 +106,11 @@ class Config:
     )
 
     # Transcription
-    # ElevenLabs Scribe is the default — matches video-use (video-studio's own
-    # trim pipeline), which uses Scribe specifically because retake-detection
-    # needs consistent word-level text between two near-identical takes to
-    # tell them apart, and local faster-whisper (even "medium") is meaningfully
-    # weaker at this than Scribe (confirmed root cause of a real production
-    # bug: a retake survived filler-removal on faster-whisper "small").
     transcribe_provider: str = field(
-        default_factory=lambda: os.getenv("TRANSCRIBE_PROVIDER", "elevenlabs")
-    )
-    elevenlabs_api_key: str = field(
-        default_factory=lambda: os.getenv("ELEVENLABS_API_KEY", "")
+        default_factory=lambda: os.getenv("TRANSCRIBE_PROVIDER", "faster_whisper")
     )
     faster_whisper_model: str = field(
-        default_factory=lambda: os.getenv("FASTER_WHISPER_MODEL", "medium")
+        default_factory=lambda: os.getenv("FASTER_WHISPER_MODEL", "small")
     )
 
     # OpenMontage

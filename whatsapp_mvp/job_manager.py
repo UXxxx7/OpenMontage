@@ -64,18 +64,6 @@ def create_job(
         session.close()
 
 
-def get_jobs_by_status(statuses: list[JobStatus]) -> list[Job]:
-    """获取处于指定状态的任务列表（用于启动时找孤儿任务，不预加载 user/messages）。"""
-    session = get_session()
-    try:
-        jobs = session.query(Job).filter(Job.status.in_(statuses)).all()
-        for job in jobs:
-            session.expunge(job)
-        return jobs
-    finally:
-        session.close()
-
-
 def get_job(job_id: str) -> Optional[Job]:
     """获取任务，预加载 user 关系以避免 DetachedInstanceError。"""
     from sqlalchemy.orm import joinedload

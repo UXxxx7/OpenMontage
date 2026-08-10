@@ -1,100 +1,46 @@
 name: CI
 
-# 目标：挡住"各自都对、合起来崩"的合并事故（本次 job_slug 就是这类）。
-# 两个独立 job：
-#   1) static-checks —— 不装重依赖、秒级完成。语法编译 + 签名不匹配静态检查。
-#      本次的 qa_stills 传了 remotion_bundle 里不存在的 job_slug（E1123），
-#      在这一步就会被静态抓到，根本轮不到线上 WhatsApp 才发现。
-#   2) import-and-unit-tests —— uv sync 后 import 冒烟 + 跑单元测试。
-#      抓"合并后 import 就崩 / 单测挂"的问题。
-# 两个 job 相互独立：即使重依赖的 test job 偶尔环境抖动，轻量的签名闸也照常拦。
-
 on:
   pull_request:
-    branches: [whatsapp-studio, main]
+    branches:
+      - main
   push:
-    branches: [whatsapp-studio, main]
+    branches:
+      - main
+
+permissions:
+  contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  # ── 关键闸：纯静态、无需安装项目依赖、几秒钟出结果 ──
-  static-checks:
-    name: static-checks
+  validate:
+    name: Validate Python
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
 
-      # 语法闸：任何 .py 编译不过（缩进/语法错）直接红
-      - name: Compile all Python (syntax gate)
-        run: python -m compileall -q whatsapp_mvp lib
-
-      - name: Install pylint
-        run: pip install "pylint>=3.0"
-
-      # 签名闸：只开这几条"调用与定义对不上"的错误码，其余全关，避免噪音。
-      #   E1120 少传必填参数 / E1121 位置参数过多 / E1123 未知关键字参数
-      #   E1124 关键字参数重复 / E1125 缺少必填的仅关键字参数
-      # 这次的 job_slug 属于 E1123。--ignored-modules 让 pylint 忽略未安装的重依赖，
-      # 只在项目内部做签名推断（ensure_remotion_bundle 在项目内，能被解析到）。
-      - name: Signature-mismatch guard (call vs def)
-        run: |
-          pylint --disable=all \
-                 --enable=E1120,E1121,E1123,E1124,E1125 \
-                 --ignored-modules=cv2,torch,faster_whisper,elevenlabs,remotion \
-                 --score=n \
-                 whatsapp_mvp lib
-
-  # ── 运行时闸：装齐依赖后 import + 单测 ──
-  import-and-unit-tests:
-    name: import-and-unit-tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install uv
-        run: pip install uv
-
-      # 注：uv sync 会装 opencv/torch 等重依赖，首次约几分钟；有缓存后更快。
-      # 若想更快，可在此改成只装 import 冒烟需要的最小子集。
-      - name: Sync dependencies
-        run: uv sync
-
-      # import 冒烟：合并若把某个模块的 import 弄崩（改了签名/删了符号/循环导入），
-      # 这一行会立刻炸出来，不用等真的跑任务。
-      - name: Import smoke
-        run: >
-          uv run python -c "import whatsapp_mvp.webhook,
-          whatsapp_mvp.pipeline_runner, whatsapp_mvp.agent_editor,
-          whatsapp_mvp.remotion_bundle, whatsapp_mvp.qa_stills,
-          whatsapp_mvp.content_planner; print('import OK')"
-
-      # 单元测试。若你有需要联网/花钱的用例（调 wolfai/omni 等），
-      # 给它们打上 @pytest.mark.network，再用下面的 -m 'not network' 在 CI 里跳过，
-      # 避免 CI 花钱/因外部服务抖动而误红。
-      # tests/qa/ 里的视频集成测试会 spawn ffmpeg；CI 的 Linux 机器默认没装，
-      # 会在收集阶段报 FileNotFoundError: 'ffmpeg'。装上它们就能真跑。
-      - name: Install ffmpeg (qa integration tests spawn it)
+      - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
-      # 用 --with pytest 临时把 pytest 带进运行环境（pytest 不是项目主依赖，
-      # uv sync 不会装它，直接 uv run pytest 会报 "Failed to spawn: pytest"）。
-      #
-      # 方案 A（当前）：装了 ffmpeg，跑全部测试（含 tests/qa 视频集成）。
-      # 方案 B（备选，最快绿）：只跑快速单元测试、跳过重的视频集成——
-      #   把上面的 Install ffmpeg 步骤删掉，并改用下面这行：
-      #     run: uv run --with pytest pytest -q --ignore=tests/qa
-      # 若某个用例需要联网/花钱（如 end_to_end 调 LLM），给它打
-      # @pytest.mark.network，再加 -m "not network" 跳过。
-      - name: Unit tests
-        run: uv run --with pytest pytest -q
+      - name: Install dependencies
+        run: make install-dev
+
+      - name: Run lint smoke checks
+        run: make lint
+
+      - name: Run test suite
+        run: make test

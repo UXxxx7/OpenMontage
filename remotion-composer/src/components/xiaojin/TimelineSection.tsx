@@ -10,18 +10,18 @@
  * arriving at each dot exactly on that stage's beat frame. Each node's
  * duration counts up rather than appearing as static text.
  *
- * Fix D6（2026-07-16）：颜色曾经完全写死为深色画布配色，SectionLayer 因此
- * 只在 mode==='dark' 时才渲染这个图形，content_planner 又因此强制把每个
- * process_timeline 章节的 dark 标成 true——三层叠在一起的结果是：默认
- * colorMode（"warm"，大多数任务的实际配色）永远用不上这个组件，真实
- * backtest 截图证实了后果：一个"3 步流程"的 takeover 章节只剩标题+一个
- * 装饰性光斑+底下够不着的 topic cards，大片空白（用户原话："还有这么多
- * 空白，还不如直接把说话人留在那，别为了一个叫 process 的标题就撤了"）。
- * 现在改成读 theme.ts 的 PALETTES，跟其它组件一样按 colorMode 取色——
- * warm 模式下这个图形完全能用，不用再靠"强制 dark"才能显示。
+ * Colors are hardcoded (not read from theme.ts's colorMode palettes) --
+ * this component is designed to fill a Section takeover's dark canvas (see
+ * SectionLayer, which renders it), and the sandbox build's own theme.ts
+ * experiment (overriding the SHARED dark palette's accent to this
+ * red-orange) was reverted before porting: that palette is also the
+ * documented brand "dark mode" for other xiaojin videos (electric blue,
+ * see CLAUDE.md's style doc), and overriding it globally would have changed
+ * every other dark-mode composition's accent color. Hardcoding here keeps
+ * the change scoped to this one component, matching the pattern its sibling
+ * components (StatCard/BudgetRevealSection) already use.
  */
 import { interpolate, spring, useCurrentFrame, useVideoConfig } from "remotion";
-import { ColorMode, PALETTES } from "./theme";
 
 export interface TimelineNode {
   label: string;
@@ -37,10 +37,18 @@ export interface TimelineSectionProps {
   mountFrame: number;
   endFrame: number;
   nodes: TimelineNode[];
-  colorMode?: ColorMode;
   headingFont?: string;
   labelFont?: string;
 }
+
+// Matches production theme.ts's unmodified `dark` palette values exactly
+// (bg/line/shadow untouched there) plus this component's own red-orange
+// accent (see doc comment above for why that isn't in the shared palette).
+const ACCENT = "#E0552F";
+const ACCENT_ALT = "#E8A13C";
+const LINE = "rgba(255,255,255,0.10)";
+const BG = "#0D1117";
+const SHADOW = "rgba(0,0,0,0.45)";
 
 const TRACK_X = 340;
 // Cleared below SectionLayer's header (title at y=360) and icon zone
@@ -59,22 +67,11 @@ export const TimelineSection: React.FC<TimelineSectionProps> = ({
   mountFrame,
   endFrame,
   nodes,
-  colorMode = "dark",
   headingFont = "inherit",
   labelFont = "inherit",
 }) => {
   const frame = useCurrentFrame();
   const { fps } = useVideoConfig();
-  const palette = PALETTES[colorMode];
-  const ACCENT = palette.accent;
-  const ACCENT_ALT = palette.accentAlt;
-  const LINE = palette.line;
-  const BG = palette.bg;
-  const SHADOW = palette.shadow;
-  // Node label/heading text: white only makes sense on the dark canvas —
-  // warm mode needs the same dark ink every other warm-mode component uses.
-  const TEXT = colorMode === "dark" ? "#FFFFFF" : palette.ink;
-  const TEXT_SOFT = colorMode === "dark" ? "rgba(255,255,255,0.7)" : palette.inkSoft;
 
   if (frame < mountFrame || frame >= endFrame || nodes.length < 2) return null;
 
@@ -201,7 +198,7 @@ export const TimelineSection: React.FC<TimelineSectionProps> = ({
                   fontSize: node.isTotal ? 34 : 28,
                   fontWeight: 800,
                   letterSpacing: 2,
-                  color: TEXT,
+                  color: "#FFFFFF",
                   marginBottom: 4,
                 }}
               >
@@ -230,7 +227,7 @@ export const TimelineSection: React.FC<TimelineSectionProps> = ({
                     fontFamily: labelFont,
                     fontSize: 24,
                     fontWeight: 700,
-                    color: TEXT_SOFT,
+                    color: "rgba(255,255,255,0.7)",
                     letterSpacing: 1,
                   }}
                 >
