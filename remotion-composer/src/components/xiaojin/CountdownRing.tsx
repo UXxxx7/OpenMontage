@@ -33,8 +33,6 @@ export interface CountdownRingProps {
   endFrame?: number;
   x?: number;
   y?: number;
-  /** Fixed card width (e.g. the full 960px content-zone lane). Omit for content-sized. */
-  width?: number;
   colorMode: ColorMode;
   headingFont?: string;
   labelFont?: string;
@@ -52,7 +50,6 @@ export const CountdownRing: React.FC<CountdownRingProps> = ({
   endFrame,
   x = 80,
   y = 900,
-  width,
   colorMode,
   headingFont = "inherit",
   labelFont = "inherit",
@@ -70,7 +67,7 @@ export const CountdownRing: React.FC<CountdownRingProps> = ({
   const palette = PALETTES[colorMode];
   const cardEntry = spring({ frame: local, fps, config: { damping: 14, stiffness: 220 } });
 
-  const R = 100;
+  const R = 80;
   const CIRC = 2 * Math.PI * R;
   const targetFill = maxValue ? Math.max(0, Math.min(1, value / maxValue)) : 1;
   const arcFill = interpolate(local, [0, revealFrames], [0, targetFill], {
@@ -90,35 +87,31 @@ export const CountdownRing: React.FC<CountdownRingProps> = ({
         transform: `translateX(${(1 - cardEntry) * -40}px)`,
         background: "rgba(13,17,23,0.86)",
         borderRadius: 24,
-        padding: "32px 36px",
+        padding: "28px 32px",
         boxShadow: `0 8px 32px ${palette.shadow}`,
         display: "flex",
         alignItems: "center",
-        // When given a fixed lane width (full content zone), center the
-        // ring+text group instead of leaving them hugging the left edge.
-        justifyContent: width !== undefined ? "center" : "flex-start",
-        width,
-        gap: 32,
+        gap: 28,
       }}
     >
       <svg width={R * 2 + 24} height={R * 2 + 24} style={{ flexShrink: 0 }}>
-        <circle cx={R + 12} cy={R + 12} r={R} fill="none" stroke="rgba(255,255,255,0.08)" strokeWidth={12} />
+        <circle cx={R + 12} cy={R + 12} r={R} fill="none" stroke="rgba(255,255,255,0.08)" strokeWidth={10} />
         <circle
           cx={R + 12}
           cy={R + 12}
           r={R}
           fill="none"
           stroke={palette.accent}
-          strokeWidth={12}
+          strokeWidth={10}
           strokeLinecap="round"
           strokeDasharray={CIRC}
           strokeDashoffset={dashOffset}
           transform={`rotate(-90 ${R + 12} ${R + 12})`}
         />
-        <text x={R + 12} y={R + 8} textAnchor="middle" fill={palette.accent} fontSize={56} fontWeight={800} fontFamily={headingFont}>
+        <text x={R + 12} y={R + 8} textAnchor="middle" fill={palette.accent} fontSize={44} fontWeight={800} fontFamily={headingFont}>
           {value}
         </text>
-        <text x={R + 12} y={R + 32} textAnchor="middle" fill="rgba(255,255,255,0.5)" fontSize={16} fontFamily={labelFont}>
+        <text x={R + 12} y={R + 26} textAnchor="middle" fill="rgba(255,255,255,0.5)" fontSize={13} fontFamily={labelFont}>
           {unitLabel}
         </text>
       </svg>
@@ -126,17 +119,17 @@ export const CountdownRing: React.FC<CountdownRingProps> = ({
         <div
           style={{
             fontFamily: labelFont,
-            fontSize: 16,
+            fontSize: 13,
             fontWeight: 600,
             color: "rgba(255,255,255,0.5)",
             letterSpacing: 3,
             textTransform: "uppercase",
-            marginBottom: 10,
+            marginBottom: 8,
           }}
         >
           {label}
         </div>
-        <div style={{ fontFamily: headingFont, fontSize: 38, fontWeight: 800, color: "#FFFFFF", lineHeight: 1.2 }}>
+        <div style={{ fontFamily: headingFont, fontSize: 32, fontWeight: 800, color: "#FFFFFF", lineHeight: 1.2 }}>
           {headline}
           {headlineAccent ? (
             <>

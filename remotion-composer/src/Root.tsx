@@ -22,8 +22,6 @@ import {
   calculateReferenceStyleEditMetadata,
 } from "./ReferenceStyleEdit";
 import { XiaojinEditorial, XiaojinEditorialProps, calculateXiaojinEditorialMetadata } from "./XiaojinEditorial";
-import { NewGraphicsDemo } from "./NewGraphicsDemo";
-import { NewGraphicsDemo2 } from "./NewGraphicsDemo2";
 
 // ---------------------------------------------------------------------------
 // Theme System — prevents every video from looking like dark fintech
@@ -480,22 +478,6 @@ export const Root: React.FC = () => {
           fadeOutSeconds: 1.5,
           overlay: true,
         } as EndTagProps}
-      />
-      <Composition
-        id="NewGraphicsDemo"
-        component={NewGraphicsDemo}
-        durationInFrames={540}
-        fps={30}
-        width={1080}
-        height={1920}
-      />
-      <Composition
-        id="NewGraphicsDemo2"
-        component={NewGraphicsDemo2}
-        durationInFrames={540}
-        fps={30}
-        width={1080}
-        height={1920}
       />
     </>
   );

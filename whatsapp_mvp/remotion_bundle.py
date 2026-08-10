@@ -37,29 +37,6 @@ _KEEP_GENERATIONS = 2  # 当前 + 上一代，保证切换瞬间仍在读上一�
 _PROC_LOCK = threading.Lock()  # 同进程内的双重检查锁；跨进程保护见 _cross_process_lock
 
 
-def _clean_stale_build_artifacts(remotion_dir: Path, build: Path) -> None:
-    """Fix C17（2026-07-17，来自友人提供的 WINDOWS_REMOTION_WINERROR5.md，一份
-    独立记录过的 Windows 专属排查文档）：Remotion 重建 bundle 的最后一步是把
-    临时目录 `.build.tmp-xxxx` 改名成 `build`；`build` 已存在（上一次构建
-    中途被打断——例如进程被杀、机器休眠、渲染超时——没跑到改名那一步就留下的
-    半成品）或被外部进程（杀毒软件扫描/资源管理器/编辑器）占着句柄时，Windows
-    会拒绝这次改名，报 `[WinError 5] 拒绝访问`；Linux/macOS 不受影响。
-    `_PROC_LOCK`/`_cross_process_lock` 只挡得住并发重建，挡不住上一次进程
-    崩溃/被杀留下的残留目录——这正是本会话里我自己 `taskkill` 一个卡住的
-    验证脚本时会造成的那种残留，如果它当时恰好在重建 bundle。新架构下每次
-    重建都用带随机后缀的 `tmp_link` 名字（见 ensure_remotion_bundle），单次
-    重建不会撞上自己的残留，但历史崩溃留下的 `.build.tmp-*` 目录不会自己
-    消失，会在 remotion_dir 里一直堆着——这里在每次重建前顺手清一遍，避免
-    无限堆积。
-    """
-    for stale in remotion_dir.glob(".build.tmp-*"):
-        try:
-            shutil.rmtree(stale, ignore_errors=True)
-            logger.info(f"  remotion: 清理上次遗留的临时打包目录 {stale.name}")
-        except Exception as e:
-            logger.warning(f"  remotion: 清理 {stale.name} 失败（忽略，继续）: {e}")
-
-
 def _src_mtime(remotion_dir: Path) -> float:
     newest = 0.0
     for sub in ("src", "contracts"):
@@ -140,14 +117,9 @@ def _cleanup_old_generations(cache_dir: Path, keep: set[str]) -> None:
 # 对 http 开头的 src 透传），bundle 从此纯只读共享。
 
 
-def ensure_remotion_bundle(remotion_dir: Path, job_slug: Optional[str] = None) -> Optional[str]:
+def ensure_remotion_bundle(remotion_dir: Path) -> Optional[str]:
     """返回可直接喂给 still/render 的 bundle 目录（真实路径）；不可用时返回
-    None（调用方回退到按次打包）。
-
-    job_slug：向后兼容参数，接受但不使用。本版设计已移除 bundle public/ 素材同步
-    （见本文件顶部注释），videoSrc/qrSrc 一律走本机 API 的 /files 路由，still/render
-    都不需要把素材写进 bundle。qa_stills.py 仍按旧签名传 job_slug，这里接住以避免
-    TypeError（#38 合并残留：新版 remotion_bundle + 旧版 qa_stills 调用签名不一致）。"""
+    None（调用方回退到按次打包）。"""
     remotion_dir = Path(remotion_dir).resolve()  # 相对路径+cwd 组合会把 out-dir 解析进嵌套目录（实测）
     cache_dir = remotion_dir / _CACHE_DIRNAME
     build_link = remotion_dir / "build"
@@ -176,7 +148,6 @@ def ensure_remotion_bundle(remotion_dir: Path, job_slug: Optional[str] = None) -
 
         npx = shutil.which("npx") or "npx"
         cache_dir.mkdir(exist_ok=True)
-        _clean_stale_build_artifacts(remotion_dir, build_link)
         new_dir = cache_dir / f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
         logger.info("  remotion: 预打包 bundle（src 有更新或首次）...")
         try:
@@ -215,33 +186,13 @@ def ensure_remotion_bundle(remotion_dir: Path, job_slug: Optional[str] = None) -
         if tmp_link.exists() or tmp_link.is_symlink():
             tmp_link.unlink()
         tmp_link.symlink_to(new_dir, target_is_directory=True)
-        # Fix C52（2026-07-22，本机真实复现，job_2729b2e0a795 连续两次重试都在这里
-        # 炸——不是并发/杀毒软件占句柄，手动在无任何其它进程运行时原地重放这段
-        # swap 逻辑，100% 必现 WinError 5）：上面这条注释的假设是错的。
-        # `Path.replace()`（=`os.replace`=`MoveFileEx(...,MOVEFILE_REPLACE_EXISTING)`）
-        # 在 Windows 上确实不能覆盖"真实目录"，但也同样不能覆盖一个已存在的
-        # "指向目录的符号链接/reparse point"——之前只处理了前者（`not
-        # build_link.is_symlink()` 那个分支），符号链接-覆盖-符号链接这条路径
-        # 从没被真正验证过。触发条件：`build` 已经存在（不是首次打包）+ 目标是
-        # 符号链接，也就是这套缓存机制"正常更新"的那条主路径——本该最常跑到
-        # 的分支反而每次必炸，只是这台机器上 `src/` 长期没人改动，`_resolve_current`
-        # 一直命中缓存直接返回，从来没真正走到这次 replace，把这个 bug 掩盖了
-        # 很久，直到这次往 src/ 里新增组件文件、mtime 一变就必现。
-        # 修复：不再依赖"改名覆盖已存在目标"这种 Windows 不支持的原子操作——
-        # 已存在就先 unlink 旧符号链接（只删 reparse point 本身，不删它指向的
-        # 目录内容，旧生成目录还留着，靠下面 _cleanup_old_generations 按代数清）
-        # 再对空位置做一次纯改名（首次打包已验证这条路径没问题）。牺牲了严格
-        # 原子性（unlink 和 rename 之间有个极短窗口 build 路径不存在），但比
-        # "每次更新必炸、apply_style 每次都降级"好得多；保留重试作为杀毒/索引
-        # 短暂占句柄的兜底。
+        # Windows：os.replace 无法覆盖"真实目录"（WinError 5 拒绝访问）。build 若是
+        # 残留的真实目录（非符号链接）就先删掉再切；对短暂占用（杀软/索引持句柄）重试几次。
         for _swap_attempt in range(5):
             try:
-                if build_link.exists() or build_link.is_symlink():
-                    if build_link.is_symlink():
-                        build_link.unlink()
-                    else:
-                        shutil.rmtree(build_link, ignore_errors=True)
-                tmp_link.rename(build_link)
+                if build_link.exists() and not build_link.is_symlink():
+                    shutil.rmtree(build_link, ignore_errors=True)
+                tmp_link.replace(build_link)
                 break
             except OSError:
                 if _swap_attempt == 4:

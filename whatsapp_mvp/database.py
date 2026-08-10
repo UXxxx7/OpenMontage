@@ -207,40 +207,10 @@ def _init_engine() -> None:
     db_url = config.database_url
 
     connect_args = {}
-    is_sqlite = db_url.startswith("sqlite")
-    if is_sqlite:
+    if db_url.startswith("sqlite"):
         connect_args["check_same_thread"] = False
 
     _engine = create_engine(db_url, connect_args=connect_args, echo=False)
-
-    if is_sqlite:
-        # Fix C29（2026-07-20，真实生产复现——job_f7b171f8d952 真实卡死：apply_style
-        # 的后台管线线程在跑的同时（_run_in_background 起的真实 OS 线程，
-        # check_same_thread=False 允许它跨线程读写同一个 SQLite 文件），
-        # /files/{job_id}/{filename}（qa_stills 的 6 个并发 Chrome tab 反复调用）
-        # 也在同一时间读同一个 jobs 表——SQLite 默认的 rollback-journal 模式下，
-        # 写事务持有的是整个数据库文件的排他锁，读端会被卡住等锁；这里既没配
-        # busy_timeout（默认 0，锁冲突要么立刻报错要么无限等，取决于底层 OS
-        # 文件锁语义），也没开 WAL（允许读写并发、互不阻塞的标准模式）。Windows
-        # 上 SQLite 的默认文件锁实现又比 Linux/macOS 更容易在这种反复短事务的
-        # 场景下卡住——真实复现：先是这个 /files 路由反复超时（Remotion 自己的
-        # delayRender 28s 超时），最后连 /health 都完全不响应，整个 uvicorn 进程
-        # 卡死，需要手动 kill 重启。
-        #
-        # WAL（write-ahead log）模式让读操作不再需要等写事务释放锁（读的是
-        # WAL 文件里已提交的快照，写继续追加到 WAL，定期 checkpoint 回主库），
-        # 是官方文档明确推荐的"多线程/多进程并发读写同一个 SQLite 文件"标准
-        # 配置。busy_timeout 兜底剩下那极少数真的撞上写锁的瞬间——阻塞式重试
-        # 到超时为止，而不是立刻报错或者（更糟）无限期挂起。
-        from sqlalchemy import event as _sa_event
-
-        @_sa_event.listens_for(_engine, "connect")
-        def _set_sqlite_pragma(dbapi_connection, connection_record):
-            cursor = dbapi_connection.cursor()
-            cursor.execute("PRAGMA journal_mode=WAL")
-            cursor.execute("PRAGMA busy_timeout=5000")
-            cursor.close()
-
     Base.metadata.create_all(bind=_engine)
     _migrate_schema(_engine)
 

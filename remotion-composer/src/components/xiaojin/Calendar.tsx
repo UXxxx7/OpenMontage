@@ -30,11 +30,6 @@ export interface CalendarProps {
   endFrame?: number;
   x?: number;
   y?: number;
-  /** Card width. Default bumped 460->720 (confirmed real user complaint: at
-      460px inside the ~960px content-zone lane, this was the single most
-      undersized component in the whole build, leaving huge empty margins —
-      "biggen the calendar, that's one technique to remove empty space"). */
-  width?: number;
   colorMode: ColorMode;
   headingFont?: string;
   labelFont?: string;
@@ -72,7 +67,6 @@ export const Calendar: React.FC<CalendarProps> = ({
   endFrame,
   x = 80,
   y = 900,
-  width = 720,
   colorMode,
   headingFont = "inherit",
   labelFont = "inherit",
@@ -105,31 +99,31 @@ export const Calendar: React.FC<CalendarProps> = ({
         borderRadius: 24,
         border: `1.5px solid ${palette.line}`,
         boxShadow: `0 8px 32px ${palette.shadow}`,
-        padding: "32px 36px",
-        width,
+        padding: "24px 28px",
+        width: 460,
       }}
     >
       <div
         style={{
           fontFamily: headingFont,
-          fontSize: 32,
+          fontSize: 22,
           fontWeight: 800,
           color: palette.ink,
-          marginBottom: 20,
+          marginBottom: 16,
           letterSpacing: 1,
         }}
       >
         {MONTH_NAMES[month - 1]} {year}
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 6, marginBottom: 10 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 4, marginBottom: 8 }}>
         {DAY_HEADERS.map((d) => (
           <div
             key={d}
             style={{
               textAlign: "center",
               fontFamily: labelFont,
-              fontSize: 18,
+              fontSize: 13,
               fontWeight: 700,
               color: palette.inkSoft,
               letterSpacing: 1,
@@ -141,7 +135,7 @@ export const Calendar: React.FC<CalendarProps> = ({
       </div>
 
       {weeks.map((week, wi) => (
-        <div key={wi} style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 6, marginBottom: 6 }}>
+        <div key={wi} style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 4, marginBottom: 4 }}>
           {week.map((day, di) => {
             const isTarget = day === targetDay;
             const isToday = todayDay !== undefined && day === todayDay;
@@ -151,11 +145,11 @@ export const Calendar: React.FC<CalendarProps> = ({
                 style={{
                   textAlign: "center",
                   fontFamily: labelFont,
-                  fontSize: 26,
+                  fontSize: 18,
                   fontWeight: isTarget ? 800 : 600,
                   color: isTarget ? "#FFFFFF" : day === null ? "transparent" : palette.ink,
-                  padding: "12px 4px",
-                  borderRadius: isTarget ? "50%" : 10,
+                  padding: "8px 4px",
+                  borderRadius: isTarget ? "50%" : 8,
                   background: isTarget ? palette.accent : isToday ? "rgba(196,113,74,0.10)" : "transparent",
                   boxShadow: isTarget
                     ? `0 0 0 ${3 + pulse * 4}px ${palette.accent}${Math.round((0.25 + pulse * 0.25) * 255).toString(16).padStart(2, "0")}`
@@ -171,16 +165,16 @@ export const Calendar: React.FC<CalendarProps> = ({
 
       <div
         style={{
-          marginTop: 16,
+          marginTop: 12,
           display: "flex",
           alignItems: "center",
-          gap: 12,
-          paddingTop: 16,
+          gap: 10,
+          paddingTop: 12,
           borderTop: `1px solid ${palette.line}`,
         }}
       >
-        <div style={{ width: 16, height: 16, borderRadius: "50%", background: palette.accent, flexShrink: 0 }} />
-        <span style={{ fontFamily: labelFont, fontSize: 22, fontWeight: 700, color: palette.accent }}>
+        <div style={{ width: 12, height: 12, borderRadius: "50%", background: palette.accent, flexShrink: 0 }} />
+        <span style={{ fontFamily: labelFont, fontSize: 16, fontWeight: 700, color: palette.accent }}>
           {eventLabel} — {MONTH_NAMES[month - 1]} {targetDay}
         </span>
       </div>

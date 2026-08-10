@@ -70,10 +70,8 @@ const worker = new Worker(queueName, async (job) => {
       case "collect-note": return collectNote(job.data);
       case "finalize-collection": return finalizeCollection(job.data);
       case "collection-choice": return collectionChoice(job.data);
-      case "arm-choice": return armChoice(job.data);
       case "idle-warn": return idleWarn(job.data);
       case "idle-cancel": return idleCancel(job.data);
-      case "await-continue": return awaitContinue(job.data);
       default: throw new Error(`Unknown job type: ${job.name}`);
     }
   } catch (err) {
@@ -97,18 +95,10 @@ worker.on("completed", (job) => {
 const _SILENT_FAIL_JOBS = new Set(["idle-warn", "idle-cancel", "collect-ack", "collect-nudge", "collect-note"]);
 
 worker.on("failed", async (job, error) => {
-  const attemptsMade = job?.attemptsMade ?? 1;
-  const attemptsMax = job?.opts?.attempts ?? 1;
-  const isFinalAttempt = attemptsMade >= attemptsMax;
-  console.error(`[worker] failed ${job?.name} ${job?.id} (attempt ${attemptsMade}/${attemptsMax}): ${error.message}`);
-  // 真实事故（2026-07-23，job_08b94c0922ce）：BullMQ 还有自动重试在路上时
-  // 这里就无条件先给用户发"失败了，请重新尝试"——Python 后台管线其实完全
-  // 没被打断，只是这一次尝试的等待窗口不够长；用户被误导以为要手动重来，
-  // 而 BullMQ 的自动重试（以及原来那个从未中断的后台任务）往往几分钟后
-  // 自己就成功了。现在只在真正没有下一次重试时才打扰用户。
+  console.error(`[worker] failed ${job?.name} ${job?.id}: ${error.message}`);
   const waNumber = job?.data?.waNumber;
-  if (isFinalAttempt && waNumber && !_SILENT_FAIL_JOBS.has(job?.name)) {
-    const lang = resolveLang(DEFAULT_LANG, job?.data?.text, job?.data?.editRequest, job?.data?.lang);
+  if (waNumber && !_SILENT_FAIL_JOBS.has(job?.name)) {
+    const lang = resolveLang(DEFAULT_LANG, job?.data?.text, job?.data?.editRequest);
     await safeSendText(waNumber, t(lang,
       "抱歉，视频处理任务失败了，请重新尝试。",
       "Sorry, the video job failed. Please try again."));
@@ -124,8 +114,8 @@ async function editVideo({ waNumber, mediaId, editRequest }) {
     throw new Error("WhatsApp credentials not configured");
   }
   await sendText(waNumber, t(lang,
-    "视频已收到，正在下载并生成剪辑方案（预计 1-3 分钟）...",
-    "Video received. Downloading and preparing edit plan (usually 1-3 min)..."));
+    "视频已收到，正在下载并生成剪辑方案...",
+    "Video received. Downloading and preparing edit plan..."));
 
   const tempPath = await downloadWhatsAppMedia(mediaId);
   try {
@@ -137,12 +127,23 @@ async function editVideo({ waNumber, mediaId, editRequest }) {
 
     const status = await waitForStatus(jobId,
       ["WAITING_CONFIRMATION", "NEEDS_CLARIFICATION", "PREVIEW_READY", "ERROR"],
-      Number(env("WA_PLAN_TIMEOUT_MS", "180000")), { waNumber, lang });
-    if (!status) return;
+      Number(env("WA_PLAN_TIMEOUT_MS", "180000")));
+    const jobLang = resolveLang(lang, status.edit_request);
+
     if (status.status === "ERROR") {
       throw new Error(status.error_message || "Python planning failed");
     }
-    await deliverStageResult(waNumber, jobId, status, lang);
+    if (status.status === "NEEDS_CLARIFICATION") {
+      await sendText(waNumber, clarificationMessage(jobLang, status));
+      return;
+    }
+    if (status.status === "PREVIEW_READY") {
+      await sendText(waNumber, previewReadyMessage(jobLang, jobId, status.degraded_operations, status.generation_cost_usd) + idleHint(jobLang, "export"));
+      await armIdle(waNumber, jobId, "export", jobLang);
+      return;
+    }
+    await sendText(waNumber, formatPlanMessage(status, jobLang) + idleHint(jobLang, "confirm"));
+    await armIdle(waNumber, jobId, "confirm", jobLang);
   } finally {
     await fs.promises.rm(tempPath, { force: true });
   }
@@ -161,9 +162,6 @@ async function crollGenerate({ waNumber, mediaId, caption }) {
       "Service is starting up. Please send your photo again in a moment."));
     throw new Error("WhatsApp credentials not configured");
   }
-  await sendText(waNumber, t(lang,
-    "照片已收到，正在生成口播文案和数字人视频（预计 3-8 分钟）...",
-    "Photo received. Generating your script and talking-head video (usually 3-8 min)..."));
   const tempPath = await downloadWhatsAppMedia(mediaId, "image");
   try {
     const created = await createPythonCrollJob(tempPath, lang, caption);
@@ -173,12 +171,23 @@ async function crollGenerate({ waNumber, mediaId, caption }) {
 
     const status = await waitForStatus(jobId,
       ["WAITING_CONFIRMATION", "NEEDS_CLARIFICATION", "PREVIEW_READY", "ERROR"],
-      Number(env("WA_CROLL_TIMEOUT_MS", "1200000")), { waNumber, lang });
-    if (!status) return;
+      Number(env("WA_CROLL_TIMEOUT_MS", "1200000")));
+    const jobLang = resolveLang(lang, status.edit_request);
+
     if (status.status === "ERROR") {
       throw new Error(status.error_message || "C-roll generation failed");
     }
-    await deliverStageResult(waNumber, jobId, status, lang);
+    if (status.status === "NEEDS_CLARIFICATION") {
+      await sendText(waNumber, clarificationMessage(jobLang, status));
+      return;
+    }
+    if (status.status === "PREVIEW_READY") {
+      await sendText(waNumber, previewReadyMessage(jobLang, jobId, status.degraded_operations, status.generation_cost_usd) + idleHint(jobLang, "export"));
+      await armIdle(waNumber, jobId, "export", jobLang);
+      return;
+    }
+    await sendText(waNumber, formatPlanMessage(status, jobLang) + idleHint(jobLang, "confirm"));
+    await armIdle(waNumber, jobId, "confirm", jobLang);
   } finally {
     await fs.promises.rm(tempPath, { force: true });
   }
@@ -205,17 +214,15 @@ async function confirmJob({ waNumber, jobId }) {
   const before = await getPythonJob(jobId).catch(() => null);
   const lang = resolveLang(DEFAULT_LANG, before?.edit_request);
   await postPython(`/jobs/${encodeURIComponent(jobId)}/confirm`);
-  await sendText(waNumber, t(lang,
-    "已确认，正在剪辑视频（预计 3-10 分钟）...",
-    "Confirmed. Editing video now (usually 3-10 min)..."));
+  await sendText(waNumber, t(lang, "已确认，正在剪辑视频...", "Confirmed. Editing video now..."));
   const status = await waitForStatus(jobId,
     ["PREVIEW_READY", "ERROR"],
-    Number(env("WA_PIPELINE_TIMEOUT_MS", "1200000")), { waNumber, lang });
-  if (!status) return;
+    Number(env("WA_PIPELINE_TIMEOUT_MS", "900000")));
   if (status.status === "ERROR") {
     throw new Error(status.error_message || "Python pipeline failed");
   }
-  await deliverStageResult(waNumber, jobId, status, lang);
+  await sendText(waNumber, previewReadyMessage(lang, jobId, status.degraded_operations, status.generation_cost_usd) + idleHint(lang, "export"));
+  await armIdle(waNumber, jobId, "export", lang); // 进入"等待导出"，重新计时
 }
 
 // 整单按原方案重跑：预览有降级步骤（用户要完整效果）或 ERROR 后再试。
@@ -226,16 +233,17 @@ async function retryJob({ waNumber, jobId, text }) {
   const lang = resolveLang(DEFAULT_LANG, text, before?.edit_request);
   await postPython(`/jobs/${encodeURIComponent(jobId)}/retry`);
   await sendText(waNumber, t(lang,
-    "正在按原方案重新剪辑（预计 3-10 分钟）...",
-    "Retrying the edit with the same plan (usually 3-10 min)..."));
+    "正在按原方案重新剪辑...",
+    "Retrying the edit with the same plan..."));
   const status = await waitForStatus(jobId,
     ["PREVIEW_READY", "ERROR"],
-    Number(env("WA_PIPELINE_TIMEOUT_MS", "1200000")), { waNumber, lang });
-  if (!status) return;
+    Number(env("WA_PIPELINE_TIMEOUT_MS", "900000")));
   if (status.status === "ERROR") {
     throw new Error(status.error_message || "Python pipeline failed");
   }
-  await deliverStageResult(waNumber, jobId, status, lang);
+  const jobLang = resolveLang(lang, status.edit_request);
+  await sendText(waNumber, previewReadyMessage(jobLang, jobId, status.degraded_operations, status.generation_cost_usd) + idleHint(jobLang, "export"));
+  await armIdle(waNumber, jobId, "export", jobLang);
 }
 
 async function renderJob({ waNumber, jobId }) {
@@ -244,17 +252,20 @@ async function renderJob({ waNumber, jobId }) {
   const lang = resolveLang(DEFAULT_LANG, before?.edit_request);
   await postPython(`/jobs/${encodeURIComponent(jobId)}/render`);
   await sendText(waNumber, t(lang,
-    "已开始导出（预计 3-10 分钟），完成后会把最终视频发给你。",
-    "Export started (usually 3-10 min). Will send the final video when ready."));
+    "已开始导出，完成后会把最终视频发给你。",
+    "Export started. Will send the final video when ready."));
   const status = await waitForStatus(jobId,
     ["DONE", "ERROR"],
-    Number(env("WA_RENDER_TIMEOUT_MS", "1200000")), { waNumber, lang });
-  if (!status) return;
+    Number(env("WA_RENDER_TIMEOUT_MS", "900000")));
   if (status.status === "ERROR") {
     throw new Error(status.error_message || "Python render failed");
   }
+
   // 成品通常 > 16MB，超出 WhatsApp 视频消息上限，统一以链接投递（走 PUBLIC_BASE_URL）
-  await deliverStageResult(waNumber, jobId, status, lang);
+  await sendText(waNumber, t(lang,
+    `最终视频已生成：${fileUrl(jobId, "final.mp4")}`,
+    `Your final video is ready: ${fileUrl(jobId, "final.mp4")}`));
+  await redis.del(activeJobKey(waNumber));
 }
 
 async function cancelJob({ waNumber, jobId }) {
@@ -452,100 +463,16 @@ async function collectionChoice({ waNumber, choice }) {
 async function startWithMain(waNumber, items, mainItem, assign, lang) {
   const videos = items.filter((i) => i.kind === "video");
   const labels = (assign && assign.labels) || {};
-  // 参考风格视频(可选,模块4):从 assign.reference_index(视频编号,1 开始)识别。
-  // 它既不是主视频、也不进 b-roll,单独抽出来透传给 Python 落成 style_ref.*。
-  let referenceItem = null;
-  const refNum = Number(assign && assign.reference_index);
-  if (refNum >= 1 && refNum <= videos.length) {
-    const cand = videos[refNum - 1];
-    if (cand && cand !== mainItem) referenceItem = cand;
-  }
-  const brollItems = items
-    .filter((i) => i !== mainItem && i !== referenceItem)
-    .map((i) => {
-      let label = i.caption || "";
-      if (i.kind === "video") {
-        const num = videos.indexOf(i) + 1;  // 该视频的上传编号（1 开始）
-        label = labels[String(num)] || labels[num] || i.caption || "";
-      }
-      return { ...i, label };
-    });
+  const brollItems = items.filter((i) => i !== mainItem).map((i) => {
+    let label = i.caption || "";
+    if (i.kind === "video") {
+      const num = videos.indexOf(i) + 1;  // 该视频的上传编号（1 开始）
+      label = labels[String(num)] || labels[num] || i.caption || "";
+    }
+    return { ...i, label };
+  });
   const editRequest = (assign && assign.edit_request) || mainItem.caption || "";
-  // 方案A:go 后先让用户点选臂(套模板 / AI 现写),不立即建 job;点选后由 armChoice 续跑。
-  await askArm(waNumber, { mainItem, brollItems, referenceItem, editRequest, lang });
-}
-
-// ── 方案A:选臂(Arm A 套模板 / Arm B AI 现写)──────────────────────────
-function armPendingKey(waNumber) { return `wa:user:${waNumber}:arm_pending`; }
-function awaitArmKey(waNumber) { return `wa:user:${waNumber}:await_arm`; }
-
-async function askArm(waNumber, ctx) {
-  const ttl = Number(env("WA_COLLECT_TTL", "3600"));
-  await redis.set(armPendingKey(waNumber), JSON.stringify(ctx), "EX", ttl);
-  await redis.set(awaitArmKey(waNumber), "1", "EX", ttl);
-  const lang = ctx.lang || DEFAULT_LANG;
-  const body = t(lang,
-    "先选剪辑方式：\n• 套用模板：用现成品牌模板，快\n• AI 现写：为这条视频量身现写场景，更灵活、稍慢",
-    "Choose an editing style:\n• Template: fast branded preset\n• AI author: a scene written for THIS video, more flexible but a bit slower");
-  const buttons = [
-    { id: "arm_a", title: t(lang, "套用模板", "Template") },
-    { id: "arm_b", title: t(lang, "AI 现写", "AI author") },
-  ];
-  try {
-    await sendButtons(waNumber, body, buttons);
-  } catch (err) {
-    console.warn(`[worker] sendButtons failed, fallback to text: ${err.message}`);
-    await safeSendText(waNumber, t(lang,
-      "先选剪辑方式，回复数字：\n1 = 套用模板\n2 = AI 现写",
-      "Choose an editing style, reply a number:\n1 = Template\n2 = AI author"));
-  }
-}
-
-function _mapArm(armId, armText) {
-  if (armId === "arm_a" || armId === "arm_b") return armId;
-  const n = String(armText == null ? "" : armText).trim().toLowerCase();
-  if (["1", "a", "arm_a", "模板", "套模板", "套用模板", "template", "tpl"].includes(n)) return "arm_a";
-  if (["2", "b", "arm_b", "ai", "ai现写", "ai 现写", "ai剪", "author"].includes(n)) return "arm_b";
-  return null;
-}
-
-async function armChoice({ waNumber, armId, armText }) {
-  const raw = await redis.get(armPendingKey(waNumber));
-  if (!raw) return; // pending 已过期/被认领 —— 别把用户卡住
-  let ctx = {};
-  try { ctx = JSON.parse(raw); } catch (e) { ctx = {}; }
-  const lang = ctx.lang || DEFAULT_LANG;
-  const n = String(armText == null ? "" : armText).trim().toLowerCase();
-  if (["cancel", "no", "stop", "取消"].includes(n)) {
-    await redis.del(armPendingKey(waNumber));
-    await redis.del(awaitArmKey(waNumber));
-    await safeSendText(waNumber, t(lang, "已取消。重新发送视频即可开始。", "Cancelled. Send a new video to start again."));
-    return;
-  }
-  const arm = _mapArm(armId, armText);
-  if (!arm) {
-    await safeSendText(waNumber, t(lang,
-      "没看懂选择。回复 1（套用模板）或 2（AI 现写），也可以直接点上面的按钮。",
-      "Didn't catch that. Reply 1 (Template) or 2 (AI author), or tap a button above."));
-    return;
-  }
-  // 原子认领：双击/重复回复时只有第一个建 job
-  const claimed = await redis.del(armPendingKey(waNumber));
-  if (!claimed) return;
-  await redis.del(awaitArmKey(waNumber));
-  await runCollectionJob(waNumber, ctx.mainItem, ctx.brollItems, ctx.editRequest, lang, arm, ctx.referenceItem);
-}
-
-async function sendButtons(to, bodyText, buttons) {
-  await axios.post(`${graphBase}/${whatsappPhoneId()}/messages`, {
-    messaging_product: "whatsapp", recipient_type: "individual", to,
-    type: "interactive",
-    interactive: {
-      type: "button",
-      body: { text: bodyText },
-      action: { buttons: buttons.map((b) => ({ type: "reply", reply: { id: b.id, title: b.title } })) },
-    },
-  }, { headers: authJsonHeaders(), timeout: Number(env("WA_SEND_TIMEOUT_MS", "30000")) });
+  await runCollectionJob(waNumber, mainItem, brollItems, editRequest, lang);
 }
 
 // 汇总描述文字：各媒体 caption + 收集期独立文字（notes 缓冲）
@@ -582,7 +509,7 @@ async function postAssign(videoCount, notes) {
 }
 
 // 下载主视频 + 所有 b-roll → 一次性 POST /jobs → 设活跃任务 → 等方案 → 回方案
-async function runCollectionJob(waNumber, mainItem, brollItems, editRequest, lang, arm, referenceItem) {
+async function runCollectionJob(waNumber, mainItem, brollItems, editRequest, lang) {
   const effLang = resolveLang(lang || DEFAULT_LANG, editRequest, mainItem.caption);
   if (!hasWACredentials()) {
     await sendText(waNumber, t(effLang,
@@ -612,47 +539,43 @@ async function runCollectionJob(waNumber, mainItem, brollItems, editRequest, lan
       tempPaths.push(p);
       brollPaths.push({ path: p, label: b.label || b.caption || "", kind: b.kind });
     }
-    // 参考风格视频(可选):下载后作为 reference 传给 Python，落成 job_dir/style_ref.*。
-    // 它只是"照这个风格剪"的 best-effort 输入,不是用户要的内容——下载失败绝不能
-    // 拖垮整单(此时 collectKey 已被认领删除,抛错会让重试空转、用户被迫重发全部素材)。
-    // 失败就降级为 null(不带参考风格),让主视频照常剪完。
-    let referencePayload = null;
-    if (referenceItem && referenceItem.mediaId) {
-      try {
-        const refPath = await downloadWhatsAppMedia(referenceItem.mediaId, referenceItem.kind || "video");
-        tempPaths.push(refPath);
-        referencePayload = { path: refPath, kind: referenceItem.kind || "video" };
-      } catch (err) {
-        console.warn(`[worker] reference download failed, proceeding without style ref: ${err.message}`);
-      }
-    }
     const created = await createPythonJobMulti(
       mainPath,
       editRequest || mainItem.caption || "Remove blank parts, add subtitles, and make it flow smoothly.",
-      brollPaths, arm, referencePayload);
+      brollPaths);
     const jobId = created.job_id;
     await redis.set(activeJobKey(waNumber), jobId, "EX", Number(env("WA_ACTIVE_JOB_TTL", "86400")));
 
     const status = await waitForStatus(jobId,
       ["WAITING_CONFIRMATION", "NEEDS_CLARIFICATION", "PREVIEW_READY", "ERROR"],
-      Number(env("WA_PLAN_TIMEOUT_MS", "180000")), { waNumber, lang: effLang });
-    if (!status) return;
+      Number(env("WA_PLAN_TIMEOUT_MS", "180000")));
+    const jobLang = resolveLang(effLang, status.edit_request);
+
     if (status.status === "ERROR") {
       throw new Error(status.error_message || "Python planning failed");
     }
-    await deliverStageResult(waNumber, jobId, status, effLang);
+    if (status.status === "NEEDS_CLARIFICATION") {
+      await sendText(waNumber, clarificationMessage(jobLang, status));
+      return;
+    }
+    if (status.status === "PREVIEW_READY") {
+      await sendText(waNumber, previewReadyMessage(jobLang, jobId, status.degraded_operations, status.generation_cost_usd) + idleHint(jobLang, "export"));
+      await armIdle(waNumber, jobId, "export", jobLang);
+      return;
+    }
+    await sendText(waNumber, formatPlanMessage(status, jobLang) + idleHint(jobLang, "confirm"));
+    await armIdle(waNumber, jobId, "confirm", jobLang);
   } finally {
     for (const p of tempPaths) await fs.promises.rm(p, { force: true });
   }
 }
 
-async function createPythonJobMulti(videoPath, editRequest, brollPaths, arm, reference) {
+async function createPythonJobMulti(videoPath, editRequest, brollPaths) {
   const form = new FormData();
   form.append("video", fs.createReadStream(videoPath),
     { filename: "input.mp4", contentType: "video/mp4" });
   form.append("edit_request", editRequest);
   form.append("pipeline", "talking-head");
-  if (arm) form.append("arm", arm);
   brollPaths.forEach((b, i) => {
     const ext = path.extname(b.path) || (b.kind === "image" ? ".jpg" : ".mp4");
     const ctype = b.kind === "image" ? "image/jpeg" : "video/mp4";
@@ -661,14 +584,6 @@ async function createPythonJobMulti(videoPath, editRequest, brollPaths, arm, ref
     form.append("broll_labels", b.label || "");
     form.append("broll_kinds", b.kind || "video");
   });
-  // 参考风格视频(可选,模块4):作为 reference 字段随表单上传，Python /jobs 落成 style_ref.*
-  if (reference && reference.path) {
-    const refExt = path.extname(reference.path) || (reference.kind === "image" ? ".jpg" : ".mp4");
-    const refCtype = reference.kind === "image" ? "image/jpeg" : "video/mp4";
-    form.append("reference", fs.createReadStream(reference.path),
-      { filename: `style_ref${refExt}`, contentType: refCtype });
-    form.append("reference_kind", reference.kind || "video");
-  }
   const resp = await axios.post(`${pythonApiBase}/jobs`, form, {
     headers: form.getHeaders(),
     maxBodyLength: Infinity, maxContentLength: Infinity,
@@ -724,98 +639,29 @@ async function reviseJob({ waNumber, jobId, text }) {
   await postPythonForm(`/jobs/${encodeURIComponent(jobId)}/revise`, text);
   const status = await waitForStatus(jobId,
     ["WAITING_CONFIRMATION", "NEEDS_CLARIFICATION", "ERROR"],
-    Number(env("WA_PLAN_TIMEOUT_MS", "180000")), { waNumber, lang });
-  if (!status) return;
+    Number(env("WA_PLAN_TIMEOUT_MS", "180000")));
   if (status.status === "ERROR") {
     throw new Error(status.error_message || "Revise failed");
   }
-  await deliverStageResult(waNumber, jobId, status, lang); // 新方案又回到"等待确认"，重新计时
+  const jobLang = resolveLang(lang, status.edit_request);
+  if (status.status === "NEEDS_CLARIFICATION") {
+    const q = status.planned_edit?.clarification_question ||
+      t(jobLang, "需要更多信息才能继续。", "I need more information to continue.");
+    await sendText(waNumber, q);
+    return;
+  }
+  await sendText(waNumber, formatPlanMessage(status, jobLang) + idleHint(jobLang, "confirm"));
+  await armIdle(waNumber, jobId, "confirm", jobLang); // 新方案又回到"等待确认"，重新计时
 }
 
-// heartbeat（通过 ctx.waNumber/ctx.lang 触发，可选）：等待超过
-// WA_HEARTBEAT_AFTER_MS（默认 5 分钟）仍未出结果时，主动发一句"还在处理"，
-// 而不是让用户干等到本轮超时都收不到任何中间反馈（真实事故：
-// job_08b94c0922ce 卡在 DeepSeek 内容规划慢响应，用户全程没有任何中间反馈，
-// 直到超时才收到一条误导性的"失败了"）。每一轮（round）最多发一次，不刷屏；
-// 本轮超时不再抛错——见下方 requeue 逻辑（合并自主线 await-continue 方案）。
-async function waitForStatus(jobId, wanted, timeoutMs, ctx) {
+async function waitForStatus(jobId, wanted, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
-  const heartbeatAt = ctx?.waNumber ? Date.now() + Number(env("WA_HEARTBEAT_AFTER_MS", "300000")) : null;
-  let heartbeatSent = false;
   while (Date.now() < deadline) {
     const last = await getPythonJob(jobId);
     if (wanted.includes(last.status)) return last;
-    if (ctx?.waNumber && !heartbeatSent && Date.now() >= heartbeatAt) {
-      heartbeatSent = true;
-      await sendText(ctx.waNumber, t(ctx.lang,
-        "还在处理中，这一步比预计慢一点，请再耐心等一下，马上就好。",
-        "Still working on it — taking a bit longer than usual, hang tight, almost there.")).catch(() => {});
-    }
     await delay(Number(env("WA_STATUS_POLL_MS", "3000")));
   }
-  // Backend hasn't reported ERROR — it's just slower than this poll window
-  // (heavy edits: face enhance + color grade + audio enhance + template
-  // render can legitimately run long). Telling the user "job failed" here
-  // used to be a false failure: the Python pipeline kept running underneath
-  // and often finished minutes later with nobody watching for it anymore.
-  // Instead, requeue a job that resumes waiting for the same terminal
-  // states and delivers the real result once it lands — never re-issues
-  // the original confirm/render/etc. call, just keeps polling.
-  if (ctx && ctx.waNumber) {
-    const round = (ctx.round || 0) + 1;
-    await timers.add("await-continue",
-      { waNumber: ctx.waNumber, jobId, wanted, lang: ctx.lang, round },
-      { removeOnComplete: true, removeOnFail: true });
-  }
-  return null;
-}
-
-// Shared "what to tell the user" for every terminal status a job can reach.
-// Used by every stage function below AND by awaitContinue() so a wait that
-// had to be resumed past the original poll window delivers the exact same
-// message a same-round success would have.
-async function deliverStageResult(waNumber, jobId, status, lang) {
-  const jobLang = resolveLang(lang, status.edit_request);
-  if (status.status === "NEEDS_CLARIFICATION") {
-    await sendText(waNumber, clarificationMessage(jobLang, status));
-    return;
-  }
-  if (status.status === "PREVIEW_READY") {
-    await sendText(waNumber, previewReadyMessage(jobLang, jobId, status.animations, status.degraded_operations, status.generation_cost_usd) + idleHint(jobLang, "export"));
-    await armIdle(waNumber, jobId, "export", jobLang);
-    return;
-  }
-  if (status.status === "DONE") {
-    await sendText(waNumber, t(jobLang,
-      `最终视频已生成：${fileUrl(jobId, "final.mp4")}`,
-      `Your final video is ready: ${fileUrl(jobId, "final.mp4")}`));
-    await redis.del(activeJobKey(waNumber));
-    return;
-  }
-  // WAITING_CONFIRMATION
-  await sendText(waNumber, formatPlanMessage(status, jobLang) + idleHint(jobLang, "confirm"));
-  await armIdle(waNumber, jobId, "confirm", jobLang);
-}
-
-// Resumed wait after a previous round's poll window ran out without the
-// backend actually erroring. Keeps polling for the same terminal states;
-// only tells the user something went wrong if the backend really does
-// report ERROR, or this has gone on for an unreasonable number of rounds.
-async function awaitContinue({ waNumber, jobId, wanted, lang, round }) {
-  const maxRounds = Number(env("WA_AWAIT_CONTINUE_MAX_ROUNDS", "6"));
-  if (round > maxRounds) {
-    await safeSendText(waNumber, t(lang || DEFAULT_LANG,
-      `任务 ${jobId} 处理时间远超预期。可以回复 *retry* 重新尝试，或稍后再看。`,
-      `Job ${jobId} is taking far longer than expected. Reply *retry* to try again, or check back later.`));
-    return;
-  }
-  const status = await waitForStatus(jobId, wanted,
-    Number(env("WA_PIPELINE_TIMEOUT_MS", "1200000")), { waNumber, lang, round });
-  if (!status) return; // still going — waitForStatus already queued the next round
-  if (status.status === "ERROR") {
-    throw new Error(status.error_message || "Pipeline failed");
-  }
-  await deliverStageResult(waNumber, jobId, status, lang);
+  throw new Error(`Timed out waiting for ${jobId}`);
 }
 
 async function downloadWhatsAppMedia(mediaId, kind = "video") {
@@ -895,18 +741,10 @@ function formatPlanMessage(job, lang) {
   return lines.join("\n");
 }
 
-function previewReadyMessage(lang, jobId, animations, degradedOps, generationCostUsd) {
-  // 用户明确反馈：以前这条消息只念模板简介（条条视频一模一样），从不说这条
-  // 视频实际包含哪些动画。Python API 的 GET /jobs/{id} 现在带 animations
-  // （从最终渲染 props 提取的真实清单）——有就逐条列出来。
-  let animBlock = "";
-  if (Array.isArray(animations) && animations.length > 0) {
-    const items = animations.map((a) => `• ${a}`).join("\n");
-    animBlock = t(lang, `本片动画：\n${items}\n`, `Animations in this cut:\n${items}\n`);
-  }
+function previewReadyMessage(lang, jobId, degradedOps, generationCostUsd) {
   let msg = t(lang,
-    `预览已生成：${fileUrl(jobId, "preview.mp4")}\n${animBlock}回复 export 导出最终视频。`,
-    `Preview ready: ${fileUrl(jobId, "preview.mp4")}\n${animBlock}Reply export to generate final video.`);
+    `预览已生成：${fileUrl(jobId, "preview.mp4")}\n回复 export 导出最终视频。`,
+    `Preview ready: ${fileUrl(jobId, "preview.mp4")}\nReply export to generate final video.`);
   // 降级必须发声：某步非致命失败被跳过时（Python 侧已自动重试过一次），明确
   // 告诉用户缺了什么、怎么补救——决不静默交付半成品假装全须全尾。
   const ops = degradedOps || [];
