@@ -20,6 +20,7 @@ from .job_manager import (
     finalize_target,
     get_active_job_for_user,
     get_assets,
+    get_clips,
     get_job,
     get_jobs_by_status,
     get_or_create_user,
@@ -413,7 +414,14 @@ def _enqueue_pipeline(job_id: str) -> None:
             # once (one extra plan_content call + one extra bounded QA-stills
             # pass) before falling through to graceful degradation; the old
             # budget was sized for a single render only.
-            q.enqueue(run_pipeline, job_id, job_timeout=2700)
+            # clip-factory 渲染的是 N 条独立 clip（裁剪+转写+字幕+调色+降噪+配文
+            # 各来一遍），管线内部自己的 wall-time 预算（config.clip_factory_wall_time_s，
+            # 默认 1800s）到点会主动收尾，但 RQ 的 job_timeout 必须留够余量盖过它，
+            # 否则 RQ 会在管线自己优雅收尾之前就先把整个 worker 进程杀掉。
+            job = get_job(job_id)
+            timeout = (max(2700, config.clip_factory_wall_time_s + 600)
+                      if job and job.pipeline == "clip-factory" else 2700)
+            q.enqueue(run_pipeline, job_id, job_timeout=timeout)
             logger.info(f"Enqueued pipeline {job_id} to RQ")
             return
         except Exception as e:
@@ -828,6 +836,28 @@ async def create_job_endpoint(
     return {"job_id": job.id, "status": job.status.value}
 
 
+def _clips_summary(job) -> list:
+    """clip-factory 管线的 Clip 子表 -> API 响应用的扁平列表。status 不是
+    READY 的（RENDERING/FAILED）也照样列出来，不静默丢弃——跟这个代码库
+    其余地方"如实告知有哪些没成"的一贯做法一致，Node 侧靠 error_message
+    判断要不要显示"第 N 条失败了"而不是假装那条从来没存在过。"""
+    config = get_config()
+    out = []
+    for c in get_clips(job.id):
+        out.append({
+            "rank": c.rank,
+            "clip_family": c.clip_family,
+            "status": c.status.value,
+            "hook_text": c.hook_text,
+            "duration_seconds": c.duration_seconds,
+            "url": (f"{config.public_base_url}/files/{job.id}/{c.output_filename}"
+                   if c.status.value == "READY" and c.output_filename else None),
+            "caption": json.loads(c.caption_json) if c.caption_json else None,
+            "error_message": c.error_message,
+        })
+    return out
+
+
 def _animations_summary(job) -> Optional[list]:
     """从 apply_style 的最终 props 里提取"这条视频实际包含哪些动画"的人话
     清单——确认过的真实用户反馈：预览消息只会念模板简介（"floating cards +
@@ -937,6 +967,16 @@ async def get_job_endpoint(job_id: str):
         # AI 生成累计花费（b-roll/背景音乐等）。Node 侧预览消息靠它如实告知
         # 用户/团队这单实际花了多少钱，不再是"哪儿都看不见"的隐性支出。
         "generation_cost_usd": job.generation_cost_usd or 0.0,
+        # 发帖配文 + hashtag（social_caption.py 生成，可能为 None——没转写/
+        # LLM 失败/超时都是正常的"没生成成功"，不是错误，Node 侧据此决定要不要
+        # 发第二条"可直接复制粘贴"的消息）。命名为 talkinghead_social_caption
+        # 而不是 social_caption——那个字段名已经被 social_batch.py（形状不同，
+        # 纯字符串）占用了。
+        "talkinghead_social_caption": json.loads(job.talkinghead_social_caption) if job.talkinghead_social_caption else None,
+        # clip-factory 管线用——之前一直没往外暴露过，Node 侧要靠它判断
+        # CLIPS_READY 时该不该走 clip 专属的展示逻辑。
+        "pipeline": job.pipeline,
+        "clips": _clips_summary(job) if job.pipeline == "clip-factory" else [],
         "created_at": job.created_at.isoformat() if job.created_at else None,
         "updated_at": job.updated_at.isoformat() if job.updated_at else None,
     }
@@ -976,6 +1016,7 @@ async def confirm_job_endpoint(job_id: str):
         JobStatus.RUNNING_PIPELINE,
         JobStatus.RENDERING,
         JobStatus.PREVIEW_READY,
+        JobStatus.CLIPS_READY,
         JobStatus.DONE,
     ):
         return {"job_id": job_id, "status": job.status.value}

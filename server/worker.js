@@ -929,6 +929,14 @@ async function deliverStageResult(waNumber, jobId, status, lang) {
   }
   if (status.status === "PREVIEW_READY") {
     await sendText(waNumber, previewReadyMessage(jobLang, jobId, status.animations, status.degraded_operations, status.generation_cost_usd) + idleHint(jobLang, "export"));
+    // 发帖配文单独一条消息，不并进上面那条——上面那条混了花费这些噪音，
+    // 用户想直接复制文案去发 Instagram/Facebook 的话，不该还要手动删掉不
+    // 相关的行。talkinghead_social_caption 缺失（没转写/LLM 失败/超时）是
+    // 正常情况，不发第二条、不额外提示——这是锦上添花的功能，不是用户在等
+    // 的核心交付物，缺了不用道歉。
+    if (status.talkinghead_social_caption && status.talkinghead_social_caption.caption) {
+      await safeSendText(waNumber, socialCaptionMessage(jobLang, status.talkinghead_social_caption));
+    }
     await armIdle(waNumber, jobId, "export", jobLang);
     return;
   }
@@ -936,6 +944,23 @@ async function deliverStageResult(waNumber, jobId, status, lang) {
     await sendText(waNumber, t(jobLang,
       `最终视频已生成：${fileUrl(jobId, "final.mp4")}`,
       `Your final video is ready: ${fileUrl(jobId, "final.mp4")}`));
+    await redis.del(activeJobKey(waNumber));
+    return;
+  }
+  if (status.status === "CLIPS_READY") {
+    // v1 就是终态，没有 export/revise 后续动作——跟 DONE 一样立即清活跃任务
+    // key。单条 clip 的重渲/修订不在今天范围内（复用现成的 /jobs/{id}/retry
+    // 能重跑整批，但没有"只改第 3 条"这种颗粒度）。
+    await sendText(waNumber, clipsReadyMessage(jobLang, jobId, status.clips,
+      status.generation_cost_usd));
+    // 只对排名前 3 的成功片段单独发文案消息——不是每条都发：10 条片子配 10
+    // 条单独消息会把聊天刷屏。"回复片号看该条文案"是明确记录过不做的快速跟进项。
+    const topCaptioned = (status.clips || [])
+      .filter((c) => c.status === "READY" && c.caption?.caption)
+      .slice(0, 3);
+    for (const c of topCaptioned) {
+      await safeSendText(waNumber, socialCaptionMessage(jobLang, c.caption));
+    }
     await redis.del(activeJobKey(waNumber));
     return;
   }
@@ -1173,6 +1198,44 @@ function previewReadyMessage(lang, jobId, animations, degradedOps, generationCos
     msg += t(lang,
       `\n\n💰 本次 AI 生成花费：$${cost.toFixed(2)}`,
       `\n\n💰 AI generation cost for this edit: $${cost.toFixed(2)}`);
+  }
+  return msg;
+}
+
+// 发帖配文消息——独立成一条，格式尽量干净（标签行 + 空行 + 正文 + 空行 +
+// hashtag），方便用户长按整条消息复制后直接粘到 Instagram/Facebook。标签行
+// 会被一起复制到剪贴板（用户要手动删一行）——在"看得懂这是什么"和"复制零
+// 摩擦"之间选了前者，后续如果客户反馈这行确实碍事，再拿掉。
+function socialCaptionMessage(lang, socialCaption) {
+  const hashtags = (socialCaption.hashtags || []).join(" ");
+  return t(lang,
+    `📋 *社交媒体文案*（可直接复制粘贴）：\n\n${socialCaption.caption}\n\n${hashtags}`,
+    `📋 *Social caption* (copy-paste ready):\n\n${socialCaption.caption}\n\n${hashtags}`);
+}
+
+// clip-factory 批次完成消息——按 rank 列出每条片段。失败的片段照样列出来
+// （标 ⚠ 而不是悄悄跳过），跟 previewReadyMessage 对 degradedOps 的一贯做法
+// 一致：宁可让用户知道"这条没成"，也不假装这批只有成功的那几条存在过。
+function clipsReadyMessage(lang, jobId, clips, generationCostUsd) {
+  const list = (clips || []);
+  const lines = list.map((c) => {
+    if (c.status !== "READY" || !c.url) {
+      return t(lang, `⚠ 第 ${c.rank} 條失敗：${c.error_message || "未知原因"}`,
+        `⚠ Clip ${c.rank} failed: ${c.error_message || "unknown reason"}`);
+    }
+    const hook = c.hook_text ? `"${c.hook_text}"` : "";
+    const dur = c.duration_seconds ? ` (${Math.round(c.duration_seconds)}s)` : "";
+    return `${c.rank}. [${c.clip_family || "clip"}]${dur} ${hook}\n${c.url}`;
+  });
+
+  let msg = t(lang,
+    `✅ 幫你剪好咗 ${list.length} 條片，按質量排名：\n\n${lines.join("\n\n")}`,
+    `✅ Here are your ${list.length} ranked clips:\n\n${lines.join("\n\n")}`);
+
+  const cost = Number(generationCostUsd) || 0;
+  if (cost > 0) {
+    msg += t(lang, `\n\n💰 本次 AI 生成花費：$${cost.toFixed(2)}`,
+      `\n\n💰 AI generation cost for this batch: $${cost.toFixed(2)}`);
   }
   return msg;
 }

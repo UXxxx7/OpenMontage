@@ -7,6 +7,8 @@ import uuid
 from typing import Optional
 
 from .database import (
+    Clip,
+    ClipStatus,
     Job,
     JobStatus,
     Message,
@@ -303,5 +305,87 @@ def message_exists(whatsapp_message_id: str) -> bool:
             .first()
             is not None
         )
+    finally:
+        session.close()
+
+# ---------------------------------------------------------------------------
+# Clip CRUD (clip-factory 管线) —— 跟上面 Job 的 CRUD 是同一套写法
+# ---------------------------------------------------------------------------
+
+def create_clips(job_id: str, candidates: list[dict]) -> list[Clip]:
+    """按 rank 顺序批量插入 PENDING 状态的 Clip 行——selection 阶段选完之后、
+    真正开始渲染之前调用，candidates 是 clip_factory.rank_and_trim() 的输出。"""
+    session = get_session()
+    try:
+        clips = []
+        for cand in candidates:
+            clip = Clip(
+                job_id=job_id,
+                status=ClipStatus.PENDING,
+                rank=cand["rank"],
+                clip_family=cand.get("clip_family"),
+                start_seconds=cand["start_seconds"],
+                end_seconds=cand["end_seconds"],
+                hook_text=cand.get("hook_text"),
+                score_hook=(cand.get("scores") or {}).get("hook"),
+                score_coherence=(cand.get("scores") or {}).get("coherence"),
+                score_value=(cand.get("scores") or {}).get("value"),
+                score_energy=(cand.get("scores") or {}).get("energy"),
+                score_platform_fit=(cand.get("scores") or {}).get("platform_fit"),
+                score_total=cand.get("score_total"),
+            )
+            session.add(clip)
+            clips.append(clip)
+        session.commit()
+        for clip in clips:
+            session.refresh(clip)
+            session.expunge(clip)
+        return clips
+    finally:
+        session.close()
+
+
+def get_clips(job_id: str) -> list[Clip]:
+    session = get_session()
+    try:
+        clips = (
+            session.query(Clip)
+            .filter(Clip.job_id == job_id)
+            .order_by(Clip.rank)
+            .all()
+        )
+        for clip in clips:
+            session.expunge(clip)
+        return clips
+    finally:
+        session.close()
+
+
+def update_clip_fields(clip_id: int, **kwargs) -> Optional[Clip]:
+    session = get_session()
+    try:
+        clip = session.query(Clip).filter(Clip.id == clip_id).first()
+        if clip:
+            for key, value in kwargs.items():
+                if hasattr(clip, key):
+                    setattr(clip, key, value)
+            session.commit()
+            session.refresh(clip)
+        return clip
+    finally:
+        session.close()
+
+
+def update_clip_status(clip_id: int, status: ClipStatus, error_message: Optional[str] = None) -> Optional[Clip]:
+    session = get_session()
+    try:
+        clip = session.query(Clip).filter(Clip.id == clip_id).first()
+        if clip:
+            clip.status = status
+            if error_message:
+                clip.error_message = error_message
+            session.commit()
+            session.refresh(clip)
+        return clip
     finally:
         session.close()

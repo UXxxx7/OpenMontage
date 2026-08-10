@@ -43,8 +43,16 @@ class JobStatus(str, Enum):
     RENDERING = "RENDERING"
     DELIVERING = "DELIVERING"
     PREVIEW_READY = "PREVIEW_READY"
+    CLIPS_READY = "CLIPS_READY"  # clip-factory 管线的终态，等价于 talking-head 的 PREVIEW_READY
     DONE = "DONE"
     ERROR = "ERROR"
+
+
+class ClipStatus(str, Enum):
+    PENDING = "PENDING"      # selection 阶段选中，还没开始渲染
+    RENDERING = "RENDERING"
+    READY = "READY"
+    FAILED = "FAILED"        # 真失败或者被 wall-time 预算跳过，用 error_message 区分
 
 
 class MessageDirection(str, Enum):
@@ -137,6 +145,14 @@ class Job(Base):
     social_caption: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     social_hashtags: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON list[str]
 
+    # 发帖配文 + hashtag（social_caption.py 生成，JSON: {lang, caption, hashtags}）。
+    # 命名为 talkinghead_social_caption 而不是 social_caption——那个名字已经被
+    # 上面 social_batch.py 的字段占了（纯字符串 + 独立的 social_hashtags 列，
+    # 形状不一样），两边都叫 social_caption 会互相踩。每次 update_job_fields
+    # 都必须显式传（哪怕是 None）——retry 会重新走到写这个字段的调用点，漏传
+    # kwarg 会让上一轮的旧文案在内容可能已经变了的情况下静默留存。
+    talkinghead_social_caption: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime, default=datetime.datetime.utcnow
     )
@@ -163,6 +179,59 @@ class Job(Base):
     @property
     def final_path_local(self) -> Path:
         return self.job_dir / "final.mp4"
+
+
+class Clip(Base):
+    """clip-factory 管线的产出——一个父 Job（一次对话/一次确认/一套状态机，
+    完全不动）对应 N 条 Clip。没有用 social_batch.py 那种"多条 sibling Job
+    共享 batch_id"的模式：get_active_job_for_user() 和 Node 那整套会话状态机
+    （activeJobKey/armIdle/waitForStatus）都硬编码假设"每个用户同一时间只有
+    一条活跃 Job"，N 条并存的 sibling Job 会让 confirm/retry/cancel 解析到
+    错的那条。子表 + 外键，既有的会话管线一行都不用动。"""
+    __tablename__ = "clips"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    job_id: Mapped[str] = mapped_column(String(36), ForeignKey("jobs.id"), nullable=False, index=True)
+    status: Mapped[ClipStatus] = mapped_column(SAEnum(ClipStatus), default=ClipStatus.PENDING, nullable=False)
+
+    rank: Mapped[int] = mapped_column(Integer, nullable=False)  # 1 = 最强，发布顺序
+    # 自由字符串，不做数据库枚举——clip_factory.py 的 prompt 给了固定词表
+    # （hook/insight/story/proof/opinion），但 LLM 输出偶尔会跑偏，DB 层不
+    # 因为一个没见过的取值就整条写入失败。
+    clip_family: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    start_seconds: Mapped[float] = mapped_column(Float, nullable=False)
+    end_seconds: Mapped[float] = mapped_column(Float, nullable=False)
+    hook_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    score_hook: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    score_coherence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    score_value: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    score_energy: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    score_platform_fit: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    score_total: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    # /files/{job_id}/{filename} 这条路由（FastAPI 和 Express 两边都一样）
+    # 不支持嵌套路径，所以最终产物是平铺在 job_dir 根目录下的文件名，不是
+    # 完整路径——跟 job.preview_path/final_path 存完整路径不是一回事。
+    output_filename: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    duration_seconds: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    # {lang, caption, hashtags}，social_caption.generate_caption() 的原样输出。
+    # 故意不叫 social_caption——那个名字在这个文件里已经被 Job.social_caption
+    # （social_batch.py 用，纯字符串）和 Job.talkinghead_social_caption
+    # （transcript-based caption 功能，JSON blob）两边占用了，三个不同形状的
+    # 字段抢同一个名字迟早互相踩。
+    caption_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    degraded_operations: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON list，同 Job 的用法
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, default=datetime.datetime.utcnow
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow
+    )
+    # 没有加 relationship 到 Job——get_job() 现有那套 detached-instance/expunge
+    # 处理比较敏感，不想因为这个新功能牵连改动。clips 通过 job_manager.get_clips()
+    # 单独查询。
 
 
 class Message(Base):
@@ -226,6 +295,9 @@ def _migrate_schema(engine) -> None:
     if "social_hashtags" not in cols:
         with engine.begin() as conn:
             conn.execute(_text("ALTER TABLE jobs ADD COLUMN social_hashtags TEXT"))
+    if "talkinghead_social_caption" not in cols:
+        with engine.begin() as conn:
+            conn.execute(_text("ALTER TABLE jobs ADD COLUMN talkinghead_social_caption TEXT"))
 
     try:
         user_cols = {c["name"] for c in _inspect(engine).get_columns("users")}

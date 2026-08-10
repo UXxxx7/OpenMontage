@@ -227,6 +227,192 @@ def run_final_export(job: Job) -> dict[str, Any]:
 
 
 # ============================================================================
+# Clip Factory：一条长视频 -> N 条独立排名短片
+#
+# 跟 run_talking_head_pipeline 的通用 op-handler 派发不是一回事——candidate
+# 列表已经在规划阶段（worker._plan_clip_factory -> clip_factory.select_clips）
+# 定好了，这里只负责把每条候选真正渲染出来。每条 clip 独立 try/except、
+# 独立落库，一条失败不连累其它——这是 clip-factory.yaml 的 compose-director
+# 阶段"fail softly, continue the rest of the batch"要求的具体实现，不只是
+# 写在注释里的美好愿望。
+# ============================================================================
+
+def run_clip_factory_pipeline(job: Job) -> dict[str, Any]:
+    """按 job.planned_edit 里的 candidates 列表逐条渲染，每条独立成败。
+
+    只有全批次一条都没成功时才抛异常（外层 worker.run_pipeline 的 try/except
+    会把它变成 JobStatus.ERROR，跟 run_talking_head_pipeline 失败时的传播方式
+    一致）——只要有一条成功，整批就按"部分交付"处理，不整体报错。
+    """
+    from .job_manager import create_clips, update_clip_fields, update_clip_status
+    from .database import ClipStatus
+
+    job_dir = job.job_dir
+    input_video = job_dir / "input.mp4"
+    if not input_video.exists():
+        raise FileNotFoundError(f"找不到输入视频: {input_video}")
+
+    plan = _load_plan(job)
+    candidates = plan.get("candidates") or []
+    if not candidates:
+        raise RuntimeError("planned_edit 里没有 candidates，clip-factory 无法渲染")
+
+    clip_rows = create_clips(job.id, candidates)
+    config = get_config()
+    deadline = time.time() + config.clip_factory_wall_time_s
+
+    ready_count = 0
+    total_generation_cost = 0.0
+    for i, (cand, row) in enumerate(zip(candidates, clip_rows), 1):
+        if time.time() > deadline:
+            logger.warning(f"clip-factory: job {job.id} 达到 wall-time 预算，"
+                           f"跳过剩余 {len(candidates) - i + 1} 条")
+            update_clip_status(row.id, ClipStatus.FAILED,
+                              "skipped: batch wall-time budget exhausted")
+            continue
+
+        update_clip_status(row.id, ClipStatus.RENDERING)
+        clip_workdir = job_dir / f"clip_{row.id}"
+        clip_workdir.mkdir(parents=True, exist_ok=True)
+        out_filename = f"clip_{row.rank:02d}.mp4"
+        try:
+            result = _render_one_clip(input_video, clip_workdir, cand, job_dir, out_filename)
+        except Exception as e:
+            logger.exception(f"clip-factory: 第 {i} 条渲染失败: {e}")
+            update_clip_status(row.id, ClipStatus.FAILED, str(e)[:500])
+            continue
+
+        caption_result = result.get("caption")
+        update_clip_fields(
+            row.id,
+            status=ClipStatus.READY,
+            output_filename=out_filename,
+            duration_seconds=result.get("duration"),
+            caption_json=json.dumps(caption_result, ensure_ascii=False) if caption_result else None,
+            degraded_operations=json.dumps(result.get("degraded") or []),
+        )
+        ready_count += 1
+
+    if ready_count == 0:
+        raise RuntimeError("clip-factory: 全部候选片段渲染失败，没有任何一条成功")
+
+    return {
+        "clip_count": ready_count,
+        "clip_count_total": len(candidates),
+        "generation_cost_usd": total_generation_cost,
+    }
+
+
+def _render_one_clip(input_video: Path, clip_workdir: Path, cand: dict,
+                     job_dir: Path, out_filename: str) -> dict:
+    """单条候选的渲染：裁剪 -> 转写(clip 自己独立时间轴) -> 字幕烧录(可降级) ->
+    音频降噪+调色(可降级) -> 平铺拷到 job_dir 根目录 -> 生成配文(可降级)。
+
+    裁剪失败是致命的（没有视频可用），其余步骤失败都只记录到 degraded 列表、
+    继续用上一步的产物往后走——跟 run_talking_head_pipeline 对 apply_style/
+    insert_broll 的降级哲学一致。
+    """
+    from tools.video.video_trimmer import VideoTrimmer
+    from tools.video.remotion_caption_burn import RemotionCaptionBurn
+    from tools.enhancement.color_grade import ColorGrade
+    from tools.audio.audio_enhance import AudioEnhance
+
+    degraded: list[str] = []
+    config = get_config()
+
+    # 1. 裁剪——致命，没有片段就没有这条 clip。
+    start = float(cand["start_seconds"])
+    end = float(cand["end_seconds"])
+    trimmed = clip_workdir / "trimmed.mp4"
+    r = VideoTrimmer().execute({
+        "operation": "cut", "input_path": str(input_video),
+        "start_seconds": start, "end_seconds": end, "codec": "libx264",
+        "output_path": str(trimmed),
+    })
+    if not r.success:
+        raise RuntimeError(f"clip 裁剪失败: {r.error}")
+    src = r.artifacts[0] if r.artifacts else str(trimmed)
+
+    # 2. 独立转写——clip 有自己的 0 基时间轴，不是从源视频时间戳平移过来的
+    # （跟 _op_add_subtitles 对剪过的视频重新转写是同一个道理）。这次转写
+    # 拿到的是 word-level 原始 segments（给 RemotionCaptionBurn 用），额外
+    # 精简一份 {id,start,end,text} 存成 script_transcript.json（跟
+    # pipeline_runner.transcribe_segments() 的缓存形状一致），让
+    # social_caption.generate_caption() 能直接复用，不用再转写一次。
+    t = _safe_transcribe(src, clip_workdir, config.faster_whisper_model)
+    word_segments = (t.data.get("segments") if t and t.success else None) or []
+    if word_segments:
+        slim = [
+            {"id": s.get("id"), "start": round(_num(s.get("start")) or 0.0, 2),
+             "end": round(_num(s.get("end")) or 0.0, 2), "text": (s.get("text") or "").strip()}
+            for s in word_segments
+        ]
+        (clip_workdir / "script_transcript.json").write_text(
+            json.dumps({"segments": slim, "language": t.data.get("language")},
+                      ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    # 3. 字幕烧录——可降级：没转写出内容就不烧字幕，不整条失败。
+    if word_segments:
+        try:
+            captioned = clip_workdir / "captioned.mp4"
+            r = RemotionCaptionBurn().execute({
+                "input_path": src, "output_path": str(captioned), "segments": word_segments,
+            })
+            if r.success and r.artifacts:
+                src = r.artifacts[0]
+            else:
+                degraded.append("add_subtitles")
+                logger.warning(f"clip 字幕烧录失败，交付无字幕版本: {getattr(r, 'error', None)}")
+        except Exception as e:
+            degraded.append("add_subtitles")
+            logger.warning(f"clip 字幕烧录异常，交付无字幕版本: {e}")
+    else:
+        degraded.append("add_subtitles")
+
+    # 4. 调色 + 降噪——best-effort：单步失败就跳过、继续用上一步的产物，不让
+    # 收尾步骤拖垮整条 clip。
+    for name, tool_cls, extra in (
+        ("color_grade", ColorGrade, {"profile": "cinematic_warm", "intensity": 0.85}),
+        ("audio_enhance", AudioEnhance, {"preset": "clean_speech"}),
+    ):
+        try:
+            out = clip_workdir / f"_{name}.mp4"
+            r = tool_cls().execute({"input_path": src, "output_path": str(out), **extra})
+            if r.success:
+                new_src = r.data.get("output") or (r.artifacts[0] if r.artifacts else None)
+                if new_src and Path(new_src).exists():
+                    src = new_src
+                else:
+                    degraded.append(name)
+            else:
+                degraded.append(name)
+        except Exception as e:
+            degraded.append(name)
+            logger.warning(f"clip {name} 出错，跳过: {e}")
+
+    # 5. 平铺拷到 job_dir 根目录——/files/{job_id}/{filename} 这条路由（FastAPI
+    # 和 Express 两边都一样）不支持嵌套路径，clip_workdir 只是中间产物暂存地。
+    final_path = job_dir / out_filename
+    shutil.copy(src, final_path)
+    duration = _probe_duration(final_path)
+
+    # 6. 配文——复用今天已经建好、验证过的 social_caption.py，原样调用，不
+    # 重新发明第三套文案系统。hook_text 当 edit_request 传进去，只是用来给
+    # 语言判定 (_resolve_lang) 一个信号，不是真正意义上的"用户指令"。
+    caption_result = None
+    try:
+        from .social_caption import generate_caption
+        caption_result = generate_caption(clip_workdir, cand.get("hook_text"))
+    except Exception as e:
+        degraded.append("social_caption")
+        logger.warning(f"clip 配文生成失败，不影响 clip 本身交付: {e}")
+
+    return {"duration": duration, "degraded": degraded, "caption": caption_result}
+
+
+# ============================================================================
 # 操作处理器（op -> 正式工具）
 # 每个 handler: (src_path, op_dict, workdir) -> 新文件路径 或 None（无变化则跳过）
 # 工具都是惰性 import，缺依赖只影响对应操作，不会拖垮整个 worker。
