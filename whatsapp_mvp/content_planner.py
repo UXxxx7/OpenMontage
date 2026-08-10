@@ -348,6 +348,39 @@ def _call_llm_json(label: str, system_prompt: str, user_message: str, *, tempera
         return None
 
 
+_PIPELINE_INTENT_SYSTEM = """You classify a user's WhatsApp message (attached to a video upload)
+into exactly one of two categories. Respond with JSON only: {"intent": "clip-factory"} or
+{"intent": "talking-head"}.
+
+"clip-factory" = the user wants MULTIPLE independent short clips extracted from one long recording
+for social posting — e.g. "cut this into some short clips", "give me a few TikTok clips from this",
+"turn this webinar into shorts", "repurpose this for social media", "剪幾條短片", "幫我剪出幾條片",
+"整幾條reels", "拆返幾條片出嚟". The signal is an explicit MULTIPLICITY / repurposing intent, not
+just "make it shorter" — a bare "make it shorter" / "剪短一點" is a normal single-edit trim request,
+NOT clip-factory, even though it also implies less footage.
+
+"talking-head" = everything else: a normal single-video edit (trim, subtitles, filler removal,
+music, b-roll, style/branding, or ambiguous/underspecified requests).
+
+If genuinely ambiguous, answer "talking-head" — it is the existing, safer, cheaper default; a
+clip-factory false positive costs the user a long wait and an unwanted batch of videos."""
+
+
+def classify_pipeline_intent(edit_request: str) -> str:
+    """用户发视频时附带的文字 -> "clip-factory" 还是 "talking-head"。
+
+    失败关闭（fail closed）到 "talking-head"——这里"talking-head"才是那个便宜、
+    快、符合预期的既有默认路径，误判成 clip-factory 会让用户平白等上大半小时、
+    收到一堆不想要的视频；误判成 talking-head 顶多是用户需要把话说得更明确
+    一点再试一次。
+    """
+    raw = _call_llm_json("管线意图分类", _PIPELINE_INTENT_SYSTEM, edit_request or "",
+                         temperature=0.0)
+    if isinstance(raw, dict) and raw.get("intent") == "clip-factory":
+        return "clip-factory"
+    return "talking-head"
+
+
 def plan_content(segments: list[dict], duration: float, *, feedback: Optional[str] = None,
                   word_timestamps: Optional[list[dict]] = None,
                   deadline: Optional[float] = None) -> dict[str, Any]:

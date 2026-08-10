@@ -76,6 +76,26 @@ def run_pipeline(job_id: str) -> None:
     try:
         update_job_status(job_id, JobStatus.RUNNING_PIPELINE)
 
+        # clip-factory 走完全不同的执行函数和终态——candidates 早在规划阶段
+        # 就选好了（见 _plan_clip_factory），这里只负责逐条渲染。跟下面
+        # talking-head 分支共享同一层 try/except：clip-factory 整批失败
+        # （run_clip_factory_pipeline 只在一条都没成功时才抛异常）一样会落进
+        # 底部的 except，变成 JobStatus.ERROR，传播方式完全一致。
+        if job.pipeline == "clip-factory":
+            _safe_send(WhatsAppClient(get_config()), job.user.whatsapp_id,
+                      "开始渲染选中的片段…（片数较多时会比较久）")
+            from .pipeline_runner import run_clip_factory_pipeline
+
+            cf_result = run_clip_factory_pipeline(job)
+            update_job_fields(
+                job_id,
+                status=JobStatus.CLIPS_READY,
+                generation_cost_usd=cf_result.get("generation_cost_usd") or 0.0,
+            )
+            logger.info(f"clip-factory 完成: job {job_id}, "
+                       f"{cf_result.get('clip_count')}/{cf_result.get('clip_count_total')} 条成功")
+            return
+
         # 进度预览：确认后到预览生成之间可能较久（剪辑 + b-roll 合成 + 渲染），先回一条
         _safe_send(WhatsAppClient(get_config()), job.user.whatsapp_id,
                    "开始剪辑与合成，正在生成预览…（含 b-roll 合成时会稍久）")
@@ -85,6 +105,24 @@ def run_pipeline(job_id: str) -> None:
         result = run_talking_head_pipeline(job)
 
         if result.get("preview_path"):
+            # 发帖配文生成——必须在标记 PREVIEW_READY 的同一次 update_job_fields
+            # 里一起落库（原子写），不能等这次写完再补一次。Node 网关的
+            # waitForStatus() 一见到 PREVIEW_READY 就返回、不会再轮询第二次，
+            # deliverStageResult() 只会拿那一次快照发消息——如果 talkinghead_social_caption
+            # 是分两次写，轮询窗口刚好卡在两次写中间时，文案会在用户毫无感知的
+            # 情况下永久丢失。这里内部已有 25s 硬性上限（social_caption.py），
+            # 失败/超时都返回 None，外层再包一层 try/except 双保险——文案这个
+            # 附加功能绝不能拖累或搞崩预览消息本身。
+            social_caption_json = None
+            if get_config().social_caption_enabled:
+                try:
+                    from .social_caption import generate_caption
+                    caption_result = generate_caption(job.job_dir, job.edit_request)
+                    if caption_result:
+                        social_caption_json = json.dumps(caption_result, ensure_ascii=False)
+                except Exception as e:
+                    logger.warning(f"social_caption: 生成失败，不影响预览交付: {e}")
+
             update_job_fields(
                 job_id,
                 preview_path=result["preview_path"],
@@ -95,6 +133,9 @@ def run_pipeline(job_id: str) -> None:
                 degraded_operations=json.dumps(result.get("degraded_operations") or []),
                 # AI 生成累计花费（同理覆盖旧值，没生成过就是 0）。
                 generation_cost_usd=result.get("generation_cost_usd") or 0.0,
+                # 同上：显式传，哪怕是 None——retry 会重新走到这里，漏传会让
+                # 上一轮成功生成的旧文案在这一轮失败时静默留存下来。
+                talkinghead_social_caption=social_caption_json,
             )
             config = get_config()
             wa = WhatsAppClient(config)
@@ -457,12 +498,77 @@ def _script_stage(job: Any, input_path: Path) -> list:
         return []
 
 
+def _plan_clip_factory(job: Any, wa: Any = None) -> None:
+    """clip-factory 管线的规划阶段：转录 -> 选片排序 -> 写 planned_edit。
+
+    故意不新写一套确认消息逻辑——把 planned_edit 写成跟 talking-head 规划
+    兼容的 {summary, edit_operations} 形状，直接复用现成的 _send_confirmation
+    （Python 侧）/ formatPlanMessage（Node 侧，真正展示给用户的那条），
+    confirm/cancel 整条会话流程一行都不用改。candidates 的完整结构化数据
+    另外存在 planned_edit.candidates 里，供确认后 run_clip_factory_pipeline
+    真正渲染时使用。
+
+    选不出候选（源太短/没有转写内容/LLM 不可用）就退回 talking-head 规划，
+    不让用户卡在一个"选片选不出来"的死胡同里。
+    """
+    update_job_status(job.id, JobStatus.PLANNING)
+    input_path = job.job_dir / "input.mp4"
+
+    if wa:
+        _safe_send(wa, job.user.whatsapp_id, "正在转录并挑选最佳片段…（长视频这一步会比较久）")
+
+    from .pipeline_runner import _probe_duration, transcribe_segments
+    duration = _probe_duration(input_path) or 0.0
+    segments = transcribe_segments(str(input_path), job.job_dir)
+
+    from .clip_factory import select_clips, rank_and_trim
+    selection = select_clips(segments, duration, workdir=job.job_dir)
+    candidates = rank_and_trim(selection)
+
+    if not candidates:
+        logger.info(f"clip-factory: job {job.id} 没有选出合格候选片段，退回 talking-head 规划")
+        update_job_fields(job.id, pipeline="talking-head")
+        _run_llm_planner(job, wa)
+        return
+
+    min_c = selection.get("min_clips", 0)
+    max_c = selection.get("max_clips", 0)
+    summary = (f"这段视频大约 {duration/60:.0f} 分钟，我按质量挑了 {len(candidates)} 条独立片段"
+              f"（目标区间 {min_c}-{max_c} 条），排名如下：")
+    operations = [
+        {"description": f"#{c['rank']} [{c.get('clip_family', 'clip')}] "
+                        f"{(c.get('hook_text') or '')[:60]} (~{c['duration_seconds']:.0f}s)"}
+        for c in candidates
+    ]
+    plan = {
+        "pipeline": "clip-factory",
+        "summary": summary,
+        "edit_operations": operations,
+        "candidates": candidates,
+    }
+    update_job_fields(job.id, pipeline="clip-factory",
+                      planned_edit=json.dumps(plan, ensure_ascii=False))
+    logger.info(f"clip-factory 规划完成: job {job.id}, {len(candidates)} 条候选")
+
+
 def _run_llm_planner(job: Any, wa: Any = None) -> None:
     """用 L2 agent 规划编辑方案（读 manifest/skill + tool-calling + 自审 + schema 校验）。
 
     agent 出错时回退到 L1.5 关键词/结构化规划器，保证任务不中断。
     传入 wa 时会在转录/规划两个较慢阶段前回传进度消息（进度预览）。
     """
+    # clip-factory 意图分类——放在最前面，比 Arm B/L2 都早：命中就整条短路，
+    # 走完全不同的规划路径（选片而不是单条编辑方案）。分类失败关闭到
+    # "talking-head"（见 classify_pipeline_intent 自己的注释），不会卡在这里。
+    # CLIP_FACTORY_ENABLED=false 时整段跳过分类调用，等价于这个功能不存在——
+    # 出问题能立刻关掉，不用等代码回滚（同 SOCIAL_CAPTION_ENABLED 的用法）。
+    if get_config().clip_factory_enabled:
+        from .content_planner import classify_pipeline_intent
+        pipeline_kind = classify_pipeline_intent(job.edit_request or "")
+        if pipeline_kind == "clip-factory":
+            _plan_clip_factory(job, wa)
+            return
+
     # ── Arm B:author 先行(补丁点①)──
     # 路由命中 arm_b 时,规划阶段就现写 tsx + 出分镜当方案,短路 L2。
     # plan_authored 返回 None(未命中 / author 失败)→ 落穿下面的 L2 规划(Arm A)。

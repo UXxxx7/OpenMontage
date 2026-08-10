@@ -137,6 +137,22 @@ class Config:
     remotion_preview: bool = field(
         default_factory=lambda: os.getenv("REMOTION_PREVIEW", "true").lower() == "true"
     )
+    # 发帖配文生成的开关——第一个上线的"创作型" LLM 功能，质量还没有生产数据
+    # 验证过（few-shot 样本库现在是空的），出问题时客户要能立刻关掉而不用等
+    # 代码回滚。默认开，跟 remotion_preview 同一个模式。
+    social_caption_enabled: bool = field(
+        default_factory=lambda: os.getenv("SOCIAL_CAPTION_ENABLED", "true").lower() == "true"
+    )
+    # clip-factory 每批次的硬性 wall-time 上限（秒）——一条长视频可能选出 15
+    # 条候选，每条都要跑裁剪+转写+字幕+调色+降噪+配文，加起来可能远超单条
+    # talking-head 编辑的耗时。达到上限就停止渲染剩余候选、把已经渲染好的
+    # 交付出去（fail soft，不整批报错）——见 pipeline_runner.run_clip_factory_pipeline。
+    clip_factory_wall_time_s: int = field(
+        default_factory=lambda: int(os.getenv("CLIP_FACTORY_WALL_TIME_S", "1800"))
+    )
+    clip_factory_enabled: bool = field(
+        default_factory=lambda: os.getenv("CLIP_FACTORY_ENABLED", "true").lower() == "true"
+    )
 
     @property
     def jobs_dir(self) -> Path:

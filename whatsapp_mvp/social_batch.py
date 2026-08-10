@@ -27,6 +27,28 @@ from .llm_client import call_vision_chat
 
 logger = logging.getLogger(__name__)
 
+# 只用繁體字是硬性要求，但光靠 prompt 管不住（social_caption.py 那边真人实测
+# 抓到过模型自己混入简体字）。这里加同一道机械防线：产出前统一过一遍简转繁。
+# s2t（通用简转繁）而不是 s2hk（香港政府官方字形表）——两者对同一批字给出不同
+# 字形（"説" vs "說"），s2t 给出的是日常打字实际会打出来的字形，更贴近这段文案
+# 要被复制去发帖的真实使用场景。
+try:
+    from opencc import OpenCC
+    _S2T_CONVERTER: Optional["OpenCC"] = OpenCC("s2t")
+except Exception as e:
+    logger.warning(f"social_batch: OpenCC 初始化失败，简转繁安全网关闭: {e}")
+    _S2T_CONVERTER = None
+
+
+def _to_traditional(text: str) -> str:
+    if _S2T_CONVERTER is None:
+        return text
+    try:
+        return _S2T_CONVERTER.convert(text)
+    except Exception as e:
+        logger.warning(f"social_batch: 简转繁调用失败，放行原文: {e}")
+        return text
+
 # 平台变体定义：asset_kind 决定这个变体用照片还是视频；order 决定生成顺序
 # （video 类共享同一条基础视频，只需生成一次，放前面）。
 PLATFORM_SPECS = [
@@ -37,34 +59,57 @@ PLATFORM_SPECS = [
 
 _CAPTION_RULES = {
     "instagram_feed": {
-        "zh": "写一段充满氛围感的走心长文（3-5 句），配 3 个贴切的 emoji（穿插在文字里，不要全堆在结尾）。语气私人、像艺人自己发的，不是通稿。",
-        "en": "Write an atmospheric, heartfelt caption (3-5 sentences) with 3 well-placed emoji woven into the text (not all dumped at the end). Personal tone, like the artist wrote it themselves, not a press release.",
+        "zh": "写一段充满氛围感的走心长文（3-5 句），配 3 个貼切的 emoji（穿插在文字里，不要全堆在结尾）。语气私人、像本人自己发的，不是通稿。",
+        "en": "Write an atmospheric, heartfelt caption (3-5 sentences) with 3 well-placed emoji woven into the text (not all dumped at the end). Personal tone, like the poster wrote it themselves, not a press release.",
     },
     "instagram_reel": {
-        "zh": "写一句能在前3秒抓住人的钩子文案（1-2 句，够短够冲），配合视频里的高光瞬间。",
-        "en": "Write a scroll-stopping hook line (1-2 sentences, punchy) that works as the first 3 seconds of text on screen, matching the video's peak moment.",
+        "zh": "写一句能在前3秒抓住人的钩子文案（1-2 句，够短够冲），配合视频里的高光瞬间。可以加1个貼切的 emoji 加强语气，不必强求。",
+        "en": "Write a scroll-stopping hook line (1-2 sentences, punchy) that works as the first 3 seconds of text on screen, matching the video's peak moment. One well-placed emoji is fine if it fits, don't force it.",
     },
     "instagram_story": {
-        "zh": "写一句简短的互动文字（1 句话），像投票贴纸或提问贴纸配的文案——邀请粉丝回复或互动，不是陈述。",
-        "en": "Write one short interactive line — like the text next to a poll or question sticker — inviting a reply, not a statement.",
+        "zh": "写一句简短的互动文字（1 句话），像投票贴纸或提问贴纸配的文案——邀请粉丝回复或互动，不是陈述。可以加1个 emoji。",
+        "en": "Write one short interactive line — like the text next to a poll or question sticker — inviting a reply, not a statement. One emoji is fine.",
     },
 }
 _HASHTAG_COUNT = {"instagram_feed": 0, "instagram_reel": 8, "instagram_story": 0}
+
+# 老套/AI 腔調用語黑名單——跟 social_caption.py 的做法一致：一份清單，prompt 里當
+# 硬性禁止項，生成後再拿來做機械檢查（見 _lint_caption），不指望只靠 prompt 就
+# 100% 杜絕。
+_BANNED_PHRASES_ZH = [
+    "在這個瞬息萬變的時代", "在这个瞬息万变的时代",
+    "你知唔知道", "你有無諗過", "你有沒有想過",
+    "立即聯繫我了解更多", "立即联系我了解更多",
+]
+_BANNED_PHRASES_EN = [
+    "in today's fast-paced world", "let's dive in", "have you ever wondered",
+    "contact me today to learn more", "3 things you need to know",
+]
 
 
 def _base_photo_prompt(hint: str, platform: str, lang: str) -> str:
     rules = _CAPTION_RULES[platform][lang]
     hint_line = ""
     if hint.strip():
-        hint_line = (f'艺人给的方向提示："{hint.strip()}"，围绕这个来写。\n' if lang == "zh"
-                    else f'The artist gave this direction: "{hint.strip()}" — write around it.\n')
+        hint_line = (f'方向提示："{hint.strip()}"，围绕这个来写。\n' if lang == "zh"
+                    else f'Direction given: "{hint.strip()}" — write around it.\n')
     hashtag_n = _HASHTAG_COUNT[platform]
     if lang == "zh":
-        hashtag_line = (f"文案写完后单独另起一行，只放 {hashtag_n} 个贴切的英文 hashtag（空格分隔，"
+        hashtag_line = (f"文案写完后单独另起一行，只放 {hashtag_n} 个貼切的英文 hashtag（空格分隔，"
                         "带#号，不要混进文案正文里）。" if hashtag_n else "不要加任何 hashtag。")
         return (
-            "这张照片来自一位艺人的巡演后台，要发布到社交媒体。请看图写一段配文。\n"
+            # 原本这里硬写死"这张照片来自一位艺人的巡演后台"——跟这个产品实际的目标
+            # 用户（香港保险从业员/KOL）完全对不上，硬套这个场景只会让配文显得莫名其妙。
+            # 交给照片本身 + hint 去带出真实场景，不预设身份。
+            "这张照片准备发布到社交媒体，请看图写一段配文。\n"
             f"{hint_line}{rules}\n"
+            "只用繁體字，不可以出现简体字（哪怕看图判断出来的内容让你想用简体，输出也必须是繁體）。\n"
+            "唔好用破折號「—」，一次都唔好——用句號、逗號或者換行代替，真人用手機打字幾乎唔會打破折號。\n"
+            "絕對唔好出現呢啲老套/AI 腔調嘅講法：「在這個瞬息萬變的時代」、連續堆疊反問句\n"
+            "（「你有沒有想過…你知唔知道…」）、清單式開頭（「3個原因」）、推銷式收尾\n"
+            "（「立即聯繫我了解更多」）、空洞嘅行業套話。\n"
+            "文案入面提到嘅嘢要同相片本身或者方向提示對得上——唔好編造相片入面睇唔到、\n"
+            "方向提示冇講過嘅內容。\n"
             "emoji 必须是真正的 emoji 字符（比如 🎤 ❤️ ✨），"
             "绝对不要用「[鼓掌]」「[心形]」这种方括号文字描述代替 emoji。\n"
             "只输出文案本身，不要解释、不要加引号、不要 markdown。\n"
@@ -74,9 +119,20 @@ def _base_photo_prompt(hint: str, platform: str, lang: str) -> str:
                     "relevant hashtags (space-separated, with #) — do not mix hashtags into "
                     "the caption text itself." if hashtag_n else "Do not include any hashtags.")
     return (
-        "This photo is from an artist's tour backstage, to be posted on social media. "
-        "Look at the photo and write the caption.\n"
+        # Previously hardcoded "this photo is from an artist's tour backstage" here — doesn't
+        # match this product's actual target user (HK insurance agents/KOLs), and forcing that
+        # scenario onto an unrelated photo just reads as bizarre. Let the photo + hint carry
+        # the real context instead of presupposing one.
+        "This photo is being posted to social media. Look at the photo and write the caption.\n"
         f"{hint_line}{rules}\n"
+        "No em dashes (—), anywhere — use a period, comma, or line break instead; real "
+        "people typing on a phone essentially never use them.\n"
+        "Never use these clichés, not even once: \"In today's fast-paced world...\", \"Let's "
+        "dive in\", stacked rhetorical questions (\"Have you ever wondered... Did you "
+        "know...\"), listicle framing (\"3 reasons why...\"), corporate CTA closers (\"Contact "
+        "us today to learn more\"), generic platitudes.\n"
+        "Everything in the caption must match what's actually visible in the photo or stated "
+        "in the direction above — don't invent details you can't see or weren't told.\n"
         "Emoji must be real emoji characters (e.g. 🎤 ❤️ ✨) — never bracketed text "
         "placeholders like \"[clap]\" or \"[heart]\".\n"
         "Output only the caption itself — no explanation, no quotes, no markdown.\n"
@@ -108,7 +164,24 @@ def generate_social_caption(photo_path: str, platform: str, lang: str = "zh",
     if not caption:
         # 保守兜底：万一整段都被当成 hashtag 抠空了，用原始输出兜底，不返回空文案。
         caption = result.strip()
+
+    if lang == "zh":
+        caption = _to_traditional(caption)
+        hashtags = [_to_traditional(h) for h in hashtags]
+
+    _lint_caption(caption, lang)
     return {"caption": caption, "hashtags": hashtags}
+
+
+def _lint_caption(caption: str, lang: str) -> None:
+    """非阻断检查——命中只记 warning，不拦截、不重跑，跟 social_caption.py 的
+    _lint_caption 同一个哲学：给开发者留观测信号，不指望 LLM 自我审查靠得住。"""
+    blocklist = _BANNED_PHRASES_ZH if lang == "zh" else _BANNED_PHRASES_EN
+    hits = [p for p in blocklist if p.lower() in caption.lower()]
+    if hits:
+        logger.warning(f"social_batch: 生成结果命中老套用语黑名单 {hits}——文案仍会交付")
+    if "—" in caption:
+        logger.warning("social_batch: 生成结果含有破折号「—」——文案仍会交付")
 
 
 def generate_batch(batch_id: str, user_id: int, photo_path: str, lang: str = "zh",

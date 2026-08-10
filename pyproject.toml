@@ -9,6 +9,7 @@ dependencies = [
     "faster-whisper>=1.2.1",
     "jsonschema>=4.26.0",
     "ngrok>=1.7.0",
+    "opencc-python-reimplemented>=0.1.7",
     "opencv-python-headless<5",
     "pillow>=12.3.0",
     "pydantic>=2.13.4",

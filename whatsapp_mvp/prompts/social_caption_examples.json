@@ -1,0 +1,12 @@
+{
+  "_comment": "social_caption.py 的 few-shot 样本库——发帖配文（IG/Facebook 帖子正文 + hashtag），不是口播稿，不能从 insurance_scripts_extended.json 借用（那是内地话术腔调的长口播稿，genre 完全不同）。目前是空的：还没有真实的香港 KOL 帖文样本可以放进来，虚构几条看似真实的样本比不放样本更糟——要么被当真样本用，要么将来还得手工甄别哪些是编的。这是客户那边的待办：从 KOL 网络/往期发帖里收集 15-20+ 条真实样本，按下面的 schema 整理进来，是目前提升'不像 AI 腔'这个质量目标的最高杠杆动作。样本库为空时 social_caption.py 会优雅降级成 zero-shot 生成，不会报错。",
+  "_schema": {
+    "id": "字符串，唯一标识，如 CAP_ZH_001",
+    "category": "险种/主题分类，如 重疾險/醫療險/退休年金，泛用样本可留空字符串",
+    "lang": "zh 或 en",
+    "platform": "generic，未来如需按平台区分再扩展（如 instagram/xiaohongshu）",
+    "caption": "真实发过的帖文正文，保留原始换行（\\n）和表情符号",
+    "hashtags": ["数组，真实用过的 hashtag，含 # 前缀"]
+  },
+  "captions": []
+}
