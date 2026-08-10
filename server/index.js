@@ -85,6 +85,27 @@ app.get("/files/:jobId/:filename", async (req, res) => {
   }
 });
 
+// Studio 预览页数据接口：JSON 代理到 Python GET /batches/{id}（跟上面
+// /files 那条同一个"薄代理"模式，浏览器不用直连 Python API）。
+app.get("/api/batches/:batchId", async (req, res) => {
+  const upstream = `${PYTHON_API_BASE}/batches/${encodeURIComponent(req.params.batchId)}`;
+  try {
+    const upstreamRes = await axios.get(upstream, { validateStatus: () => true });
+    res.status(upstreamRes.status).json(upstreamRes.data);
+  } catch (err) {
+    console.error(`[batches-proxy] failed to fetch ${upstream}:`, err.message);
+    res.sendStatus(502);
+  }
+});
+
+// Studio 预览页本体：纯静态页面 + 客户端 JS 拉 /api/batches/:batchId 渲染
+// （跟 /upgrade 同一个"Node 挂静态页、WhatsApp 消息里发链接过去"的模式）。
+// batchId 本身不可猜测（uuid 前 12 位）就是这里的访问控制，跟 /files/:jobId
+// 一直以来的做法一致，未额外加登录。
+app.get("/studio/:batchId", (_req, res) => {
+  res.sendFile(resolve(dirname(fileURLToPath(import.meta.url)), "studio.html"));
+});
+
 app.get(["/webhook", "/webhook/whatsapp"], (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
@@ -162,6 +183,21 @@ async function handleMessage(message) {
     const mediaId = message.audio?.id;
     const lang = resolveLang(env("WA_DEFAULT_LANG", "zh"));
     if (!mediaId) return;
+
+    // 正在等这条语音去做声音克隆——这条音频本身就是要克隆的素材，不是要
+    // 理解内容的一句话，转写没有意义（还会浪费一次转写调用）。必须在转写
+    // 之前拦截，拦完直接 return，不落进下面"变成文字消息"的通用路由。
+    const awaitVoiceClone = await withTimeout(
+      redis.get(awaitVoiceCloneKey(waNumber)), Number(env("WA_REDIS_OP_TIMEOUT_MS", "2000")), null);
+    if (awaitVoiceClone) {
+      await redis.del(awaitVoiceCloneKey(waNumber));
+      await gatewaySendText(waNumber, t(lang,
+        "收到，正在注册你的专属声音，大约几秒钟…",
+        "Got it — registering your voice, this takes a few seconds…"));
+      await videoQueue.add("voice-clone-create", { waNumber, mediaId, msgId }, queueOptions(msgId));
+      return;
+    }
+
     let transcribed = "";
     try {
       transcribed = await downloadAndTranscribeVoice(mediaId);
@@ -231,6 +267,11 @@ async function handleMessage(message) {
     return;
   }
 
+  // 社媒批次：一张照片 + 触发词 caption → 一次生成 IG Feed/Reel·TikTok/Story
+  // 三个平台变体（各自文案+hashtag），Studio 预览页链接发回。跟下面 C-roll
+  // 同一个"必须显式触发词、且收集态未进行中才认"的防撞车规则，关键词集合
+  // 跟 CROLL_TRIGGER_RE 不重叠，两者互斥判断不影响彼此。
+  const SOCIAL_BATCH_TRIGGER_RE = /\bsocial\b|instagram|tiktok|\breel\b|\bpost\b|发(?:个|条)?\s*(?:ins|图文|帖子)|社媒|多平台/i;
   // C-roll：一张照片 + 触发词 caption → AI 看图写文案 + HeyGen 生成数字人
   // 说话视频，再自动接入常规剪辑管线。必须显式触发词才认（不能让所有
   // 图片上传都被当成 C-roll 请求）——不然会跟下面正常的 b-roll 图片收集
@@ -241,7 +282,7 @@ async function handleMessage(message) {
     const media = message.image || {};
     const mediaId = media.id;
     const caption = media.caption || "";
-    if (mediaId && CROLL_TRIGGER_RE.test(caption)) {
+    if (mediaId && (SOCIAL_BATCH_TRIGGER_RE.test(caption) || CROLL_TRIGGER_RE.test(caption))) {
       const pendingCount = await withTimeout(
         redis.llen(collectKey(waNumber)), Number(env("WA_REDIS_OP_TIMEOUT_MS", "2000")), 0
       );
@@ -250,6 +291,13 @@ async function handleMessage(message) {
       );
       if (!pendingCount && !awaitingChoice) {
         const lang = resolveLang(env("WA_DEFAULT_LANG", "zh"), caption);
+        if (SOCIAL_BATCH_TRIGGER_RE.test(caption)) {
+          await gatewaySendText(waNumber, t(lang,
+            "收到图片，正在生成多平台社媒内容（IG Feed / Reel·TikTok / Story），大约 1-2 分钟…",
+            "Got the photo — generating multi-platform social content (IG Feed / Reel·TikTok / Story), about 1-2 minutes…"));
+          await videoQueue.add("social-batch-generate", { waNumber, mediaId, caption, msgId }, queueOptions(msgId));
+          return;
+        }
         await gatewaySendText(waNumber, t(lang,
           "收到图片，正在生成数字人说话视频（AI 看图写文案 + 生成口型动画），这一步通常要 1-2 分钟…",
           "Got the photo — generating your talking-photo video (AI writing the script + animating it), usually takes 1-2 minutes…"));
@@ -309,6 +357,22 @@ async function handleMessage(message) {
       redis.get(awaitArmKey(waNumber)), Number(env("WA_REDIS_OP_TIMEOUT_MS", "2000")), null);
     if (awaitArmFlag) {
       await videoQueue.add("arm-choice", { waNumber, armText: text, msgId }, queueOptions(msgId));
+      return;
+    }
+
+    // 声音克隆入驻：一次性把这个艺人的真实音色注册进 ElevenLabs（见
+    // voice_clone.py），之后 C-roll/social batch 生成的数字人视频就用真声，
+    // 不再是 HeyGen 库存声音。触发词命中就把 Redis 标一下等下一条语音消息
+    // （下面 msgType==="audio" 那块要在转写之前查这个标记——用户发的是要
+    // 拿去克隆的原始声音样本，不是一句要理解意图的话，转写了也没用）。
+    const VOICE_CLONE_TRIGGER_RE = /克隆.*声音|注册声音|声音克隆|voice\s*clone|clone\s*(my\s*)?voice/i;
+    if (VOICE_CLONE_TRIGGER_RE.test(text)) {
+      const lang = resolveLang(env("WA_DEFAULT_LANG", "zh"), text);
+      await redis.set(awaitVoiceCloneKey(waNumber), "1", "EX",
+        Number(env("WA_VOICE_CLONE_AWAIT_TTL_S", "300")));
+      await gatewaySendText(waNumber, t(lang,
+        "好的！请发一条 30 秒左右、环境安静的语音消息，我会用它注册你的专属声音，之后生成的数字人视频就会用你的真实声音。",
+        "Got it! Please send a ~30-second voice note in a quiet environment — I'll use it to register your voice, so future digital-human videos sound like you."));
       return;
     }
     const activeJobId = await withTimeout(
@@ -462,6 +526,10 @@ function awaitChoiceKey(waNumber) {
 
 function awaitArmKey(waNumber) {
   return `wa:user:${waNumber}:await_arm`;
+}
+
+function awaitVoiceCloneKey(waNumber) {
+  return `wa:user:${waNumber}:await_voice_clone`;
 }
 
 function notesKey(waNumber) {

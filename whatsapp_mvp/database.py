@@ -77,6 +77,11 @@ class User(Base):
         DateTime, default=datetime.datetime.utcnow
     )
 
+    # ElevenLabs Instant Voice Clone（voice_clone.py）——一个 WhatsApp 号一份克隆
+    # 音色，注册一次、之后每次生成 C-roll/social batch 都复用，不是一次性资源。
+    # 跟 heygen_croll 的 talking_photo（用完即删）性质不同：这个是长期持有的。
+    elevenlabs_voice_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
     jobs: Mapped[list["Job"]] = relationship(back_populates="user", lazy="selectin")
 
 
@@ -121,6 +126,16 @@ class Job(Base):
     # 成本账本）。Node 网关靠它在预览消息里如实告知花费，防止用户/团队
     # 完全看不到生成类操作的真实成本。
     generation_cost_usd: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    # ── 社媒批次（social_batch.py）──────────────────────────────────────
+    # 一次语音+照片提交 -> 多个平台变体，每个变体是独立一条 Job（复用整套
+    # 既有的 job 生命周期/文件存储/状态机），batch_id 把它们串成一组，给
+    # Studio 预览页按批次查询用。非批次任务（普通视频/单条 C-roll）这三个
+    # 字段一律为 None，不受影响。
+    batch_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, index=True)
+    platform: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)  # 见 social_batch.PLATFORM_SPECS
+    social_caption: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    social_hashtags: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON list[str]
 
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime, default=datetime.datetime.utcnow
@@ -199,6 +214,26 @@ def _migrate_schema(engine) -> None:
     if "generation_cost_usd" not in cols:
         with engine.begin() as conn:
             conn.execute(_text("ALTER TABLE jobs ADD COLUMN generation_cost_usd FLOAT"))
+    if "batch_id" not in cols:
+        with engine.begin() as conn:
+            conn.execute(_text("ALTER TABLE jobs ADD COLUMN batch_id VARCHAR(36)"))
+    if "platform" not in cols:
+        with engine.begin() as conn:
+            conn.execute(_text("ALTER TABLE jobs ADD COLUMN platform VARCHAR(32)"))
+    if "social_caption" not in cols:
+        with engine.begin() as conn:
+            conn.execute(_text("ALTER TABLE jobs ADD COLUMN social_caption TEXT"))
+    if "social_hashtags" not in cols:
+        with engine.begin() as conn:
+            conn.execute(_text("ALTER TABLE jobs ADD COLUMN social_hashtags TEXT"))
+
+    try:
+        user_cols = {c["name"] for c in _inspect(engine).get_columns("users")}
+    except Exception:
+        user_cols = set()
+    if user_cols and "elevenlabs_voice_id" not in user_cols:
+        with engine.begin() as conn:
+            conn.execute(_text("ALTER TABLE users ADD COLUMN elevenlabs_voice_id VARCHAR(64)"))
 
 
 def _init_engine() -> None:

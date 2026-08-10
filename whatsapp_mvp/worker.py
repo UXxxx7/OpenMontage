@@ -271,7 +271,16 @@ def generate_croll(job_id: str, photo_path: str, lang: str = "zh", hint: str = "
         if not talking_photo_id:
             raise RuntimeError("HeyGen 照片上传失败")
 
-        video_id = heygen_croll.generate_talking_video(talking_photo_id, script, lang=lang)
+        # 艺人注册过克隆音色（voice_clone.py）就用真实声音合成、走 HeyGen 的
+        # 音频对口型模式；没注册过，或合成这一步失败，退回 HeyGen 库存声音——
+        # 这是"锦上添花"不是"必需依赖"，克隆环节挂了不该拖垮整条 C-roll。
+        from .voice_clone import synthesize_for_heygen
+        audio_url = synthesize_for_heygen(script, job.user.elevenlabs_voice_id, job.job_dir)
+        if audio_url:
+            logger.info(f"  C-roll（{job_id}）使用克隆音色语音: {audio_url}")
+            video_id = heygen_croll.generate_talking_video(talking_photo_id, audio_url=audio_url)
+        else:
+            video_id = heygen_croll.generate_talking_video(talking_photo_id, script, lang=lang)
         if not video_id:
             raise RuntimeError("HeyGen 视频生成提交失败")
 
