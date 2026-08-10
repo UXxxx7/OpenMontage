@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenMontage — Upgrade</title>
+<meta property="og:title" content="OpenMontage Pro — unlimited AI video editing">
+<meta property="og:description" content="You've used your 3 free edits. Upgrade for unlimited videos, priority processing, and AI b-roll generation.">
+<meta property="og:type" content="website">
+<style>
+  :root {
+    --bg: #f5f3ef;
+    --card: #ffffff;
+    --text: #1a1a1a;
+    --muted: #6b6b6b;
+    --accent: #d97757;
+    --accent-ink: #ffffff;
+    --border: #e5e0d8;
+    --pro-bg: #1a1a1a;
+    --pro-text: #f5f3ef;
+    --pro-muted: #b5b0a6;
+    --pro-border: #3a3a3a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17161a;
+      --card: #211f24;
+      --text: #f2f0ec;
+      --muted: #a3a0a8;
+      --accent: #e3906a;
+      --accent-ink: #17161a;
+      --border: #35323a;
+      --pro-bg: #e3906a;
+      --pro-text: #17161a;
+      --pro-muted: #3a2a20;
+      --pro-border: #c97a55;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #17161a; --card: #211f24; --text: #f2f0ec; --muted: #a3a0a8;
+    --accent: #e3906a; --accent-ink: #17161a; --border: #35323a;
+    --pro-bg: #e3906a; --pro-text: #17161a; --pro-muted: #3a2a20; --pro-border: #c97a55;
+  }
+  :root[data-theme="light"] {
+    --bg: #f5f3ef; --card: #ffffff; --text: #1a1a1a; --muted: #6b6b6b;
+    --accent: #d97757; --accent-ink: #ffffff; --border: #e5e0d8;
+    --pro-bg: #1a1a1a; --pro-text: #f5f3ef; --pro-muted: #b5b0a6; --pro-border: #3a3a3a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    padding: 32px 16px 64px;
+  }
+  .wrap { max-width: 760px; margin: 0 auto; }
+  .badge {
+    display: inline-block;
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+    color: var(--accent);
+    font-size: 13px;
+    font-weight: 600;
+    padding: 6px 14px;
+    border-radius: 999px;
+    margin-bottom: 18px;
+  }
+  h1 { font-size: 32px; line-height: 1.25; margin: 0 0 10px; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); font-size: 16px; line-height: 1.55; margin: 0 0 36px; max-width: 56ch; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 620px) { .grid { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 18px;
+    padding: 28px 24px;
+    display: flex;
+    flex-direction: column;
+  }
+  .card.pro {
+    background: var(--pro-bg);
+    color: var(--pro-text);
+    border-color: var(--pro-border);
+  }
+  .tier-name { font-size: 14px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+  .card.pro .tier-name { color: var(--pro-muted); }
+  .price { font-size: 40px; font-weight: 700; margin: 10px 0 2px; letter-spacing: -0.02em; }
+  .price span { font-size: 15px; font-weight: 500; color: var(--muted); }
+  .card.pro .price span { color: var(--pro-muted); }
+  .tier-desc { color: var(--muted); font-size: 14px; margin-bottom: 20px; }
+  .card.pro .tier-desc { color: var(--pro-muted); }
+  ul { list-style: none; padding: 0; margin: 0 0 24px; flex: 1; }
+  li { padding: 7px 0; font-size: 14.5px; display: flex; gap: 9px; }
+  li::before { content: "✓"; color: var(--accent); font-weight: 700; flex-shrink: 0; }
+  .card.pro li::before { color: var(--pro-text); }
+  button.cta {
+    border: none;
+    border-radius: 12px;
+    padding: 13px 20px;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+    background: var(--accent);
+    color: var(--accent-ink);
+    transition: transform 0.1s ease, opacity 0.15s ease;
+  }
+  .card.pro button.cta { background: var(--pro-text); color: var(--pro-bg); }
+  button.cta:hover { opacity: 0.9; }
+  button.cta:active { transform: scale(0.98); }
+  .note {
+    margin-top: 28px;
+    font-size: 13px;
+    color: var(--muted);
+    text-align: center;
+  }
+  .toast {
+    position: fixed;
+    left: 50%;
+    bottom: 28px;
+    transform: translateX(-50%) translateY(20px);
+    background: var(--text);
+    color: var(--bg);
+    padding: 12px 20px;
+    border-radius: 10px;
+    font-size: 14px;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.25s ease, transform 0.25s ease;
+    white-space: nowrap;
+  }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); pointer-events: auto; }
+  nav {
+    background: var(--card); border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 20px; margin: -32px -16px 32px;
+  }
+  .brand { font-weight: 800; font-size: 15px; letter-spacing: -0.01em; color: var(--text); }
+  .brand span { color: var(--accent); }
+  .navlinks { display: flex; gap: 4px; }
+  .navlinks a {
+    text-decoration: none; color: var(--muted); font-size: 13.5px; font-weight: 600;
+    padding: 7px 14px; border-radius: 8px;
+  }
+  .navlinks a.active { color: var(--text); background: color-mix(in srgb, var(--accent) 15%, transparent); }
+  .navlinks a.soon { opacity: 0.55; cursor: default; }
+  .navlinks a.soon::after { content: " · soon"; font-size: 11px; }
+</style>
+</head>
+<body>
+  <nav>
+    <div class="brand">OpenMontage <span>Dashboard</span></div>
+    <div class="navlinks">
+      <a href="/dashboard">Dashboard</a>
+      <a class="soon" title="Editor ships once PR #51 is wired up">Editor</a>
+      <a href="/publish-flow-demo">Publish Flow</a>
+      <a href="/upgrade" class="active">Upgrade</a>
+    </div>
+  </nav>
+  <div class="wrap">
+    <span class="badge">🎬 You've used your 3 free edits</span>
+    <h1>Keep editing with OpenMontage</h1>
+    <p class="sub">Your free trial covered 3 videos. Upgrade to keep sending clips over WhatsApp and getting branded, AI-edited videos back — no more limits.</p>
+
+    <div class="grid">
+      <div class="card">
+        <div class="tier-name">Creator</div>
+        <div class="price">$9<span>/month</span></div>
+        <div class="tier-desc">For regular solo use</div>
+        <ul>
+          <li>Unlimited video edits</li>
+          <li>Standard processing speed</li>
+          <li>Branded template styles</li>
+          <li>WhatsApp delivery</li>
+        </ul>
+        <button class="cta" onclick="demoClick(this)">Upgrade to Creator</button>
+      </div>
+      <div class="card pro">
+        <div class="tier-name">Pro</div>
+        <div class="price">$29<span>/month</span></div>
+        <div class="tier-desc">For teams shipping content often</div>
+        <ul>
+          <li>Everything in Creator</li>
+          <li>Priority processing queue</li>
+          <li>AI-generated b-roll credits</li>
+          <li>AI digital-human avatar videos</li>
+        </ul>
+        <button class="cta" onclick="demoClick(this)">Upgrade to Pro</button>
+      </div>
+    </div>
+
+    <p class="note">This is a demo page — no payment is actually processed.</p>
+  </div>
+
+  <div class="toast" id="toast">🚧 Demo only — checkout isn't connected yet</div>
+
+  <script>
+    function demoClick(btn) {
+      const toast = document.getElementById("toast");
+      toast.classList.add("show");
+      setTimeout(() => toast.classList.remove("show"), 2200);
+    }
+  </script>
+</body>
+</html>

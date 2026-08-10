@@ -110,11 +110,25 @@ def _probe_video(path: Path, tool_registry: Any) -> dict[str, Any]:
             timestamps = _sample_timestamps(duration, count=4)
             sample_result = frame_sampler.execute({
                 "input_path": str(path),
+                "strategy": "timestamps",  # 漏传这个必填字段——frame_sampler.execute()
+                # 对 required 字段是裸 inputs["strategy"] 取值，不传直接 KeyError('strategy')。
+                # 100% 复现：从这条调用写出来那天起(2026-07-13 最早的日志)每个 job 都会命中，
+                # 静默被上面的 except 吞掉，只在日志里留一条 warning，representative_frames
+                # 因此永远是空列表——不影响下游(quality_risks 走的是 ffprobe 技术探测，不依赖
+                # 这批帧；schema 也没有 minItems 约束)，但"产出代表帧"这个能力本身18天来
+                # 一直没真正跑起来过。
                 "timestamps": timestamps,
                 "output_dir": str(path.parent / ".source_review_frames"),
             })
             if sample_result.success:
-                result["representative_frames"] = sample_result.data.get("frame_paths", [])
+                # 第二个坑：frame_sampler 返回的 key 是 "frames"（一个
+                # {path, timestamp_seconds, index} 字典列表），不是 "frame_paths"。
+                # 之前这行读一个压根不存在的 key，靠 .get(..., []) 静默兜底成空列表——
+                # 跟上面漏传 strategy 是两个独立的坑，叠在一起，任何一个单独修都不够，
+                # representative_frames 实际拿到东西必须两个都改对。
+                result["representative_frames"] = [
+                    f["path"] for f in sample_result.data.get("frames", []) if f.get("path")
+                ]
     except Exception as e:
         logger.warning("frame_sampler failed for %s: %s", path, e)
 

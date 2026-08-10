@@ -76,15 +76,50 @@
     padding: 40px 18px; text-align: center; color: var(--muted); font-size: 14px;
   }
   .empty, .error { color: var(--muted); font-size: 15px; padding: 40px 0; text-align: center; }
+  select.action {
+    background: var(--accent); color: var(--accent-ink); border: none; appearance: none;
+  }
+  .toast {
+    position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%) translateY(20px);
+    background: var(--text); color: var(--bg); padding: 12px 20px; border-radius: 10px;
+    font-size: 13.5px; opacity: 0; pointer-events: none; transition: opacity 0.25s ease, transform 0.25s ease;
+    max-width: 90vw; text-align: center; z-index: 20;
+  }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  nav {
+    background: var(--card); border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 20px; margin: -32px -16px 32px;
+  }
+  .brand { font-weight: 800; font-size: 15px; letter-spacing: -0.01em; color: var(--text); }
+  .brand span { color: var(--accent); }
+  .navlinks { display: flex; gap: 4px; }
+  .navlinks a {
+    text-decoration: none; color: var(--muted); font-size: 13.5px; font-weight: 600;
+    padding: 7px 14px; border-radius: 8px;
+  }
+  .navlinks a.active { color: var(--text); background: var(--pill-bg); }
+  .navlinks a.soon { opacity: 0.55; cursor: default; }
+  .navlinks a.soon::after { content: " · soon"; font-size: 11px; }
 </style>
 </head>
 <body>
+<nav>
+  <div class="brand">OpenMontage <span>Dashboard</span></div>
+  <div class="navlinks">
+    <a href="/dashboard">Dashboard</a>
+    <a class="soon" title="Editor ships once PR #51 is wired up">Editor</a>
+    <a href="/publish-flow-demo">Publish Flow</a>
+    <a href="/upgrade">Upgrade</a>
+  </div>
+</nav>
 <div class="wrap">
   <span class="badge">🎬 Studio Preview</span>
   <h1 id="title">Loading your content…</h1>
   <p class="sub" id="subtitle"></p>
   <div class="grid" id="grid"></div>
 </div>
+<div class="toast" id="toast"></div>
 <script>
 const PLATFORM_LABELS = {
   instagram_feed: "IG Feed",
@@ -97,6 +132,20 @@ function batchIdFromPath() {
   const parts = location.pathname.split("/").filter(Boolean);
   return parts[parts.length - 1];
 }
+
+// 每种变体能发去哪些平台——没有真发布 API 前，"选择平台"做的是：复制文案 +
+// 打开对应平台官网，人工落地少一步（不是摆设，以后接了 API 直接换掉
+// publishTo() 内部实现即可，UI 不用改）。
+const PLATFORM_TARGETS = {
+  instagram_reel: [["instagram", "Instagram"], ["tiktok", "TikTok"]],
+  instagram_story: [["instagram", "Instagram"]],
+  instagram_feed: [["instagram", "Instagram"], ["facebook", "Facebook"]],
+};
+const PLATFORM_URLS = {
+  instagram: "https://www.instagram.com/",
+  tiktok: "https://www.tiktok.com/upload",
+  facebook: "https://www.facebook.com/",
+};
 
 function cardHtml(v) {
   const label = PLATFORM_LABELS[v.platform] || v.platform;
@@ -112,9 +161,10 @@ function cardHtml(v) {
   const hashtagsHtml = v.hashtags.length
     ? `<div class="hashtags">${v.hashtags.map((h) => `<span class="hashtag">#${escapeHtml(h)}</span>`).join("")}</div>`
     : "";
-  const captionForCopy = escapeAttr(
-    v.hashtags.length ? `${v.caption}\n\n${v.hashtags.map((h) => "#" + h).join(" ")}` : v.caption
-  );
+  const fullCaption = v.hashtags.length ? `${v.caption}\n\n${v.hashtags.map((h) => "#" + h).join(" ")}` : v.caption;
+  const captionForCopy = escapeAttr(fullCaption);
+  const targets = PLATFORM_TARGETS[v.platform] || [];
+  const options = targets.map(([val, name]) => `<option value="${val}">${name}</option>`).join("");
   return `
     <div class="card">
       <div class="${mediaClass}">${media}</div>
@@ -126,8 +176,34 @@ function cardHtml(v) {
           <button class="action" data-copy="${captionForCopy}">Copy caption</button>
           <a class="action" href="${fileUrl}" download>Download</a>
         </div>
+        <div class="card-actions">
+          <select class="action" onchange="publishTo(this)" data-caption="${captionForCopy}">
+            <option value="">Publish to…</option>
+            ${options}
+          </select>
+        </div>
       </div>
     </div>`;
+}
+
+function publishTo(selectEl) {
+  const platform = selectEl.value;
+  if (!platform) return;
+  const caption = selectEl.getAttribute("data-caption")
+    .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&#10;/g, "\n");
+  navigator.clipboard.writeText(caption).catch(() => {});
+  window.open(PLATFORM_URLS[platform], "_blank", "noopener");
+  showToast(`📋 Caption copied — paste it when you post on ${platform[0].toUpperCase() + platform.slice(1)}. Direct publishing isn't connected yet.`);
+  selectEl.value = "";
+}
+window.publishTo = publishTo;
+
+function showToast(text) {
+  const toast = document.getElementById("toast");
+  toast.textContent = text;
+  toast.classList.add("show");
+  setTimeout(() => toast.classList.remove("show"), 3200);
 }
 
 function escapeHtml(s) {

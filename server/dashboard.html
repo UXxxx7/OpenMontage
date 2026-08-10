@@ -1,0 +1,385 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenMontage — Dashboard</title>
+<meta property="og:title" content="OpenMontage — AI content dashboard">
+<style>
+  :root {
+    --bg: #f5f3ef; --card: #ffffff; --text: #1a1a1a; --muted: #6b6b6b;
+    --accent: #d97757; --accent-ink: #ffffff; --border: #e5e0d8;
+    --pill-bg: color-mix(in srgb, var(--accent) 12%, transparent);
+    --bubble-user: #1a1a1a; --bubble-user-text: #f5f3ef;
+    --nav-bg: #ffffff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17161a; --card: #211f24; --text: #f2f0ec; --muted: #a3a0a8;
+      --accent: #e3906a; --accent-ink: #17161a; --border: #35323a;
+      --bubble-user: #e3906a; --bubble-user-text: #17161a;
+      --nav-bg: #1c1b1f;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #17161a; --card: #211f24; --text: #f2f0ec; --muted: #a3a0a8;
+    --accent: #e3906a; --accent-ink: #17161a; --border: #35323a;
+    --bubble-user: #e3906a; --bubble-user-text: #17161a; --nav-bg: #1c1b1f;
+  }
+  :root[data-theme="light"] {
+    --bg: #f5f3ef; --card: #ffffff; --text: #1a1a1a; --muted: #6b6b6b;
+    --accent: #d97757; --accent-ink: #ffffff; --border: #e5e0d8;
+    --bubble-user: #1a1a1a; --bubble-user-text: #f5f3ef; --nav-bg: #ffffff;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    display: flex; flex-direction: column;
+  }
+
+  /* ── Nav ── */
+  nav {
+    background: var(--nav-bg); border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 20px; flex-shrink: 0;
+  }
+  .brand { font-weight: 800; font-size: 15px; letter-spacing: -0.01em; }
+  .brand span { color: var(--accent); }
+  .navlinks { display: flex; gap: 4px; }
+  .navlinks a {
+    text-decoration: none; color: var(--muted); font-size: 13.5px; font-weight: 600;
+    padding: 7px 14px; border-radius: 8px;
+  }
+  .navlinks a.active { color: var(--text); background: var(--pill-bg); }
+  .navlinks a.soon { opacity: 0.55; cursor: default; }
+  .navlinks a.soon::after { content: " · soon"; font-size: 11px; }
+
+  /* ── Identity strip ── */
+  .idbar {
+    display: flex; align-items: center; gap: 8px; padding: 8px 20px;
+    border-bottom: 1px solid var(--border); font-size: 12.5px; color: var(--muted);
+    flex-shrink: 0;
+  }
+  .idbar input {
+    border: 1px solid var(--border); background: var(--card); color: var(--text);
+    border-radius: 7px; padding: 5px 10px; font-size: 12.5px; width: 200px;
+    font-family: inherit;
+  }
+
+  /* ── Chat area ── */
+  main {
+    flex: 1; overflow-y: auto; padding: 24px 16px 12px;
+    display: flex; justify-content: center;
+  }
+  .thread { width: 100%; max-width: 720px; display: flex; flex-direction: column; gap: 18px; }
+  .empty-state {
+    text-align: center; color: var(--muted); font-size: 14px; padding: 60px 20px;
+  }
+  .empty-state h2 { color: var(--text); font-size: 20px; margin: 0 0 8px; }
+
+  .msg { display: flex; flex-direction: column; max-width: 82%; }
+  .msg.from-user { align-self: flex-end; align-items: flex-end; }
+  .msg.from-bot { align-self: flex-start; align-items: flex-start; }
+  .bubble {
+    border-radius: 16px; padding: 12px 16px; font-size: 14.5px; line-height: 1.5;
+  }
+  .msg.from-user .bubble {
+    background: var(--bubble-user); color: var(--bubble-user-text); border-bottom-right-radius: 4px;
+  }
+  .msg.from-bot .bubble {
+    background: var(--card); border: 1px solid var(--border); border-bottom-left-radius: 4px;
+  }
+  .msg-photo {
+    max-width: 160px; border-radius: 12px; margin-top: 8px; display: block;
+  }
+  .spinner {
+    display: inline-block; width: 13px; height: 13px; border-radius: 50%;
+    border: 2px solid var(--muted); border-top-color: var(--accent);
+    animation: spin 0.8s linear infinite; margin-right: 8px; vertical-align: -2px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ── Result cards (batch variants) ── */
+  .result-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 10px; width: 100%; }
+  @media (max-width: 640px) { .result-grid { grid-template-columns: 1fr; } }
+  .vcard {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 12px;
+    overflow: hidden; display: flex; flex-direction: column;
+  }
+  .vcard-media { background: #000; aspect-ratio: 9/16; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+  .vcard-media.feed { aspect-ratio: 1/1; }
+  .vcard-media video, .vcard-media img { width: 100%; height: 100%; object-fit: cover; }
+  .vcard-body { padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 6px; }
+  .vcard-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: var(--accent); }
+  .vcard-caption { font-size: 12.5px; line-height: 1.45; max-height: 90px; overflow-y: auto; }
+  .vcard-actions { display: flex; gap: 6px; margin-top: 2px; }
+  .vcard-actions button, .vcard-actions a, .vcard-actions select {
+    flex: 1; text-align: center; border: 1px solid var(--border); background: transparent;
+    color: var(--text); border-radius: 7px; padding: 5px 6px; font-size: 11.5px; font-weight: 600;
+    cursor: pointer; text-decoration: none; font-family: inherit;
+  }
+  .vcard-actions select { background: var(--accent); color: var(--accent-ink); border: none; }
+  .studio-link { font-size: 12px; color: var(--accent); text-decoration: none; margin-top: 6px; display: inline-block; }
+  .toast {
+    position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%) translateY(20px);
+    background: var(--text); color: var(--bg); padding: 12px 20px; border-radius: 10px;
+    font-size: 13.5px; opacity: 0; pointer-events: none; transition: opacity 0.25s ease, transform 0.25s ease;
+    max-width: 90vw; text-align: center; z-index: 20;
+  }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+  /* ── Composer ── */
+  .composer {
+    flex-shrink: 0; border-top: 1px solid var(--border); background: var(--nav-bg);
+    padding: 12px 16px; display: flex; justify-content: center;
+  }
+  .composer-inner { width: 100%; max-width: 720px; display: flex; gap: 8px; align-items: flex-end; }
+  .attach-btn {
+    flex-shrink: 0; width: 40px; height: 40px; border-radius: 10px; border: 1px solid var(--border);
+    background: var(--card); color: var(--muted); font-size: 18px; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .attach-btn.has-photo { border-color: var(--accent); color: var(--accent); }
+  .composer textarea {
+    flex: 1; resize: none; border: 1px solid var(--border); background: var(--card); color: var(--text);
+    border-radius: 12px; padding: 10px 14px; font-size: 14.5px; font-family: inherit; max-height: 100px;
+  }
+  .send-btn {
+    flex-shrink: 0; height: 40px; padding: 0 18px; border: none; border-radius: 10px;
+    background: var(--accent); color: var(--accent-ink); font-weight: 700; font-size: 14px; cursor: pointer;
+  }
+  .send-btn:disabled { opacity: 0.5; cursor: default; }
+  .photo-preview { font-size: 11.5px; color: var(--accent); padding: 0 4px 4px; text-align: center; }
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="brand">OpenMontage <span>Dashboard</span></div>
+  <div class="navlinks">
+    <a href="/dashboard" class="active">Dashboard</a>
+    <a class="soon" title="Editor ships once PR #51 is wired up">Editor</a>
+    <a href="/publish-flow-demo">Publish Flow</a>
+    <a href="/upgrade">Upgrade</a>
+  </div>
+</nav>
+
+<div class="idbar">
+  <span>Posting as:</span>
+  <input id="identity" type="text" placeholder="your name or WhatsApp number" spellcheck="false">
+  <span style="opacity:.7;">(used only to keep your generated content together — not a real login yet)</span>
+</div>
+
+<main>
+  <div class="thread" id="thread">
+    <div class="empty-state" id="emptyState">
+      <h2>Send a photo + a quick direction</h2>
+      <p>Just like WhatsApp — attach a photo, type what you want ("just walked off stage, so pumped"),
+      and get IG Feed / Reel·TikTok / Story versions back, each with its own caption and hashtags.</p>
+    </div>
+  </div>
+</main>
+
+<div class="composer">
+  <div class="composer-inner">
+    <input type="file" id="photoInput" accept="image/*" style="display:none;">
+    <button class="attach-btn" id="attachBtn" title="Attach a photo">📎</button>
+    <textarea id="textInput" rows="1" placeholder="Type your direction…"></textarea>
+    <button class="send-btn" id="sendBtn">Send</button>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const CJK_RE = /[一-鿿]/;
+const PLATFORM_LABELS = { instagram_feed: "IG Feed", instagram_reel: "IG Reel / TikTok", instagram_story: "IG Story" };
+const TERMINAL = new Set(["DONE", "ERROR"]);
+
+const thread = document.getElementById("thread");
+const emptyState = document.getElementById("emptyState");
+const photoInput = document.getElementById("photoInput");
+const attachBtn = document.getElementById("attachBtn");
+const textInput = document.getElementById("textInput");
+const sendBtn = document.getElementById("sendBtn");
+const identityInput = document.getElementById("identity");
+
+let pendingPhoto = null;
+
+identityInput.value = localStorage.getItem("om_identity") || "";
+identityInput.addEventListener("change", () => localStorage.setItem("om_identity", identityInput.value.trim()));
+
+attachBtn.addEventListener("click", () => photoInput.click());
+photoInput.addEventListener("change", () => {
+  pendingPhoto = photoInput.files[0] || null;
+  attachBtn.classList.toggle("has-photo", !!pendingPhoto);
+  attachBtn.title = pendingPhoto ? pendingPhoto.name : "Attach a photo";
+});
+
+textInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+});
+sendBtn.addEventListener("click", send);
+
+function escapeHtml(s) {
+  return (s || "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function addUserMessage(text, photoFile) {
+  emptyState.remove();
+  const el = document.createElement("div");
+  el.className = "msg from-user";
+  const photoUrl = photoFile ? URL.createObjectURL(photoFile) : null;
+  el.innerHTML = `<div class="bubble">${escapeHtml(text) || "(no direction — AI will freestyle from the photo)"}</div>`
+    + (photoUrl ? `<img class="msg-photo" src="${photoUrl}">` : "");
+  thread.appendChild(el);
+  thread.parentElement.scrollTop = thread.parentElement.scrollHeight;
+  return el;
+}
+
+function addBotMessage(html) {
+  const el = document.createElement("div");
+  el.className = "msg from-bot";
+  el.innerHTML = `<div class="bubble">${html}</div>`;
+  thread.appendChild(el);
+  thread.parentElement.scrollTop = thread.parentElement.scrollHeight;
+  return el;
+}
+
+// 每种变体能发去哪些平台——Reel/Story 视频两个平台通用（同一条素材），
+// Feed 静态图对应 Instagram/Facebook 帖子。没有真发布 API 前，"选择平台"
+// 这个动作做的是：复制文案 + 打开对应平台官网，让人工落地少一步——不是
+// 摆设按钮，选了真的有事发生，以后接了 API 直接换掉 publishTo() 的实现即可。
+const PLATFORM_TARGETS = {
+  instagram_reel: [["instagram", "Instagram"], ["tiktok", "TikTok"]],
+  instagram_story: [["instagram", "Instagram"]],
+  instagram_feed: [["instagram", "Instagram"], ["facebook", "Facebook"]],
+};
+const PLATFORM_URLS = {
+  instagram: "https://www.instagram.com/",
+  tiktok: "https://www.tiktok.com/upload",
+  facebook: "https://www.facebook.com/",
+};
+
+function cardHtml(v) {
+  const label = PLATFORM_LABELS[v.platform] || v.platform;
+  if (v.status !== "DONE") {
+    const msg = v.status === "ERROR" ? "didn't generate" : "generating…";
+    return `<div class="vcard"><div class="vcard-body"><div class="vcard-label">${label}</div><div class="vcard-caption">${msg}</div></div></div>`;
+  }
+  const fileUrl = `/files/${encodeURIComponent(v.job_id)}/${encodeURIComponent(v.filename)}`;
+  const mediaClass = v.platform === "instagram_feed" ? "vcard-media feed" : "vcard-media";
+  const media = v.asset_kind === "video"
+    ? `<video src="${fileUrl}" controls playsinline muted loop></video>`
+    : `<img src="${fileUrl}" alt="${label}">`;
+  const full = v.hashtags.length ? `${v.caption}\n\n${v.hashtags.map((h) => "#" + h).join(" ")}` : v.caption;
+  const captionAttr = JSON.stringify(full).replace(/"/g, "&quot;");
+  const targets = PLATFORM_TARGETS[v.platform] || [];
+  const options = targets.map(([val, name]) => `<option value="${val}">${name}</option>`).join("");
+  return `
+    <div class="vcard">
+      <div class="${mediaClass}">${media}</div>
+      <div class="vcard-body">
+        <div class="vcard-label">${label}</div>
+        <div class="vcard-caption">${escapeHtml(v.caption)}</div>
+        <div class="vcard-actions">
+          <button onclick="copyText(this, ${captionAttr})">Copy</button>
+          <a href="${fileUrl}" download>Download</a>
+        </div>
+        <div class="vcard-actions">
+          <select onchange="publishTo(this)" data-caption="${captionAttr}">
+            <option value="">Publish to…</option>
+            ${options}
+          </select>
+        </div>
+      </div>
+    </div>`;
+}
+
+function publishTo(selectEl) {
+  const platform = selectEl.value;
+  if (!platform) return;
+  const caption = selectEl.getAttribute("data-caption");
+  navigator.clipboard.writeText(caption).catch(() => {});
+  window.open(PLATFORM_URLS[platform], "_blank", "noopener");
+  showToast(`📋 Caption copied — paste it when you post on ${platform[0].toUpperCase() + platform.slice(1)}. Direct publishing isn't connected yet.`);
+  selectEl.value = "";
+}
+window.publishTo = publishTo;
+
+function showToast(text) {
+  const toast = document.getElementById("toast");
+  toast.textContent = text;
+  toast.classList.add("show");
+  setTimeout(() => toast.classList.remove("show"), 3200);
+}
+
+function copyText(btn, text) {
+  navigator.clipboard.writeText(text).then(() => {
+    const old = btn.textContent;
+    btn.textContent = "Copied!";
+    setTimeout(() => { btn.textContent = old; }, 1500);
+  });
+}
+window.copyText = copyText;
+
+async function send() {
+  const text = textInput.value.trim();
+  const photo = pendingPhoto;
+  if (!photo) { alert("Attach a photo first — that's what the pipeline generates from."); return; }
+
+  addUserMessage(text, photo);
+  textInput.value = "";
+  const sentPhoto = photo;
+  pendingPhoto = null;
+  attachBtn.classList.remove("has-photo");
+  photoInput.value = "";
+  sendBtn.disabled = true;
+
+  const botEl = addBotMessage(`<span class="spinner"></span>Generating your content — this can take a few minutes (HeyGen video generation is the slow part)…`);
+
+  try {
+    const form = new FormData();
+    form.append("photo", sentPhoto);
+    form.append("hint", text);
+    form.append("lang", CJK_RE.test(text) ? "zh" : "en");
+    form.append("wa_number", identityInput.value.trim() || "web_dashboard_demo");
+
+    const createResp = await fetch("/api/social-batch", { method: "POST", body: form });
+    if (!createResp.ok) throw new Error(`create failed (${createResp.status})`);
+    const { batch_id } = await createResp.json();
+
+    await pollBatch(batch_id, botEl);
+  } catch (err) {
+    botEl.querySelector(".bubble").innerHTML = `Sorry, something went wrong: ${escapeHtml(err.message)}`;
+  } finally {
+    sendBtn.disabled = false;
+  }
+}
+
+async function pollBatch(batchId, botEl) {
+  const deadline = Date.now() + 20 * 60 * 1000; // 20min, matches the WhatsApp-side ceiling
+  while (Date.now() < deadline) {
+    const resp = await fetch(`/api/batches/${encodeURIComponent(batchId)}`);
+    if (resp.ok) {
+      const data = await resp.json();
+      const variants = data.variants || [];
+      const allTerminal = variants.length > 0 && variants.every((v) => TERMINAL.has(v.status));
+      if (allTerminal) {
+        const doneCount = variants.filter((v) => v.status === "DONE").length;
+        botEl.querySelector(".bubble").innerHTML =
+          `${doneCount}/${variants.length} versions ready:`
+          + `<div class="result-grid">${variants.map(cardHtml).join("")}</div>`
+          + `<a class="studio-link" href="/studio/${batchId}" target="_blank">Open full-page Studio view →</a>`;
+        return;
+      }
+    }
+    await new Promise((r) => setTimeout(r, 4000));
+  }
+  botEl.querySelector(".bubble").innerHTML = "This is taking longer than expected — check back at the "
+    + `<a class="studio-link" href="/studio/${batchId}" target="_blank">Studio page</a> in a few minutes.`;
+}
+</script>
+</body>
+</html>

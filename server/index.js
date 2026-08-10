@@ -106,6 +106,41 @@ app.get("/studio/:batchId", (_req, res) => {
   res.sendFile(resolve(dirname(fileURLToPath(import.meta.url)), "studio.html"));
 });
 
+// 网页版 dashboard 建批次：跟 /api/batches 同一个薄代理模式，区别是这条是
+// POST 且带文件（照片）——不引入 multer 之类的中间件重新解析一遍 multipart，
+// 直接把 Express 请求本身（一个可读流）连同原始 Content-Type（含 multipart
+// boundary）转发给 Python，Python 的 FastAPI UploadFile 自己解析。
+// express.json() 只处理 application/json，不会消费掉这里的请求体。
+app.post("/api/social-batch", async (req, res) => {
+  try {
+    const upstreamRes = await axios.post(`${PYTHON_API_BASE}/social-batch`, req, {
+      headers: { "content-type": req.headers["content-type"] },
+      maxBodyLength: Infinity, maxContentLength: Infinity,
+      timeout: Number(env("WA_PYTHON_CREATE_TIMEOUT_MS", "180000")),
+      validateStatus: () => true,
+    });
+    res.status(upstreamRes.status).json(upstreamRes.data);
+  } catch (err) {
+    console.error("[social-batch-proxy] failed:", err.message);
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// 网页版 dashboard 首页 + 付费页——都是纯静态页，跟 /studio 同一个模式。
+app.get(["/dashboard", "/"], (_req, res) => {
+  res.sendFile(resolve(dirname(fileURLToPath(import.meta.url)), "dashboard.html"));
+});
+app.get("/upgrade", (_req, res) => {
+  res.sendFile(resolve(dirname(fileURLToPath(import.meta.url)), "upgrade.html"));
+});
+
+// 发布流程原型用的样例素材（真实生成过的内容，固定文件，不依赖数据库里的
+// 某条 job——纯粹给"假设接了 API 之后长什么样"这个原型演示用）。
+app.use("/samples", express.static(resolve(dirname(fileURLToPath(import.meta.url)), "samples")));
+app.get("/publish-flow-demo", (_req, res) => {
+  res.sendFile(resolve(dirname(fileURLToPath(import.meta.url)), "publish-flow-demo.html"));
+});
+
 app.get(["/webhook", "/webhook/whatsapp"], (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
