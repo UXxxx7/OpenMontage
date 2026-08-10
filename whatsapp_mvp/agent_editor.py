@@ -305,6 +305,16 @@ def _chat(config, messages, tools=None, json_mode=False):
             _logging.getLogger(__name__).warning(f"L2 LLM 429，{wait}s 后重试")
             _time.sleep(wait)
             continue
+        if resp.status_code >= 400 and attempt < 3 and (
+                "Upstream request failed" in resp.text or "upstream_error" in resp.text):
+            # 网关上游瞬时故障被包装成 4xx(实测同一请求成功率仅 20-60%)——
+            # 与 schema/内容无关,短退避重试;真正的请求体错误不含此标记,照旧直接抛。
+            wait = 3 * (attempt + 1)
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                f"L2 LLM {resp.status_code} 上游瞬时失败，{wait}s 后重试({attempt + 1}/3)")
+            _time.sleep(wait)
+            continue
         resp.raise_for_status()
         return resp.json()
     resp.raise_for_status()

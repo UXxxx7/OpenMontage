@@ -65,6 +65,26 @@ export const Captions: React.FC<CaptionsProps> = ({
           )
         );
 
+  // Fix C36 (2026-07-21, caught by vision QA on a real render): the raw
+  // `progress` above is a continuous character count driven purely by
+  // elapsed time within the phrase -- it has no notion of word boundaries,
+  // so on nearly every phrase's sweep there's a frame where it lands
+  // strictly inside a word ("spending" rendered as an orange "s" + white
+  // "pending"). Not rare -- it's just been slipping past QA's sparse frame
+  // sampling by chance until now. Snap back to the end of the last word
+  // `progress` has already fully covered; a word flips color all at once,
+  // never mid-character.
+  let snappedProgress = progress;
+  if (
+    progress > 0 &&
+    progress < active.text.length &&
+    active.text[progress] !== " " &&
+    active.text[progress - 1] !== " "
+  ) {
+    const lastSpace = active.text.lastIndexOf(" ", progress - 1);
+    snappedProgress = lastSpace === -1 ? 0 : lastSpace + 1;
+  }
+
   const chars = active.text.split("");
 
   return (
@@ -96,7 +116,7 @@ export const Captions: React.FC<CaptionsProps> = ({
               fontFamily: font,
               fontSize,
               fontWeight: 700,
-              color: i < progress ? palette.captionHighlight : palette.captionText,
+              color: i < snappedProgress ? palette.captionHighlight : palette.captionText,
             }}
           >
             {ch}

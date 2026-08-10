@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from contextlib import asynccontextmanager
 from typing import List, Optional
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
@@ -19,6 +20,7 @@ from .job_manager import (
     get_active_job_for_user,
     get_assets,
     get_job,
+    get_jobs_by_status,
     get_or_create_user,
     message_exists,
     save_message,
@@ -29,7 +31,45 @@ from .whatsapp_client import WhatsAppClient
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="OpenMontage WhatsApp MVP")
+
+def _recover_orphaned_jobs() -> None:
+    """Jobs run as a daemon thread inside *this* process (`_run_in_background`
+    in this file) unless `USE_RQ_WORKER=true` routes them to an independent RQ
+    worker process instead. In the (default, no env var set) in-process mode,
+    if this server restarts while a job's pipeline/render thread is running,
+    that thread dies with the old process — the DB is left holding a stale
+    RUNNING_PIPELINE/RENDERING status with nothing behind it, forever. Worse,
+    `/jobs/{id}/retry`'s own idempotency guard refuses to touch a job in
+    either of those states (reasonably assumes something's already handling
+    it), so nothing short of manually editing the DB row could ever unstick
+    it. Confirmed real: job_d9111d13d08b sat dead for ~30 minutes on 2026-07-23
+    after exactly this restart, silently, until fixed by hand.
+
+    At a fresh startup (in-process mode), any job already in one of those two
+    states is provably orphaned — this process just started, so nothing here
+    could have put it there. Mark it ERROR (with an explanatory message) so
+    the user's next 'retry' actually restarts the pipeline, and the existing
+    WhatsApp failure-notification path (server/worker.js) tells them so
+    instead of leaving them waiting on a job that will never move again.
+    """
+    if os.getenv("USE_RQ_WORKER", "").lower() == "true":
+        return  # separate RQ worker process — a webhook-server restart doesn't touch it
+    orphaned = get_jobs_by_status([JobStatus.RUNNING_PIPELINE, JobStatus.RENDERING])
+    for job in orphaned:
+        logger.warning(f"[startup] recovering orphaned job {job.id} (was {job.status.value}) -> ERROR")
+        update_job_status(job.id, JobStatus.ERROR,
+            error_message="Orphaned by a server restart mid-pipeline; no process was left driving it. Reply 'retry' to try again.")
+    if orphaned:
+        logger.warning(f"[startup] recovered {len(orphaned)} orphaned job(s)")
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    _recover_orphaned_jobs()
+    yield
+
+
+app = FastAPI(title="OpenMontage WhatsApp MVP", lifespan=_lifespan)
 
 
 # ---------------------------------------------------------------------------
@@ -414,11 +454,14 @@ _ASSIGN_SYSTEM = (
     "并用一段或多段文字描述这些视频要怎么剪。请判断：\n"
     "1. 哪个视频是“主视频”（出镜/口播、要加字幕或剪辑的主体）——返回它的编号（1 开始）；"
     "文字里说不清就返回 null。\n"
-    "2. 其余视频是 b-roll 补充素材，为每个 b-roll 提取插入说明（label，如“讲到 VS Code 时插入”）。\n"
-    "3. 提取对主视频的编辑要求 edit_request（如“加字幕、剪掉空白和自我打断”）。\n"
-    "只输出 JSON，不要多余文字：{\"main_index\": <int|null>, "
+    "2. 是否有某个视频是“参考风格视频”——用户想模仿它的剪辑风格/转场/节奏/特效/"
+    "色彩/字幕样式（如“参照这个视频的风格剪”“照这个的转场来”），它本身既不是要剪的"
+    "内容、也不是 b-roll 素材。有就返回它的编号（1 开始，且必须与主视频编号不同），没有返回 null。\n"
+    "3. 其余视频是 b-roll 补充素材，为每个 b-roll 提取插入说明（label，如“讲到 VS Code 时插入”）。\n"
+    "4. 提取对主视频的编辑要求 edit_request（如“加字幕、剪掉空白和自我打断”）。\n"
+    "只输出 JSON，不要多余文字：{\"main_index\": <int|null>, \"reference_index\": <int|null>, "
     "\"labels\": {\"<视频编号>\": \"<说明>\"}, \"edit_request\": \"<字符串>\"}。"
-    "labels 只含 b-roll 视频（不含主视频），键是视频编号的字符串；某段找不到说明就给空字符串。"
+    "labels 只含 b-roll 视频（不含主视频、不含参考风格视频），键是视频编号的字符串；某段找不到说明就给空字符串。"
 )
 
 
@@ -426,7 +469,7 @@ _ASSIGN_SYSTEM = (
 async def assign_endpoint(video_count: int = Form(...), notes: str = Form("")):
     """把“N 个视频（按上传顺序）+ 用户描述文字”解析成 {main_index, labels, edit_request}。
     解析失败或说不清主视频时 main_index=null，由 Node 侧回退到“问编号”。"""
-    result = {"main_index": None, "labels": {}, "edit_request": notes or ""}
+    result = {"main_index": None, "reference_index": None, "labels": {}, "edit_request": notes or ""}
     try:
         from .llm_client import call_llm_chat
         user_msg = (
@@ -445,6 +488,17 @@ async def assign_endpoint(video_count: int = Form(...), notes: str = Form("")):
                 result["main_index"] = int(mi)
             elif isinstance(mi, str) and mi.strip().isdigit():
                 result["main_index"] = int(mi.strip())
+            ri = data.get("reference_index")
+            if isinstance(ri, bool):
+                ri = None
+            if isinstance(ri, (int, float)):
+                result["reference_index"] = int(ri)
+            elif isinstance(ri, str) and ri.strip().isdigit():
+                result["reference_index"] = int(ri.strip())
+            # 参考视频不能同时是主视频（模型偶尔混淆）——冲突则丢弃参考判断
+            if (result["reference_index"] is not None
+                    and result["reference_index"] == result["main_index"]):
+                result["reference_index"] = None
             if isinstance(data.get("labels"), dict):
                 result["labels"] = {str(k): str(v) for k, v in data["labels"].items()}
             if data.get("edit_request"):
@@ -505,6 +559,9 @@ async def create_job_endpoint(
     broll: List[UploadFile] = File(default=[]),
     broll_labels: List[str] = Form(default=[]),
     broll_kinds: List[str] = Form(default=[]),
+    arm: str = Form(""),
+    reference: Optional[UploadFile] = File(default=None),
+    reference_kind: str = Form(""),
 ):
     config = get_config()
     user = get_or_create_user("api_user")
@@ -513,6 +570,14 @@ async def create_job_endpoint(
 
     job_dir = job.job_dir
     job_dir.mkdir(parents=True, exist_ok=True)
+    # 本 job 显式臂选择(WhatsApp 点选,Node 侧作为 arm 字段传来)→ 落 arm_choice.txt,
+    # arm_router.resolve_arm 最优先读它(仅次于运维急停 force_arm)。空/不传=不写。
+    if arm.strip():
+        try:
+            from .authored.arm_router import set_job_arm
+            set_job_arm(job_dir, arm.strip().lower())
+        except Exception as _e:  # noqa: BLE001 —— 写失败不拖垮建 job,退回默认路由
+            logger.warning(f"写 arm_choice 失败(忽略,走默认路由): {_e}")
     video_data = await video.read()
     (job_dir / "input.mp4").write_bytes(video_data)
 
@@ -541,6 +606,16 @@ async def create_job_endpoint(
             append_asset(job.id, media_id, kind, label)          # role=broll, order=i
             set_asset_local_path(job.id, media_id, str(dest))    # 标记已下载
 
+    # 参考风格视频（可选，模块4）：模型读它的剪辑风格（转场/节奏/特效/色彩/字幕样式
+    # 等），落盘到 job_dir/style_ref.<ext>；authored 侧 _prepare 会 glob 到它并分析成
+    # style_spec。它既不是要剪的主视频、也不是要合成的 b-roll，故不进 job.assets。
+    if reference is not None:
+        ref_data = await reference.read()
+        if ref_data:
+            ref_ext = (os.path.splitext(reference.filename or "")[1].lstrip(".")
+                       or ("jpg" if (reference_kind or "").lower() == "image" else "mp4")).lower()
+            (job_dir / f"style_ref.{ref_ext}").write_bytes(ref_data)
+
     update_job_status(job.id, JobStatus.RECEIVED)
 
     # 后台跑（下载 + L2 规划耗时可达 1~2 分钟），立即返回；否则会阻塞
@@ -551,12 +626,98 @@ async def create_job_endpoint(
     return {"job_id": job.id, "status": job.status.value}
 
 
+def _animations_summary(job) -> Optional[list]:
+    """从 apply_style 的最终 props 里提取"这条视频实际包含哪些动画"的人话
+    清单——确认过的真实用户反馈：预览消息只会念模板简介（"floating cards +
+    karaoke subtitles..."，条条视频一模一样），从不说这条视频真正规划出了
+    什么动画，用户要收到成片才发现是空的。props 是渲染的唯一事实来源，
+    从它读就不会说谎。
+
+    确认过的真实 bug（2026-07-23，job_fa4ee47e9676，用户直接指出"两句话自相
+    矛盾"）：apply_style 整个降级（跳过失败的步骤、只交付上一步结果）时，
+    _op_apply_style_props.json 依然是上一次失败/被放弃的重规划尝试留在磁盘
+    上的内容（_build() 每次调用都无条件写盘，见 Rule 5/C9）——这份 props 从
+    未真正用于渲染交付的视频，念出来的动画清单是假的。降级时必须返回 None，
+    不能假装这些动画真的在成片里。"""
+    if job.degraded_operations and "apply_style" in (json.loads(job.degraded_operations) or []):
+        return None
+    props_path = job.job_dir / "_op_apply_style_props.json"
+    if not props_path.exists():
+        return None
+    try:
+        props = json.loads(props_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    names: list[str] = []
+    for c in props.get("countdowns") or []:
+        names.append(f"Countdown ring — {c.get('headline') or str(c.get('value', ''))}")
+    for c in props.get("calendarEvents") or []:
+        names.append(f"Calendar reveal — {c.get('month')}/{c.get('targetDay')} {c.get('eventLabel', '')}".strip())
+    for c in props.get("dataCards") or []:
+        rows = ", ".join(str(r.get("label", "")) for r in (c.get("rows") or []))
+        names.append(f"Count-up data card — {c.get('title') or rows}")
+    for g in props.get("gauges") or []:
+        names.append(f"Risk gauge — {g.get('title') or g.get('rightLabel', '')}")
+    for b in props.get("beforeAfter") or []:
+        names.append(f"Before/after comparison — {b.get('kicker', '')}")
+    for s in props.get("stepLists") or []:
+        names.append(f"{len(s.get('steps') or [])}-step process list — {s.get('title', '')}".strip(" —"))
+    for tc in props.get("topicCards") or []:
+        names.append(f"Topic card — {str(tc.get('headline', ''))[:30]}")
+    for q in props.get("quotes") or []:
+        names.append(f"Quote typography — {str(q.get('text', ''))[:30]}")
+    for cc in props.get("cornerCards") or []:
+        names.append(f"Corner app card — {cc.get('appName') or cc.get('variant', '')}")
+    for cp in props.get("comparisons") or []:
+        labels = " vs ".join(str(c.get("label", "")) for c in (cp.get("columns") or []))
+        names.append(f"Side-by-side comparison — {cp.get('title') or labels}")
+    for rl in props.get("rankedLists") or []:
+        item_count = len(rl.get("items") or [])
+        names.append(f"Ranked list — {rl.get('title') or f'{item_count} items'}")
+    for cl in props.get("checklists") or []:
+        item_count = len(cl.get("items") or [])
+        names.append(f"Checklist — {cl.get('title') or f'{item_count} items'}")
+    for lp in props.get("locationPins") or []:
+        names.append(f"Location pin — {lp.get('place', '')}")
+    for tm in props.get("testimonials") or []:
+        names.append(f"Testimonial — {tm.get('name', '')}")
+    for ic in props.get("iconClusters") or []:
+        item_count = len(ic.get("items") or [])
+        names.append(f"Icon cluster — {ic.get('title') or f'{item_count} items'}")
+    for pb in props.get("progressBars") or []:
+        names.append(f"Progress bar — {pb.get('label', '')}")
+    for pcn in props.get("prosCons") or []:
+        pc_fallback = f"{pcn.get('prosLabel', '')} vs {pcn.get('consLabel', '')}"
+        names.append(f"Pros/cons — {pcn.get('title') or pc_fallback}")
+    for mt in props.get("milestoneTracks") or []:
+        stops = len(mt.get("milestones") or [])
+        names.append(f"Milestone track — {mt.get('title') or f'{stops} stops'}")
+    for tb in props.get("trustBadges") or []:
+        badge_count = len(tb.get("badges") or [])
+        names.append(f"Trust badge — {tb.get('title') or f'{badge_count} credentials'}")
+    for bc in props.get("barCharts") or []:
+        names.append(f"Bar chart — {bc.get('title', '')}")
+    for mu in props.get("milestoneUnlocks") or []:
+        names.append(f"Milestone unlock — {mu.get('label', '')}")
+    for sec in props.get("sections") or []:
+        if sec.get("timeline"):
+            names.append(f"Multi-stage timeline — {sec['timeline'].get('heading', '')}")
+        else:
+            names.append(f"Full-canvas section — {sec.get('title', '')}")
+    if props.get("intro"):
+        names.append("Intro title card")
+    if props.get("outro"):
+        names.append("Outro CTA card")
+    return names
+
+
 @app.get("/jobs/{job_id}")
 async def get_job_endpoint(job_id: str):
     job = get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     return {
+        "animations": _animations_summary(job),
         "job_id": job.id,
         "status": job.status.value,
         "input_video_path": job.input_video_path,
@@ -661,7 +822,18 @@ async def revise_job_endpoint(job_id: str, text: str = Form("")):
 # ---------------------------------------------------------------------------
 
 @app.get("/files/{job_id}/{filename}")
-async def serve_file(job_id: str, filename: str):
+def serve_file(job_id: str, filename: str):
+    # Deliberately a plain `def`, not `async def`: get_job() is a blocking
+    # SQLAlchemy query (a JOIN across user+messages), and this route is the
+    # one Remotion's renderer hits repeatedly and CONCURRENTLY (6-way tab
+    # concurrency) while seeking through the source video during a render.
+    # As `async def` it shared FastAPI's single event-loop thread, so one
+    # blocking DB call froze every concurrent fetch behind it — confirmed
+    # live as the actual cause of Remotion's repeated "server sent no data
+    # for 20 seconds" / proxy 500 failures across multiple real jobs, at many
+    # different timestamps (not tied to any one frame). A plain `def` makes
+    # FastAPI run each call in its own threadpool thread automatically, so
+    # concurrent requests no longer serialize on one blocked thread.
     job = get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")

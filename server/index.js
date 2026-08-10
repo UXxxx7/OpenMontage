@@ -147,6 +147,17 @@ async function handleMessage(message) {
 
   console.log(`[webhook] from=${waNumber} type=${msgType}`);
 
+  // 方案A:交互按钮回复(选臂)。仅在"待选臂"时有意义,否则忽略。
+  if (msgType === "interactive") {
+    const btnId = message.interactive?.button_reply?.id || message.interactive?.list_reply?.id || "";
+    const awaitArm = await withTimeout(
+      redis.get(awaitArmKey(waNumber)), Number(env("WA_REDIS_OP_TIMEOUT_MS", "2000")), null);
+    if (awaitArm) {
+      await videoQueue.add("arm-choice", { waNumber, armId: btnId, msgId }, queueOptions(msgId));
+    }
+    return;
+  }
+
   // C-roll：一张照片 + 触发词 caption → AI 看图写文案 + HeyGen 生成数字人
   // 说话视频，再自动接入常规剪辑管线。必须显式触发词才认（不能让所有
   // 图片上传都被当成 C-roll 请求）——不然会跟下面正常的 b-roll 图片收集
@@ -209,6 +220,13 @@ async function handleMessage(message) {
 
   if (msgType === "text" && text) {
     const normalized = text.toLowerCase();
+    // 方案A:正在等用户选臂时,任何文字都转给 arm-choice(worker 里映射 1/2/a/b/取消)
+    const awaitArmFlag = await withTimeout(
+      redis.get(awaitArmKey(waNumber)), Number(env("WA_REDIS_OP_TIMEOUT_MS", "2000")), null);
+    if (awaitArmFlag) {
+      await videoQueue.add("arm-choice", { waNumber, armText: text, msgId }, queueOptions(msgId));
+      return;
+    }
     const activeJobId = await withTimeout(
       redis.get(activeJobKey(waNumber)),
       Number(env("WA_REDIS_OP_TIMEOUT_MS", "2000")),
@@ -268,7 +286,7 @@ async function handleMessage(message) {
       return;
     }
 
-    if (activeJobId && ["confirm", "continue", "yes", "ok"].includes(normalized)) {
+    if (activeJobId && ["confirm", "continue", "yes", "ok", "go", "start", "done", "开始", "完成", "好了", "继续"].includes(normalized)) {
       await videoQueue.add("confirm-job", { waNumber, jobId: activeJobId, msgId }, queueOptions(msgId));
       return;
     }
@@ -356,6 +374,10 @@ function collectKey(waNumber) {
 
 function awaitChoiceKey(waNumber) {
   return `wa:user:${waNumber}:await_choice`;
+}
+
+function awaitArmKey(waNumber) {
+  return `wa:user:${waNumber}:await_arm`;
 }
 
 function notesKey(waNumber) {

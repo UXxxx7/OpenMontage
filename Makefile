@@ -42,11 +42,19 @@ install-gpu:
 
 # ---- Testing ----
 
-test:
+test: test-whatsapp
 	$(PYTHON) -m pytest tests/ -v
 
 test-contracts:
 	$(PYTHON) -m pytest tests/contracts/ -v
+
+# whatsapp_mvp's own tests use a standalone check()/main() harness, not pytest
+# (see whatsapp_mvp/test_content_planner.py) — run as a script, not via pytest.
+# PYTHONIOENCODING=utf-8: the test prints Chinese assertion names; Windows'
+# default console codepage (cp1252) crashes on them without this set.
+test-whatsapp:
+	PYTHONIOENCODING=utf-8 $(PYTHON) -m whatsapp_mvp.test_content_planner
+	PYTHONIOENCODING=utf-8 $(PYTHON) -m whatsapp_mvp.test_golden_extraction
 
 # ---- Utilities ----
 

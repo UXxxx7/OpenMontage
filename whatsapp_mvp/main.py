@@ -33,11 +33,56 @@ def main():
     """Start the FastAPI webhook server."""
     from whatsapp_mvp.webhook import app
 
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    # Windows' default ProactorEventLoop has a confirmed bug: its one-shot
+    # IOCP accept() doesn't re-arm itself after a transient OSError (seen
+    # live, repeatedly: WinError 64 "The specified network name is no longer
+    # available", triggered by a burst of WhatsApp webhook retries / Remotion
+    # render traffic). The process survives — background pipeline threads
+    # keep running — but the accept loop is dead forever, so the server
+    # silently stops taking any new connection with no crash, no log past
+    # "Accept failed on a socket". SelectorEventLoop's accept is poll-based
+    # and doesn't share this failure mode.
+    #
+    # Setting asyncio.set_event_loop_policy() here does NOT work (tried it,
+    # confirmed live it has zero effect): uvicorn.run()/Server.run() calls
+    # asyncio.run(..., loop_factory=config.get_loop_factory()), and
+    # uvicorn.loops.asyncio.asyncio_loop_factory hardcodes
+    # `return asyncio.ProactorEventLoop` on win32 whenever `use_subprocess`
+    # is false (uvicorn.run()'s default) — it never consults the ambient
+    # event loop policy at all. The only way to actually get Selector is to
+    # bypass Server.run()/uvicorn.run() and drive the server on a loop we
+    # create ourselves.
+    from uvicorn import Config, Server
+
+    # timeout_graceful_shutdown defaults to None (uvicorn 0.49) — wait
+    # forever for every open connection to close before exiting on SIGTERM.
+    # Confirmed live (2026-07-23/24, this session, repeatedly): Node's
+    # worker.js polls GET /jobs/{id} over a keep-alive axios connection that
+    # never closes on its own, so a plain `kill`/SIGTERM never actually
+    # terminates the process — every restart during local dev left one more
+    # unkillable zombie behind (still requiring `kill -9`). Bound it so
+    # SIGTERM drains in-flight requests for a few seconds, then force-exits
+    # regardless of lingering keep-alive sockets.
+    config = Config(app, host="0.0.0.0", port=8000, log_level="info", timeout_graceful_shutdown=5)
+    server = Server(config)
+
+    if sys.platform == "win32":
+        import asyncio
+        loop = asyncio.SelectorEventLoop()
+        asyncio.set_event_loop(loop)
+        logging.getLogger(__name__).info(f"event loop: {type(loop).__name__} (forced, not uvicorn default)")
+        try:
+            loop.run_until_complete(server.serve())
+        finally:
+            loop.close()
+    else:
+        server.run()
 
 
 def worker():
     """Start the RQ worker."""
+    import sys
+
     from whatsapp_mvp.config import get_config
     import rq
     from redis import Redis
@@ -45,9 +90,19 @@ def worker():
     config = get_config()
     redis_conn = Redis.from_url(config.redis_url)
 
-    with rq.Connection(redis_conn):
-        worker_instance = rq.Worker("whatsapp_mvp")
-        worker_instance.work()
+    # rq.Worker forks a child process per job (os.fork) to isolate it — fork()
+    # doesn't exist on Windows at all, so the default Worker crashes with
+    # AttributeError on the very first job it picks up (confirmed: it logged
+    # the job starting, then died immediately, taking the whole worker process
+    # down with it — every job after that just sat queued forever with no
+    # worker left to claim it). SimpleWorker runs the job in-process instead
+    # of forking; that's RQ's own documented Windows workaround. Only switch
+    # on Windows — SimpleWorker skips the process-isolation forked Worker
+    # gives you for free (a segfault/OOM in one job can't be contained), so
+    # keep the real Worker on Linux/macOS where fork actually works.
+    worker_cls = rq.SimpleWorker if sys.platform == "win32" else rq.Worker
+    worker_instance = worker_cls("whatsapp_mvp", connection=redis_conn)
+    worker_instance.work()
 
 
 if __name__ == "__main__":
