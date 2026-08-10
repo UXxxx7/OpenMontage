@@ -24,6 +24,8 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
+from .video_cuts import compute_output_duration, normalize_cuts, source_to_output
+
 logger = logging.getLogger(__name__)
 
 _FPS = 30
@@ -199,7 +201,27 @@ def pick_qa_frames(props: dict) -> list[int]:
     # specifically (the "intro landed" check already samples
     # introOutFrame+15, well after the entrance), so it is never a frame worth
     # sending to vision QA regardless of which rule produced it.
-    return sorted(f for f in frames if 0 < f < duration_frames)
+    #
+    # Cuts (P6): every rule above computes its candidate frame from SOURCE-
+    # coordinate props fields (mountFrame, fromFrame, introOutFrame, ...) —
+    # exactly like every other frame field in render_props, these are never
+    # rebased when a cut is added (see remotion-composer/src/cuts.ts's header
+    # comment). But `npx remotion still --frame=N` renders the OUTPUT
+    # composition, whose frame numbering only matches SOURCE when there are
+    # no cuts. Feeding it an un-mapped SOURCE frame either points at the
+    # wrong visual moment (a frame that landed inside a since-removed region
+    # collapses onto the cut's own splice point instead) or, if it's past the
+    # now-shorter OUTPUT duration entirely, makes `remotion still` fail
+    # outright. Map every candidate through source_to_output and clamp
+    # against the real OUTPUT duration here, at this function's single exit
+    # point — same lesson as the frame-0 fix two paragraphs up (Rule 14/20 in
+    # this repo's own CLAUDE.md): fix invariants once at the return, don't
+    # trust every individual rule above to have remembered cuts exist.
+    raw_cuts = props.get("videoCuts")
+    cuts = normalize_cuts(raw_cuts if isinstance(raw_cuts, list) else None, duration_frames)
+    output_duration = compute_output_duration(props, fps=_FPS)
+    mapped = {source_to_output(f, cuts) for f in frames if 0 < f < duration_frames}
+    return sorted(f for f in mapped if 0 < f < output_duration)
 
 
 def render_still(remotion_dir: Path, props_path: Path, frame: int, out_png: Path) -> bool:
@@ -349,7 +371,10 @@ def run_props_qa(props: dict, props_path: Path, remotion_dir: Path, out_dir: Pat
     # 把 stills 交给视觉子模型（VISION_LLM_*，如 GLM-4V）对照清单挑毛病。
     # DeepSeek 主通道是纯文本模型看不了图，所以这一步走独立的视觉通道；
     # 未配置或调用失败都只是"没有眼睛"，绝不影响渲染。
-    vision = _vision_review_confirmed([s["path"] for s in result["stills"]])
+    # out_dir 是 workdir / "qa_stills"（调用方的既定约定）——取父目录作为这个
+    # job 的成本账本所在位置，跟 pipeline_runner.py 的 _generation_costs.json
+    # 写在同一个目录，而不是散落在 qa_stills 子目录里。
+    vision = _vision_review_confirmed([s["path"] for s in result["stills"]], workdir=out_dir.parent)
     if vision:
         result["vision_review"] = vision
         for f in vision.get("findings", []):
@@ -387,14 +412,23 @@ _VISION_CHECKLIST = """这些是同一条竖屏(1080x1920)成片视频在不同�
 没有问题就输出 {"findings": [], "overall": "..."}。不要为了凑数报告不存在的问题。"""
 
 
-def _vision_review(still_paths: list) -> Optional[dict]:
-    """视觉子模型复审 stills。返回 {"findings": [...], "overall": str} 或 None。"""
+def _vision_review(still_paths: list, workdir: Optional[Path] = None) -> Optional[dict]:
+    """视觉子模型复审 stills。返回 {"findings": [...], "overall": str} 或 None。
+
+    workdir: 传了就把这次调用的 token 用量记进这个 job 的成本账本
+    （cost_tracking.py）；默认 None，不追踪。
+    """
     if not still_paths:
         return None
     try:
         from .llm_client import call_vision_chat
+        from .config import get_config
 
-        raw = call_vision_chat(_VISION_CHECKLIST, still_paths[:5])
+        raw, usage = call_vision_chat(_VISION_CHECKLIST, still_paths[:5])
+        if workdir is not None and usage:
+            from .cost_tracking import record_llm_usage
+            config = get_config()
+            record_llm_usage(workdir, "vision_qa", "google", config.vision_llm_model, usage)
         if not raw:
             return None
         cleaned = raw.strip()
@@ -410,7 +444,7 @@ def _vision_review(still_paths: list) -> Optional[dict]:
         return None
 
 
-def _vision_review_confirmed(still_paths: list) -> Optional[dict]:
+def _vision_review_confirmed(still_paths: list, workdir: Optional[Path] = None) -> Optional[dict]:
     """Fix C23（2026-07-20，真实复现 job_452ef6c48100，用户反馈"自从接了视觉
     LLM 之后一直这样"促成的排查）：VISION_LLM_MODEL=glm-4v-flash 对同一帧的
     判断不是确定性的——这不是新发现，Rule 14 已经记录过它对同一张帧在不同
@@ -432,7 +466,7 @@ def _vision_review_confirmed(still_paths: list) -> Optional[dict]:
     只在第一次调用真的出现 high 发现时才多花这一次确认调用——没有发现的
     "干净"路径（多数情况）成本不变。
     """
-    first = _vision_review(still_paths)
+    first = _vision_review(still_paths, workdir=workdir)
     if not first:
         return first
     first_high = {f["frame_index"] for f in first.get("findings", [])
@@ -440,7 +474,7 @@ def _vision_review_confirmed(still_paths: list) -> Optional[dict]:
     if not first_high:
         return first
 
-    second = _vision_review(still_paths)
+    second = _vision_review(still_paths, workdir=workdir)
     if not second:
         # 二次确认调用本身失败（网络/未配置）——宁可保守地当作未确认，不让
         # 一条从没被复核过的 high 发现单独触发重规划/降级。

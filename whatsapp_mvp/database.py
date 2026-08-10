@@ -87,7 +87,6 @@ class User(Base):
 
     # ElevenLabs Instant Voice Clone（voice_clone.py）——一个 WhatsApp 号一份克隆
     # 音色，注册一次、之后每次生成 C-roll/social batch 都复用，不是一次性资源。
-    # 跟 heygen_croll 的 talking_photo（用完即删）性质不同：这个是长期持有的。
     elevenlabs_voice_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
 
     jobs: Mapped[list["Job"]] = relationship(back_populates="user", lazy="selectin")
@@ -130,28 +129,56 @@ class Job(Base):
     # 用户从头到尾被蒙在鼓里。
     degraded_operations: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-    # AI 生成花的真金白银累计（b-roll/背景音乐等，来自 pipeline_runner 的
-    # 成本账本）。Node 网关靠它在预览消息里如实告知花费，防止用户/团队
-    # 完全看不到生成类操作的真实成本。
-    generation_cost_usd: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    # 视觉复审重试后仍未解决、但没有阻断渲染的质量提示（JSON list of str，
+    # 一句话描述一个问题）。用户明确要求过：哪怕有瑕疵也要交付带模板的版本，
+    # 不要因为 vision QA 的发现就整个退回无模板的版本——这个字段就是那次改动
+    # 的配套：仍然如实告知有哪些没解决的小问题，不是静默假装完全没事。跟
+    # degraded_operations 的区别：那个字段意味着"这一步整个被跳过"，这个字段
+    # 意味着"这一步做完了、正常交付了，但过程里发现了几处没修完的小毛病"。
+    quality_warnings: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # 发帖配文 + hashtag（social_caption.py 生成，JSON: {lang, caption, hashtags}）。
+    # 每次 update_job_fields 都必须显式传（哪怕是 None）——跟 degraded_operations/
+    # quality_warnings 同理，retry 会重新走到写这个字段的调用点，漏传 kwarg 会让
+    # 上一轮的旧文案在内容可能已经变了的情况下静默留存。
+    # 命名为 talkinghead_social_caption 而不是 social_caption——social_batch.py
+    # （dashboard 那条照片->多平台文案的批次流程）也有一个同名字段，但形状不一样
+    # （纯字符串 + 独立的 social_hashtags 列，不是这里的 JSON blob）。两边都叫
+    # social_caption 会互相踩——这边改名，social_batch.py 的字段用法不动。
+    talkinghead_social_caption: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     # ── 社媒批次（social_batch.py）──────────────────────────────────────
     # 一次语音+照片提交 -> 多个平台变体，每个变体是独立一条 Job（复用整套
     # 既有的 job 生命周期/文件存储/状态机），batch_id 把它们串成一组，给
-    # Studio 预览页按批次查询用。非批次任务（普通视频/单条 C-roll）这三个
+    # Studio 预览页按批次查询用。非批次任务（普通视频/单条 C-roll）这四个
     # 字段一律为 None，不受影响。
     batch_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, index=True)
     platform: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)  # 见 social_batch.PLATFORM_SPECS
     social_caption: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     social_hashtags: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON list[str]
 
-    # 发帖配文 + hashtag（social_caption.py 生成，JSON: {lang, caption, hashtags}）。
-    # 命名为 talkinghead_social_caption 而不是 social_caption——那个名字已经被
-    # 上面 social_batch.py 的字段占了（纯字符串 + 独立的 social_hashtags 列，
-    # 形状不一样），两边都叫 social_caption 会互相踩。每次 update_job_fields
-    # 都必须显式传（哪怕是 None）——retry 会重新走到写这个字段的调用点，漏传
-    # kwarg 会让上一轮的旧文案在内容可能已经变了的情况下静默留存。
-    talkinghead_social_caption: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # AI 生成花的真金白银累计（b-roll/背景音乐等，来自 pipeline_runner 的
+    # 成本账本）。Node 网关靠它在预览消息里如实告知花费，防止用户/团队
+    # 完全看不到生成类操作的真实成本。
+    generation_cost_usd: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    # 当前处理阶段的短代码（"planning"/"layout_retry"/"qa_retry"/"rendering"），
+    # 由 pipeline_runner 在关键节点写入。Node 网关轮询时把代码翻译成双语文案
+    # 发给用户——Python 侧只发代码不发文案，避免这里重复维护一份语言判断
+    # 逻辑（跟 degraded_operations 是同一个分工模式）。
+    progress_stage: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+
+    # LLM token 用量累计（内容规划 + 视觉复审等所有 LLM 调用），配合
+    # llm_cost_usd 一起用真实 token 数 x 单价算出来，不是估算。
+    llm_tokens_input: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    llm_tokens_output: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    llm_cost_usd: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    # 本次剪辑管线实际耗时（秒）——跟 generation_cost_usd/llm_cost_usd 一起
+    # 展示给用户，让"这条视频到底花了多久、花了多少钱"有真实数据支撑，
+    # 而不是只能靠 created_at/updated_at 粗略估算（updated_at 会被很多别的
+    # 字段更新触碰到，不是干净的"管线耗时"信号）。
+    elapsed_seconds: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime, default=datetime.datetime.utcnow
@@ -217,8 +244,8 @@ class Clip(Base):
     # {lang, caption, hashtags}，social_caption.generate_caption() 的原样输出。
     # 故意不叫 social_caption——那个名字在这个文件里已经被 Job.social_caption
     # （social_batch.py 用，纯字符串）和 Job.talkinghead_social_caption
-    # （transcript-based caption 功能，JSON blob）两边占用了，三个不同形状的
-    # 字段抢同一个名字迟早互相踩。
+    # （今天早些时候的 social_caption.py 功能，JSON blob）两边占用了，三个
+    # 不同形状的字段抢同一个名字迟早互相踩。
     caption_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     degraded_operations: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON list，同 Job 的用法
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -283,6 +310,27 @@ def _migrate_schema(engine) -> None:
     if "generation_cost_usd" not in cols:
         with engine.begin() as conn:
             conn.execute(_text("ALTER TABLE jobs ADD COLUMN generation_cost_usd FLOAT"))
+    if "progress_stage" not in cols:
+        with engine.begin() as conn:
+            conn.execute(_text("ALTER TABLE jobs ADD COLUMN progress_stage VARCHAR(32)"))
+    if "llm_tokens_input" not in cols:
+        with engine.begin() as conn:
+            conn.execute(_text("ALTER TABLE jobs ADD COLUMN llm_tokens_input INTEGER"))
+    if "llm_tokens_output" not in cols:
+        with engine.begin() as conn:
+            conn.execute(_text("ALTER TABLE jobs ADD COLUMN llm_tokens_output INTEGER"))
+    if "llm_cost_usd" not in cols:
+        with engine.begin() as conn:
+            conn.execute(_text("ALTER TABLE jobs ADD COLUMN llm_cost_usd FLOAT"))
+    if "elapsed_seconds" not in cols:
+        with engine.begin() as conn:
+            conn.execute(_text("ALTER TABLE jobs ADD COLUMN elapsed_seconds FLOAT"))
+    if "quality_warnings" not in cols:
+        with engine.begin() as conn:
+            conn.execute(_text("ALTER TABLE jobs ADD COLUMN quality_warnings TEXT"))
+    if "talkinghead_social_caption" not in cols:
+        with engine.begin() as conn:
+            conn.execute(_text("ALTER TABLE jobs ADD COLUMN talkinghead_social_caption TEXT"))
     if "batch_id" not in cols:
         with engine.begin() as conn:
             conn.execute(_text("ALTER TABLE jobs ADD COLUMN batch_id VARCHAR(36)"))
@@ -295,9 +343,6 @@ def _migrate_schema(engine) -> None:
     if "social_hashtags" not in cols:
         with engine.begin() as conn:
             conn.execute(_text("ALTER TABLE jobs ADD COLUMN social_hashtags TEXT"))
-    if "talkinghead_social_caption" not in cols:
-        with engine.begin() as conn:
-            conn.execute(_text("ALTER TABLE jobs ADD COLUMN talkinghead_social_caption TEXT"))
 
     try:
         user_cols = {c["name"] for c in _inspect(engine).get_columns("users")}

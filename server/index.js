@@ -2,13 +2,10 @@
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 import crypto from "crypto";
-import fs from "fs";
-import os from "os";
 import express from "express";
 import { Queue } from "bullmq";
 import IORedis from "ioredis";
 import axios from "axios";
-import FormData from "form-data";
 import { resolveLang, t } from "./lang.js";
 
 config({ path: resolve(dirname(fileURLToPath(import.meta.url)), "../.env") });
@@ -74,10 +71,23 @@ app.get("/privacy", (_req, res) => {
 app.get("/files/:jobId/:filename", async (req, res) => {
   const upstream = `${PYTHON_API_BASE}/files/${encodeURIComponent(req.params.jobId)}/${encodeURIComponent(req.params.filename)}`;
   try {
-    const upstreamRes = await axios.get(upstream, { responseType: "stream", validateStatus: () => true });
+    // 必须把客户端的 Range 头转发给 Python，也要把 Python 回的 range 相关响应头
+    // 转发回去——不转发的后果不是"慢一点"，是浏览器 <video> 标签直接播放不了：
+    // Chrome 对 <video> 发的请求带 Range，服务端如果永远回 200（整个文件、不是
+    // 206 Partial Content）会被 Opaque Response Blocking 拦下，表现为
+    // MediaPlaybackError，画面直接黑屏、控制台看不出明显原因（Phase 2 编辑器的
+    // 真实浏览器联调中直接复现，之前这条代理只被 WhatsApp 自己的播放器/下载链接
+    // 用过，从来没有真的被 <video src> 加载过，这个缺口一直没暴露出来）。
+    const upstreamRes = await axios.get(upstream, {
+      responseType: "stream",
+      validateStatus: () => true,
+      headers: req.headers.range ? { range: req.headers.range } : {},
+    });
     res.status(upstreamRes.status);
-    if (upstreamRes.headers["content-type"]) res.setHeader("content-type", upstreamRes.headers["content-type"]);
-    if (upstreamRes.headers["content-length"]) res.setHeader("content-length", upstreamRes.headers["content-length"]);
+    const forwardHeaders = ["content-type", "content-length", "accept-ranges", "content-range", "etag", "last-modified"];
+    for (const h of forwardHeaders) {
+      if (upstreamRes.headers[h]) res.setHeader(h, upstreamRes.headers[h]);
+    }
     upstreamRes.data.pipe(res);
   } catch (err) {
     console.error(`[files-proxy] failed to fetch ${upstream}:`, err.message);
@@ -141,6 +151,154 @@ app.get("/publish-flow-demo", (_req, res) => {
   res.sendFile(resolve(dirname(fileURLToPath(import.meta.url)), "publish-flow-demo.html"));
 });
 
+// ---------------------------------------------------------------------------
+// Preview editor (Phase 2) — serves the built editor SPA and proxies its API
+// calls to the Python service. Everything here is same-origin (this gateway
+// is the one publicly tunneled server, see the PYTHON_API_BASE comment
+// above), so no CORS setup is needed anywhere in this feature.
+// ---------------------------------------------------------------------------
+
+const EDITOR_DIST_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "../remotion-composer/editor-dist");
+
+app.use("/editor/assets", express.static(resolve(EDITOR_DIST_DIR, "assets")));
+
+app.get("/editor/:jobId", (req, res) => {
+  // Token 鉴权完全交给 API 调用做（前端加载后立刻打 GET /api/editor/:jobId/
+  // props，拿到 403 就自己显示错误态）——这里只是静态 SPA 外壳，本身不含
+  // 任何敏感信息，不需要在这一层重复校验。
+  res.sendFile(resolve(EDITOR_DIST_DIR, "index.html"), (err) => {
+    if (err) {
+      res.status(404).send("Editor not built yet — run `npm run build:editor` in remotion-composer/");
+    }
+  });
+});
+
+app.get(["/api/editor/:jobId/props", "/api/editor/:jobId/status",
+         "/api/editor/:jobId/filmstrip", "/api/editor/:jobId/waveform",
+         "/api/editor/:jobId/authored"], async (req, res) => {
+  // req.path 已经是 /api/editor/:jobId/props 这类完整路径，去掉 /api 前缀
+  // 直接对应 Python 那边的 /editor/:jobId/props 路由。
+  const upstream = `${PYTHON_API_BASE}${req.path.replace(/^\/api/, "")}?token=${encodeURIComponent(req.query.token || "")}`;
+  try {
+    const upstreamRes = await axios.get(upstream, { validateStatus: () => true });
+    res.status(upstreamRes.status).json(upstreamRes.data);
+  } catch (err) {
+    console.error(`[editor-api] GET ${req.path} failed:`, err.message);
+    res.sendStatus(502);
+  }
+});
+
+app.post("/api/editor/:jobId/relayout", async (req, res) => {
+  const upstream = `${PYTHON_API_BASE}/editor/${encodeURIComponent(req.params.jobId)}/relayout`
+    + `?token=${encodeURIComponent(req.query.token || "")}`;
+  try {
+    const upstreamRes = await axios.post(upstream, req.body, { validateStatus: () => true });
+    res.status(upstreamRes.status).json(upstreamRes.data);
+  } catch (err) {
+    console.error("[editor-api] relayout failed:", err.message);
+    res.sendStatus(502);
+  }
+});
+
+app.post("/api/editor/:jobId/props", async (req, res) => {
+  const jobId = req.params.jobId;
+  const upstream = `${PYTHON_API_BASE}/editor/${encodeURIComponent(jobId)}/props`
+    + `?token=${encodeURIComponent(req.query.token || "")}`;
+  let upstreamRes;
+  try {
+    upstreamRes = await axios.post(upstream, req.body, { validateStatus: () => true });
+  } catch (err) {
+    console.error("[editor-api] save failed:", err.message);
+    return res.sendStatus(502);
+  }
+  if (upstreamRes.status !== 202) {
+    return res.status(upstreamRes.status).json(upstreamRes.data);
+  }
+  // wa_number 只应该在服务器之间传递，绝不能原样透传回浏览器——这条编辑器
+  // 链接谁点开都能保存，发起保存的人不一定就是那个 WhatsApp 号码本人；
+  // wa_number 只用来把这次保存接进 BullMQ 投递队列，触发 worker.js 的
+  // editorSave 把渲染结果发回真正的 WhatsApp 对话。
+  const { wa_number: waNumber, state, job_id: returnedJobId } = upstreamRes.data || {};
+  const effectiveJobId = returnedJobId || jobId;
+  if (waNumber) {
+    const msgId = `editor-${effectiveJobId}-${Date.now()}`;
+    try {
+      await videoQueue.add("editor-save", { waNumber, jobId: effectiveJobId, msgId }, queueOptions(msgId));
+    } catch (err) {
+      console.error("[editor-api] failed to enqueue editor-save:", err.message);
+    }
+  } else {
+    console.warn(`[editor-api] save for ${effectiveJobId} had no wa_number — delivery will not fire`);
+  }
+  res.status(202).json({ job_id: effectiveJobId, state });
+});
+
+// Phase 8 — Arm B (AI-authored) manual edits. Mirrors the /props POST
+// handler above exactly (same upstream-status check, same wa_number →
+// BullMQ "editor-save" enqueue) — a job is only ever Arm A or Arm B, never
+// both, but the delivery mechanism once a save lands is identical either
+// way, so this deliberately isn't a new code path, just a new upstream path.
+app.post("/api/editor/:jobId/overrides", async (req, res) => {
+  const jobId = req.params.jobId;
+  const upstream = `${PYTHON_API_BASE}/editor/${encodeURIComponent(jobId)}/overrides`
+    + `?token=${encodeURIComponent(req.query.token || "")}`;
+  let upstreamRes;
+  try {
+    upstreamRes = await axios.post(upstream, req.body, { validateStatus: () => true });
+  } catch (err) {
+    console.error("[editor-api] authored save failed:", err.message);
+    return res.sendStatus(502);
+  }
+  if (upstreamRes.status !== 202) {
+    return res.status(upstreamRes.status).json(upstreamRes.data);
+  }
+  const { wa_number: waNumber, state, job_id: returnedJobId } = upstreamRes.data || {};
+  const effectiveJobId = returnedJobId || jobId;
+  if (waNumber) {
+    const msgId = `editor-${effectiveJobId}-${Date.now()}`;
+    try {
+      await videoQueue.add("editor-save", { waNumber, jobId: effectiveJobId, msgId }, queueOptions(msgId));
+    } catch (err) {
+      console.error("[editor-api] failed to enqueue editor-save:", err.message);
+    }
+  } else {
+    console.warn(`[editor-api] authored save for ${effectiveJobId} had no wa_number — delivery will not fire`);
+  }
+  res.status(202).json({ job_id: effectiveJobId, state });
+});
+
+// Dashboard "Edit" action — mints a token via Python (POST /jobs/:id/editor_token,
+// itself already scoped "给 Node 网关用") and re-hosts the URL onto whatever
+// origin the browser actually loaded the dashboard from. Python's own
+// public_base_url defaults to its own port (localhost:8000) and isn't
+// guaranteed to match the gateway's address in every environment (local dev
+// vs. an ngrok tunnel), whereas req.get("host") always is — the editor SPA
+// itself is only ever served from this gateway (see EDITOR_DIST_DIR above),
+// never from Python directly.
+app.post("/api/jobs/:jobId/editor-link", async (req, res) => {
+  const jobId = req.params.jobId;
+  const upstream = `${PYTHON_API_BASE}/jobs/${encodeURIComponent(jobId)}/editor_token`;
+  let upstreamRes;
+  try {
+    upstreamRes = await axios.post(upstream, {}, { validateStatus: () => true });
+  } catch (err) {
+    console.error("[editor-link] mint failed:", err.message);
+    return res.sendStatus(502);
+  }
+  if (upstreamRes.status !== 200) {
+    return res.status(upstreamRes.status).json(upstreamRes.data);
+  }
+  let token;
+  try {
+    token = new URL(upstreamRes.data.editor_url).searchParams.get("token");
+  } catch (err) {
+    return res.sendStatus(502);
+  }
+  if (!token) return res.sendStatus(502);
+  const editorUrl = `${req.protocol}://${req.get("host")}/editor/${encodeURIComponent(jobId)}?token=${encodeURIComponent(token)}`;
+  res.json({ editor_url: editorUrl });
+});
+
 app.get(["/webhook", "/webhook/whatsapp"], (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
@@ -174,12 +332,8 @@ app.post(["/webhook", "/webhook/whatsapp"], async (req, res) => {
 async function handleMessage(message) {
   const waNumber = message.from;
   const msgId = message.id;
-  // msgType/text 用 let，不用 const——语音消息转写完之后会把这两个变量
-  // 改写成 ("text", 转写文字)，直接落进下面已有的整套文字路由逻辑
-  // （收集态/等选臂/活跃任务确认/修改意见/问答……），不用为语音另外
-  // 写一份可能悄悄跟文字路由分叉的平行逻辑。
-  let msgType = message.type;
-  let text = message.text?.body?.trim() || "";
+  const msgType = message.type;
+  const text = message.text?.body?.trim() || "";
 
   if (!waNumber || !msgId) return;
 
@@ -210,49 +364,8 @@ async function handleMessage(message) {
 
   console.log(`[webhook] from=${waNumber} type=${msgType}`);
 
-  // 语音消息：下载 + 转写成文字，然后原地把这条消息"变成"一条文字消息，
-  // 落进下面已有的整套文字路由逻辑——同一句话不管是打字还是说出来，理解
-  // 和路由方式完全一样。转写失败/没听清就按"没听清"礼貌回复，不当成
-  // 静默失败晾着用户（架构复审后新增，2026-07-29）。
-  if (msgType === "audio") {
-    const mediaId = message.audio?.id;
-    const lang = resolveLang(env("WA_DEFAULT_LANG", "zh"));
-    if (!mediaId) return;
-
-    // 正在等这条语音去做声音克隆——这条音频本身就是要克隆的素材，不是要
-    // 理解内容的一句话，转写没有意义（还会浪费一次转写调用）。必须在转写
-    // 之前拦截，拦完直接 return，不落进下面"变成文字消息"的通用路由。
-    const awaitVoiceClone = await withTimeout(
-      redis.get(awaitVoiceCloneKey(waNumber)), Number(env("WA_REDIS_OP_TIMEOUT_MS", "2000")), null);
-    if (awaitVoiceClone) {
-      await redis.del(awaitVoiceCloneKey(waNumber));
-      await gatewaySendText(waNumber, t(lang,
-        "收到，正在注册你的专属声音，大约几秒钟…",
-        "Got it — registering your voice, this takes a few seconds…"));
-      await videoQueue.add("voice-clone-create", { waNumber, mediaId, msgId }, queueOptions(msgId));
-      return;
-    }
-
-    let transcribed = "";
-    try {
-      transcribed = await downloadAndTranscribeVoice(mediaId);
-    } catch (err) {
-      console.warn(`[webhook] voice transcribe failed: ${err.message}`);
-    }
-    if (!transcribed) {
-      await gatewaySendText(waNumber, t(lang,
-        "抱歉，没听清这条语音消息，可以再说一遍或者直接打字。",
-        "Sorry, I couldn't make out that voice message — try again or type it instead."));
-      return;
-    }
-    console.log(`[webhook] voice transcribed: "${transcribed}"`);
-    msgType = "text";
-    text = transcribed;
-  }
-
-  // 交互按钮回复：方案A选臂 / 方案确认(confirm/cancel) / 收集态(完成/取消)。
-  // 原则跟 armChoice 一致——按钮只是文字指令的快捷方式，命中哪个分支就走
-  // 跟对应文字指令完全相同的队列任务，不新增后端逻辑；状态已经过期/变化时
+  // 交互按钮回复：方案A选臂。按钮只是文字指令的快捷方式，命中就走跟对应
+  // 文字指令完全相同的队列任务，不新增后端逻辑；等待状态已过期/不存在时
   // 静默忽略（不报错也不追问），避免用户点了一条陈旧消息上的按钮却卡住。
   if (msgType === "interactive") {
     const btnId = message.interactive?.button_reply?.id || message.interactive?.list_reply?.id || "";
@@ -260,53 +373,10 @@ async function handleMessage(message) {
       redis.get(awaitArmKey(waNumber)), Number(env("WA_REDIS_OP_TIMEOUT_MS", "2000")), null);
     if (awaitArm) {
       await videoQueue.add("arm-choice", { waNumber, armId: btnId, msgId }, queueOptions(msgId));
-      return;
-    }
-    if (btnId === "job_confirm" || btnId === "job_cancel") {
-      const activeJobId = await withTimeout(
-        redis.get(activeJobKey(waNumber)), Number(env("WA_REDIS_OP_TIMEOUT_MS", "2000")), null);
-      if (activeJobId) {
-        if (btnId === "job_confirm") {
-          await videoQueue.add("confirm-job", { waNumber, jobId: activeJobId, msgId }, queueOptions(msgId));
-        } else {
-          await redis.del(activeJobKey(waNumber));
-          await videoQueue.add("cancel-job", { waNumber, jobId: activeJobId, msgId }, queueOptions(msgId));
-        }
-      }
-      return;
-    }
-    if (btnId === "collect_done" || btnId === "collect_cancel") {
-      const awaitingChoice = await withTimeout(
-        redis.get(awaitChoiceKey(waNumber)), Number(env("WA_REDIS_OP_TIMEOUT_MS", "2000")), null);
-      const pendingCount = await withTimeout(
-        redis.llen(collectKey(waNumber)), Number(env("WA_REDIS_OP_TIMEOUT_MS", "2000")), 0);
-      if (!awaitingChoice && !pendingCount) return; // 素材已清空/任务已开始，按钮已过期
-      if (btnId === "collect_cancel") {
-        let captionSignal;
-        try {
-          const items = (await redis.lrange(collectKey(waNumber), 0, -1)).map((s) => JSON.parse(s));
-          captionSignal = items.map((i) => i.caption).find((c) => c);
-        } catch {}
-        await redis.del(collectKey(waNumber));
-        await redis.del(awaitChoiceKey(waNumber));
-        await videoQueue.add("collect-cancel", { waNumber, text: "cancel", captionSignal, msgId }, queueOptions(msgId));
-      } else if (!awaitingChoice && pendingCount > 0) {
-        // “完成”按钮等价于文字 go；仅在真正的收集阶段生效——若这期间已经
-        // 进了“选主视频”阶段（awaitingChoice），文字路径本身也不认 go 为
-        // 收尾指令（会被当成对编号问题的文字回答），按钮跟着同样规则走，
-        // 不额外绕过必要的主视频消歧步骤。
-        await videoQueue.add("finalize-collection", { waNumber, text: "go", msgId }, queueOptions(msgId));
-      }
-      return;
     }
     return;
   }
 
-  // 社媒批次：一张照片 + 触发词 caption → 一次生成 IG Feed/Reel·TikTok/Story
-  // 三个平台变体（各自文案+hashtag），Studio 预览页链接发回。跟下面 C-roll
-  // 同一个"必须显式触发词、且收集态未进行中才认"的防撞车规则，关键词集合
-  // 跟 CROLL_TRIGGER_RE 不重叠，两者互斥判断不影响彼此。
-  const SOCIAL_BATCH_TRIGGER_RE = /\bsocial\b|instagram|tiktok|\breel\b|\bpost\b|发(?:个|条)?\s*(?:ins|图文|帖子)|社媒|多平台/i;
   // C-roll：一张照片 + 触发词 caption → AI 看图写文案 + HeyGen 生成数字人
   // 说话视频，再自动接入常规剪辑管线。必须显式触发词才认（不能让所有
   // 图片上传都被当成 C-roll 请求）——不然会跟下面正常的 b-roll 图片收集
@@ -317,7 +387,7 @@ async function handleMessage(message) {
     const media = message.image || {};
     const mediaId = media.id;
     const caption = media.caption || "";
-    if (mediaId && (SOCIAL_BATCH_TRIGGER_RE.test(caption) || CROLL_TRIGGER_RE.test(caption))) {
+    if (mediaId && CROLL_TRIGGER_RE.test(caption)) {
       const pendingCount = await withTimeout(
         redis.llen(collectKey(waNumber)), Number(env("WA_REDIS_OP_TIMEOUT_MS", "2000")), 0
       );
@@ -326,13 +396,6 @@ async function handleMessage(message) {
       );
       if (!pendingCount && !awaitingChoice) {
         const lang = resolveLang(env("WA_DEFAULT_LANG", "zh"), caption);
-        if (SOCIAL_BATCH_TRIGGER_RE.test(caption)) {
-          await gatewaySendText(waNumber, t(lang,
-            "收到图片，正在生成多平台社媒内容（IG Feed / Reel·TikTok / Story），大约 1-2 分钟…",
-            "Got the photo — generating multi-platform social content (IG Feed / Reel·TikTok / Story), about 1-2 minutes…"));
-          await videoQueue.add("social-batch-generate", { waNumber, mediaId, caption, msgId }, queueOptions(msgId));
-          return;
-        }
         await gatewaySendText(waNumber, t(lang,
           "收到图片，正在生成数字人说话视频（AI 看图写文案 + 生成口型动画），这一步通常要 1-2 分钟…",
           "Got the photo — generating your talking-photo video (AI writing the script + animating it), usually takes 1-2 minutes…"));
@@ -371,17 +434,6 @@ async function handleMessage(message) {
       `可以继续发素材，也可以用文字补充说明。全部发完回复 *go* 开始，回复 *cancel* 取消。${queueNote}`,
       `Received item #${count}, ${noun}${note}.\n` +
       `Keep sending more assets, or add a text description. Reply *go* when done, or *cancel* to clear.${queueNote}`));
-    // 按钮是文字指令 go/cancel 的快捷方式，不是替代——先发的文字消息已经
-    // 完整可用，这条按钮消息发送失败（网络抖动等）静默忽略即可，不影响
-    // 用户继续用文字完成整个收集流程。
-    try {
-      await gatewaySendButtons(waNumber, t(lang, "素材收好了吗？", "Got everything you need?"), [
-        { id: "collect_done", title: t(lang, "✅ 完成，开始", "✅ Done, go") },
-        { id: "collect_cancel", title: t(lang, "❌ 取消", "❌ Cancel") },
-      ]);
-    } catch (err) {
-      console.warn(`[webhook] collect buttons failed (text ack already sent): ${err.message}`);
-    }
     return;
   }
 
@@ -392,22 +444,6 @@ async function handleMessage(message) {
       redis.get(awaitArmKey(waNumber)), Number(env("WA_REDIS_OP_TIMEOUT_MS", "2000")), null);
     if (awaitArmFlag) {
       await videoQueue.add("arm-choice", { waNumber, armText: text, msgId }, queueOptions(msgId));
-      return;
-    }
-
-    // 声音克隆入驻：一次性把这个艺人的真实音色注册进 ElevenLabs（见
-    // voice_clone.py），之后 C-roll/social batch 生成的数字人视频就用真声，
-    // 不再是 HeyGen 库存声音。触发词命中就把 Redis 标一下等下一条语音消息
-    // （下面 msgType==="audio" 那块要在转写之前查这个标记——用户发的是要
-    // 拿去克隆的原始声音样本，不是一句要理解意图的话，转写了也没用）。
-    const VOICE_CLONE_TRIGGER_RE = /克隆.*声音|注册声音|声音克隆|voice\s*clone|clone\s*(my\s*)?voice/i;
-    if (VOICE_CLONE_TRIGGER_RE.test(text)) {
-      const lang = resolveLang(env("WA_DEFAULT_LANG", "zh"), text);
-      await redis.set(awaitVoiceCloneKey(waNumber), "1", "EX",
-        Number(env("WA_VOICE_CLONE_AWAIT_TTL_S", "300")));
-      await gatewaySendText(waNumber, t(lang,
-        "好的！请发一条 30 秒左右、环境安静的语音消息，我会用它注册你的专属声音，之后生成的数字人视频就会用你的真实声音。",
-        "Got it! Please send a ~30-second voice note in a quiet environment — I'll use it to register your voice, so future digital-human videos sound like you."));
       return;
     }
     const activeJobId = await withTimeout(
@@ -559,12 +595,10 @@ function awaitChoiceKey(waNumber) {
   return `wa:user:${waNumber}:await_choice`;
 }
 
+// 方案A(选臂):Redis key 必须跟 worker.js 里的 awaitArmKey 用同一套命名/编码,
+// 两个进程各自独立定义(索引进程收消息判断要不要拦下来转发,worker 进程消费)。
 function awaitArmKey(waNumber) {
   return `wa:user:${waNumber}:await_arm`;
-}
-
-function awaitVoiceCloneKey(waNumber) {
-  return `wa:user:${waNumber}:await_voice_clone`;
 }
 
 function notesKey(waNumber) {
@@ -581,38 +615,6 @@ function env(name, fallback = "") {
   return process.env[name] || fallback;
 }
 
-// 下载一条 WhatsApp 语音消息 + 转写成文字（架构复审后新增，2026-07-29）。
-// 语音消息通常几秒到一两分钟，直接留在内存里传给 Python 的 /transcribe，
-// 不落临时文件——不像 worker.js 那边处理的视频/图片素材，没有"文件可能
-// 很大、要流式落盘"的顾虑，也就不需要那边那一整套临时文件生命周期管理。
-async function downloadAndTranscribeVoice(mediaId) {
-  const token = env("WA_TOKEN", env("WHATSAPP_ACCESS_TOKEN"));
-  const info = await axios.get(
-    `https://graph.facebook.com/${env("WA_GRAPH_VERSION", "v21.0")}/${mediaId}`,
-    { headers: { Authorization: `Bearer ${token}` }, timeout: Number(env("WA_MEDIA_INFO_TIMEOUT_MS", "30000")) }
-  );
-  const mediaUrl = info.data.url;
-  if (!mediaUrl) throw new Error(`WhatsApp voice media ${mediaId} no download URL`);
-  const mime = info.data.mime_type || "";
-  // WhatsApp 语音消息固定是 audio/ogg; codecs=opus；万一遇到非语音的普通
-  // 音频附件（mime 不同），扩展名跟着 mime 走，Python 那边靠 ffmpeg 解码，
-  // 不挑格式。
-  const ext = mime.includes("ogg") ? "ogg" : mime.includes("mp4") || mime.includes("m4a") ? "m4a" : "ogg";
-  const audioResp = await axios.get(mediaUrl, {
-    headers: { Authorization: `Bearer ${token}` },
-    responseType: "arraybuffer",
-    timeout: Number(env("WA_MEDIA_DOWNLOAD_TIMEOUT_MS", "60000")),
-  });
-  const form = new FormData();
-  form.append("audio", Buffer.from(audioResp.data), { filename: `voice.${ext}`, contentType: mime || "audio/ogg" });
-  const resp = await axios.post(`${PYTHON_API_BASE}/transcribe`, form, {
-    headers: form.getHeaders(),
-    maxBodyLength: Infinity, maxContentLength: Infinity,
-    timeout: Number(env("WA_TRANSCRIBE_TIMEOUT_MS", "60000")),
-  });
-  return (resp.data?.text || "").trim();
-}
-
 async function gatewaySendText(waNumber, text) {
   const token = env("WA_TOKEN", env("WHATSAPP_ACCESS_TOKEN"));
   const phoneId = env("WA_PHONE_ID", env("WHATSAPP_PHONE_NUMBER_ID"));
@@ -626,31 +628,6 @@ async function gatewaySendText(waNumber, text) {
   } catch (err) {
     console.warn("[gateway] ack send failed:", err.message);
   }
-}
-
-// worker.js 里 sendButtons 的网关侧对应版本——网关(index.js)和 worker
-// 是两个独立进程，各自直连 Graph API 发消息，不共享函数（worker 那份用的
-// 是 worker.js 自己的 axios/鉴权封装，这里保持跟同文件里 gatewaySendText
-// 一致的最小实现，不引入跨文件依赖）。调用方需要自行 try/catch——这里不
-// 吞异常，因为按钮属于“先发文字、按钮是锦上添花”的场景，调用方要知道
-// 按钮到底发没发成功，才能决定要不要静默降级。
-async function gatewaySendButtons(waNumber, bodyText, buttons) {
-  const token = env("WA_TOKEN", env("WHATSAPP_ACCESS_TOKEN"));
-  const phoneId = env("WA_PHONE_ID", env("WHATSAPP_PHONE_NUMBER_ID"));
-  if (!token || !phoneId) return;
-  await axios.post(
-    `https://graph.facebook.com/${env("WA_GRAPH_VERSION", "v21.0")}/${phoneId}/messages`,
-    {
-      messaging_product: "whatsapp", recipient_type: "individual", to: waNumber,
-      type: "interactive",
-      interactive: {
-        type: "button",
-        body: { text: bodyText },
-        action: { buttons: buttons.map((b) => ({ type: "reply", reply: { id: b.id, title: b.title } })) },
-      },
-    },
-    { headers: { Authorization: `Bearer ${token}` }, timeout: 10000 }
-  );
 }
 
 function whatsappVerifyToken() {

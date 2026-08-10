@@ -5,11 +5,10 @@
 
 from __future__ import annotations
 
+import copy
 import difflib
 import json
 import logging
-import os
-import re
 import shutil
 import subprocess
 import time
@@ -18,7 +17,7 @@ from typing import Any, Callable, Optional
 
 from .config import get_config
 from .database import Job
-from . import authored as _armb  # Arm B(模型现写 composition)接线层;flag 关时零行为差异
+from . import authored as _armb  # Arm B（模型现写 composition）接线层；flag 关时零行为差异
 
 logger = logging.getLogger(__name__)
 
@@ -40,20 +39,212 @@ from .concurrency import (
 # 主入口
 # ============================================================================
 
+
+class _ApplyStyleReplanExhausted(RuntimeError):
+    """Fix C（2026-07-24）：`_op_apply_style` 内部的内容规划/视觉复审重试机制
+    （props_lint 的 3 轮重试循环、视觉复审的一轮重规划）已经用尽预算时专用的
+    异常类型——区别于渲染子进程崩溃那类真正瞬时、值得整函数级重试的失败。
+    子类化 RuntimeError，任何不知道这个新类型存在的代码（`except Exception`/
+    `except RuntimeError`）依然能照常捕获，行为不变。见 `_run_op_with_retry`
+    的说明：这类异常只应该让 handler 被调用一次，不该像渲染崩溃那样再整函数
+    重跑一遍（那会白白重跑一次 enhancement chain + 转写 + 全新内容规划）。"""
+
+
+class _StyleRerunUnsupported(RuntimeError):
+    """`rerun_style_only`（预览阶段"只重跑样式"路径）判定这个 job 不适合走快
+    速路径时抛出——例如方案里没有 apply_style 操作，或它的 chapters/data_cards
+    是手工编排（`_build` 会直接绕过 plan_content，反馈根本传不进去）。调用方
+    （`worker.revise_style`）捕获后原样退回今天既有的完整方案重规划
+    （`revise_plan`），不是错误，是"这条路走不通，走回原来那条"。"""
+
+
+class _StyleRerunFailed(RuntimeError):
+    """`rerun_style_only` 已经决定走快速路径、但 `_op_apply_style` 本身失败
+    （渲染出错等）时抛出——跟上面 `_StyleRerunUnsupported`（"根本不该走这条
+    路"）是不同语义：这里是"该走这条路，但这次没走成"。调用方必须把
+    `_op_apply_style_props.json`/`_vision_qa_warnings.json` 恢复成重跑前的快照
+    （`rerun_style_only` 自己在 raise 前已经做了），保留旧 preview.mp4 不动，
+    状态退回 PREVIEW_READY 而不是 ERROR——不能让用户因为一次修订意见就把已经
+    到手的预览弄丢。"""
+
+
+class _EditorPropsInvalid(ValueError):
+    """`render_props_directly`（预览编辑器"保存"路径）在 pin+strip 之后，
+    发现结果不满足 contracts/render_props.schema.json 时抛出——发生在写盘/
+    渲染之前，磁盘上什么都没被动过，调用方（webhook.py）应该直接回 400 +
+    这条异常的错误文本，不需要走后台任务、不需要恢复任何快照。"""
+
+
+class _EditorRenderFailed(RuntimeError):
+    """`render_props_directly` 已经通过校验、真正尝试渲染，但
+    `_remotion_render_props` 本身失败时抛出——语义跟 `_StyleRerunFailed`
+    完全对应（同一类"决定要做、但没做成"），调用方同样必须恢复 props/
+    vision-warnings 快照、保留旧 preview.mp4、状态退回 PREVIEW_READY。"""
+
+
 # add_music 重试前的等待：Pixabay 检索失败常是 Cloudflare 反爬挑战（非官方 API，
 # 爬公开搜索页），这类拦截一般数十秒内解除，立即重试大概率还在同一个挑战窗口里。
 # （合并自 PR #39，2026-07-20）
 _MUSIC_RETRY_DELAY_S = 30
 
 
-def run_talking_head_pipeline(job: Job) -> dict[str, Any]:
+def _run_op_with_retry(op_type: str, handler: Callable[[str, dict, Path], Optional[str]],
+                        src: str, op: dict, job_dir: Path,
+                        degradable_ops: set[str]) -> tuple[Optional[str], bool]:
+    """执行单个 op handler，失败时的重试/降级路由。返回 `(new_src, degraded)`。
+
+    抽成独立函数有两个目的：(1) 让下面的异常路由逻辑不需要真实渲染/转写就能
+    单测；(2) Fix C（2026-07-24）——`_ApplyStyleReplanExhausted` 走一条不同
+    的路径，只调用一次 `handler` 就直接进降级判断，不像其它异常那样再整
+    函数重跑一遍。触发这个异常的原因是 `_op_apply_style` 内部的内容规划/
+    视觉复审重试机制已经用尽预算——外层再整函数重跑一遍，等于白白重跑一次
+    enhancement chain（face/color/audio 全部重新编码）+ 转写 + 全新内容规划，
+    而这个原因本身不是"瞬时失败"，重跑大概率原样再失败一次，纯属浪费。
+    渲染子进程崩溃等其它异常（真正瞬时的失败）保留原有的"重试一次再降级"
+    行为，完全不变。
+    """
+    try:
+        return handler(src, op, job_dir), False
+    except _ApplyStyleReplanExhausted as e:
+        logger.warning(
+            f"    {op_type}: 内容规划/视觉复审重试已耗尽（非渲染子进程崩溃），"
+            f"跳过整函数级重试直接降级。原因: {e}"
+        )
+        if op_type in degradable_ops:
+            return None, True
+        raise
+    except Exception as e:
+        # 先自动重试一次再谈降级：渲染类失败里有一部分是瞬时的（资源争抢、
+        # 子进程偶发），一次重试能白捡回来；确定性失败则重试也快（在同一
+        # 个错误上再挂一次），代价可控。
+        logger.warning(f"    {op_type}: 执行失败，自动重试一次。原因: {e}")
+        try:
+            return handler(src, op, job_dir), False
+        except Exception as e2:
+            if op_type in degradable_ops:
+                logger.warning(
+                    f"    {op_type}: 重试仍失败，降级——保留上一步结果继续交付"
+                    f"（会显性告知用户，非静默）。原因: {e2}"
+                )
+                return None, True
+            raise
+
+
+def _finalize_pipeline_tail(job_dir: Path, src: str, *, subtitle_op: Optional[dict],
+                            music_op: Optional[dict], applied: list[str],
+                            degraded: list[str], job_id: str,
+                            reuse_music: bool = False) -> dict[str, Any]:
+    """管线尾段：字幕 -> 背景音乐 -> 定稿 preview.mp4 -> 组装结果 dict。
+
+    从 `run_talking_head_pipeline` 抽出来，供 `rerun_style_only`（只重跑
+    apply_style 的预览修订路径）共用——那条路径同样需要"字幕/音乐要不要重新
+    走一遍、定稿到 preview.mp4、拼出同样形状的结果 dict"这整段逻辑，不能只
+    复制粘贴一份容易跟这边的修复脱节。除了三处必要的参数化替换（preview_path
+    本地计算、job.id -> job_id、reuse_music 分支），逻辑与原
+    run_talking_head_pipeline 的对应片段完全一致，一字未改。
+    """
+    preview_path = job_dir / "preview.mp4"
+
+    if subtitle_op is not None:
+        logger.info("  执行操作: add_subtitles")
+        new_src = _op_add_subtitles(src, subtitle_op, job_dir)
+        if new_src and Path(new_src).exists():
+            src = str(new_src)
+            applied.append("add_subtitles")
+
+    if music_op is not None:
+        if reuse_music:
+            music_op = {**music_op, "_reuse_cached_music": True}
+        logger.info("  执行操作: add_music")
+        try:
+            new_src = _op_add_music(src, music_op, job_dir)
+        except Exception as e:
+            # Pixabay 检索走的是公开搜索页爬取（没有官方 API），失败常是 Cloudflare
+            # 的人机验证挑战（cf-mitigated: challenge）——这类拦截通常几十秒内自行
+            # 放行，立即重试大概率撞在同一个挑战窗口里、白重试一次。等一段再重试，
+            # 成功率明显更高（2026-07-17 实测复现过：403 立即重试仍 403，等待后
+            # 用完全相同的请求参数直接成功）。
+            logger.warning(f"    add_music: 执行失败，{_MUSIC_RETRY_DELAY_S}s 后重试一次。原因: {e}")
+            time.sleep(_MUSIC_RETRY_DELAY_S)
+            try:
+                new_src = _op_add_music(src, music_op, job_dir)
+            except Exception as e2:
+                logger.warning(
+                    f"    add_music: 重试仍失败，降级——保留无背景音乐的版本继续交付"
+                    f"（会显性告知用户，非静默）。原因: {e2}"
+                )
+                new_src = None
+                degraded.append("add_music")
+        if new_src and Path(new_src).exists():
+            src = str(new_src)
+            applied.append("add_music")
+
+    # 定稿为 preview.mp4
+    if Path(src).resolve() != preview_path.resolve():
+        shutil.copyfile(src, preview_path)
+
+    duration = _probe_duration(preview_path)
+    if degraded:
+        logger.warning(f"=== 降级交付: {job_id} 跳过失败的 {degraded}，交付上一步结果 ===")
+    generation_cost = _read_generation_cost(job_dir)
+    from .cost_tracking import read_llm_usage
+    llm_usage = read_llm_usage(job_dir)
+    quality_warnings = _read_vision_qa_warnings(job_dir)
+    logger.info(f"=== 管线完成: {job_id} → {preview_path} ({duration:.1f}s), 应用: {applied} ===")
+    return {
+        "preview_path": str(preview_path),
+        "duration": duration,
+        "applied_operations": applied,
+        "degraded_operations": degraded,
+        "generation_cost_usd": generation_cost,
+        "llm_tokens_input": llm_usage["prompt_tokens"],
+        "llm_tokens_output": llm_usage["completion_tokens"],
+        "llm_cost_usd": llm_usage["cost_usd"],
+        "quality_warnings": quality_warnings,
+    }
+
+
+def _adapt_authored_result(result: dict[str, Any]) -> dict[str, Any]:
+    """compose_authored()（whatsapp_mvp/authored/__init__.py）返回的字段名
+    跟这个函数正常路径返回的字段名不完全对齐（如 degraded vs
+    degraded_operations）——worker.run_pipeline 读取时对每个字段都用
+    `.get(key) or default`，所以字段名不对齐不会报错，只会静默漏报（降级
+    操作列表、真实 LLM 花费都读成空/零）。不改 authored/ 包本身（那是队友的
+    代码，见 compose_authored 自己的注释："返回与 Arm A 主返回同构的关键
+    字段;验收时如发现下游还消费其它键,在此补齐"）——补齐就放在这里。"""
+    out = dict(result)
+    if "duration" not in out and "duration_seconds" in out:
+        out["duration"] = out["duration_seconds"]
+    if "applied_operations" not in out and "applied" in out:
+        out["applied_operations"] = out["applied"]
+    if "degraded_operations" not in out and "degraded" in out:
+        out["degraded_operations"] = out["degraded"]
+    # authored_report 是 ComposeReport 数据类（compose_orchestrator.py），
+    # 只累计一个总花费，不区分"生成"与"LLM"——Arm B 全程都是 LLM 现写，算
+    # llm_cost_usd 而不是 generation_cost_usd（webhook.py 里两者是相加显示
+    # 总花费的，塞进两个字段会把花费翻倍算）。
+    if "llm_cost_usd" not in out:
+        report = out.get("authored_report")
+        cost = getattr(report, "cost_usd", None) if report is not None else None
+        out["llm_cost_usd"] = cost or 0.0
+    return out
+
+
+def run_talking_head_pipeline(job: Job, *, on_progress: Optional[Callable[[str], None]] = None) -> dict[str, Any]:
     """按编辑计划用 OpenMontage 正式工具执行编辑，输出 preview.mp4。
 
     顺序：先应用所有视频类操作，字幕留到最后（转写才对得上剪过的时间轴）。
+
+    on_progress: 可选回调，`apply_style` 在关键节点（开始规划/进入排版重试/
+    进入视觉复审重规划/开始渲染）调用一次，报一个短代码（不是文案——文案
+    交给 Node 网关按语言翻译，这里只发信号）。默认 None（no-op），不影响
+    任何现有调用方。跟"presenter 模式"用的是同一套挂在 op dict 上传参数的
+    办法（见上面 `_presenter` 那段），不是给 handler 签名新增参数——
+    `_OP_HANDLERS` 里所有 handler 的签名统一是 `(src, op, job_dir)`，不想为了
+    一个可选功能打破这个约定。
     """
     job_dir = job.job_dir
     input_video = job_dir / "input.mp4"
-    preview_path = job_dir / "preview.mp4"
 
     if not input_video.exists():
         raise FileNotFoundError(f"找不到输入视频: {input_video}")
@@ -64,15 +255,8 @@ def run_talking_head_pipeline(job: Job) -> dict[str, Any]:
     if _armb.arm_b_enabled(job):
         _armb_result = _armb.compose_authored(job)
         if _armb_result is not None:
-            return _armb_result
+            return _adapt_authored_result(_armb_result)
         logger.warning("Arm B 未出片,落回 Arm A 继续")
-
-    # apply_style 的内容规划总预算标记（见 _op_apply_style 里的说明）只应该在
-    # *这一次*管线运行内、跨"原始尝试 + 外层自动重试一次"共享；每次重新跑
-    # 整条管线（无论是首次 confirm 还是用户显式 retry）都要清掉上一次留下的
-    # 标记，否则会一直沿用一个早就过期的截止时间，新的一次尝试会被误判成
-    # "预算已用完"，直接跳过所有重试。
-    (job_dir / "_apply_style_deadline.txt").unlink(missing_ok=True)
 
     plan = _load_plan(job)
     operations = plan.get("edit_operations", [])
@@ -112,6 +296,10 @@ def run_talking_head_pipeline(job: Job) -> dict[str, Any]:
         for _o in ordered_ops:
             if _o.get("type") == "insert_broll":
                 _o["_presenter"] = True
+    if on_progress:
+        for _o in ordered_ops:
+            if _o.get("type") == "apply_style":
+                _o["_on_progress"] = on_progress
     if len(removes) > 1:
         logger.info(f"  {len(removes)} 段 remove_segment 将按起点降序执行（防时间轴错位）")
 
@@ -126,24 +314,10 @@ def run_talking_head_pipeline(job: Job) -> dict[str, Any]:
             continue
         logger.info(f"  执行操作: {op_type}")
         before = _probe_duration(Path(src))
-        try:
-            new_src = handler(src, op, job_dir)
-        except Exception as e:
-            # 先自动重试一次再谈降级：渲染类失败里有一部分是瞬时的（资源争抢、
-            # 子进程偶发），一次重试能白捡回来；确定性失败则重试也快（在同一
-            # 个错误上再挂一次），代价可控。
-            logger.warning(f"    {op_type}: 执行失败，自动重试一次。原因: {e}")
-            try:
-                new_src = handler(src, op, job_dir)
-            except Exception as e2:
-                if op_type in _DEGRADABLE_OPS:
-                    logger.warning(
-                        f"    {op_type}: 重试仍失败，降级——保留上一步结果继续交付"
-                        f"（会显性告知用户，非静默）。原因: {e2}"
-                    )
-                    degraded.append(op_type)
-                    continue
-                raise
+        new_src, was_degraded = _run_op_with_retry(op_type, handler, src, op, job_dir, _DEGRADABLE_OPS)
+        if was_degraded:
+            degraded.append(op_type)
+            continue
         if new_src and Path(new_src).exists() and str(Path(new_src).resolve()) != str(Path(src).resolve()):
             after = _probe_duration(Path(new_src))
             logger.info(f"    {op_type}: 时长 {before:.1f}s → {after:.1f}s"
@@ -153,54 +327,8 @@ def run_talking_head_pipeline(job: Job) -> dict[str, Any]:
         else:
             logger.info(f"    {op_type}: 无输出/未改变视频 (no-op)")
 
-    if subtitle_op is not None:
-        logger.info("  执行操作: add_subtitles")
-        new_src = _op_add_subtitles(src, subtitle_op, job_dir)
-        if new_src and Path(new_src).exists():
-            src = str(new_src)
-            applied.append("add_subtitles")
-
-    if music_op is not None:
-        logger.info("  执行操作: add_music")
-        try:
-            new_src = _op_add_music(src, music_op, job_dir)
-        except Exception as e:
-            # Pixabay 检索走的是公开搜索页爬取（没有官方 API），失败常是 Cloudflare
-            # 的人机验证挑战（cf-mitigated: challenge）——这类拦截通常几十秒内自行
-            # 放行，立即重试大概率撞在同一个挑战窗口里、白重试一次。等一段再重试，
-            # 成功率明显更高（2026-07-17 实测复现过：403 立即重试仍 403，等待后
-            # 用完全相同的请求参数直接成功）。
-            logger.warning(f"    add_music: 执行失败，{_MUSIC_RETRY_DELAY_S}s 后重试一次。原因: {e}")
-            time.sleep(_MUSIC_RETRY_DELAY_S)
-            try:
-                new_src = _op_add_music(src, music_op, job_dir)
-            except Exception as e2:
-                logger.warning(
-                    f"    add_music: 重试仍失败，降级——保留无背景音乐的版本继续交付"
-                    f"（会显性告知用户，非静默）。原因: {e2}"
-                )
-                new_src = None
-                degraded.append("add_music")
-        if new_src and Path(new_src).exists():
-            src = str(new_src)
-            applied.append("add_music")
-
-    # 定稿为 preview.mp4
-    if Path(src).resolve() != preview_path.resolve():
-        shutil.copyfile(src, preview_path)
-
-    duration = _probe_duration(preview_path)
-    if degraded:
-        logger.warning(f"=== 降级交付: {job.id} 跳过失败的 {degraded}，交付上一步结果 ===")
-    generation_cost = _read_generation_cost(job_dir)
-    logger.info(f"=== 管线完成: {job.id} → {preview_path} ({duration:.1f}s), 应用: {applied} ===")
-    return {
-        "preview_path": str(preview_path),
-        "duration": duration,
-        "applied_operations": applied,
-        "degraded_operations": degraded,
-        "generation_cost_usd": generation_cost,
-    }
+    return _finalize_pipeline_tail(job_dir, src, subtitle_op=subtitle_op, music_op=music_op,
+                                   applied=applied, degraded=degraded, job_id=job.id)
 
 
 def run_final_export(job: Job) -> dict[str, Any]:
@@ -237,7 +365,7 @@ def run_final_export(job: Job) -> dict[str, Any]:
 # 写在注释里的美好愿望。
 # ============================================================================
 
-def run_clip_factory_pipeline(job: Job) -> dict[str, Any]:
+def run_clip_factory_pipeline(job: Job, *, on_progress: Optional[Callable[[str], None]] = None) -> dict[str, Any]:
     """按 job.planned_edit 里的 candidates 列表逐条渲染，每条独立成败。
 
     只有全批次一条都没成功时才抛异常（外层 worker.run_pipeline 的 try/except
@@ -252,7 +380,17 @@ def run_clip_factory_pipeline(job: Job) -> dict[str, Any]:
     if not input_video.exists():
         raise FileNotFoundError(f"找不到输入视频: {input_video}")
 
-    plan = _load_plan(job)
+    # 故意不用 _load_plan(job)——那是 talking-head 专用的安全加载器，见它的
+    # _plan_has_executable_op() 检查：只认 op 里带 "type" 且在 _OP_HANDLERS/
+    # add_music/add_subtitles 白名单里的方案，认不出来就静默替换成零指令
+    # 默认方案（真实生产 bug 的修复，job_f7e59271bb22）。clip-factory 的
+    # edit_operations 是给确认消息看的人话描述，没有 "type" 字段，会被那个
+    # 检查判定成"不可执行"，candidates 就会被那层安全网悄悄换没——这里必须
+    # 直接读 job.planned_edit，不经过那层专为另一种方案形状设计的校验。
+    try:
+        plan = json.loads(job.planned_edit) if job.planned_edit else {}
+    except (json.JSONDecodeError, TypeError):
+        plan = {}
     candidates = plan.get("candidates") or []
     if not candidates:
         raise RuntimeError("planned_edit 里没有 candidates，clip-factory 无法渲染")
@@ -262,8 +400,11 @@ def run_clip_factory_pipeline(job: Job) -> dict[str, Any]:
     deadline = time.time() + config.clip_factory_wall_time_s
 
     ready_count = 0
+    total_llm_cost = 0.0
     total_generation_cost = 0.0
     for i, (cand, row) in enumerate(zip(candidates, clip_rows), 1):
+        if on_progress:
+            on_progress(f"clip_{i}_of_{len(candidates)}")
         if time.time() > deadline:
             logger.warning(f"clip-factory: job {job.id} 达到 wall-time 预算，"
                            f"跳过剩余 {len(candidates) - i + 1} 条")
@@ -292,6 +433,8 @@ def run_clip_factory_pipeline(job: Job) -> dict[str, Any]:
             degraded_operations=json.dumps(result.get("degraded") or []),
         )
         ready_count += 1
+        total_llm_cost += result.get("llm_cost_usd") or 0.0
+        total_generation_cost += result.get("generation_cost_usd") or 0.0
 
     if ready_count == 0:
         raise RuntimeError("clip-factory: 全部候选片段渲染失败，没有任何一条成功")
@@ -299,6 +442,7 @@ def run_clip_factory_pipeline(job: Job) -> dict[str, Any]:
     return {
         "clip_count": ready_count,
         "clip_count_total": len(candidates),
+        "llm_cost_usd": total_llm_cost,
         "generation_cost_usd": total_generation_cost,
     }
 
@@ -371,8 +515,8 @@ def _render_one_clip(input_video: Path, clip_workdir: Path, cand: dict,
     else:
         degraded.append("add_subtitles")
 
-    # 4. 调色 + 降噪——best-effort：单步失败就跳过、继续用上一步的产物，不让
-    # 收尾步骤拖垮整条 clip。
+    # 4. 调色 + 降噪——best-effort，同 _run_enhancement_chain_inner 的做法：
+    # 单步失败就跳过、继续用上一步的产物，不让收尾步骤拖垮整条 clip。
     for name, tool_cls, extra in (
         ("color_grade", ColorGrade, {"profile": "cinematic_warm", "intensity": 0.85}),
         ("audio_enhance", AudioEnhance, {"preset": "clean_speech"}),
@@ -830,7 +974,7 @@ def _safe_transcribe(src: str, workdir: Path, model_size: str, hotwords: str = _
                 "output_dir": str(workdir),
                 "model_size": model_size,
                 "hotwords": hotwords,
-                "realign": os.getenv("OM_FORCED_ALIGNMENT", "true").lower() == "true",
+                "realign": _os.getenv("OM_FORCED_ALIGNMENT", "true").lower() == "true",
             })
     except Exception as e:
         logger.warning(f"  转写调用异常: {e}")
@@ -849,34 +993,6 @@ def _safe_transcribe(src: str, workdir: Path, model_size: str, hotwords: str = _
 
 _DEFAULT_SPEAKER_OBJECT_POSITION = "50% 35%"
 
-# 架构复审后新增（2026-07-28）：统计过本机全部 33 次人脸校准记录，23 次
-# （70%）落在 Y=51-52% 附近——这个区间就是这一晚反复触发"脸部被裁切"降级
-# 的那个区间（job_cb04960d9a48/job_5b0ec0b914ee/job_7a33f9a80af8 三个 job
-# 都是这个校准值）。根因：compose-director.md 规定的公式（下面 docstring
-# 里那行）直接把人脸在**原始视频**里的位置占比，原样套用成卡片里的取景
-# 位置——这个换算只在"原视频里人脸的相对位置刚好也适合卡片"时凑巧成立，
-# 对着摄像头略低于视线拍摄（很常见的笔记本摄像头角度）的视频，人脸中心
-# 天然落在画面偏下的位置，直接套用就会让卡片的裁剪窗口偏下、把头顶切掉。
-# 极端情况更明显：还观测到两次 92%/79-80% 的校准结果，明显是误检测（背景
-# 里的物体/画面边角），不加边界的话这类误检测会直接产出完全不能用的取景。
-#
-# 钳制边界不是拍脑袋定的：qa_stills._VISION_CHECKLIST 第一条本来就明确写了
-# "脸应在其卡片顶部 20-40% 位置"——这是视觉复审自己拿来判断取景好坏的标准，
-# 直接拿来当校准结果的钳制区间，跟下游判断口径完全一致。X 方向的钳制只是
-# 防止误检测产生的极端值，观测到的正常范围都在 42-53% 附近，30-70% 给了
-# 足够宽的余量，不会影响任何正常校准结果。
-_CALIBRATION_Y_MIN, _CALIBRATION_Y_MAX = 20.0, 40.0
-_CALIBRATION_X_MIN, _CALIBRATION_X_MAX = 30.0, 70.0
-
-
-def _clamp_calibrated_object_position(raw_x_pct: float, raw_y_pct: float) -> tuple[str, bool]:
-    """纯函数，方便直接单测，不用 mock FaceTracker。返回 (钳制后的 CSS
-    object-position 字符串, 这次是否真的被钳制过)。"""
-    clamped_x = max(_CALIBRATION_X_MIN, min(raw_x_pct, _CALIBRATION_X_MAX))
-    clamped_y = max(_CALIBRATION_Y_MIN, min(raw_y_pct, _CALIBRATION_Y_MAX))
-    was_clamped = abs(clamped_x - raw_x_pct) > 0.5 or abs(clamped_y - raw_y_pct) > 0.5
-    return f"{round(clamped_x)}% {round(clamped_y)}%", was_clamped
-
 
 def calibrate_speaker_object_position(src: str, workdir: Path) -> str:
     """对源视频跑 face_tracker，取人脸中心中位数 -> CSS object-position。
@@ -884,10 +1000,6 @@ def calibrate_speaker_object_position(src: str, workdir: Path) -> str:
     compose-director.md 的强制校准项：objPos ≈ face_center_y/source_height*100，
     不同源视频没有通用值。检测不到人脸/缺 opencv 时退回静态默认值。
     （注意本机 opencv-python 必须 <5：5.0 wheel 不带 Haar cascade。）
-
-    计算完原始公式后钳制到 [_CALIBRATION_X_MIN, _CALIBRATION_X_MAX] x
-    [_CALIBRATION_Y_MIN, _CALIBRATION_Y_MAX]——见上面模块级注释，这个区间
-    直接取自视觉复审自己的取景判断标准，不是新发明的口径。
     """
     try:
         from tools.analysis.face_tracker import FaceTracker
@@ -908,15 +1020,8 @@ def calibrate_speaker_object_position(src: str, workdir: Path) -> str:
         centers_x = sorted(f["bbox"]["x"] + f["bbox"]["width"] / 2 for f in faces)
         centers_y = sorted(f["bbox"]["y"] + f["bbox"]["height"] / 2 for f in faces)
         mid = len(faces) // 2
-        raw_x, raw_y = centers_x[mid] * 100, centers_y[mid] * 100
-        obj_pos, was_clamped = _clamp_calibrated_object_position(raw_x, raw_y)
-        if was_clamped:
-            logger.info(
-                f"  apply_style: 人脸校准取景原始值 {raw_x:.0f}% {raw_y:.0f}% 超出合理区间，"
-                f"钳制为 {obj_pos}（{len(faces)}帧检出，取中位数）"
-            )
-        else:
-            logger.info(f"  apply_style: 人脸校准取景 -> {obj_pos}（{len(faces)}帧检出，取中位数）")
+        obj_pos = f"{round(centers_x[mid] * 100)}% {round(centers_y[mid] * 100)}%"
+        logger.info(f"  apply_style: 人脸校准取景 -> {obj_pos}（{len(faces)}帧检出，取中位数）")
         return obj_pos
     except Exception as e:
         logger.warning(f"  apply_style: face_tracker 调用异常，用默认取景: {e}")
@@ -925,48 +1030,6 @@ def calibrate_speaker_object_position(src: str, workdir: Path) -> str:
 
 _MAX_CAPTION_WORDS = 7
 _MAX_CAPTION_CHARS = 42
-
-# 确认过的真实 bug（2026-07-27，job_f1eec580e3c7 真实渲染出的成片）：整段字幕
-# 连成一坨（"Hithere,it'sDavidfromPacificLife."），逐词卡拉OK高亮完全消失。
-# 根因是拼接约定被打破，不是新 bug 的新写法——faster-whisper 原生词表每个
-# 词自带前导空格（" Hi"/" there,"），下面原来一直用 "".join(...) 直接拼接、
-# 靠这个前导空格分隔词与词；ElevenLabs 那条路径也刻意把 spacing token 的
-# 文本搬到下一个词头上维持同一约定（见上面 elevenlabs 转写函数的注释）。
-# 但今天默认开启的 WhisperX 强制对齐（forced_alignment.py，2026-07-24 加的
-# 精度优化）重新计算词级时间戳时，产出的词表是 whisperx 自己的干净分词，
-# **不带**前导空格——"".join(...) 因此把整句焊死成一个无空格字符串。
-# Captions.tsx 的逐词高亮完全靠 text.indexOf(" ", ...) 找词边界，没有空格
-# 就永远找不到，只能在整句结尾突然一次性点亮——用户看到的正是这个症状。
-#
-# 与其要求"以后任何词级时间戳的产出者都必须记得嵌入前导空格"这种容易被
-# 破坏的隐性约定（forced_alignment 这次已经证明了它会被破坏——而且破坏得
-# 很安静，没有任何测试或类型检查能拦住），不如让消费方自己彻底不依赖这个
-# 约定：先 strip 掉每个词 token 自带的任何空白，再按字符集自行判断该不该
-# 加空格——中日韩文字之间原生不加空格，其余按正常西文词间距处理。不管未来
-# 换成哪个转写/对齐后端、输出词表带不带前导空格，这里都能拼出正确文本。
-_CJK_CHAR_RE = re.compile(r"[一-鿿㐀-䶿豈-﫿぀-ヿ가-힯]")
-
-
-def _append_word_token(parts: list[str], token: str) -> None:
-    token = str(token).strip()
-    if not token:
-        return
-    if not parts:
-        parts.append(token)
-        return
-    prev_char = parts[-1][-1:]
-    cur_char = token[:1]
-    if _CJK_CHAR_RE.match(prev_char) or _CJK_CHAR_RE.match(cur_char):
-        parts.append(token)
-    else:
-        parts.append(" " + token)
-
-
-def _words_to_caption_text(ws: list[dict]) -> str:
-    parts: list[str] = []
-    for w in ws:
-        _append_word_token(parts, w.get("word", ""))
-    return "".join(parts).strip()
 
 
 def build_caption_phrases(words: list[dict], segments: list[dict]) -> list[dict]:
@@ -987,7 +1050,7 @@ def build_caption_phrases(words: list[dict], segments: list[dict]) -> list[dict]
     def flush():
         if not cur:
             return
-        text = _words_to_caption_text(cur)
+        text = "".join(w["word"] for w in cur).strip()
         if text:
             phrases.append({
                 "text": text,
@@ -998,7 +1061,7 @@ def build_caption_phrases(words: list[dict], segments: list[dict]) -> list[dict]
 
     for w in words:
         cur.append(w)
-        text = _words_to_caption_text(cur)
+        text = "".join(x["word"] for x in cur).strip()
         ends_sentence = text.endswith((".", "?", "!", "。", "？", "！", ",", "，"))
         if len(cur) >= _MAX_CAPTION_WORDS or len(text) >= _MAX_CAPTION_CHARS or ends_sentence:
             flush()
@@ -1027,7 +1090,7 @@ def _op_remove_filler(src: str, op: dict, workdir: Path) -> Optional[str]:
 
     words = t.data.get("word_timestamps") or []
     duration = _probe_duration(Path(src))
-    keep_ranges = plan_filler_removal(words, duration)
+    keep_ranges = plan_filler_removal(words, duration, workdir=workdir)
     if not keep_ranges:
         logger.info("  remove_filler: 没有判断出需要剪的口误/重录，跳过（视频不变）")
         return None
@@ -1288,9 +1351,18 @@ def _op_add_music(src: str, op: dict, workdir: Path) -> Optional[str]:
     if not query:
         return None
 
-    from .music_providers import fetch_music_via
     music_path = workdir / "_bgm_source.mp3"
-    result = fetch_music_via(op.get("provider", "pixabay"), query, music_path)
+    if op.get("_reuse_cached_music") and music_path.exists() and music_path.stat().st_size > 0:
+        # 只重跑 apply_style 的预览修订路径（rerun_style_only）用：这个 job 已经
+        # 成功配过一次背景音乐，原样复用磁盘上的 _bgm_source.mp3，不重新查询
+        # Pixabay——它的检索是爬公开搜索页（无官方 API），失败常是 Cloudflare
+        # 人机验证挑战，重新查一次纯属风险，能把一段本来正常的音乐变成
+        # 新的 degraded: ["add_music"]。
+        logger.info("  add_music: 复用本 job 已下载的 _bgm_source.mp3（不重新检索 Pixabay）")
+        result: Optional[dict] = {"path": str(music_path), "cost_usd": 0.0}
+    else:
+        from .music_providers import fetch_music_via
+        result = fetch_music_via(op.get("provider", "pixabay"), query, music_path)
     if not result:
         raise RuntimeError(f"add_music: 没找到匹配「{query}」的背景音乐")
 
@@ -1328,6 +1400,10 @@ def _op_add_music(src: str, op: dict, workdir: Path) -> Optional[str]:
         "-filter_complex", filter_complex,
         "-map", "0:v", "-map", audio_map,
         "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+        # moov-at-front — see ensure_editor_preview_video's docstring for the
+        # confirmed real symptom (a browser <video> can't play a frame of a
+        # moov-at-end file without downloading almost all of it first).
+        "-movflags", "+faststart",
         "-shortest", str(out),
     ]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
@@ -1843,70 +1919,7 @@ def _run_enhancement_chain(src: str, workdir: Path) -> str:
 
 
 def _run_enhancement_chain_inner(src: str, workdir: Path) -> str:
-    """face_enhance -> color_grade -> audio_enhance。
-
-    架构复审发现（2026-07-24）：这三步原本是三次完全独立的 ffmpeg 调用，每次
-    都对整段视频重新解码->滤镜->编码——但 face_enhance/color_grade 都只是
-    单纯的 -vf 滤镜串，audio_enhance 是单纯的 -af 滤镜串，三者分别只碰视频流
-    /音频流，天然可以合并成一次 ffmpeg 调用（-vf "人脸滤镜,调色滤镜" -af
-    音频滤镜），把三次解码+编码压成一次。优先走合并路径；合并失败（任何原因：
-    滤镜取不到、ffmpeg 报错、超时……）时退回原来久经考验的三步串行版本，
-    单步失败互不影响的降级行为完全不变——合并只是性能优化，不改变行为保证。
-    """
-    try:
-        return _run_enhancement_chain_combined(src, workdir)
-    except Exception as e:
-        logger.warning(f"  apply_style: 合并增强通道失败，退回三步串行: {e}")
-        return _run_enhancement_chain_sequential(src, workdir)
-
-
-def _run_enhancement_chain_combined(src: str, workdir: Path) -> str:
-    """face_enhance + color_grade + audio_enhance 在一次 ffmpeg 调用里全部做完。
-
-    直接复用三个工具各自的滤镜构造逻辑（_build_filter / PRESETS），只是不
-    分别起 ffmpeg 进程——所以视觉/听觉效果跟三步串行版本应当逐帧一致，唯一
-    区别是省掉两次多余的解码+编码。任何一步取不到滤镜串、或 ffmpeg 本身报错
-    /超时，都整体抛异常交给调用方退回三步串行，不在这里做部分容错（部分容错
-    在单次 ffmpeg 调用里做不到——一旦开始编码就没有"这步跳过、那步继续"的
-    余地，这也是保留三步串行作为退路的原因）。
-    """
-    from tools.audio.audio_enhance import PRESETS as _AUDIO_PRESETS
-    from tools.enhancement.color_grade import ColorGrade
-    from tools.enhancement.face_enhance import FaceEnhance
-
-    face_vf = FaceEnhance()._build_filter({"preset": "talking_head_standard"})
-    color_vf = ColorGrade()._build_filter({"profile": "cinematic_warm", "intensity": 0.85})
-    af = _AUDIO_PRESETS["clean_speech"]["af"]
-    if not face_vf or not color_vf or not af:
-        raise RuntimeError("滤镜串为空")
-
-    # 沿用 face_enhance.py/color_grade.py 里那份 CFR+关键帧间隔的教训（Fix
-    # C12 等）：re-encode 必须钉死 fps/-g，否则 Remotion 渲染阶段会报
-    # "No frame found at position N"。
-    fps = 30
-    out = workdir / "_op_audio_enhance.mp4"  # 沿用原三步链最后一步的文件名，
-    # 下游（simulate_job.py 等）按这个文件名找"增强完成的视频"，合并版本
-    # 产出同名文件保持兼容，不需要改动任何调用方。
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", src,
-        "-vf", f"{face_vf},{color_vf}",
-        "-af", af,
-        "-c:v", "libx264", "-crf", "20", "-preset", "fast",
-        "-fps_mode", "cfr", "-r", str(fps), "-g", str(fps),
-        "-c:a", "aac", "-b:a", "192k",
-        str(out),
-    ]
-    subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=_RENDER_TIMEOUT_S)
-    if not out.exists() or out.stat().st_size == 0:
-        raise RuntimeError("合并增强产出文件为空")
-    logger.info("  apply_style: face_enhance+color_grade+audio_enhance 合并为一次编码完成")
-    return str(out)
-
-
-def _run_enhancement_chain_sequential(src: str, workdir: Path) -> str:
-    """face_enhance -> color_grade -> audio_enhance 原始三步串行版本，
-    best-effort（单步失败不影响其它步骤）——合并路径（见上）失败时的退路。
+    """face_enhance -> color_grade -> audio_enhance，best-effort（单步失败不影响其它步骤）。
 
     对应 compose-director.md Step 1（"Attempt every step if the tool is
     available — do not skip steps without a reason"）。三个工具都是纯 FFmpeg
@@ -1951,15 +1964,6 @@ def _run_enhancement_chain_sequential(src: str, workdir: Path) -> str:
 # 只重试一次，见 _op_apply_style 里那段旧注释。
 _PROPS_LINT_MAX_ATTEMPTS = 3
 
-# 架构复审后新增（2026-07-24）：content_planner.plan_content 自己的 3 轮质量
-# 判定循环，被 props_lint 的 3 轮重试，又被 vision-QA 触发的重规划各自嵌套调用
-# ——最坏情况下一条视频的 apply_style 要打 9+ 次内容规划 LLM 调用。真实事故
-# （job_fa4ee47e9676，2026-07-23）：DeepSeek 那天响应慢，这套嵌套加起来拖到了
-# 33 分钟。这个预算不改变任何质量判断标准——每一轮该跑的检查一次不少——只是
-# 给"还要不要再等一轮 LLM"这件事设一个总时长上限，超了就直接走本来就有的
-# best-of 交付（正常轮数用尽时也是同一条路径），不是新的降级逻辑。
-_APPLY_STYLE_CONTENT_DEADLINE_S = int(os.getenv("OM_APPLY_STYLE_CONTENT_DEADLINE_S", "720"))
-
 # 参与"丰富度"计分的 props 字段——每一项都是真正的动画/图形，不是纯文字。
 _RICHNESS_FIELDS = (
     "dataCards", "gauges", "countdowns", "calendarEvents", "beforeAfter",
@@ -1988,6 +1992,18 @@ def _content_unchanged(props_a: dict, props_b: dict) -> bool:
     不会有内容真的变了却被误判"没变"而跳过复审的风险。
     """
     return all(props_a.get(f) == props_b.get(f) for f in _CONTENT_COMPARISON_FIELDS)
+
+
+def _props_lint_stagnated(candidate_findings: list[dict], prior_findings: list[dict]) -> bool:
+    """Fix D2：props_lint 重试循环里，这一轮重规划命中的问题*类型*集合是否跟
+    上一轮最好版本一字不差——同一道理的另一处应用（另一处见 content_planner.py
+    的 D1）：类型集合不变说明重规划没有解决任何一类真实问题，继续重试大概率
+    原样重复，不值得再耗一轮 LLM 调用。比较的是 `check` 类型集合而不是完整
+    finding 文本，因为 detail 里的坐标细节可能每轮略有出入，但类型不变就代表
+    问题种类没有真正解决——跟 `_content_unchanged`（比较完整内容）刻意不同，
+    这里只关心"同一类问题是否还在"，不要求内容本身逐字不变。
+    """
+    return {f["check"] for f in candidate_findings} == {f["check"] for f in prior_findings}
 
 
 def _fill_intro_lead_dead_space(props: dict, findings: list[dict], captions: list[dict], segments: list[dict]) -> dict:
@@ -2244,6 +2260,61 @@ def _restore_facecam_before_end(props: dict, findings: list[dict], duration_fram
     return candidate
 
 
+def _drop_ungrounded_count_up_rows(props: dict, segments: list[dict]) -> dict:
+    """Fix A2（安全网，配合 content_planner.py 的 A1 根因修复一起用——A1 修的
+    是复合口语金额被误判成两个独立数字这一类具体解析漏洞，这里是防止*任何*
+    其它检测覆盖不到的幻觉数值蒙混过关的最后一道确定性兜底）。交付前再检查
+    一遍每张 count_up 卡的数值是否真的能在转写里找到依据，找不到就整行丢掉
+    （行丢空了连卡片一起丢）——绝不猜测/挪用一个"差不多"的替代值上屏（宁缺
+    毋错，跟这个仓库处理"宁缺勿错"类问题的一贯做法一致，例如 `_zero_value_titles`）。
+
+    跟 C13/C15/C37 同一类安全阀：丢卡前后各跑一次 `lint_props`，这次改动
+    引入了新的 finding *类型*（最可能是丢掉的卡片恰好是某个时间段唯一的
+    内容区元素，制造出新的空档）就撤销这次改动、原样返回——不能让"消除一个
+    幻觉数字"反而制造一个新的布局问题。
+    """
+    from .content_planner import _expanded_grounded_candidates, _is_value_grounded, _num
+    from .props_lint import lint_props
+
+    expanded = _expanded_grounded_candidates(segments)
+    if not expanded:
+        return props  # 没有任何候选可比对时不做任何改动，跟检测端的规则一致
+
+    candidate = json.loads(json.dumps(props))  # 深拷贝——safety valve 拒绝时要能原样回退
+    changed = False
+    kept_cards = []
+    for card in candidate.get("dataCards") or []:
+        kept_rows = []
+        for row in (card.get("rows") or []):
+            value = _num(row.get("value")) if isinstance(row, dict) else None
+            if value is None or value == 0:
+                kept_rows.append(row)  # 0/None 是 _zero_value_titles 的地盘，这里不重复处理
+                continue
+            if _is_value_grounded(value, expanded):
+                kept_rows.append(row)
+            else:
+                changed = True
+        if kept_rows:
+            card["rows"] = kept_rows
+            kept_cards.append(card)
+        else:
+            changed = True  # 整卡的行都被丢空了，卡片本身也丢掉
+    if not changed:
+        return props
+    candidate["dataCards"] = kept_cards
+
+    before_types = {f["check"] for f in lint_props(props)}
+    after_types = {f["check"] for f in lint_props(candidate)}
+    new_finding_types = after_types - before_types
+    if new_finding_types:
+        logger.warning(
+            "  apply_style: 丢弃疑似幻觉数值会引入新的 finding 类型"
+            f"（新增: {new_finding_types}），放弃这次改动，保留原样"
+        )
+        return props
+    return candidate
+
+
 def _visual_richness(props: dict) -> int:
     """Fix C6（2026-07-16）：确认过的真实生产 bug——MrBeast backtest
     (job_95e1e08b0995)第一轮规划出了完整的 TIMELINE 时间线图形 + 数据卡 +
@@ -2264,164 +2335,59 @@ def _visual_richness(props: dict) -> int:
     return score
 
 
-# 架构复审后新增（2026-07-27）：真实日志统计过（2026-07-13~27，22 个跑过
-# apply_style 的任务），6 个（27%）最终降级；把每一次降级前的视觉复审发现
-# 拉出来看，高严重度问题几乎全部是这两类："说话人取景不当/脸部被裁切"、
-# "对比度过低"。这两类完全由 speakerObjectPosition/colorMode 决定——两者都
-# 在 apply_style 一开始就算好一次（见 _op_apply_style 里 speaker_object_
-# position 的赋值），此后不管内容规划重试多少轮都不会再被碰——用"重新规划
-# 内容"去回应这两类问题，规划出来的内容因此每次都跟上一轮一字不差（反馈
-# 里说的东西它根本无权修改），白白烧光一整轮的时间预算才降级，"慢"和"没
-# 套上模板"是同一个根因的两个症状。
-#
-# 对症的做法：识别出高严重度问题**只**是这两类（没有掺杂真正的内容问题）
-# 时，跳过昂贵的内容重规划（零 LLM 调用），直接调整对应参数重渲染一次
-# 验证——取景问题把裁剪窗口往上移让出更多头顶空间，对比度问题切换明暗
-# 配色。混杂了其它类型问题时仍然走原来的内容重规划路径，不动那条路径的
-# 行为。
-_FRAMING_ISSUE_KEYWORDS = ("取景", "裁切", "贴边")
-_CONTRAST_ISSUE_KEYWORDS = ("对比度",)
-_GEOMETRY_COLOR_KEYWORDS = _FRAMING_ISSUE_KEYWORDS + _CONTRAST_ISSUE_KEYWORDS
+def _remotion_render_props(props_path: Path, out: Path, remotion_dir: Path, *,
+                           on_progress: Callable[[str], None] = lambda _s: None,
+                           composition: str = "XiaojinEditorial") -> Optional[str]:
+    """从 `_op_apply_style` 抽出的渲染子进程调用——不依赖 job/转写/内容规划，
+    只要一份已经写盘、已经过 schema 校验的 props 文件，就能渲染。供
+    `render_props_directly`（预览编辑器"保存"路径）复用，让两条路径共享同一份
+    重试/并发/超时逻辑，不必各自维护一份容易漂移的渲染调用。
 
+    props_path/out 必须是绝对路径——这个子进程以 cwd=remotion_dir 运行，
+    相对路径会解析到 remotion-composer/ 而不是仓库根目录，Remotion 会直接
+    拒绝（"neither valid JSON nor a file path to a valid JSON file"）。
+    """
+    npx_bin = shutil.which("npx") or "npx"  # Windows: subprocess needs the resolved npx.cmd, plain "npx" raises WinError 2
+    from .remotion_bundle import ensure_remotion_bundle
+    bundle = ensure_remotion_bundle(remotion_dir)
+    # props_path/out must be absolute — this subprocess runs with cwd=remotion_dir,
+    # so a relative path (e.g. "storage/jobs/<id>/_op_apply_style_props.json")
+    # resolves against remotion-composer/ instead of the repo root, and Remotion
+    # rejects it outright ("neither valid JSON nor a file path to a valid JSON
+    # file"). Confirmed real production bug: apply_style silently degraded to
+    # the bare unstyled cut on every run where workdir happened to be relative,
+    # with qa_stills' own still-renders (same bug, same fix needed there) failing
+    # identically just before it.
+    cmd = [npx_bin, "remotion", "render"] + ([bundle] if bundle else []) + [
+        composition, str(out.resolve()),
+        f"--props={props_path.resolve()}",
+        "--crf=18",
+    ]
+    on_progress("rendering")
+    logger.info(f"  apply_style: rendering via {' '.join(cmd)} (cwd={remotion_dir})")
+    # 重试一次：确认过真实生产 bug——同一份 props/视频独立跑总是成功，只有紧跟在
+    # qa_stills 那几次连续 still 渲染后面立刻起片渲染时才会报 "No frame found at
+    # position N"（Remotion 自己的 asset 缓存/本地 server 在 qa_stills 和整片渲染
+    # 之间交接时的瞬时状态，不是数据或编码问题——独立复现直接 1462/1462 渲染成功）。
+    # 跟这个文件里其它瞬时失败（LLM 调用、口误复核）已有的重试模式一致，不是发明
+    # 新机制。
+    last_result = None
+    for attempt in range(2):
+        with _RENDER_SLOTS:  # Remotion 渲染跨任务串行 + 硬超时防卡死占坑
+            result = subprocess.run(cmd, cwd=str(remotion_dir), capture_output=True, text=True,
+                                    timeout=_RENDER_TIMEOUT_S)
+        if result.returncode == 0:
+            last_result = None
+            break
+        last_result = result
+        if attempt == 0:
+            logger.warning(f"  apply_style: 渲染失败(exit {result.returncode})，重试一次: {result.stderr[-500:]}")
 
-def _is_geometry_or_color_only(findings: list[dict]) -> bool:
-    """高严重度发现是否**全部**属于取景/对比度这类跟内容选择无关的几何或
-    配色问题——只要有一条不属于，就说明混杂了真正的内容问题，不适用这条
-    对症修复捷径，交回原来的内容重规划路径处理。"""
-    if not findings:
-        return False
-    return all(
-        any(kw in f.get("issue", "") for kw in _GEOMETRY_COLOR_KEYWORDS)
-        for f in findings
-    )
+    if last_result is not None:
+        logger.error(f"apply_style render stderr: {last_result.stderr[-4000:]}")
+        raise RuntimeError(f"apply_style 渲染失败 (exit {last_result.returncode})")
 
-
-def _correct_geometry_and_color(props: dict, findings: list[dict]) -> dict:
-    """直接调整 speakerObjectPosition/colorMode，不调用 LLM——这是真正对症
-    的修复，而不是像内容重规划那样反馈了个它管不了的问题。"""
-    corrected = dict(props)
-    issues_text = " ".join(f.get("issue", "") for f in findings)
-
-    if any(kw in issues_text for kw in _FRAMING_ISSUE_KEYWORDS):
-        pos = corrected.get("speakerObjectPosition") or "50% 50%"
-        try:
-            x_part, y_part = pos.replace("%", "").split()
-            # object-position 的 Y 值越小，裁剪窗口越往上（露出更多头顶）；
-            # 报告"脸部被裁切"说明当前窗口偏下，把 Y 往下调 15 个百分点、
-            # 下限钉在 10%（避免反过来把下巴/胸口裁没）。
-            new_y = max(10.0, float(y_part) - 15.0)
-            corrected["speakerObjectPosition"] = f"{x_part}% {new_y:.0f}%"
-            logger.info(
-                f"  apply_style: 取景问题——speakerObjectPosition 从 '{pos}' "
-                f"调整为 '{corrected['speakerObjectPosition']}'（露出更多头顶空间）"
-            )
-        except (ValueError, AttributeError):
-            logger.warning(f"  apply_style: speakerObjectPosition '{pos}' 格式无法解析，跳过取景修正")
-
-    if any(kw in issues_text for kw in _CONTRAST_ISSUE_KEYWORDS):
-        old_mode = corrected.get("colorMode", "warm")
-        corrected["colorMode"] = "dark" if old_mode == "warm" else "warm"
-        logger.info(
-            f"  apply_style: 对比度问题——colorMode 从 '{old_mode}' "
-            f"切换为 '{corrected['colorMode']}'"
-        )
-
-    return corrected
-
-
-# 验证上面这条捷径时发现的第二个、更根本的问题（2026-07-27，直接复现
-# job_cb04960d9a48）：真实触发降级的那条 finding（frame_index 0）实测根本
-# 不是裁剪窗口问题——它采样到的是 intro 标题卡（IntroTitle.tsx）还没淡出
-# 的那一帧（frame 28 < introOutFrame(80) + 12），那段时间整屏盖着深色渐变
-# 蒙层 + 大标题文字，说话人的脸本来就该被压暗/半遮挡，是设计如此。实测
-# speakerObjectPosition 从 51% 一路调到 25%（Y 方向移动了 26 个百分点）
-# 这条 finding 原样复现——不是修正力度不够，是这类 finding 根本不归
-# speakerObjectPosition 管，跟 Rule 14 那类"采样帧本来就不该被这条判断
-# 标准检查"是同一种 bug，只是这次不是"帧还没渲染任何东西"，是"帧本来就
-# 该长这样"。往内容重规划那条路径走一样无解——intro 蒙层是固定的渲染
-# 组件逻辑，不受 content_planner 的规划结果影响。
-# 对症做法：intro 蒙层仍在生效的窗口内、且 finding 是取景类问题的，直接
-# 认定"设计如此"丢弃，不进入任何重试/降级判断——不止在这条捷径分支生效，
-# 三处读取 major 的地方都要用同一个函数过滤（Rule 5/13 的教训：一个只在
-# 单个调用点生效的保证不是保证）。
-#
-# 同一晚验证时又实测复现了第二种、第三种同源问题（job_7a33f9a80af8，两轮
-# 独立尝试都踩中）：这次 intro 用的是 StatsHookIntro.tsx（"stats_hook"
-# 变体，跟 IntroTitle.tsx 是同一批"固定深色开场"组件的另一个），frame 28
-# 报"对比度过低"——`_correct_geometry_and_color` 照常把 colorMode 从
-# warm 切成 dark 去"修"，但 StatsHookIntro.tsx 第 77 行的背景色是
-# `colorMode === "warm" ? "#0D1117" : palette.bgDeep`，而 `palette.bgDeep`
-# 在 dark 主题下是 "#090C10"——两个分支都是近乎全黑，colorMode 根本不
-# 影响这个组件的背景色，是这两个 intro 组件共同的设计（"dark full-bleed
-# opener"，不管全片选的是哪个 colorMode，开场这几十帧本来就该是近黑背景
-# 配大字号高对比文字）。切换 colorMode 对这条 finding 完全是无效操作，
-# 还会把后面一整条视频的配色也带偏（colorMode 是全局属性，SpeakerCard/
-# 数据卡等其它组件都真的会跟着变）。同一次重试里，切换 colorMode 之后
-# 复审反而多冒出 4 条取景类 high 发现——大概率是同一个说话人视频取景本来
-# 就临界（这一晚另外两个 job 也是这个说话人、同一个 43% 51% 校准值，见
-# job_cb04960d9a48/job_5b0ec0b914ee 的调查记录），叠加上视觉模型本身的
-# 判断噪音，不是 colorMode 切换真的让画面变差了，但也没有证据证明切换
-# colorMode 帮上了忙——两轮独立尝试，"对比度过低"->切换->复审都变得更差，
-# 一次巧合可以理解成噪音，两次同源复现更像是这条捷径对这类 finding 从
-# 结构上就不该出手。同一帧也报了"画面为黑色，无任何内容"——StatsHookIntro
-# 的设计就是"深色满屏 + 居中大字号数字 + 一条细进度条 + 最多两行小标签"，
-# 本来就没有大面积"内容"可言（跟 IntroTitle 的深色蒙层是同一类"设计如此"，
-# 只是这次视觉模型换了个说法）。
-# 三类关键词一起在 intro 蒙层窗口内丢弃，不只丢取景类：取景/对比度/黑屏
-# 空画布，在这个窗口内都不是 speakerObjectPosition/colorMode/内容规划
-# 能真正修好的问题。
-_INTRO_SCRIM_TAIL_FRAMES = 12  # 对应 IntroTitle.tsx/StatsHookIntro.tsx: exit 的 interpolate 终点是 introOutFrame + 12
-_INTRO_UNFIXABLE_KEYWORDS = _GEOMETRY_COLOR_KEYWORDS + ("黑色", "纯黑", "无任何内容", "空画布")
-
-
-def _drop_intro_scrim_unfixable_findings(
-    findings: list[dict], stills: list[dict], intro_out_frame: int
-) -> list[dict]:
-    dropped = []
-    kept = []
-    for f in findings:
-        idx = f.get("frame_index")
-        frame_no = stills[idx]["frame"] if isinstance(idx, int) and 0 <= idx < len(stills) else None
-        in_scrim = frame_no is not None and frame_no <= intro_out_frame + _INTRO_SCRIM_TAIL_FRAMES
-        is_unfixable = any(kw in f.get("issue", "") for kw in _INTRO_UNFIXABLE_KEYWORDS)
-        if in_scrim and is_unfixable:
-            dropped.append(f)
-        else:
-            kept.append(f)
-    if dropped:
-        logger.info(
-            f"  apply_style: 忽略 intro 深色开场窗口内的取景/对比度/黑屏类发现（设计如此，非缺陷）: {dropped}"
-        )
-    return kept
-
-
-def _apply_geometry_color_shortcut(
-    props: dict, props_path: Path, major: list[dict], remotion_dir: Path, workdir: Path, duration: float
-) -> tuple[dict, list[dict]]:
-    """真正执行取景/对比度捷径修正 + 重新过一遍视觉复审，返回更新后的
-    (props, major)。两个调用点共享（第一次视觉复审 AND 内容重规划之后的
-    第二次视觉复审）——Rule 5/13 的教训：只在一个调用点生效的修正不是
-    真正的修正，内容重规划把"纯黑画面"这类真内容问题修好之后，剩下的
-    发现完全可能变成纯取景/对比度类，这时候一样该走这条捷径，不该直接
-    降级交付。"""
-    from .qa_stills import run_props_qa
-
-    issues = "; ".join(f"still #{f.get('frame_index')}: {f.get('issue', '')}" for f in major)[:500]
-    logger.warning(f"  apply_style: 视觉复审发现的问题都是取景/对比度类，跳过内容重规划直接调参重试: {issues}")
-    props = _correct_geometry_and_color(props, major)
-    props = _recompute_scenes_from_content(props, round(duration * 30))
-    props_path.write_text(json.dumps(props, ensure_ascii=False), encoding="utf-8")
-    qa_result = run_props_qa(props, props_path, remotion_dir, workdir / "qa_stills")
-    major = _major_vision_findings(qa_result, props)
-    return props, major
-
-
-def _major_vision_findings(qa_result: dict, props: dict) -> list[dict]:
-    vision_findings = (qa_result.get("vision_review") or {}).get("findings") or []
-    major = [f for f in vision_findings if f.get("severity") == "high"]
-    return _drop_intro_scrim_unfixable_findings(
-        major, qa_result.get("stills") or [], props.get("introOutFrame", 20)
-    )
+    return str(out) if out.exists() else None
 
 
 def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
@@ -2445,6 +2411,7 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
     """
     from .content_planner import plan_content
 
+    on_progress = op.get("_on_progress") or (lambda _stage: None)
     config = get_config()
 
     # Enhancement chain (compose-director.md Step 1: "attempt every step if the
@@ -2459,7 +2426,16 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
     # going with the pre-that-step video rather than failing the whole edit —
     # matching the "attempt, don't hard-fail" philosophy already used
     # throughout this file for optional refinement steps.
-    src = _run_enhancement_chain(src, workdir)
+    if op.get("_skip_enhancement"):
+        # 只重跑 apply_style 的预览修订路径（rerun_style_only）用：src 已经是
+        # 上一次正常管线跑完增强链之后的产物，原样重新增强一遍纯属浪费（还会
+        # 因为二次编码损失画质），且 video_src_url（下面）拼的是 job_dir 里的
+        # 文件名，src 必须留在 workdir 内部这个断言才有意义。
+        if Path(src).resolve().parent != workdir.resolve():
+            raise RuntimeError(f"_skip_enhancement requires src inside workdir: {src}")
+        logger.info("  apply_style: 跳过增强链（style 重跑，源视频已增强过）")
+    else:
+        src = _run_enhancement_chain(src, workdir)
     src_path = Path(src)
 
     duration = _probe_duration(src_path)
@@ -2477,6 +2453,16 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         word_timestamps = t.data.get("word_timestamps") or []
         # 短语级字幕（词级时间戳重组），不是 5-6 行的 segment 大段
         captions = build_caption_phrases(word_timestamps, segments)
+
+        # 只重跑样式的预览修订路径（rerun_style_only）专用：用户反馈里明确指出
+        # 某条字幕文本错了（转写错字/要求的具体措辞）时，定点纠正——不重新
+        # 转写、不改时间轴，只可能改 text 字段。正常首次规划/QA 内部重试路径
+        # 不带 _user_feedback，这里是纯粹的 no-op（apply_caption_correction
+        # 本身对空 user_request 也会直接原样返回，双重保险）。
+        _user_feedback = op.get("_user_feedback")
+        if _user_feedback:
+            from .content_planner import apply_caption_correction
+            captions = apply_caption_correction(captions, _user_feedback, workdir=workdir)
 
         # Fix A4：对"剪完之后真正会播出的内容"做最后一道确定性检查——转写的
         # 是已经剪过口误的视频，这里的 word_timestamps 就是最终播出文本。
@@ -2530,29 +2516,6 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
 
     props_path = workdir / "_op_apply_style_props.json"
 
-    # 从内容规划真正开始算起（不算前面 enhancement chain/转写的时间——那些
-    # 各自已经有自己的超时/信号量保护），到 props_lint 循环 + vision-QA 触发
-    # 的重规划全部结束为止的总预算。见 _APPLY_STYLE_CONTENT_DEADLINE_S 的
-    # 说明。
-    #
-    # 真实事故（2026-07-27，job_cb04960d9a48）：run_talking_head_pipeline 主
-    # 循环里 apply_style 失败会自动整体重试一次（_DEGRADABLE_OPS 的通用逻辑，
-    # 见文件顶部）——但这个预算原本每次调用 _op_apply_style 都重新算一次
-    # deadline，导致第一次尝试吃满 12 分钟预算触发降级、外层重试后第二次
-    # 尝试又重新吃满 12 分钟，从确认到交付实测花了 30 分 47 秒，是预算本身的
-    # 2 倍还多。用 workdir 里的一个标记文件让两次调用共享同一个总预算——
-    # 第二次调用读到第一次算好的截止时间，不会重新给满整段预算。用挂钟时间
-    # （不是 time.monotonic()）存盘，两次调用之间即使隔着进程重启也不会失真。
-    _deadline_marker = workdir / "_apply_style_deadline.txt"
-    try:
-        content_deadline_wall = float(_deadline_marker.read_text().strip())
-    except (OSError, ValueError):
-        content_deadline_wall = time.time() + _APPLY_STYLE_CONTENT_DEADLINE_S
-        _deadline_marker.write_text(str(content_deadline_wall))
-    # 内部判断继续用 monotonic 语义（跟 time.time() 的差值在同一次调用里是
-    # 稳定的，不受挂钟被外部改动影响）；两个时间基准这里只做一次换算。
-    content_deadline = time.monotonic() + (content_deadline_wall - time.time())
-
     def _build(feedback: Optional[str] = None) -> dict[str, Any]:
         """内容规划 + 组 contract② props。包成闭包是为了让视觉复核重试只重新
         走这一步（一次 LLM 调用 + 一轮 QA stills），不用重新跑 enhancement
@@ -2592,8 +2555,9 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
             plan_milestone_unlocks = op.get("milestone_unlocks") or []
         else:
             logger.info("  apply_style: 内容规划中（章节 + 数据展示分析）...")
-            content_plan = plan_content(segments, duration, feedback=feedback, word_timestamps=word_timestamps,
-                                         deadline=content_deadline)
+            content_plan = plan_content(segments, duration, feedback=feedback,
+                                         user_request=op.get("_user_feedback"),
+                                         word_timestamps=word_timestamps, workdir=workdir)
             chapters = content_plan["chapters"]
             data_cards = content_plan["data_cards"]
             gauges = content_plan["gauges"]
@@ -2748,25 +2712,12 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
             # aren't assigned into props until further below, so reading them
             # back via props.get(...) here would silently no-op.
             _mount_floor = intro_out + 20 + 20  # intro_out+20(clamp) + TRANSITION_FRAMES(20)
-            # plan_corner_cards 加进这个列表是架构复审后新增（2026-07-28，真实
-            # 复现 job_5b0ec0b914ee）：这条地板线本来就覆盖了几乎所有图形类型，
-            # 唯独漏了 corner_cards——CornerCard.tsx 自己的文档明确写了"绝不在
-            # section takeover/quote 期间渲染，卡片被隐藏时渲染了也看不见"，但
-            # 那条保护只覆盖 content_planner 认识的 sections/quote takeover，intro
-            # 是下游 pipeline_runner 才算出来的独立窗口，content_planner 规划
-            # corner_card 时根本不知道它的存在。真实复现：mountFrame=0 的聊天
-            # 气泡卡片跟 intro 深色开场大标题同时出现在画面上，视觉复审判定其中
-            # 文字"被截断"（实际是卡片被挤到画布边缘、跟开场标题抢位置），
-            # 是这个 job 最终降级交付的直接原因。corner_card 渲染在 SpeakerCard
-            # 内部、不参与内容区堆叠，机制上跟这条地板线已覆盖的其它图形类型
-            # 完全一样，直接并入同一条地板线，不用另写一套逻辑。
             for _items in (data_cards, gauges, countdowns, calendar_events,
                            before_after, plan_quotes, plan_pills, plan_step_lists, plan_topic_cards,
                            plan_comparisons, plan_ranked_lists, plan_checklists,
                            plan_location_pins, plan_testimonials, plan_icon_clusters,
                            plan_progress_bars, plan_pros_cons, plan_milestone_tracks,
-                           plan_trust_badges, plan_bar_charts, plan_milestone_unlocks,
-                           plan_corner_cards):
+                           plan_trust_badges, plan_bar_charts, plan_milestone_unlocks):
                 _floor_shift_graphics(_items, _mount_floor)
             _floor_shift_zone_headers(plan_zone_headers, _mount_floor)
 
@@ -2908,6 +2859,7 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         props_path.write_text(json.dumps(props, ensure_ascii=False), encoding="utf-8")
         return props
 
+    on_progress("planning")
     props = _build()
 
     # Fix C4：确定性的 props 层面几何×时间重叠检查（whatsapp_mvp/props_lint.py）
@@ -2936,16 +2888,12 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
     best_richness = _visual_richness(props)
     attempt = 1
     while best_findings and attempt <= _PROPS_LINT_MAX_ATTEMPTS:
-        if time.monotonic() >= content_deadline:
-            logger.warning(
-                f"  apply_style: 内容规划总预算已用完，跳过 props_lint 第 "
-                f"{attempt}/{_PROPS_LINT_MAX_ATTEMPTS} 轮重规划，交付目前最好的一版"
-            )
-            break
+        on_progress("layout_retry")
         logger.warning(
             f"  apply_style: props_lint 第 {attempt}/{_PROPS_LINT_MAX_ATTEMPTS} 轮发现 "
             f"{len(best_findings)} 处问题，重新规划: {[f['check'] for f in best_findings]}"
         )
+        prior_findings_for_stagnation = best_findings
         lint_feedback = "; ".join(f["detail"] for f in best_findings)[:600]
         candidate = _build(feedback=lint_feedback)
         candidate_findings = _run_props_lint(candidate)
@@ -2956,28 +2904,25 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         # 都满足才采用这一轮；丰富度下降就算 findings 更少也不换。
         if len(candidate_findings) < len(best_findings) and candidate_richness >= best_richness:
             best_props, best_findings, best_richness = candidate, candidate_findings, candidate_richness
-            attempt += 1
-            continue
-        # 早退（保质量提速）：本轮没有产出"更少问题且不降丰富度"的改进。喂回的
-        # lint_feedback 只由 best_findings 决定，而 best 这轮没变——再跑同样的重
-        # 规划只会得到同样结果，后续轮次是确定性空转（low_visual_richness/
-        # element_over_card 这类"内容本身改不动"的 finding 会一路耗满 _PROPS_LINT_
-        # MAX_ATTEMPTS 轮，每轮一次完整 LLM 规划）。提前结束：best_props 已保留，
-        # 交付版本与跑满全部轮次完全一致，只省掉注定白烧的后续 LLM 调用。通用于
-        # 任何"重规划改不动"的 finding，不特判某一类；能持续改进时仍会继续（上面
-        # accept 分支 continue）。
-        if len(candidate_findings) < len(best_findings):
+        elif len(candidate_findings) < len(best_findings):
             logger.warning(
                 f"  apply_style: props_lint 第 {attempt}/{_PROPS_LINT_MAX_ATTEMPTS} 轮的重规划"
                 f"findings 更少({len(candidate_findings)} < {len(best_findings)})，但丰富度从 "
                 f"{best_richness} 降到 {candidate_richness}——拒绝采用，保留内容更丰富的版本"
             )
-        else:
-            logger.info(
-                f"  apply_style: props_lint 第 {attempt} 轮重规划未改进"
-                f"（{[f['check'] for f in best_findings]} 修不动）——提前结束重试，交付当前最佳版本"
+        # Fix D2：这一轮重规划命中的问题*类型*跟目前最好版本一字不差——重规划
+        # 没有带来实质改善，往下喂的 lint_feedback 大概率不变，剩余轮次大概率
+        # 原样重复。跟 content_planner 自己 criterion loop 的 D1 是同一个道理
+        # （见那边注释），只是这里比较的是 props_lint 的 check 类型集合，不是
+        # 完整 failures 文本——props_lint 的 detail 文本可能因坐标细节每轮
+        # 略有不同，但 check 类型不变就代表问题种类没有真正解决。
+        if _props_lint_stagnated(candidate_findings, prior_findings_for_stagnation):
+            logger.warning(
+                f"  apply_style: props_lint 第 {attempt}/{_PROPS_LINT_MAX_ATTEMPTS} 轮的重规划"
+                f"问题类型跟当前最好版本完全一致，判定继续重试不会有新结果，提前结束"
             )
-        break
+            break
+        attempt += 1
     if best_findings:
         logger.warning(
             f"  apply_style: props_lint {_PROPS_LINT_MAX_ATTEMPTS} 轮后仍有 "
@@ -3019,6 +2964,7 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
         if findings:
             p = _restore_facecam_before_end(p, findings, round(duration * 30))
             findings = _run_props_lint(p)
+        p = _drop_ungrounded_count_up_rows(p, segments)  # Fix A2
         p = _recompute_scenes_from_content(p, round(duration * 30))
         return p
 
@@ -3044,103 +2990,63 @@ def _op_apply_style(src: str, op: dict, workdir: Path) -> Optional[str]:
     # （qa_stills._vision_review/call_vision_chat）已经存在；这里补上原本
     # 缺失的一环——真的按它的发现做点什么，而不是只记录进 qa_report.json
     # 就撒手不管。发现 "high" 级问题就把问题喂回内容规划重试一次——只重新走
-    # 这一步（一次 LLM 调用 + 一轮 QA stills），不用重新渲染整片。重试后仍有
-    # 问题就 raise，交给下面已有的 _DEGRADABLE_OPS 降级交付逻辑处理——不是
-    # 发明新的失败处理方式，是复用已经存在、已经验证过的那一套（render 失败
-    # 时走的就是同一条路）。
+    # 这一步（一次 LLM 调用 + 一轮 QA stills），不用重新渲染整片。
+    #
+    # Fix（2026-07-24，用户明确要求）：重试后仍有问题，此前会直接 raise ->
+    # 触发 _DEGRADABLE_OPS 降级交付，交付的是完全没套模板的原始剪辑——但
+    # vision QA 是基于几张抽样静态图的启发式判断，不是看过真实渲染的完整
+    # 视频；一个"标题文字轻微压到卡片边缘"级别的瑕疵，跟"完全没有模板"相比，
+    # 用户明确表示宁可要前者（"even if there's defects just give me the
+    # preview with the edits"）。改为：不再因为视觉复审的发现而阻断渲染——
+    # 记录下这些仍未解决的问题，正常往下渲染整片，把带瑕疵的品牌模板版本
+    # 实际交付出去，而不是连试都不试就退回无模板版本。仍然不做静默处理——
+    # 剩余问题写进这个 job 的质量提示账本（_vision_qa_warnings.json，
+    # 跟 _generation_costs.json/_llm_usage.json 同一套 per-job 文件账本
+    # 模式），最终交付消息里会如实告知用户"渲染完成，但有几处小瑕疵"，
+    # 而不是假装完全没有过问题。
+    final_vision_warnings: list[dict] = []
     if not op.get("skipQaStills"):
         from .qa_stills import run_props_qa
 
         qa_result = run_props_qa(props, props_path, remotion_dir, workdir / "qa_stills")
-        major = _major_vision_findings(qa_result, props)
-        if major and time.monotonic() >= content_deadline:
-            logger.warning(
-                "  apply_style: 内容规划总预算已用完，跳过视觉复审触发的重规划，"
-                "直接走降级交付（不是新逻辑，跟重试后仍有问题走的是同一条路）"
-            )
-            raise RuntimeError(f"apply_style: 内容规划总预算已用完，视觉复审发现的问题未再尝试修复，触发降级交付: {major}")
-        if major and _is_geometry_or_color_only(major):
-            # 取景/对比度问题跟内容规划无关（speakerObjectPosition/colorMode
-            # 只算一次，任何重规划都碰不到它们）——走内容重规划必然原样复现
-            # 同一个问题，白白多花一轮 LLM + QA stills 还是没用。直接调参数、
-            # 重跑一次确定性保底（对齐 scenes）、重新过一遍视觉复审验证。
-            props, major = _apply_geometry_color_shortcut(props, props_path, major, remotion_dir, workdir, duration)
-            if major:
-                raise RuntimeError(f"apply_style: 取景/对比度修正后仍发现问题，触发降级交付: {major}")
-        elif major:
+        vision_findings = (qa_result.get("vision_review") or {}).get("findings") or []
+        major = [f for f in vision_findings if f.get("severity") == "high"]
+        if major:
+            on_progress("qa_retry")
             feedback = "; ".join(f"still #{f.get('frame_index')}: {f.get('issue', '')}" for f in major)[:500]
             logger.warning(f"  apply_style: 视觉复审发现问题，重新规划一次: {feedback}")
             replanned = _apply_deterministic_guarantees(_build(feedback=feedback))
             # 重规划内容跟上一轮一字不差 → LLM 没有真的按反馈调整任何东西，
             # 第二轮 qa_stills 几乎一定原样报回同样的 high severity 问题——
-            # 直接跳过（省一次视觉模型调用 + 几帧静态图渲染），走跟"重试后
-            # 仍有问题"完全一样的降级路径，不做无意义的重复确认。
+            # 直接跳过（省一次视觉模型调用 + 几帧静态图渲染），不做无意义的
+            # 重复确认，直接把这一轮的发现当作"最终仍未解决"记下来。
             if _content_unchanged(props, replanned):
                 logger.warning(
                     "  apply_style: 重规划内容与上一轮完全一致，判定反馈未被采纳，"
-                    "跳过第二轮视觉复审直接触发降级交付"
+                    "跳过第二轮视觉复审，带着已知问题继续渲染"
                 )
-                raise RuntimeError(f"apply_style: 重规划未产生实质变化，视觉复审发现的问题预计仍然存在，触发降级交付: {major}")
-            props = replanned
-            # _build() 自己已经无条件写过一次 props_path（未经确定性保底的版本，
-            # 见 Fix C9 的注释）——这里必须用保底之后的版本覆盖写回去，否则
-            # run_props_qa/最终渲染读到的还是磁盘上那份没经过 C13/C15 的旧内容
-            # （跟 C9 是同一类"内存和磁盘不同步"教训，只是这次是 Fix C16 引入的
-            # 新调用点）。
-            props_path.write_text(json.dumps(props, ensure_ascii=False), encoding="utf-8")
-            qa_result = run_props_qa(props, props_path, remotion_dir, workdir / "qa_stills")
-            major = _major_vision_findings(qa_result, props)
-            if major and _is_geometry_or_color_only(major):
-                # 内容重规划把真正的内容问题（比如上面反馈里带的"纯黑画面"）
-                # 修好之后，剩下的发现完全可能变成纯取景/对比度类——这时候
-                # 还有必要再走一次内容重规划吗？不需要，跟第一次检查同一条
-                # 捷径，同一个函数（Rule 5/13：只在一个调用点生效的修正不是
-                # 真正的修正）。
-                props, major = _apply_geometry_color_shortcut(props, props_path, major, remotion_dir, workdir, duration)
-            if major:
-                raise RuntimeError(f"apply_style: 视觉复审重试后仍发现问题，触发降级交付: {major}")
+                final_vision_warnings = major
+            else:
+                props = replanned
+                # _build() 自己已经无条件写过一次 props_path（未经确定性保底的版本，
+                # 见 Fix C9 的注释）——这里必须用保底之后的版本覆盖写回去，否则
+                # run_props_qa/最终渲染读到的还是磁盘上那份没经过 C13/C15 的旧内容
+                # （跟 C9 是同一类"内存和磁盘不同步"教训，只是这次是 Fix C16 引入的
+                # 新调用点）。
+                props_path.write_text(json.dumps(props, ensure_ascii=False), encoding="utf-8")
+                qa_result = run_props_qa(props, props_path, remotion_dir, workdir / "qa_stills")
+                vision_findings = (qa_result.get("vision_review") or {}).get("findings") or []
+                major = [f for f in vision_findings if f.get("severity") == "high"]
+                if major:
+                    logger.warning(f"  apply_style: 视觉复审重试后仍发现问题，带着已知问题继续渲染: {major}")
+                    final_vision_warnings = major
+    if final_vision_warnings:
+        (workdir / "_vision_qa_warnings.json").write_text(
+            json.dumps(final_vision_warnings, ensure_ascii=False), encoding="utf-8"
+        )
 
     out = workdir / "_op_styled.mp4"
-    npx_bin = shutil.which("npx") or "npx"  # Windows: subprocess needs the resolved npx.cmd, plain "npx" raises WinError 2
-    from .remotion_bundle import ensure_remotion_bundle
-    bundle = ensure_remotion_bundle(remotion_dir)
-    # props_path/out must be absolute — this subprocess runs with cwd=remotion_dir,
-    # so a relative path (e.g. "storage/jobs/<id>/_op_apply_style_props.json")
-    # resolves against remotion-composer/ instead of the repo root, and Remotion
-    # rejects it outright ("neither valid JSON nor a file path to a valid JSON
-    # file"). Confirmed real production bug: apply_style silently degraded to
-    # the bare unstyled cut on every run where workdir happened to be relative,
-    # with qa_stills' own still-renders (same bug, same fix needed there) failing
-    # identically just before it.
-    cmd = [npx_bin, "remotion", "render"] + ([bundle] if bundle else []) + [
-        "XiaojinEditorial", str(out.resolve()),
-        f"--props={props_path.resolve()}",
-        "--crf=18",
-    ]
-    logger.info(f"  apply_style: rendering via {' '.join(cmd)} (cwd={remotion_dir})")
-    # 重试一次：确认过真实生产 bug——同一份 props/视频独立跑总是成功，只有紧跟在
-    # qa_stills 那几次连续 still 渲染后面立刻起片渲染时才会报 "No frame found at
-    # position N"（Remotion 自己的 asset 缓存/本地 server 在 qa_stills 和整片渲染
-    # 之间交接时的瞬时状态，不是数据或编码问题——独立复现直接 1462/1462 渲染成功）。
-    # 跟这个文件里其它瞬时失败（LLM 调用、口误复核）已有的重试模式一致，不是发明
-    # 新机制。
-    last_result = None
-    for attempt in range(2):
-        with _RENDER_SLOTS:  # Remotion 渲染跨任务串行 + 硬超时防卡死占坑
-            result = subprocess.run(cmd, cwd=str(remotion_dir), capture_output=True, text=True,
-                                    timeout=_RENDER_TIMEOUT_S)
-        if result.returncode == 0:
-            last_result = None
-            break
-        last_result = result
-        if attempt == 0:
-            logger.warning(f"  apply_style: 渲染失败(exit {result.returncode})，重试一次: {result.stderr[-500:]}")
-
-    if last_result is not None:
-        logger.error(f"apply_style render stderr: {last_result.stderr[-4000:]}")
-        raise RuntimeError(f"apply_style 渲染失败 (exit {last_result.returncode})")
-
-    return str(out) if out.exists() else None
+    return _remotion_render_props(props_path, out, remotion_dir, on_progress=on_progress)
 
 
 
@@ -3199,6 +3105,593 @@ def _read_generation_cost(workdir: Path) -> float:
         return 0.0
 
 
+_VISION_QA_WARNINGS_NAME = "_vision_qa_warnings.json"
+
+
+def _read_vision_qa_warnings(workdir: Path) -> list[str]:
+    """读回 `_op_apply_style` 交付前记下的、未能在重试内解决的视觉复审发现
+    （一句话描述，供交付消息如实告知用户）。没有文件（没发现问题，或走的是
+    `skipQaStills` 路径）就返回空列表——不是失败信号，只是"没有需要说的"。"""
+    ledger_path = workdir / _VISION_QA_WARNINGS_NAME
+    if not ledger_path.exists():
+        return []
+    try:
+        findings = json.loads(ledger_path.read_text(encoding="utf-8"))
+        return [f.get("issue", "") for f in findings if isinstance(f, dict) and f.get("issue")]
+    except Exception:
+        return []
+
+
+def resolve_apply_style_source(job_dir: Path) -> Optional[str]:
+    """`rerun_style_only` 用：这个 job 上一次 apply_style 渲染实际用的、已经跑
+    完增强链的源视频是哪个文件——不是重新猜测，而是直接读回
+    `_op_apply_style_props.json["videoSrc"]`（`_op_apply_style` 无条件写盘，见
+    Fix C9/C16），因为那正是当时真正喂给 Remotion 渲染的文件。
+
+    没有 props 文件、或它引用的文件已经不在（job_dir 被清理过之类），退回
+    `simulate_job.py._mode_apply_style` 同款的启发式：按增强链的执行顺序依次
+    找存在的中间产物——face_enhance/color_grade/audio_enhance 各自都是
+    best-effort（`_run_enhancement_chain_inner`），任何一步都可能没跑成，所以
+    要把三个都列进候选，不能只看最后一步。全都不存在时返回 None。
+    """
+    props_path = job_dir / "_op_apply_style_props.json"
+    if props_path.exists():
+        try:
+            props = json.loads(props_path.read_text(encoding="utf-8"))
+            video_src = props.get("videoSrc") or ""
+            name = video_src.rsplit("/", 1)[-1] if video_src else ""
+            if name and (job_dir / name).exists():
+                return str(job_dir / name)
+        except Exception:
+            pass
+    for candidate in ("_op_audio_enhance.mp4", "_op_color_grade.mp4", "_op_face_enhance.mp4",
+                      "_op_nofiller.mp4", "input.mp4"):
+        p = job_dir / candidate
+        if p.exists():
+            return str(p)
+    return None
+
+
+def rerun_style_only(job: Job, style_feedback: str, *,
+                     on_progress: Optional[Callable[[str], None]] = None) -> dict[str, Any]:
+    """预览阶段用户打字提修改意见 -> 只重跑 apply_style（+ 字幕/音乐尾段），
+    不重新剪辑/转写/增强。
+
+    跟完整管线（`run_talking_head_pipeline`）的关系：这是它的一个子集，专门
+    给"用户已经看过预览、只对模板展示的内容/图形有意见"这一类请求用（意图
+    判断在调用方 `worker.revise_style` 里做，见 `content_planner.
+    classify_revision_intent`）。这里只负责：定位上一次真正渲染用的源视频、
+    带着用户反馈重跑 apply_style、复用尾段逻辑（`_finalize_pipeline_tail`）
+    补上字幕/音乐、失败时把 job 恢复到修订前的状态。
+
+    raises:
+        _StyleRerunUnsupported: 这个 job 根本不适合走这条路（没有 apply_style
+            操作、或它是手工编排的 chapters/data_cards、或找不到可用的源文件）
+            ——调用方应该退回完整方案重规划，不是失败。
+        _StyleRerunFailed: 决定走这条路但 `_op_apply_style` 本身出错——旧
+            preview.mp4 未被触碰，props/vision-warnings 快照已恢复。
+    """
+    job_dir = job.job_dir
+    plan = _load_plan(job)
+    operations = plan.get("edit_operations", [])
+    apply_style_op = next((o for o in operations if o.get("type") == "apply_style"), None)
+    if apply_style_op is None:
+        raise _StyleRerunUnsupported("plan has no apply_style operation")
+    if apply_style_op.get("chapters") or apply_style_op.get("data_cards"):
+        # `_op_apply_style` 的 `_build()` 在这两个字段存在时会整个绕过
+        # plan_content（手工编排的 props），用户反馈根本传不进 LLM。
+        raise _StyleRerunUnsupported("apply_style op is hand-authored (chapters/data_cards)")
+
+    src = resolve_apply_style_source(job_dir)
+    if src is None:
+        raise _StyleRerunUnsupported("no usable source video found for a style-only rerun")
+
+    # 快照当前 props/视觉复审警告——不是防御性多余动作：`_build()` 会在渲染前
+    # 无条件覆写 _op_apply_style_props.json（Fix C9/C16），渲染失败时如果不
+    # 恢复，`_animations_summary`（webhook.py）会读到"这次失败的重规划"留下的
+    # 内容，向用户播报一份实际没渲染出来的动画清单——就是它自己文档里那个
+    # "两句话自相矛盾"的真实 bug（2026-07-23，job_fa4ee47e9676），只是通过一条
+    # 它的 degraded_operations 守卫没覆盖到的新路径重新引入。同理
+    # _vision_qa_warnings.json 从不会被删除（只在非空时覆写），干净的重跑必须
+    # 先清掉，否则会把上一轮的旧警告当成这一轮的结果重新播报。
+    props_path = job_dir / "_op_apply_style_props.json"
+    warnings_path = job_dir / _VISION_QA_WARNINGS_NAME
+    prev_props_text = props_path.read_text(encoding="utf-8") if props_path.exists() else None
+    prev_warnings_text = warnings_path.read_text(encoding="utf-8") if warnings_path.exists() else None
+    prev_props: dict = {}
+    if prev_props_text:
+        try:
+            prev_props = json.loads(prev_props_text)
+        except Exception:
+            prev_props = {}
+    props_path.unlink(missing_ok=True)
+    warnings_path.unlink(missing_ok=True)
+
+    def _restore_snapshots() -> None:
+        if prev_props_text is not None:
+            props_path.write_text(prev_props_text, encoding="utf-8")
+        else:
+            props_path.unlink(missing_ok=True)
+        if prev_warnings_text is not None:
+            warnings_path.write_text(prev_warnings_text, encoding="utf-8")
+        else:
+            warnings_path.unlink(missing_ok=True)
+
+    style_op = copy.deepcopy(apply_style_op)
+    style_op["_user_feedback"] = style_feedback
+    style_op["_skip_enhancement"] = True
+    if on_progress:
+        style_op["_on_progress"] = on_progress
+    # 复用上一轮已经算好/选好的确定性值——都是同一段视频每次都会得到相同结果
+    # 的东西，重算纯属浪费（人脸裁剪校准还会重新跑一次 FaceTracker）。
+    if prev_props.get("speakerObjectPosition"):
+        style_op["speaker_object_position"] = prev_props["speakerObjectPosition"]
+    if prev_props.get("colorMode"):
+        style_op["colorMode"] = prev_props["colorMode"]
+
+    try:
+        styled = _op_apply_style(src, style_op, job_dir)
+    except Exception as e:
+        _restore_snapshots()
+        raise _StyleRerunFailed(f"apply_style rerun failed: {e}") from e
+    if not styled or not Path(styled).exists():
+        _restore_snapshots()
+        raise _StyleRerunFailed("apply_style rerun produced no output")
+
+    music_op = next((o for o in operations if o.get("type") == "add_music"), None)
+    subtitle_op = next((o for o in operations if o.get("type") == "add_subtitles"), None)
+    result = _finalize_pipeline_tail(job_dir, styled, subtitle_op=subtitle_op, music_op=music_op,
+                                     applied=["apply_style"], degraded=[], job_id=job.id,
+                                     reuse_music=True)
+
+    # 把这个 job 之前遗留的、跟这次重跑范围无关的降级标记带回来（例如上一轮
+    # insert_broll 失败过）——但 apply_style/add_music/add_subtitles 这三项必须
+    # 用这次重跑的真实结果，不能沿用陈旧标记。
+    prev_degraded: list[str] = []
+    try:
+        prev_degraded = json.loads(job.degraded_operations) if job.degraded_operations else []
+    except Exception:
+        prev_degraded = []
+    carried_over = [d for d in prev_degraded if d not in ("apply_style", "add_music", "add_subtitles")]
+    result["degraded_operations"] = list(dict.fromkeys(result["degraded_operations"] + carried_over))
+    return result
+
+
+_ASSET_PINNED_TOP_LEVEL = ("videoSrc", "durationSeconds")
+
+
+def pin_server_owned_props(user_props: dict, disk_props: dict) -> dict:
+    """预览编辑器"保存"路径的安全闸门：把浏览器提交的这几项资源/时长字段
+    强制换成服务端磁盘上真实的值，绝不信任客户端传来的原始内容。
+
+    不是防御性冗余——`render_props.schema.json` 把 `videoSrc` 定义成一个裸
+    字符串，没有这层覆盖，一次编辑器保存就能把它设成 `file:///…/.env`
+    （本地任意文件读取，读出的内容会被渲染进一帧画面，攻击者下载视频就能
+    拿到）或内网地址（SSRF）；`durationSeconds` 同理——`ceil(d*30)` 没有上限，
+    设成一个极大值会占住唯一的 `RENDER_SLOTS` 信号量整整 `OM_RENDER_TIMEOUT_S`
+    秒，拖垮所有 WhatsApp 任务。
+
+    `videoSrc`/`presenter.src`/`qrContact.qrSrc` 是全部三个真正会被组件当
+    资源加载的字段（`SpeakerCard`/`Presenter`/`QRContactCard`）——锁死这三个
+    + 给 `durationSeconds` 封顶，就彻底堵死这条注入面，不需要逐个校验其它
+    字段。
+
+    `presenter`/`qrContact` 是可选块：磁盘上这个 job 如果从没有过合法的
+    `src`/`qrSrc` 可以拿来钉死（例如这条 job 从没跑过 presenter 模式），就不
+    猜、不放行用户提交的路径，把用户新加的整块直接去掉——总比信任一个未经
+    验证的路径安全。
+    """
+    props = copy.deepcopy(user_props)
+    for key in _ASSET_PINNED_TOP_LEVEL:
+        if key in disk_props:
+            props[key] = disk_props[key]
+
+    disk_presenter_src = (disk_props.get("presenter") or {}).get("src")
+    if "presenter" in props:
+        if disk_presenter_src:
+            props["presenter"] = {**props["presenter"], "src": disk_presenter_src}
+        else:
+            props.pop("presenter", None)
+
+    disk_qr_src = (disk_props.get("qrContact") or {}).get("qrSrc")
+    if "qrContact" in props:
+        if disk_qr_src:
+            props["qrContact"] = {**props["qrContact"], "qrSrc": disk_qr_src}
+        else:
+            props.pop("qrContact", None)
+
+    return props
+
+
+def _clamp_video_cuts(props: dict, disk_props: dict) -> dict:
+    """Clamp client-supplied `videoCuts` against the real on-disk source
+    duration before rendering — same threat model as `durationSeconds` above
+    (a cut referencing frames past the real source video's end, or a huge
+    bogus `toFrame`, would either error out mid-render or hold a
+    `RENDER_SLOTS` slot on a nonsense range). `videoCuts` isn't in
+    `_ASSET_PINNED_TOP_LEVEL` — the editor is meant to set it — so this
+    normalizes/clamps rather than blanket-overwriting. Mirrors
+    `normalizeCuts` in remotion-composer/src/cuts.ts exactly (see
+    video_cuts.py's own header comment on why a Python port exists at all);
+    a client whose source got reprocessed shorter since the editor loaded
+    degrades gracefully (cuts past the new end just clamp down) rather than
+    hard-failing the whole save.
+    """
+    from .content_planner import FPS
+    from .video_cuts import normalize_cuts
+
+    raw_cuts = props.get("videoCuts")
+    if not raw_cuts:
+        return props
+
+    disk_duration = disk_props.get("durationSeconds")
+    if not disk_duration:
+        props.pop("videoCuts", None)
+        return props
+
+    import math
+    src_len = max(1, math.ceil(float(disk_duration) * FPS))
+    cuts = normalize_cuts(raw_cuts if isinstance(raw_cuts, list) else None, src_len)
+
+    if not cuts:
+        props.pop("videoCuts", None)
+    else:
+        props["videoCuts"] = cuts
+    return props
+
+
+def _editor_disk_props(job: Job) -> Optional[dict]:
+    props_path = job.job_dir / "_op_apply_style_props.json"
+    if props_path.exists():
+        try:
+            return json.loads(props_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+    # Arm B (AI-authored) jobs never produce _op_apply_style_props.json —
+    # their render props live at authored/props.json instead, written by
+    # authored_renderer._stage_workspace's own props dict, in a different
+    # shape (durationInFrames + fps, not durationSeconds). Without this
+    # fallback, ensure_editor_filmstrip/ensure_editor_waveform below always
+    # returned empty for every Arm B job (this function's None short-circuits
+    # both), so the editor's Video/Audio reference lanes were silently
+    # always missing on that arm. Normalize into the two keys those two
+    # functions actually read (videoSrc, durationSeconds) rather than
+    # duplicating their logic for a second props source.
+    authored_props_path = job.job_dir / "authored" / "props.json"
+    if not authored_props_path.exists():
+        return None
+    try:
+        authored_props = json.loads(authored_props_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    duration_frames = authored_props.get("durationInFrames")
+    fps = authored_props.get("fps")
+    if not duration_frames or not fps:
+        return None
+    return {
+        "videoSrc": authored_props.get("videoSrc"),
+        "durationSeconds": float(duration_frames) / float(fps),
+    }
+
+
+def _source_video_path(job: Job, disk_props: dict) -> Optional[Path]:
+    """`videoSrc` on disk is always `f"{local_api_base}/files/{job_id}/{filename}"`
+    (see webhook.py's `_rewrite_asset_url` docstring) — resolve it back to the
+    real local file under this job's dir without an HTTP round-trip."""
+    video_src = disk_props.get("videoSrc")
+    if not video_src:
+        return None
+    filename = video_src.rsplit("/", 1)[-1]
+    path = job.job_dir / filename
+    return path if path.exists() else None
+
+
+_FILMSTRIP_COUNT = 10
+
+
+def ensure_editor_filmstrip(job: Job) -> list[Path]:
+    """Generate (once, cached to disk) `_FILMSTRIP_COUNT` evenly-spaced JPEG
+    thumbnails from the job's current source video, for the editor timeline's
+    Video track. Deliberately raw ffmpeg frame-grabs from the source only —
+    no Remotion composition render involved, so none of the "20 full
+    composition renders would be brutal" concern that ruled out a filmstrip
+    in the Phase 3 editor applies here (this thumbnails the raw clip, not the
+    ~40-card composition).
+    """
+    job_dir = job.job_dir
+    existing = [job_dir / f"_editor_filmstrip_{i}.jpg" for i in range(_FILMSTRIP_COUNT)]
+    if all(p.exists() for p in existing):
+        return existing
+
+    disk_props = _editor_disk_props(job)
+    if disk_props is None:
+        return []
+    src = _source_video_path(job, disk_props)
+    duration = disk_props.get("durationSeconds")
+    if src is None or not duration or duration <= 0:
+        return []
+
+    out_paths: list[Path] = []
+    for i in range(_FILMSTRIP_COUNT):
+        # Sample the midpoint of each of N equal slices, not the exact edges
+        # — avoids landing on frame 0 (often a blank pre-roll moment; same
+        # class of "meaningless sample" this codebase already excludes for
+        # QA-still sampling elsewhere) or right at EOF.
+        t = (i + 0.5) * duration / _FILMSTRIP_COUNT
+        out = job_dir / f"_editor_filmstrip_{i}.jpg"
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-ss", f"{t:.3f}", "-i", str(src),
+                 "-frames:v", "1", "-vf", "scale=-2:120", "-q:v", "4", str(out)],
+                capture_output=True, check=True, timeout=30,
+            )
+        except Exception:
+            logger.warning(f"filmstrip 缩略图生成失败 job={job.id} i={i}", exc_info=True)
+            continue
+        if out.exists():
+            out_paths.append(out)
+    return out_paths
+
+
+_WAVEFORM_NAME = "_editor_waveform.png"
+
+
+def ensure_editor_waveform(job: Job) -> Optional[Path]:
+    """Generate (once, cached) a waveform PNG from the job's current source
+    video's audio track via ffmpeg's `showwavespic` filter — one subprocess
+    call. Deliberately server-side, not decoded client-side via
+    @remotion/media-utils: that would mean downloading/decoding the whole
+    audio track on a phone connection just to draw a strip of pixels."""
+    job_dir = job.job_dir
+    out = job_dir / _WAVEFORM_NAME
+    if out.exists():
+        return out
+
+    disk_props = _editor_disk_props(job)
+    if disk_props is None:
+        return None
+    src = _source_video_path(job, disk_props)
+    if src is None:
+        return None
+
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", str(src),
+             "-filter_complex", "showwavespic=s=1600x120:colors=0x6C63FF",
+             "-frames:v", "1", str(out)],
+            capture_output=True, check=True, timeout=30,
+        )
+    except Exception:
+        logger.warning(f"waveform 生成失败 job={job.id}", exc_info=True)
+        return None
+    return out if out.exists() else None
+
+
+_EDITOR_PREVIEW_VIDEO_NAME = "_editor_preview.mp4"
+
+
+def ensure_editor_preview_video(job: Job) -> Optional[Path]:
+    """Generate (once, cached) a small, faststart (moov-at-front) copy of the
+    job's current source video, for the browser editor's `<video>` element to
+    load.
+
+    Two separate bugs stacked here, found in order:
+
+    1. **Root cause of "permanently black, no error".** Every intermediate
+       `_op_*.mp4` this pipeline produces (confirmed: 70/70
+       `_op_audio_enhance.mp4` on disk, the file `videoSrc` actually points at
+       15/15 times on the current code path) has its `moov` atom written
+       LAST — `_op_audio_enhance.mp4` specifically is a pure `-c:v copy`
+       remux (`tools/audio/audio_enhance.py`), and `-c:v copy` does NOT imply
+       faststart. A browser cannot decode a single frame of a non-faststart
+       MP4 until it has fetched essentially the whole file (the moov atom
+       carries the sample tables). Confirmed via direct atom parsing: moov at
+       byte 8,016,184 of 8,070,768 on a real job.
+
+    2. **Root cause of "faststart fixed, still nothing for 17+ seconds".**
+       Confirmed live via a real user's Network tab: with faststart alone
+       (pure `-c copy` remux, same ~8MB as the source), the browser's request
+       for the file transferred only ~3.7MB in 17+ seconds over their actual
+       connection to the ngrok tunnel (~220KB/s) — a direct curl of the exact
+       same URL through the exact same path (ngrok -> Node gateway -> this
+       server) from a different network got the full file in under 5s, so
+       this is that specific user's link to the tunnel being slow, not a
+       server/proxy bug. Faststart alone doesn't help enough at that speed
+       for an ~8MB file. Fix: re-encode down to something that finishes fast
+       even on a slow link — editing (positioning cards, checking caption
+       sync, judging cut points) doesn't need source-quality video.
+
+    Deliberately NOT a pure remux anymore (was `-c copy`, sub-second) — this
+    re-encodes, which costs a few seconds of one-time generation (cached
+    after) in exchange for a file roughly an order of magnitude smaller.
+
+    It intentionally does NOT touch the original file: `render_props_directly`
+    always renders from the real `videoSrc` on disk (this copy is
+    browser-facing only, see `webhook._rewrite_props_for_browser`), and
+    `pin_server_owned_props` overwrites whatever `videoSrc` a save
+    round-trips back before it's ever persisted, so this cannot leak into
+    what actually gets rendered or delivered.
+    """
+    job_dir = job.job_dir
+    out = job_dir / _EDITOR_PREVIEW_VIDEO_NAME
+    if out.exists():
+        return out
+
+    disk_props = _editor_disk_props(job)
+    if disk_props is None:
+        return None
+    src = _source_video_path(job, disk_props)
+    if src is None:
+        return None
+
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", str(src),
+             # Portrait source (~478x850 typical) -> cap width at 360,
+             # height auto (kept even, "-2") — plenty for judging card
+             # position/timing/captions on a phone or laptop screen; not
+             # meant to represent final delivered quality.
+             "-vf", "scale=360:-2",
+             "-c:v", "libx264", "-crf", "30", "-preset", "veryfast",
+             # -ar 44100 is load-bearing, not cosmetic: this pipeline's
+             # source audio is 96kHz (confirmed via ffprobe), and at a small
+             # bitrate that combination made Chrome's WebAudio pipeline
+             # (which Remotion's Player routes audio through for volume
+             # control) throw a real, reproducible error mid-playback —
+             # "Code 3 - PipelineStatus::AUDIO_RENDERER_ERROR" — confirmed
+             # live via a real user's console, right around the 1s mark.
+             # 44.1kHz is the standard, universally-supported web audio rate.
+             "-c:a", "aac", "-ar", "44100", "-b:a", "128k",
+             "-movflags", "+faststart",
+             str(out)],
+            capture_output=True, check=True, timeout=120,
+        )
+    except Exception:
+        logger.warning(f"编辑器预览副本生成失败 job={job.id}——编辑器会退回原始文件（可能仍然黑屏/很慢）", exc_info=True)
+        return None
+    return out if out.exists() else None
+
+
+def validate_render_props(props: dict) -> tuple[Optional[bool], Optional[str]]:
+    """按 contracts/render_props.schema.json 校验渲染 props。返回
+    (True/False/None, err)——跟同文件里 `validate_artifact` 同一套约定
+    （None 表示 jsonschema 没装，不是校验失败；False 才是真的没通过）。"""
+    try:
+        import jsonschema
+    except ImportError:
+        return None, "jsonschema 未安装"
+    try:
+        schema_path = Path(get_config().openmontage_root) / "contracts" / "render_props.schema.json"
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        jsonschema.validate(props, schema)
+        return True, None
+    except jsonschema.ValidationError as e:
+        return False, e.message
+    except Exception as e:
+        return False, str(e)[:300]
+
+
+def apply_editor_music_volume(music_op: Optional[dict], music_volume: Any) -> Optional[dict]:
+    """Editor-authored musicVolume override (Phase C) for the render_props_directly
+    save path. `music_volume` absent/non-numeric (the overwhelming majority
+    of saves, and every job before this field existed) returns `music_op`
+    untouched — unchanged behavior. `music_volume <= 0` means "drop the
+    music bed" rather than passing 0 through: _op_add_music's own volume
+    read (`vol = _num(op.get("volume")); vol = ... if vol else 0.18`) treats
+    an explicit 0 as falsy and silently substitutes the 0.18 default, which
+    would be exactly backwards for a user who dragged the slider to mute.
+    Never mutates `music_op` in place."""
+    if not isinstance(music_volume, (int, float)):
+        return music_op
+    if music_volume <= 0:
+        return None
+    if music_op is None:
+        return None
+    return {**music_op, "volume": music_volume}
+
+
+def render_props_directly(job: Job, user_props: dict, *,
+                          on_progress: Optional[Callable[[str], None]] = None) -> dict[str, Any]:
+    """预览编辑器"保存"的渲染路径——用户在浏览器里手改的 props 直接拿去渲染，
+    不经过 `plan_content`、不经过 `_apply_deterministic_guarantees`、不经过
+    props_lint 重试循环、不经过视觉复审。用户的编辑就是最终结果，这几层
+    "自动纠正"机制全都会在用户没要求的情况下悄悄改写内容（详见
+    `_op_apply_style` 内 `_apply_deterministic_guarantees` 和
+    `_recompute_scenes_from_content` 的文档）——编辑器场景下这些改写反而是
+    需要绕开的东西，不是需要复用的保障。
+
+    raises:
+        _EditorPropsInvalid: pin+strip 之后仍不满足 schema——磁盘上什么都
+            没被动过，调用方应直接回 400，不必进后台任务、不必恢复快照。
+        _EditorRenderFailed: 校验通过、真正尝试渲染，但渲染本身失败——旧
+            preview.mp4 未被触碰，props/vision-warnings 快照已恢复。
+    """
+    job_dir = job.job_dir
+    disk_props_path = job_dir / "_op_apply_style_props.json"
+    disk_props: dict = {}
+    if disk_props_path.exists():
+        try:
+            disk_props = json.loads(disk_props_path.read_text(encoding="utf-8"))
+        except Exception:
+            disk_props = {}
+
+    props = pin_server_owned_props(user_props, disk_props)
+    props = _clamp_video_cuts(props, disk_props)
+    # contentBeats 在 XiaojinEditorial.tsx 里被解构读取，但从未被加进 schema
+    # （schema 是 additionalProperties:false）——任何带着它的 props 都会在
+    # jsonschema 这一步被直接拒绝。防御性剔除，不让这个历史遗留字段挡路。
+    props.pop("contentBeats", None)
+
+    ok, err = validate_render_props(props)
+    if ok is False:
+        raise _EditorPropsInvalid(f"props failed contract② validation: {err}")
+
+    # 快照当前 props/视觉复审警告，供渲染失败时恢复——跟 rerun_style_only
+    # 同一个理由：`_animations_summary`（webhook.py）不能读到一份从未真正
+    # 渲染成功的 props，向用户播报假动画清单；_vision_qa_warnings.json 只在
+    # 非空时被覆写，干净的保存必须显式清掉旧账。
+    warnings_path = job_dir / _VISION_QA_WARNINGS_NAME
+    prev_props_text = disk_props_path.read_text(encoding="utf-8") if disk_props_path.exists() else None
+    prev_warnings_text = warnings_path.read_text(encoding="utf-8") if warnings_path.exists() else None
+
+    def _restore_snapshots() -> None:
+        if prev_props_text is not None:
+            disk_props_path.write_text(prev_props_text, encoding="utf-8")
+        else:
+            disk_props_path.unlink(missing_ok=True)
+        if prev_warnings_text is not None:
+            warnings_path.write_text(prev_warnings_text, encoding="utf-8")
+        else:
+            warnings_path.unlink(missing_ok=True)
+
+    disk_props_path.write_text(json.dumps(props, ensure_ascii=False), encoding="utf-8")
+
+    remotion_dir = Path(get_config().openmontage_root) / "remotion-composer"
+    out = job_dir / "_op_styled.mp4"
+    try:
+        styled = _remotion_render_props(disk_props_path, out, remotion_dir,
+                                        on_progress=on_progress or (lambda _s: None))
+    except Exception as e:
+        _restore_snapshots()
+        raise _EditorRenderFailed(f"editor render failed: {e}") from e
+    if not styled or not Path(styled).exists():
+        _restore_snapshots()
+        raise _EditorRenderFailed("editor render produced no output")
+
+    # 没有跑过视觉复审——必须在 _finalize_pipeline_tail 之前清掉，不能等它
+    # 之后再删：_finalize_pipeline_tail 内部会调用 _read_vision_qa_warnings
+    # 读这个文件算 quality_warnings（Fix，2026-07-27 真实复现——这里原来写
+    # 在 _finalize_pipeline_tail 之后，导致一次编辑器保存的 quality_warnings
+    # 里混进了这个 job 更早一轮、完全无关的旧视觉复审发现，读的时候已经
+    # 来不及了）。
+    warnings_path.unlink(missing_ok=True)
+
+    plan = _load_plan(job)
+    operations = plan.get("edit_operations", [])
+    music_op = next((o for o in operations if o.get("type") == "add_music"), None)
+    subtitle_op = next((o for o in operations if o.get("type") == "add_subtitles"), None)
+    music_op = apply_editor_music_volume(music_op, props.get("musicVolume"))
+    result = _finalize_pipeline_tail(job_dir, styled, subtitle_op=subtitle_op, music_op=music_op,
+                                     applied=["apply_style"], degraded=[], job_id=job.id,
+                                     reuse_music=True)
+
+    # 标记这个 job 已经被手动编辑过——server/worker.js 的 reviseJob 靠它决定
+    # 要不要在 WhatsApp 文字反馈快速路径（会从转写重新生成一切）覆盖用户的
+    # 手动改动前先弹一句警告确认（Stage 7）。只在这里（保存成功）写，不在
+    # 校验失败/渲染失败的分支写——那些情况用户的手动编辑其实没有真正生效。
+    (job_dir / "_manual_edit.json").write_text(
+        json.dumps({"edited_at": time.time()}), encoding="utf-8")
+
+    prev_degraded: list[str] = []
+    try:
+        prev_degraded = json.loads(job.degraded_operations) if job.degraded_operations else []
+    except Exception:
+        prev_degraded = []
+    carried_over = [d for d in prev_degraded if d not in ("apply_style", "add_music", "add_subtitles")]
+    result["degraded_operations"] = list(dict.fromkeys(result["degraded_operations"] + carried_over))
+    return result
+
+
 def _probe_duration(path: Path) -> float:
     try:
         probe = subprocess.run(
@@ -3219,13 +3712,8 @@ def _probe_dimensions(path: Path) -> tuple:
              "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", str(path)],
             capture_output=True, text=True, check=True,
         )
-        # 稳健解析：某些容器（如 Remotion 输出的 _op_styled.mp4）ffprobe 会带
-        # 尾随分隔符，"1080x1920x" 直接解包 w,h 会 ValueError→被 except 吞成
-        # (0,0)，让 insert_broll 误判“无法读取主视频画幅”。改为取前两个纯数字段。
-        parts = [p for p in probe.stdout.strip().split("x") if p.isdigit()]
-        if len(parts) >= 2:
-            return int(parts[0]), int(parts[1])
-        return 0, 0
+        w, h = probe.stdout.strip().split("x")
+        return int(w), int(h)
     except Exception:
         return 0, 0
 
@@ -3323,11 +3811,42 @@ def validate_artifact(art: dict, schema_name: str) -> tuple[Optional[bool], Opti
         return False, str(e)[:300]
 
 
+_ZERO_INSTRUCTION_DEFAULT_OPS = [
+    {"type": "remove_filler"},
+    {"type": "apply_style", "template": "xiaojin-editorial"},
+]
+
+
+def _plan_has_executable_op(plan: dict) -> bool:
+    """确认阶段的方案不一定是这条管线能直接执行的方案——Arm B 的
+    plan_authored（补丁点①,worker.py）会在**规划阶段**就把 planned_edit 写成
+    只有一条 `{"type": "authored_compose"}` 的占位方案(真正的渲染留给
+    confirm 之后 compose_authored 认草稿去做,见 pipeline_runner.py 顶部的
+    Arm B 灰度门)。如果 compose_authored 事后真的失败落回 Arm A,这里读到
+    的还是那份占位方案——"authored_compose" 不在 `_OP_HANDLERS` 里,主循环
+    只会打一行"跳过不支持的操作"警告然后什么都不做,交付的就是原始输入
+    （确认过的真实 bug：job_f7e59271bb22，用户反馈"没有任何剪辑"）。
+    add_music/add_subtitles 不在 `_OP_HANDLERS` 里但是走独立分支执行,同样算
+    "可执行"。"""
+    for op in plan.get("edit_operations", []):
+        op_type = op.get("type", "")
+        if op_type in _OP_HANDLERS or op_type in ("add_music", "add_subtitles"):
+            return True
+    return False
+
+
 def _load_plan(job: Job) -> dict:
     """安全加载 LLM 编辑计划。"""
     try:
         plan = json.loads(job.planned_edit)
         if isinstance(plan, dict):
+            if not _plan_has_executable_op(plan):
+                logger.warning(
+                    f"{job.id}: 方案里没有任何这条管线认得的操作"
+                    f"（很可能是 Arm B 的占位方案落回 Arm A）——改用零指令默认方案，而不是原样交付未剪辑的原片。"
+                )
+                return {"edit_operations": list(_ZERO_INSTRUCTION_DEFAULT_OPS),
+                        "summary": "Arm B 未能出片，落回零指令默认方案（remove_filler + apply_style）。"}
             return plan
     except (json.JSONDecodeError, TypeError):
         pass

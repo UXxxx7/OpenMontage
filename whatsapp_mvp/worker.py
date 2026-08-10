@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -86,11 +87,18 @@ def run_pipeline(job_id: str) -> None:
                       "开始渲染选中的片段…（片数较多时会比较久）")
             from .pipeline_runner import run_clip_factory_pipeline
 
-            cf_result = run_clip_factory_pipeline(job)
+            def _report_clip_progress(stage: str) -> None:
+                update_job_fields(job_id, progress_stage=stage)
+
+            started_at = time.time()
+            cf_result = run_clip_factory_pipeline(job, on_progress=_report_clip_progress)
+            elapsed = round(time.time() - started_at, 1)
             update_job_fields(
                 job_id,
                 status=JobStatus.CLIPS_READY,
+                elapsed_seconds=elapsed,
                 generation_cost_usd=cf_result.get("generation_cost_usd") or 0.0,
+                llm_cost_usd=cf_result.get("llm_cost_usd") or 0.0,
             )
             logger.info(f"clip-factory 完成: job {job_id}, "
                        f"{cf_result.get('clip_count')}/{cf_result.get('clip_count_total')} 条成功")
@@ -102,17 +110,22 @@ def run_pipeline(job_id: str) -> None:
 
         from .pipeline_runner import run_talking_head_pipeline
 
-        result = run_talking_head_pipeline(job)
+        def _report_progress(stage: str) -> None:
+            update_job_fields(job_id, progress_stage=stage)
+
+        pipeline_started_at = time.time()
+        result = run_talking_head_pipeline(job, on_progress=_report_progress)
+        elapsed_seconds = round(time.time() - pipeline_started_at, 1)
 
         if result.get("preview_path"):
             # 发帖配文生成——必须在标记 PREVIEW_READY 的同一次 update_job_fields
             # 里一起落库（原子写），不能等这次写完再补一次。Node 网关的
             # waitForStatus() 一见到 PREVIEW_READY 就返回、不会再轮询第二次，
-            # deliverStageResult() 只会拿那一次快照发消息——如果 talkinghead_social_caption
-            # 是分两次写，轮询窗口刚好卡在两次写中间时，文案会在用户毫无感知的
-            # 情况下永久丢失。这里内部已有 25s 硬性上限（social_caption.py），
-            # 失败/超时都返回 None，外层再包一层 try/except 双保险——文案这个
-            # 附加功能绝不能拖累或搞崩预览消息本身。
+            # deliverStageResult() 只会拿那一次快照发消息——如果 social_caption
+            # 是分两次写，轮询窗口（WA_STATUS_POLL_MS 默认 3000ms）刚好卡在两次
+            # 写中间时，文案会在用户毫无感知的情况下永久丢失。这里内部已有 25s
+            # 硬性上限（social_caption.py），失败/超时都返回 None，外层再包一层
+            # try/except 双保险——文案这个附加功能绝不能拖累或搞崩预览消息本身。
             social_caption_json = None
             if get_config().social_caption_enabled:
                 try:
@@ -133,6 +146,14 @@ def run_pipeline(job_id: str) -> None:
                 degraded_operations=json.dumps(result.get("degraded_operations") or []),
                 # AI 生成累计花费（同理覆盖旧值，没生成过就是 0）。
                 generation_cost_usd=result.get("generation_cost_usd") or 0.0,
+                # LLM token 用量 + 折算成本、管线实际耗时——同理覆盖旧值。
+                llm_tokens_input=result.get("llm_tokens_input") or 0,
+                llm_tokens_output=result.get("llm_tokens_output") or 0,
+                llm_cost_usd=result.get("llm_cost_usd") or 0.0,
+                elapsed_seconds=elapsed_seconds,
+                # 视觉复审重试后仍未解决、但没阻断渲染的质量提示（同理覆盖旧值，
+                # 没有就是空列表）——渲染照常交付，只是如实告知有哪些小瑕疵。
+                quality_warnings=json.dumps(result.get("quality_warnings") or []),
                 # 同上：显式传，哪怕是 None——retry 会重新走到这里，漏传会让
                 # 上一轮成功生成的旧文案在这一轮失败时静默留存下来。
                 talkinghead_social_caption=social_caption_json,
@@ -270,6 +291,363 @@ def revise_plan(job_id: str, feedback: str) -> None:
         update_job_status(job_id, JobStatus.ERROR, str(e))
 
 
+def revise_style(job_id: str, feedback: str) -> None:
+    """预览阶段用户打字提意见：先判断是不是"只关于模板展示内容"的修改
+    （`content_planner.classify_revision_intent`），是就只重跑 apply_style
+    （`pipeline_runner.rerun_style_only`，跳过转写/剪辑/增强，快很多）；不是、
+    或这个 job 结构上不支持快速路径，就原样退回今天的完整方案重规划
+    （`revise_plan`）——保守默认，绝不因为分类器判断有误就漏掉一次真正的
+    编辑意图。
+
+    对应 `webhook.py` 的 `POST /jobs/{id}/revise_style`：那个端点已经同步把
+    状态设成 RUNNING_PIPELINE、写好了 `_style_revision.json` 忙碌标记（给
+    Node 网关挡并发用），这里只负责摘掉标记（无论成败）+ 实际做修订。
+    """
+    logger.info(f"预览修订 {job_id}: {feedback[:80]}")
+    job = get_job(job_id)
+    if job is None:
+        return
+
+    marker = job.job_dir / "_style_revision.json"
+
+    def _delegate() -> None:
+        update_job_fields(job_id, status=JobStatus.PLANNING, progress_stage=None)
+        revise_plan(job_id, feedback)
+
+    try:
+        try:
+            plan = json.loads(job.planned_edit) if job.planned_edit else {}
+        except (json.JSONDecodeError, TypeError):
+            plan = {}
+        operations = plan.get("edit_operations", []) if isinstance(plan, dict) else []
+        apply_style_op = next((o for o in operations if o.get("type") == "apply_style"), None)
+        # 免费的确定性预筛：这个 job 结构上就不支持只重跑样式（没有 apply_style
+        # 操作，或它是手工编排的 chapters/data_cards），提前退出，省一次分类
+        # 器 LLM 调用。
+        style_capable = apply_style_op is not None and not (
+            apply_style_op.get("chapters") or apply_style_op.get("data_cards")
+        )
+        if not style_capable:
+            _delegate()
+            return
+
+        from .content_planner import classify_revision_intent
+
+        if classify_revision_intent(feedback, workdir=job.job_dir) != "style":
+            _delegate()
+            return
+
+        from .pipeline_runner import _StyleRerunUnsupported, rerun_style_only
+
+        def _report_progress(stage: str) -> None:
+            update_job_fields(job_id, progress_stage=stage)
+
+        started_at = time.time()
+        try:
+            result = rerun_style_only(job, feedback, on_progress=_report_progress)
+        except _StyleRerunUnsupported as e:
+            logger.info(f"预览修订 {job_id}: 不支持只重跑样式，退回完整方案重规划: {e}")
+            _delegate()
+            return
+        elapsed_seconds = round(time.time() - started_at, 1)
+
+        update_job_fields(
+            job_id,
+            preview_path=result["preview_path"],
+            status=JobStatus.PREVIEW_READY,
+            degraded_operations=json.dumps(result.get("degraded_operations") or []),
+            generation_cost_usd=result.get("generation_cost_usd") or 0.0,
+            llm_tokens_input=result.get("llm_tokens_input") or 0,
+            llm_tokens_output=result.get("llm_tokens_output") or 0,
+            llm_cost_usd=result.get("llm_cost_usd") or 0.0,
+            # 这次重跑自己的耗时，不是跟上一轮累加——跟 run_pipeline 的写法一致。
+            elapsed_seconds=elapsed_seconds,
+            quality_warnings=json.dumps(result.get("quality_warnings") or []),
+            progress_stage=None,
+            edit_request=f"{job.edit_request}。补充：{feedback}",
+        )
+    except Exception as e:
+        # 这条路径的失败绝不设成 ERROR——那会让用户已经到手的预览凭空消失，
+        # Node 网关也会把它当整单失败抛出去。旧 preview.mp4 从未被触碰
+        # （rerun_style_only 只在成功时才会调用 _finalize_pipeline_tail 写它），
+        # 只需要把状态退回 PREVIEW_READY，如实告诉用户这次修改没生效。
+        logger.exception(f"预览修订出错 {job_id}: {e}")
+        prev_warnings: list[str] = []
+        try:
+            prev_warnings = json.loads(job.quality_warnings) if job.quality_warnings else []
+        except Exception:
+            prev_warnings = []
+        note = ("Couldn't apply that change to the styling — your previous preview is "
+                "unchanged. Reply retry to re-run the full edit.")
+        update_job_fields(
+            job_id,
+            status=JobStatus.PREVIEW_READY,
+            progress_stage=None,
+            quality_warnings=json.dumps(prev_warnings + [note]),
+        )
+    finally:
+        marker.unlink(missing_ok=True)
+
+
+def _editor_marker_path(job) -> Path:
+    return job.job_dir / "_editor_render.json"
+
+
+def _read_editor_marker(job) -> dict:
+    default = {"state": "idle", "pending_props": None, "started_at": None,
+               "error": None, "save_timestamps": [],
+               # Phase 8 — Arm B 的手动编辑(overrides)版本,跟 pending_props
+               # 共用同一个标记文件/state machine(一个 job 同时只可能是 Arm A
+               # 或 Arm B 中的一种,两个字段不会同时有值)。
+               "pending_overrides": None}
+    path = _editor_marker_path(job)
+    if not path.exists():
+        return default
+    try:
+        marker = json.loads(path.read_text(encoding="utf-8"))
+        return {**default, **marker}
+    except Exception:
+        return default
+
+
+def _write_editor_marker(job, marker: dict) -> None:
+    _editor_marker_path(job).write_text(json.dumps(marker, ensure_ascii=False), encoding="utf-8")
+
+
+def _finish_editor_render_with_note(job_id: str, job, note: str) -> None:
+    """预览编辑器保存失败时的收尾——从不设成 ERROR（理由跟 revise_style 的
+    失败分支一样：旧 preview.mp4 从未被 render_props_directly 触碰，用户
+    不该因为一次编辑失败就丢掉已经到手的预览），只把状态退回
+    PREVIEW_READY，把原因如实追加进 quality_warnings。"""
+    prev_warnings: list[str] = []
+    try:
+        prev_warnings = json.loads(job.quality_warnings) if job.quality_warnings else []
+    except Exception:
+        prev_warnings = []
+    update_job_fields(
+        job_id,
+        status=JobStatus.PREVIEW_READY,
+        progress_stage=None,
+        quality_warnings=json.dumps(prev_warnings + [note]),
+    )
+
+
+def editor_render(job_id: str) -> None:
+    """预览编辑器"保存"的后台渲染入口。从 `_editor_render.json`（跟
+    `webhook.py` 的 `POST /editor/{id}/props` 共享同一份标记文件）里取出
+    待渲染的 `pending_props`，渲染；如果渲染期间又有新的保存到达
+    （`pending_props` 被那个端点刷新过），接着渲最新这份，直到没有新的
+    待渲染内容为止——这就是合并（coalescing）：同一个 job 任何时刻只有一次
+    渲染真正在跑，`RENDER_SLOTS` 全局只有一个槽位，排队会让用户等最多
+    `OM_RENDER_TIMEOUT_S`（默认 1800s）。
+
+    跟 `revise_style` 同样的原则：从不把失败变成 `ERROR`——旧 preview.mp4
+    永远保留，状态退回 `PREVIEW_READY`，`quality_warnings` 里如实追加一句。
+    """
+    logger.info(f"预览编辑器渲染 {job_id}")
+    job = get_job(job_id)
+    if job is None:
+        return
+
+    from .pipeline_runner import _EditorPropsInvalid, _EditorRenderFailed, render_props_directly
+
+    try:
+        while True:
+            marker = _read_editor_marker(job)
+            props = marker["pending_props"]
+            if props is None:
+                break
+            # 摘掉这份 pending_props 再开始渲染——如果不摘空，渲染完成时无法
+            # 区分"pending_props 还是我刚取出的这份"和"渲染期间被新保存刷新
+            # 过"，摘空后循环末尾能干净地通过"是否非 None"判断出后者。
+            marker["pending_props"] = None
+            _write_editor_marker(job, marker)
+
+            job = get_job(job_id)  # 重新加载，取最新的 degraded_operations/quality_warnings
+            if job is None:
+                return
+
+            def _report_progress(stage: str) -> None:
+                update_job_fields(job_id, progress_stage=stage)
+
+            started_at = time.time()
+            try:
+                result = render_props_directly(job, props, on_progress=_report_progress)
+            except _EditorPropsInvalid as e:
+                logger.warning(f"预览编辑器 {job_id}: props 校验失败: {e}")
+                marker = _read_editor_marker(job)
+                marker["error"] = str(e)[:500]
+                _write_editor_marker(job, marker)
+                _finish_editor_render_with_note(
+                    job_id, job, f"Your edit didn't pass validation and wasn't applied: {e}")
+                continue
+            except _EditorRenderFailed as e:
+                logger.exception(f"预览编辑器渲染出错 {job_id}: {e}")
+                marker = _read_editor_marker(job)
+                marker["error"] = str(e)[:500]
+                _write_editor_marker(job, marker)
+                _finish_editor_render_with_note(
+                    job_id, job,
+                    "Couldn't render your edit — your previous preview is unchanged.")
+                continue
+            except Exception as e:
+                # 未预料到的异常（不是上面两个已知失败类型）——同样不设 ERROR，
+                # 后台线程静默死掉比明确回退更糟：job 会卡在 RUNNING_PIPELINE
+                # 里，Node 那边只能等到轮询超时才当失败处理，用户中途拿不到
+                # 任何解释。
+                logger.exception(f"预览编辑器渲染出现未预料异常 {job_id}: {e}")
+                marker = _read_editor_marker(job)
+                marker["error"] = str(e)[:500]
+                _write_editor_marker(job, marker)
+                _finish_editor_render_with_note(
+                    job_id, job,
+                    "Couldn't render your edit — your previous preview is unchanged.")
+                continue
+            elapsed_seconds = round(time.time() - started_at, 1)
+
+            update_job_fields(
+                job_id,
+                preview_path=result["preview_path"],
+                status=JobStatus.PREVIEW_READY,
+                degraded_operations=json.dumps(result.get("degraded_operations") or []),
+                generation_cost_usd=result.get("generation_cost_usd") or 0.0,
+                llm_tokens_input=result.get("llm_tokens_input") or 0,
+                llm_tokens_output=result.get("llm_tokens_output") or 0,
+                llm_cost_usd=result.get("llm_cost_usd") or 0.0,
+                elapsed_seconds=elapsed_seconds,
+                quality_warnings=json.dumps(result.get("quality_warnings") or []),
+                progress_stage=None,
+            )
+    finally:
+        # 循环退出时（正常没有更多 pending_props，或提前 return）一律把状态
+        # 收回 idle——POST /editor/{id}/props 靠 state=="rendering" 判断要不要
+        # 合并而不是起新的后台任务，这里不收回的话下一次保存会永远走合并
+        # 分支，实际上再也不会真正触发渲染。
+        job2 = get_job(job_id)
+        if job2 is not None:
+            marker = _read_editor_marker(job2)
+            marker["state"] = "idle"
+            marker["pending_props"] = None
+            _write_editor_marker(job2, marker)
+
+
+# ---------------------------------------------------------------------------
+# C-roll：照片 -> AI 文案 -> HeyGen 数字人说话视频 -> 接入常规剪辑管线
+# ---------------------------------------------------------------------------
+
+def editor_render_authored(job_id: str) -> None:
+    """Phase 8 —— Arm B（AI 现写）版预览编辑器"保存"的后台渲染入口。跟
+    editor_render 同一个标记文件/合并（coalescing）机制，只是取的是
+    pending_overrides 而不是 pending_props，且渲染只需要 render_authored
+    （直接吃 job_dir/authored/scene.tsx 这份已经现写好的代码 + 新的
+    overrides），完全不调 LLM——手动编辑本来就该是这个响应速度，不需要
+    重新现写。
+
+    基础 props（videoSrc/broll/words/fps/durationInFrames）读自
+    job_dir/authored/props.json——这是 compose_authored 成功时落的规范拷贝
+    （详见 whatsapp_mvp/authored/__init__.py 自己的注释），不重新跑 _prepare
+    （不需要重新转写/重新收 b-roll）。"""
+    logger.info(f"Arm B 预览编辑器渲染 {job_id}")
+    job = get_job(job_id)
+    if job is None:
+        return
+
+    from .authored.authored_renderer import render_authored
+
+    authored_dir = job.job_dir / "authored"
+    scene_path = authored_dir / "scene.tsx"
+    props_path = authored_dir / "props.json"
+
+    try:
+        while True:
+            marker = _read_editor_marker(job)
+            overrides = marker["pending_overrides"]
+            if overrides is None:
+                break
+            # 同样先摘掉再渲染（理由同 editor_render）：渲染完成时才能干净
+            # 区分"刚取出的这份"和"渲染期间又被新保存刷新过"。
+            marker["pending_overrides"] = None
+            _write_editor_marker(job, marker)
+
+            job = get_job(job_id)
+            if job is None:
+                return
+
+            if not scene_path.exists() or not props_path.exists():
+                logger.warning(f"Arm B 预览编辑器 {job_id}: authored/scene.tsx 或 props.json 缺失")
+                _finish_editor_render_with_note(
+                    job_id, job, "Couldn't apply your edit \u2014 this job's AI-authored scene is missing.")
+                continue
+
+            try:
+                tsx = scene_path.read_text(encoding="utf-8")
+                base_props = json.loads(props_path.read_text(encoding="utf-8"))
+            except Exception as e:
+                logger.exception(f"Arm B 预览编辑器 {job_id}: 读取 scene.tsx/props.json 失败: {e}")
+                _finish_editor_render_with_note(
+                    job_id, job, "Couldn't apply your edit \u2014 your previous preview is unchanged.")
+                continue
+
+            input_video = job.job_dir / (base_props.get("videoSrc") or "input.mp4")
+            broll_abs = [
+                {**b, "src": str(job.job_dir / b["src"])}
+                for b in (base_props.get("broll") or []) if b.get("src")
+            ]
+            words = base_props.get("words") or []
+            fps = int(base_props.get("fps") or 30)
+            duration_s = float(base_props.get("durationInFrames") or fps) / fps
+
+            started_at = time.time()
+            out_path = authored_dir / "render_manual.mp4"
+            config = get_config()
+            rc_dir = Path(config.openmontage_root) / "remotion-composer"
+            import os
+            timeout_s = int(os.getenv("ARM_B_RENDER_TIMEOUT_S", "600"))
+
+            try:
+                from .concurrency import RENDER_SLOTS
+                with RENDER_SLOTS:
+                    result = render_authored(tsx, input_video, broll_abs, words, duration_s,
+                                             out_path, rc_dir=rc_dir, timeout_s=timeout_s,
+                                             overrides=overrides)
+            except ImportError:
+                result = render_authored(tsx, input_video, broll_abs, words, duration_s,
+                                         out_path, rc_dir=rc_dir, timeout_s=timeout_s,
+                                         overrides=overrides)
+
+            if not result.ok:
+                logger.warning(f"Arm B 预览编辑器 {job_id}: 渲染失败: {result.log_tail[-500:]}")
+                marker = _read_editor_marker(job)
+                marker["error"] = (result.log_tail or "")[:500]
+                _write_editor_marker(job, marker)
+                _finish_editor_render_with_note(
+                    job_id, job, "Couldn't render your edit \u2014 your previous preview is unchanged.")
+                continue
+
+            elapsed_seconds = round(time.time() - started_at, 1)
+            preview = job.job_dir / "preview.mp4"
+            import shutil as _shutil
+            _shutil.copyfile(result.out_path, preview)
+            (authored_dir / "overrides.json").write_text(
+                json.dumps(overrides, ensure_ascii=False), encoding="utf-8")
+
+            update_job_fields(
+                job_id,
+                preview_path=str(preview),
+                status=JobStatus.PREVIEW_READY,
+                generation_cost_usd=0.0,   # 纯重渲，不调 LLM，没有新增成本
+                elapsed_seconds=elapsed_seconds,
+                progress_stage=None,
+            )
+    finally:
+        job2 = get_job(job_id)
+        if job2 is not None:
+            marker = _read_editor_marker(job2)
+            marker["state"] = "idle"
+            marker["pending_overrides"] = None
+            _write_editor_marker(job2, marker)
+
+
 # ---------------------------------------------------------------------------
 # C-roll：照片 -> AI 文案 -> HeyGen 数字人说话视频 -> 接入常规剪辑管线
 # ---------------------------------------------------------------------------
@@ -312,16 +690,7 @@ def generate_croll(job_id: str, photo_path: str, lang: str = "zh", hint: str = "
         if not talking_photo_id:
             raise RuntimeError("HeyGen 照片上传失败")
 
-        # 艺人注册过克隆音色（voice_clone.py）就用真实声音合成、走 HeyGen 的
-        # 音频对口型模式；没注册过，或合成这一步失败，退回 HeyGen 库存声音——
-        # 这是"锦上添花"不是"必需依赖"，克隆环节挂了不该拖垮整条 C-roll。
-        from .voice_clone import synthesize_for_heygen
-        audio_url = synthesize_for_heygen(script, job.user.elevenlabs_voice_id, job.job_dir)
-        if audio_url:
-            logger.info(f"  C-roll（{job_id}）使用克隆音色语音: {audio_url}")
-            video_id = heygen_croll.generate_talking_video(talking_photo_id, audio_url=audio_url)
-        else:
-            video_id = heygen_croll.generate_talking_video(talking_photo_id, script, lang=lang)
+        video_id = heygen_croll.generate_talking_video(talking_photo_id, script, lang=lang)
         if not video_id:
             raise RuntimeError("HeyGen 视频生成提交失败")
 
@@ -564,7 +933,7 @@ def _run_llm_planner(job: Any, wa: Any = None) -> None:
     # 出问题能立刻关掉，不用等代码回滚（同 SOCIAL_CAPTION_ENABLED 的用法）。
     if get_config().clip_factory_enabled:
         from .content_planner import classify_pipeline_intent
-        pipeline_kind = classify_pipeline_intent(job.edit_request or "")
+        pipeline_kind = classify_pipeline_intent(job.edit_request or "", workdir=job.job_dir)
         if pipeline_kind == "clip-factory":
             _plan_clip_factory(job, wa)
             return
@@ -643,18 +1012,6 @@ def _run_llm_planner(job: Any, wa: Any = None) -> None:
 # Phase 5: 发送确认消息
 # ---------------------------------------------------------------------------
 
-def _plan_needs_broll_generation(operations: list) -> bool:
-    """规划里有没有要求 AI 现生成 b-roll（gen_prompt，不是用户上传的
-    asset_ref）——只有这类才用得上 gemini_broll 的额度状态检测。"""
-    for op in operations or []:
-        if op.get("type") != "insert_broll":
-            continue
-        for item in op.get("items") or []:
-            if isinstance(item, dict) and item.get("gen_prompt") and not item.get("asset_ref"):
-                return True
-    return False
-
-
 def _send_confirmation(job: Any, wa: WhatsAppClient) -> None:
     """向用户发送编辑计划确认消息，等待批准。"""
     try:
@@ -674,25 +1031,6 @@ def _send_confirmation(job: Any, wa: WhatsAppClient) -> None:
     summary = plan.get("summary", "编辑计划已生成")
     operations = plan.get("edit_operations", [])
 
-    # 架构复审后新增（2026-07-29，真实事故驱动，job_9c671249eb76）：规划里
-    # 要求 AI 生成 b-roll，但账号当时在 Gemini 免费档、对应模型配额是
-    # 0——用户直到确认、等生成失败了才知道这段不会有。这里在发确认消息
-    # *之前*就检查一次（不产生真实调用，读的是最近一次真实失败留下的本地
-    # 缓存），命中就把警示写进 plan 本身并重新持久化——Node 网关模式下这条
-    # 消息真正的文案是 Node 读 GET /jobs/{id} 的 planned_edit 自己拼的（这里
-    # 走 _safe_send 那份是直连模式用的，网关模式下是死代码），所以警示必须
-    # 落进 plan 字段本身，不能只加进下面这条本地拼的 msg_lines 里。
-    if _plan_needs_broll_generation(operations):
-        from .gemini_broll import check_broll_generation_availability
-        available, reason = check_broll_generation_availability()
-        if not available:
-            plan["broll_generation_warning"] = reason
-            update_job_fields(job.id, planned_edit=json.dumps(plan, ensure_ascii=False))
-            logger.warning(
-                f"任务 {job.id}: 规划要求 AI 生成 b-roll，但当前不可用（{reason}）"
-                "，已在确认消息里提前警示"
-            )
-
     msg_lines = [
         f"*视频编辑计划* 📋",
         f"",
@@ -704,9 +1042,6 @@ def _send_confirmation(job: Any, wa: WhatsAppClient) -> None:
         for i, op in enumerate(operations, 1):
             desc = op.get("description", op.get("type", "未知操作"))
             msg_lines.append(f"  {i}. {desc}")
-
-    if plan.get("broll_generation_warning"):
-        msg_lines.extend(["", f"⚠️ AI 生成 b-roll 当前不可用：{plan['broll_generation_warning']}"])
 
     msg_lines.extend([
         "",
