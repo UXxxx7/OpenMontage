@@ -20,8 +20,8 @@ import json
 import logging
 import math
 import re
+import time
 from datetime import date
-from pathlib import Path
 from typing import Any, Callable, Optional
 
 from .config import get_config
@@ -316,20 +316,7 @@ def _build_transcript_text(segments: list[dict]) -> str:
     return text
 
 
-def _record_llm_usage(workdir: Optional[Path], source: str, usage: Optional[dict]) -> None:
-    """workdir 提供时才记账（没有 job 上下文的调用方——比如没传 workdir 的
-    历史调用点——就不追踪，默认 None 是 no-op，不强制所有调用方都要关心
-    这个功能）。"""
-    if workdir is None or not usage:
-        return
-    from .cost_tracking import record_llm_usage
-    from .config import get_config
-    config = get_config()
-    record_llm_usage(workdir, source, config.llm_provider.lower(), config.llm_model_long_output, usage)
-
-
-def _call_llm_json(label: str, system_prompt: str, user_message: str, *, temperature: float,
-                    model: Optional[str] = None, workdir: Optional[Path] = None) -> Optional[dict]:
+def _call_llm_json(label: str, system_prompt: str, user_message: str, *, temperature: float, model: Optional[str] = None) -> Optional[dict]:
     """call_llm_chat + json.loads, with ONE retry of the whole call if the
     response isn't valid JSON.
 
@@ -339,12 +326,8 @@ def _call_llm_json(label: str, system_prompt: str, user_message: str, *, tempera
     mode: same prompt succeeded on a later attempt with no code changes).
     Returns the parsed dict, or None if the LLM is unusable or two straight
     attempts both failed to produce valid JSON.
-
-    workdir: 传了就把这次调用的 token 用量记进这个 job 的成本账本
-    （cost_tracking.py）；默认 None，不追踪。
     """
-    content, usage = call_llm_chat(system_prompt, user_message, temperature=temperature, model=model)
-    _record_llm_usage(workdir, label, usage)
+    content = call_llm_chat(system_prompt, user_message, temperature=temperature, model=model)
     if content is None:
         logger.info(f"content_planner: {label} 没配 LLM 或调用失败，跳过")
         return None
@@ -354,8 +337,7 @@ def _call_llm_json(label: str, system_prompt: str, user_message: str, *, tempera
     except Exception as e:
         logger.warning(f"content_planner: {label} 解析 LLM 输出失败，重试一次: {e}")
 
-    content, usage = call_llm_chat(system_prompt, user_message, temperature=temperature, model=model)
-    _record_llm_usage(workdir, label, usage)
+    content = call_llm_chat(system_prompt, user_message, temperature=temperature, model=model)
     if content is None:
         logger.warning(f"content_planner: {label} 重试调用 LLM 失败，跳过")
         return None
@@ -364,45 +346,6 @@ def _call_llm_json(label: str, system_prompt: str, user_message: str, *, tempera
     except Exception as e:
         logger.warning(f"content_planner: {label} 重试后仍解析失败，跳过: {e}")
         return None
-
-
-_REVISION_INTENT_SYSTEM = """You classify a user's post-preview revision request into exactly
-one of two categories. Respond with JSON only: {"intent": "style"} or {"intent": "edit"}.
-
-"style" = the request is about what appears ON SCREEN in the branded template render —
-graphics, cards, titles, numbers, colors, chapter labels, or the timing of those visual
-elements. This also includes fixing WRONG caption/subtitle TEXT (a mis-transcribed word, a
-typo, an explicit rewording) — that's a targeted text correction, not a re-cut. Fixing any of
-these does not require re-cutting the source video.
-
-"edit" = the request would change the video's actual content or duration, or something about
-captions/subtitles that ISN'T a text correction — cutting/trimming, reordering, removing a
-section, turning subtitles on/off entirely, background music, b-roll, filler removal, or
-anything about length/pacing of the SPOKEN content (not the graphics).
-
-If genuinely ambiguous or the request mixes both, answer "edit" — it is the safer, more
-capable path (it can always still fix a styling or caption-text detail, just via a fuller
-re-plan)."""
-
-
-def classify_revision_intent(feedback: str, *, workdir: Optional[Path] = None) -> str:
-    """用户在预览阶段打字提的修改意见 -> "style" 还是 "edit"。
-
-    "style"：只影响品牌模板里显示的图形/文字/数字/颜色/时机，或字幕文本本身
-    的定点纠错（转写错字/用户明确要求的措辞），都不需要重新剪辑视频——可以
-    走更快的"只重跑 apply_style"路径（见 apply_caption_correction）。
-    "edit"：会改变视频实际内容或时长的请求，或字幕相关但不是"纠正文本"的请求
-    （整体开关字幕、音乐、b-roll、语速停顿等）——必须走完整的方案重规划。
-
-    失败关闭（fail closed）到 "edit"：LLM 没配置、调用失败、返回值不是预期
-    的 JSON 结构，一律当作 "edit"——这正是今天的既有行为，绝不能因为分类器
-    本身出问题就让用户的反馈被误判成"只是样式问题"而丢掉真正的编辑意图。
-    """
-    raw = _call_llm_json("修改意见分类", _REVISION_INTENT_SYSTEM, feedback,
-                         temperature=0.0, workdir=workdir)
-    if isinstance(raw, dict) and raw.get("intent") == "style":
-        return "style"
-    return "edit"
 
 
 _PIPELINE_INTENT_SYSTEM = """You classify a user's WhatsApp message (attached to a video upload)
@@ -423,99 +366,45 @@ If genuinely ambiguous, answer "talking-head" — it is the existing, safer, che
 clip-factory false positive costs the user a long wait and an unwanted batch of videos."""
 
 
-def classify_pipeline_intent(edit_request: str, *, workdir: Optional[Path] = None) -> str:
+def classify_pipeline_intent(edit_request: str) -> str:
     """用户发视频时附带的文字 -> "clip-factory" 还是 "talking-head"。
 
-    失败关闭（fail closed）到 "talking-head"——跟 classify_revision_intent 失败关闭到
-    "edit" 表面相反，逻辑一致：这里 "talking-head" 才是那个便宜、快、符合预期的
-    既有默认路径，误判成 clip-factory 会让用户平白等上大半小时、收到一堆不想要
-    的视频；误判成 talking-head 顶多是用户需要把话说得更明确一点再试一次。
+    失败关闭（fail closed）到 "talking-head"——这里"talking-head"才是那个便宜、
+    快、符合预期的既有默认路径，误判成 clip-factory 会让用户平白等上大半小时、
+    收到一堆不想要的视频；误判成 talking-head 顶多是用户需要把话说得更明确
+    一点再试一次。
     """
     raw = _call_llm_json("管线意图分类", _PIPELINE_INTENT_SYSTEM, edit_request or "",
-                         temperature=0.0, workdir=workdir)
+                         temperature=0.0)
     if isinstance(raw, dict) and raw.get("intent") == "clip-factory":
         return "clip-factory"
     return "talking-head"
 
 
-_CAPTION_CORRECTION_SYSTEM = """You correct subtitle/caption text for a video, based on a
-user's feedback after watching the rendered preview.
-
-You'll get the current captions, numbered in order, and the user's feedback about what's
-wrong. Identify which caption(s), if any, the feedback is asking you to fix, and what the
-corrected text should be.
-
-Only touch captions the feedback clearly refers to (a mis-transcribed word, a typo, an
-explicit rewording the user asked for). Never invent a "fix" for a caption the feedback
-doesn't mention, and never fabricate new spoken content with no basis in the feedback or the
-original caption text — a correction, not new dialogue.
-
-Respond with JSON only: {"corrections": [{"index": <int>, "text": "<corrected caption text>"}, ...]}
-- "index" is 0-based, referring to the numbered list you were given.
-- Keep corrected text close in length/wording to the original — it still has to fit the same
-  on-screen time window, the video itself is not being re-cut or re-timed.
-- If the feedback isn't about caption/subtitle text at all, return {"corrections": []}."""
-
-
-def apply_caption_correction(captions: list[dict], user_request: str, *,
-                              workdir: Optional[Path] = None) -> list[dict]:
-    """用户明确提到字幕文本本身有问题时（转写错字、或要求的具体措辞），按
-    反馈定点纠正某(几)条字幕的 text 字段——不重新转写、不改时间轴（startMs/
-    endMs 原样保留，视频本身没有被重新剪辑，时间窗必须跟原来一致）。
-
-    跟 plan_content 一以贯之的"不凭空发明内容"原则一样：只修反馈明确指出的
-    条目，反馈没提到的字幕原样保留；LLM 判断反馈跟字幕无关、调用失败、或
-    返回值不合法（index 越界/类型不对）时，原样返回整份 captions，不做任何
-    改动——宁可什么都不改，也不要瞎猜改错一条本来没问题的字幕。
-
-    只在 `_op_apply_style` 检测到 `op["_user_feedback"]` 时才会被调用（即
-    "只重跑样式"的预览修订路径）——正常首次规划/QA 重试路径完全不触碰这里，
-    默认行为不变。
-    """
-    if not captions or not user_request:
-        return captions
-    numbered = "\n".join(f"{i}: {c.get('text', '')}" for i, c in enumerate(captions))
-    user_message = f"Current captions:\n{numbered}\n\nUser feedback: {user_request}"
-    raw = _call_llm_json("字幕文本纠正", _CAPTION_CORRECTION_SYSTEM, user_message,
-                         temperature=0.1, workdir=workdir)
-    corrections = (raw or {}).get("corrections") if isinstance(raw, dict) else None
-    if not isinstance(corrections, list) or not corrections:
-        return captions
-    result = [dict(c) for c in captions]
-    for c in corrections:
-        if not isinstance(c, dict):
-            continue
-        idx, text = c.get("index"), c.get("text")
-        if isinstance(idx, int) and 0 <= idx < len(result) and isinstance(text, str) and text.strip():
-            result[idx] = {**result[idx], "text": text.strip()}
-    return result
-
-
 def plan_content(segments: list[dict], duration: float, *, feedback: Optional[str] = None,
-                  user_request: Optional[str] = None,
                   word_timestamps: Optional[list[dict]] = None,
-                  workdir: Optional[Path] = None) -> dict[str, Any]:
+                  deadline: Optional[float] = None) -> dict[str, Any]:
     """转写分段 -> 章节 + 四种图形的计划（已经是 frame 单位，可以直接喂给 XiaojinEditorial）。
 
     LLM 调用失败或没配 key 时，返回空计划——内容判断本来就是锦上添花，不应该
     因为它失败就搞垮整条剪辑流程。
-
-    workdir: 传了就把这次规划循环里每一轮 LLM 调用的 token 用量记进这个 job
-    的成本账本（cost_tracking.py）；默认 None，不追踪。
 
     feedback: 视觉复审（qa_stills._vision_review）发现问题后，_op_apply_style
     重新规划一次时传入的具体问题描述——喂给同一个 LLM 调用，让它避开已知的
     错误（例如某张数据卡跟另一个元素挤在一起），而不是盲目重跑一次一模一样
     的判断。
 
-    user_request: 跟 feedback 不同的独立通道——用户在预览阶段看过实际渲染的
-    视频后主动提出的修改意见（例如"$8400 那张卡数字不对"），是意图表达，不是
-    缺陷报告，所以用不同的措辞注入（见下方 user_message 拼接），避免跟
-    feedback 的"上一版有问题"框架混在一起、互相覆盖语气。
-
     word_timestamps: 词级时间戳（可选）——给 Fix B/E 的入场/收尾关键词校准用
     （_ground_data_point_seconds），把 LLM 估计的 seconds 对齐到真正说出对应
     数字/关键词的那个词。没有词级时间戳时校准整体跳过，规划仍然产出。
+
+    deadline: time.monotonic() 截止时间（可选，架构复审后新增，2026-07-24）。
+    这个 criterion loop 本身跟 _op_apply_style 的 props_lint 循环、vision-QA
+    触发的重规划是三层嵌套的（3×3=9 次 LLM 调用起步），真实事故实测过撞上
+    DeepSeek 响应慢时能拖到 33 分钟。deadline 不改变任何质量判断逻辑——每轮
+    该跑的检查一次不少——只是在轮次开始前先看一眼："还有没有时间做下一轮"，
+    没有就直接走后面本来就有的 best-of 交付（跟轮数正常用尽时完全同一条路
+    径），不会新引入任何质量下降，只是不再无止境地等一个已经很慢的外部 API。
     """
     empty = {
         "chapters": [], "data_cards": [], "gauges": [], "countdowns": [], "calendar_events": [],
@@ -540,12 +429,6 @@ def plan_content(segments: list[dict], duration: float, *, feedback: Optional[st
             f"NOTE: a previous rendering of this exact plan had the following visual "
             f"problem — adjust the plan so it doesn't recur: {feedback}\n\n{user_message}"
         )
-    if user_request:
-        user_message = (
-            f"USER REQUEST: the user watched the rendered video and asked for this change. "
-            f"Honor it exactly, and keep everything else about the plan as close to the "
-            f"previous plan as possible: {user_request}\n\n{user_message}"
-        )
 
     # ══════════════════════════════════════════════════════════════════════
     # 规划质量标准循环（criterion loop）——确认过的真实用户要求："ALL THE
@@ -567,10 +450,15 @@ def plan_content(segments: list[dict], duration: float, *, feedback: Optional[st
     best_plan: Optional[dict] = None
     best_raw: Optional[dict] = None
     best_failures: Optional[list[str]] = None
-    prev_failures: Optional[set[str]] = None
     for attempt in range(1, _PLAN_MAX_ATTEMPTS + 1):
+        if deadline is not None and attempt > 1 and time.monotonic() >= deadline:
+            logger.warning(
+                f"content_planner: 总时长预算已用完，跳过第 {attempt}/{_PLAN_MAX_ATTEMPTS} 轮"
+                f"（交付已有的最佳版本，而不是继续等外部 LLM）"
+            )
+            break
         raw = _call_llm_json(f"内容规划(第{attempt}轮)", SYSTEM_PROMPT, user_message,
-                             temperature=0.2, model=get_config().llm_model_long_output, workdir=workdir)
+                             temperature=0.2, model=get_config().llm_model_long_output)
         logger.debug(f"content_planner: 第{attempt}轮原始 data_points = "
                      f"{json.dumps((raw or {}).get('data_points'), ensure_ascii=False)}")
         if raw is None:
@@ -586,22 +474,24 @@ def plan_content(segments: list[dict], duration: float, *, feedback: Optional[st
             f"content_planner: 第 {attempt}/{_PLAN_MAX_ATTEMPTS} 轮未达标（{len(failures)} 项）: "
             + " | ".join(failures)
         )
-        if best_failures is None or len(failures) < len(best_failures):
+        improved = best_failures is None or len(failures) < len(best_failures)
+        if improved:
             best_plan, best_raw, best_failures = plan, raw, failures
-        # Fix D1（2026-07-24，真实生产复现——job_d9111d13d08b 里同一条
-        # "Annual Premium = $8,400" 发现连续 12 轮反复出现，从未改变；后来
-        # 查实那条发现本身是误判，但即便发现是真的，round N 跟 round N-1
-        # 失败项一字不差也说明上一轮的重规划完全没生效，同样的反馈文字
-        # 再喂一轮大概率原样重复——不是任意的轮数上限，是证明了继续跑不会
-        # 有新结果才提前退出。走的还是下面同一套 best-of 交付逻辑，不影响
-        # 交付内容，只是少浪费几次注定拿不到新结果的 LLM 调用。
-        if prev_failures is not None and set(failures) == prev_failures:
-            logger.warning(
-                f"content_planner: 第 {attempt}/{_PLAN_MAX_ATTEMPTS} 轮的失败项跟上一轮完全"
-                f"一致，判定继续重规划不会有新结果，提前结束（省 {_PLAN_MAX_ATTEMPTS - attempt} 轮）"
+        # 早退（架构复审后新增，2026-07-28，延迟优化）：跟 pipeline_runner 的
+        # props_lint 早退是同一个判断——本轮反馈喂回去之后，失败项数量没有
+        # 比已知最佳更少，说明 LLM 没有真正吸收反馈收敛，继续跑大概率是
+        # 确定性空转（真实案例：job_7a33f9a80af8 第 3 轮原样复现了第 1 轮的
+        # 失败项，第 2 轮已经换了别的失败项——第 3 轮没有新增任何价值，
+        # best-of 交付结果跟提前在第 2 轮结束完全一样，白烧了一整轮 LLM
+        # 调用，正是内容规划占掉整条流水线 70%+ 时间的主因之一）。best_plan
+        # 已经保留，交付版本不变，只省掉注定拿不到更好结果的后续调用；仍在
+        # 改进时（improved=True）不受影响，继续跑到轮数用尽或全部达标为止。
+        if not improved and attempt < _PLAN_MAX_ATTEMPTS:
+            logger.info(
+                f"content_planner: 第 {attempt} 轮重规划未改进（仍是 {len(failures)} 项失败，"
+                f"不少于已知最佳的 {len(best_failures)} 项）——提前结束重试，交付已知最佳版本"
             )
             break
-        prev_failures = set(failures)
         user_message = (
             "NOTE: your previous plan FAILED these quality criteria — you MUST fix ALL of them "
             "in this attempt (each one is checked mechanically, not judged):\n- "
@@ -2800,9 +2690,7 @@ def _spoken_word_numbers(segments: list[dict]) -> list[float]:
     same units as a count_up row's "value" field (pre-divideBy)."""
     found: list[float] = []
     for seg in segments or []:
-        text_lower = str(seg.get("text", "")).lower()
-        matches = list(_WORD_TOKEN_RE.finditer(text_lower))
-        tokens = [m.group(0) for m in matches]
+        tokens = _WORD_TOKEN_RE.findall(str(seg.get("text", "")).lower())
         n = len(tokens)
         i = 0
         while i < n:
@@ -2829,32 +2717,8 @@ def _spoken_word_numbers(segments: list[dict]) -> list[float]:
                     j = k
                     consumed_extra = True
             if j < n and tokens[j] in _SCALE_WORDS:
-                total = (base + frac) * _SCALE_WORDS[tokens[j]]
-                next_i = j + 1
-                # Fix A1（2026-07-24，真实生产复现——job_d9111d13d08b）：复合口语
-                # 金额（"eight thousand four hundred" = 8400）此前被当成两个独立
-                # 数字（8000、400），content_planner 因此把 LLM 正确写出的
-                # "$8,400" 判成"跟转写对不上"，连续 12 轮反复重规划一个从没坏过
-                # 的数字。检测：紧接着的 <数字词> <量级词> 组合，量级比刚匹配到
-                # 的这个更小（"hundred"<"thousand"），就并进同一个数字——只链接
-                # 一层，不做任意深度嵌套，匹配实际观测到的口语模式。
-                #
-                # 必须校验两段之间原文没有跨句标点——_WORD_TOKEN_RE 只抓字母，
-                # 扫描用的 token 列表本身已经把标点丢光了，"eight thousand.
-                # Four hundred people attended." 光看 token 序列跟"eight
-                # thousand four hundred dollars"没有区别，只有回到原文本按
-                # matches 的字符位置查间隔文本，才能分清是不是同一句话。
-                if next_i < n:
-                    next_base = _UNIT_WORDS.get(tokens[next_i], _TEN_WORDS.get(tokens[next_i]))
-                    if (next_base is not None and next_i + 1 < n
-                            and tokens[next_i + 1] in _SCALE_WORDS
-                            and _SCALE_WORDS[tokens[next_i + 1]] < _SCALE_WORDS[tokens[j]]):
-                        gap_text = text_lower[matches[j].end():matches[next_i].start()]
-                        if not re.search(r"[.!?]", gap_text):
-                            total += next_base * _SCALE_WORDS[tokens[next_i + 1]]
-                            next_i += 2
-                found.append(total)
-                i = next_i
+                found.append((base + frac) * _SCALE_WORDS[tokens[j]])
+                i = j + 1
                 continue
             # No scale word followed — this wasn't a big-number phrase (e.g.
             # "twelve percent", or a bare decimal like "one point five" with
@@ -2865,129 +2729,48 @@ def _spoken_word_numbers(segments: list[dict]) -> list[float]:
     return found
 
 
-_PLAIN_NUMBER_RE = re.compile(r"\b\d{1,3}(?:,\d{3})*(?:\.\d+)?\b")
+# 确认过的真实 bug（job_5b0ec0b914ee，2026-07-27）：同一句话
+# ("...covers you for $1.5 million and your annual premium is $8,400.")
+# 在 input_transcript.json（用于生成 script.json 的第一次转写）里带着 $
+# 号，但 apply_style 自己内部为字幕做的第二次转写（增强链之后重新跑一遍
+# faster-whisper）把同一段音频转成了没有 $ 号的 "1.5 million"——同一段音频、
+# 同一个模型，纯粹是 ASR 输出格式的运行间抖动。LLM 规划的 Coverage=1.5
+# 完全正确（转录里明明白白说了这个数），但 _ungrounded_count_up_rows 判定
+# "没有任何依据"——因为提取函数只认 "$<数字>" 和纯词面数字（"one and a
+# half million"）两种形式，"<数字> million" 这种数字紧跟量级词、没有货币
+# 符号的第三种口语形式两边都没覆盖。检查本身没错，是覆盖面不够；结果是
+# LLM 每一轮都被错误驳回，白白烧光 apply_style 一整段内容规划预算，最终
+# 触发降级交付——模板没套上，根因根本不在内容规划或视觉复审，而在这条
+# grounding 检查自己的正则覆盖不全。
+_DIGIT_SCALE_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s*(million|thousand|billion)\b", re.IGNORECASE)
 
 
-def _spoken_plain_numbers(segments: list[dict]) -> list[float]:
-    """转写里直接以阿拉伯数字形式出现、且不属于 $ 金额的裸数字（比如"age 65"、
-    "12 percent"里的 65/12）。
-
-    Fix A3（2026-07-24，真实生产复现——job_9ff9f9b23c31）：转写原文就是
-    "the contribution period ends at age 65"，65 是 ASR 直接转写出的数字，
-    既不是 "$"开头的金额（_spoken_dollar_amounts 只认 $ 前缀），也不是词面
-    大数（"one and a half million"这种"数字词+量级词"模式，_spoken_word_numbers
-    只认这个）——年龄/百分比/简单计数这类小数字，ASR 几乎总是直接转写成数字
-    形式而不是拼成英文单词，之前完全没有任何检测覆盖得到。后果：LLM 正确
-    提取的年龄 65 被 `_ungrounded_count_up_rows` 判定成"转写里根本没说过"的
-    幻觉，连续 3 轮重规划都在要求 LLM"修正"一个从来没错的值，白白浪费
-    接近 10 分钟（该函数自己的文档早就声明"percentages, small counts...
-    is left alone rather than false-flagged"——这里补上的正是让这句承诺
-    对"转写里至少已有一个金额/大数候选"的情况也成立，而不只在完全没有
-    候选时才成立）。
-
-    先挖掉 $ 金额子串再扫描剩余文本——$ 金额已经由 _spoken_dollar_amounts
-    单独覆盖（换算规则不同：可能带 million/thousand 后缀），避免同一个
-    数字被两条路径重复计入导致误判。"""
+def _spoken_bare_scale_numbers(segments: list[dict]) -> list[float]:
+    """'1.5 million' / '500 thousand'（数字直接跟量级词，没有 $ 前缀，数字
+    本身也不是拼出来的词）——范围跟 `_spoken_word_numbers` 一样刻意收窄，
+    只处理这一种口语金融叙述里常见的混合形式，不是通用数字解析器。"""
     found: list[float] = []
     for seg in segments or []:
-        text = str(seg.get("text", ""))
-        text_without_dollars = _DOLLAR_AMOUNT_RE.sub(" ", text)
-        for m in _PLAIN_NUMBER_RE.finditer(text_without_dollars):
-            try:
-                found.append(float(m.group(0).replace(",", "")))
-            except ValueError:
-                continue
-    return found
-
-
-def _spoken_bare_word_numbers(segments: list[dict]) -> list[float]:
-    """转写里以纯英文单词形式说出、且没有跟着量级词（thousand/million 等）的
-    小数字（比如"sixty-five"、"seventy"、"twelve"）。
-
-    Fix A4（2026-07-24，真实生产复现——job_891853f6c1b2，同一支视频、同一句
-    话，两次转写给出不同形式）：remove_filler 用的第一次转写把这句话转写成
-    数字形式"age 65"（Fix A3 已覆盖）；但 apply_style 对剪完的视频重新转写
-    时，第二次转写把同一段真实语音转写成了词面形式"age sixty-five,"——ASR
-    对同一段语音的结果本身就不是确定性的。Fix A3 只覆盖了数字形式，词面
-    形式的同一个"65"完全是另一条路径：`_spoken_word_numbers` 只识别"数字词+
-    量级词"模式（"one and a half million"），一个后面不跟量级词的"sixty-five"
-    从来没有任何检测覆盖，于是同一类"正确值被判成幻觉"的连续重规划浪费，
-    只是换了个转写形式又完整复现了一次。
-
-    刻意避免跟 `_spoken_word_numbers` 已经处理的"大数前导"模式（"X and a
-    <分数>"、"X point <数字>"，最终跟着量级词）重复计入——那些交给那个函数
-    处理，这里只处理它管不到的、没有量级词收尾的情况。同理，只供 criterion 5
-    的宽松版分组使用（见 `_grounded_spoken_values_for_count_up_check`），不进
-    criterion 6 的严格版——原因与 Fix A3 的 `_spoken_plain_numbers` 相同。"""
-    found: list[float] = []
-    for seg in segments or []:
-        tokens = _WORD_TOKEN_RE.findall(str(seg.get("text", "")).lower())
-        n = len(tokens)
-        i = 0
-        while i < n:
-            base = _UNIT_WORDS.get(tokens[i], _TEN_WORDS.get(tokens[i]))
-            if base is None:
-                i += 1
-                continue
-            j = i + 1
-            has_big_number_lead_in = (
-                (j + 2 < n and tokens[j] == "and" and tokens[j + 1] == "a" and tokens[j + 2] in _FRACTION_WORDS)
-                or (j < n and tokens[j] == "point" and j + 1 < n and _UNIT_WORDS.get(tokens[j + 1], 10) < 10)
-            )
-            if has_big_number_lead_in or (j < n and tokens[j] in _SCALE_WORDS):
-                # 已经是 _spoken_word_numbers 的地盘（大数前导，或紧跟量级词），
-                # 不在这里重复计入，只跳过这一个 token 继续扫描。
-                i += 1
-                continue
-            if tokens[i] in _TEN_WORDS and j < n and tokens[j] in _UNIT_WORDS:
-                # 十位词紧跟个位词 -> 复合两位数（"sixty five"/"sixty-five" = 65）。
-                found.append(float(base + _UNIT_WORDS[tokens[j]]))
-                i = j + 1
-                continue
-            found.append(float(base))
-            i += 1
+        for m in _DIGIT_SCALE_RE.finditer(str(seg.get("text", ""))):
+            base = _num(m.group(1))
+            if base is not None:
+                found.append(base * _SCALE_WORDS[m.group(2).lower()])
     return found
 
 
 def _grounded_spoken_values(segments: list[dict]) -> list[float]:
     """Every number actually spoken in the transcript, in the units a count_up
-    row's raw "value" would use — combines digit-form ('$8,400') and
-    word-form ('one and a half million') amounts.
-
-    Deliberately does NOT include bare digit-form numbers (Fix A3's
-    `_spoken_plain_numbers`, e.g. "age 65") — this function is also the
-    candidate source for `_uncovered_spoken_values` (criterion 6), which
-    demands a dedicated count_up/before_after card for every candidate.
-    Ages/day-counts/percentages are legitimately covered by countdown/
-    calendar/gauge cards instead — mixing them into this shared pool made
-    criterion 6 wrongly flag "30" (from "30 days", already shown via a
-    countdown/calendar card) as a missing count_up card. See
-    `_grounded_spoken_values_for_count_up_check` for the broader set that's
-    safe for criterion 5's opposite direction (avoiding a false hallucination
-    flag), which is NOT safe to also use here."""
+    row's raw "value" would use — combines digit-form ('$8,400'), word-form
+    ('one and a half million'), and bare digit+scale-word ('1.5 million',
+    no currency symbol) amounts."""
     values: list[float] = []
     for amt in _spoken_dollar_amounts(segments):
         v = _dollar_amount_to_float(amt)
         if v is not None:
             values.append(v)
     values.extend(_spoken_word_numbers(segments))
+    values.extend(_spoken_bare_scale_numbers(segments))
     return values
-
-
-def _grounded_spoken_values_for_count_up_check(segments: list[dict]) -> list[float]:
-    """`_grounded_spoken_values` 加上转写里裸数字形式（Fix A3，"age 65"）和
-    裸词面形式（Fix A4，"age sixty-five"）出现的小数字（年龄/百分比/简单
-    计数），专供 `_ungrounded_count_up_rows`（criterion 5，抓"卡片数值在转写
-    里找不到依据"）和 pipeline_runner.py 里镜像它的确定性丢弃保底（Fix A2）
-    使用。
-
-    不能直接并进 `_grounded_spoken_values` 本身——那个函数同时也是
-    `_uncovered_spoken_values`（criterion 6，抓"转写里说过的数字没有对应卡片"）
-    的候选源，语义方向相反：criterion 5 越宽松越好（避免把真实正确的小数字
-    误判成幻觉），criterion 6 却需要更严格（不然"30 days"这类已经由 countdown/
-    calendar 卡覆盖的小数字，会被误判成"缺了一张 count_up 卡"）。两个检查
-    对"候选集合该有多宽"的正确答案不是同一个，故意拆成两个函数。"""
-    return _grounded_spoken_values(segments) + _spoken_plain_numbers(segments) + _spoken_bare_word_numbers(segments)
 
 
 def _ungrounded_count_up_rows(raw: dict, segments: list[dict]) -> list[str]:
@@ -3013,9 +2796,10 @@ def _ungrounded_count_up_rows(raw: dict, segments: list[dict]) -> list[str]:
     side. So each candidate is checked at its raw scale AND divided by 1e3/1e6,
     not just matched exactly — a hallucinated value has to miss all of those
     to get flagged."""
-    expanded = _expanded_grounded_candidates(segments)
-    if not expanded:
+    candidates = _grounded_spoken_values(segments)
+    if not candidates:
         return []
+    expanded = [scaled for c in candidates for scaled in (c, c / 1_000, c / 1_000_000)]
     bad: list[str] = []
     for dp in raw.get("data_points", []) or []:
         if not isinstance(dp, dict) or dp.get("visual") != "count_up":
@@ -3026,34 +2810,10 @@ def _ungrounded_count_up_rows(raw: dict, segments: list[dict]) -> list[str]:
             value = _num(r.get("value"))
             if value is None or value == 0:
                 continue
-            if _is_value_grounded(value, expanded):
+            if any(abs(value - c) <= max(abs(c), 1.0) * 0.01 for c in expanded):
                 continue
             bad.append(f"{dp.get('title', '')} row '{r.get('label', '')}' = {value:g}")
     return bad
-
-
-def _expanded_grounded_candidates(segments: list[dict]) -> list[float]:
-    """`_grounded_spoken_values_for_count_up_check()` 的结果，展开成能同时跟
-    count_up 卡片"未缩放原始值"和"已缩放显示值"两种合法写法比对的候选集合
-    （乘 1、除以 1e3、除以 1e6）——`_ungrounded_count_up_rows` 用的就是这套
-    换算，抽出来给 `pipeline_runner.py` 的确定性丢弃保底（Fix A2）复用，
-    避免检测端和纠正端各自维护一份容易走岔的容差逻辑。用的是"criterion 5
-    专用"的宽松版本（含裸数字，Fix A3），不是 `_grounded_spoken_values` 本身
-    ——原因见 `_grounded_spoken_values_for_count_up_check` 的文档。"""
-    candidates = _grounded_spoken_values_for_count_up_check(segments)
-    return [scaled for c in candidates for scaled in (c, c / 1_000, c / 1_000_000)]
-
-
-def _is_value_grounded(value: float, expanded_candidates: list[float]) -> bool:
-    """单个数值是否落在（已经过 `_expanded_grounded_candidates` 换算展开的）
-    候选集合 1% 误差范围内——跟 `_ungrounded_count_up_rows` 内联的判断逻辑
-    完全一致。候选集合为空时返回 True（视为"没法判断，不误报"），跟
-    `_ungrounded_count_up_rows`"没有任何候选就整个跳过"的规则保持一致，独立
-    调用方（如 pipeline_runner.py 的确定性丢弃保底）不需要重新决定这个边界
-    情况该怎么处理。"""
-    if not expanded_candidates:
-        return True
-    return any(abs(value - c) <= max(abs(c), 1.0) * 0.01 for c in expanded_candidates)
 
 
 def _uncovered_spoken_values(raw: dict, segments: list[dict]) -> list[str]:
@@ -3519,8 +3279,7 @@ Output ONLY valid JSON, no markdown, no prose:
 If nothing needs cutting, return {"cut_word_indices": []}."""
 
 
-def _plan_filler_removal_once(words: list[dict], *, feedback: Optional[str] = None,
-                               workdir: Optional[Path] = None) -> set[int]:
+def _plan_filler_removal_once(words: list[dict], *, feedback: Optional[str] = None) -> set[int]:
     """单次口误/重录判断 -> LLM 判断为口误的词在传入 words 列表里的下标集合。
 
     不含 keep_ranges 构建、不含事后复核——见 plan_filler_removal。返回下标而
@@ -3536,7 +3295,7 @@ def _plan_filler_removal_once(words: list[dict], *, feedback: Optional[str] = No
         )
 
     raw = _call_llm_json("口误检测", FILLER_SYSTEM_PROMPT, numbered, temperature=0.1,
-                         model=get_config().llm_model_long_output, workdir=workdir)
+                         model=get_config().llm_model_long_output)
     if raw is None:
         return set()
 
@@ -3699,7 +3458,27 @@ def _dedupe_repeated_clauses(words: list[dict], keep_ranges: list[dict]) -> list
 # 单个词正常发音很少超过这个时长（哪怕说话人刻意拖长）。超过的部分极可能是
 # Whisper word-level 强制对齐把一段没有转写出文字的音频错误地记在了这个词
 # 头上——不是这个词真的说了这么久。
-_MAX_PLAUSIBLE_WORD_DURATION = 1.2
+#
+# 确认过的真实误伤（2026-07-24）：原阈值 1.2s 太紧——一段真实视频里单词
+# "Cloud"（"Cloud Code" 的一部分）被 Whisper 报了 1.56s，压过阈值触发强制
+# 裁剪，切掉了 16.72-17.08s 这 0.36 秒，正好切进 "Cloud Code" 里；被切过的
+# 音频重新转写后变成听不懂的 "CodeCode"/"like Code."，比原始转写还烂——
+# 这条安全网本身把干净的音频弄脏了。原始动机的事故是被吞掉整句话、时长
+# 接近 5 秒，2.2s 这个新阈值依然能拦住那类真正的异常，同时不再误伤"略慢
+# 但真实存在"的正常词。
+_MAX_PLAUSIBLE_WORD_DURATION = 2.2
+
+# 置信度兜底（2026-07-24，同一次真实误伤调查的后续）：一开始想用"低置信度
+# 才裁剪"当第二道保险，但拿真实数据一测发现这个直觉是反的——上面那个被误伤
+# 的 "Cloud" 本身 probability 只有 0.320，跟"确实听不清/不常见词"的置信度
+# 区间完全重叠，不是"转写有把握但时长算错"那种能被置信度区分出来的情况。
+# faster-whisper 的置信度反映的是"这个词是不是训练分布里常见的词"，不是
+# "这段时间戳对不对"——"Cloud Code"这种不常见专有名词，哪怕两个字都听对了，
+# 置信度天然就偏低。所以这里没有用"低置信度"当裁剪的理由，而是反过来：只有
+# 置信度低到几乎等于"模型自己都不知道这是什么"（≤0.15，比一般生僻词/专有
+# 名词的置信度还低一截）才裁剪——绝大多数真实存在但少见的词会被保护下来，
+# 只有真正对齐失败、内容成谜的那种极端情况才会触发。
+_UNACCOUNTED_AUDIO_MAX_CONFIDENCE = 0.15
 
 
 def _flag_unaccounted_audio(words: list[dict]) -> list[dict]:
@@ -3711,21 +3490,34 @@ def _flag_unaccounted_audio(words: list[dict]) -> list[dict]:
     机械兜底（_dedupe_repeated_clauses，按文本比较）都无从判断、无从剪——
     结果这段没人审查过的音频靠这个超长时长被原样带进了成片。
 
-    这里直接在源头拦截：扫出任何时长异常的词，把超出合理时长之后的部分
-    当作"不知道是什么内容，默认不能进成片"，转成强制裁剪区间。宁可保守
-    切掉一段听不出问题的音频，也不能放行一段没人看过的内容。
+    这里直接在源头拦截：扫出任何时长异常**且**置信度低到几乎为零的词，把
+    超出合理时长之后的部分当作"不知道是什么内容，默认不能进成片"，转成
+    强制裁剪区间。时长异常单独一个条件不够——见 _UNACCOUNTED_AUDIO_MAX_
+    CONFIDENCE 的说明，必须两个信号同时成立才裁剪，宁可漏放过一段真正的
+    异常，也不能再重演"把真实存在的生僻词当垃圾切掉"的真实事故。
+    ElevenLabs 转写路径不提供置信度（见 _transcribe_elevenlabs），缺失时
+    按 0.0 处理（最不确定），保留原有的纯时长防护，不因为换了转写源就
+    悄悄弱化这道安全网。
     """
     spans = []
     for w in words:
         dur = w["end"] - w["start"]
-        if dur > _MAX_PLAUSIBLE_WORD_DURATION:
-            excess_start = w["start"] + _MAX_PLAUSIBLE_WORD_DURATION
-            spans.append({"start_seconds": excess_start, "end_seconds": w["end"]})
-            logger.warning(
-                f"content_planner: 词 '{w['word']}' 时长异常({dur:.2f}s @ "
-                f"{w['start']:.2f}-{w['end']:.2f})，疑似转写吞掉了一段未知内容，"
-                f"强制裁掉 {excess_start:.2f}-{w['end']:.2f}"
+        if dur <= _MAX_PLAUSIBLE_WORD_DURATION:
+            continue
+        prob = w.get("probability", 0.0)
+        if prob > _UNACCOUNTED_AUDIO_MAX_CONFIDENCE:
+            logger.info(
+                f"content_planner: 词 '{w['word']}' 时长异常({dur:.2f}s)但置信度"
+                f"({prob:.2f})不算低到离谱，判定为真实存在的生僻词/专有名词，不裁剪"
             )
+            continue
+        excess_start = w["start"] + _MAX_PLAUSIBLE_WORD_DURATION
+        spans.append({"start_seconds": excess_start, "end_seconds": w["end"]})
+        logger.warning(
+            f"content_planner: 词 '{w['word']}' 时长异常({dur:.2f}s @ "
+            f"{w['start']:.2f}-{w['end']:.2f})且置信度极低({prob:.2f})，疑似转写"
+            f"吞掉了一段未知内容，强制裁掉 {excess_start:.2f}-{w['end']:.2f}"
+        )
     return spans
 
 
@@ -3745,8 +3537,7 @@ Output ONLY valid JSON, no markdown, no prose:
 {"clean": false, "issues": ["one sentence per distinct remaining problem", "..."]} if not."""
 
 
-def verify_filler_removal(words: list[dict], keep_ranges: list[dict],
-                           workdir: Optional[Path] = None) -> Optional[dict]:
+def verify_filler_removal(words: list[dict], keep_ranges: list[dict]) -> Optional[dict]:
     """复核 _plan_filler_removal_once 的输出：喂"剪完后实际会播放的词序列"给 LLM，
     确认真的没有遗留口误/重录。这是抓"漏剪重录"这类 bug 的关键补丁——单次判断
     之前没有任何事后检查。返回 None 表示复核本身不可用（无 LLM/调用失败/解析
@@ -3758,7 +3549,7 @@ def verify_filler_removal(words: list[dict], keep_ranges: list[dict],
     if not kept_words:
         return None
     numbered = "\n".join(f"{w['word']} [{w['start']:.2f}-{w['end']:.2f}]" for w in kept_words)
-    return _call_llm_json("口误复核", VERIFY_FILLER_SYSTEM_PROMPT, numbered, temperature=0.1, workdir=workdir)
+    return _call_llm_json("口误复核", VERIFY_FILLER_SYSTEM_PROMPT, numbered, temperature=0.1)
 
 
 _DUP_MIN_NGRAM = 4  # 判定"重复短语"至少要匹配这么多个连续词，短于此容易误伤自然重复用语
@@ -3820,7 +3611,7 @@ def _cut_duplicate_phrases(words: list[dict], cut_indices: set[int]) -> set[int]
     return newly_cut
 
 
-def plan_filler_removal(words: list[dict], duration: float, workdir: Optional[Path] = None) -> list[dict]:
+def plan_filler_removal(words: list[dict], duration: float) -> list[dict]:
     """转写词级时间戳 -> 保留片段列表（喂给 VideoTrimmer 的 concat 操作）。
 
     跟 remove_silences（纯静音检测）是两码事：这里判断的是"这个词是不是口误/
@@ -3881,7 +3672,7 @@ def plan_filler_removal(words: list[dict], duration: float, workdir: Optional[Pa
         ranges = _dedupe_repeated_clauses(words, ranges)
         return _subtract_spans(ranges, unaccounted_spans) if unaccounted_spans else ranges
 
-    cut_indices = _plan_filler_removal_once(words, workdir=workdir)
+    cut_indices = _plan_filler_removal_once(words)
     best_cut_indices = set(cut_indices)
     best_issue_count: Optional[int] = None
 
@@ -3903,7 +3694,7 @@ def plan_filler_removal(words: list[dict], duration: float, workdir: Optional[Pa
             cut_indices = cut_indices | dup_cut
 
         keep_ranges = _finalize(cut_indices)
-        review = verify_filler_removal(words, keep_ranges, workdir=workdir)
+        review = verify_filler_removal(words, keep_ranges)
         if review is None or review.get("clean", True):
             return keep_ranges
 
@@ -3930,7 +3721,7 @@ def plan_filler_removal(words: list[dict], duration: float, workdir: Optional[Pa
 
         kept_orig_indices = [i for i in range(len(words)) if i not in cut_indices]
         kept_words = [words[i] for i in kept_orig_indices]
-        new_cut_in_kept = _plan_filler_removal_once(kept_words, feedback=feedback, workdir=workdir)
+        new_cut_in_kept = _plan_filler_removal_once(kept_words, feedback=feedback)
         cut_indices = cut_indices | {kept_orig_indices[i] for i in new_cut_in_kept}
 
     # 循环内每一轮都已经跑过 _cut_duplicate_phrases（见上方 C44 注释），

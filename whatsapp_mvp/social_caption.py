@@ -259,7 +259,7 @@ def _call_llm_json(system_prompt: str, user_message: str, *, temperature: float)
     模块 import 私有函数——croll_script.py 对 content_planner.py 也是同样的
     独立处理，这个代码库里"卫星模块"之间不互相 reach into 对方的下划线开头
     helper 是既有约定。"""
-    content, _usage = call_llm_chat(system_prompt, user_message, temperature=temperature)
+    content = call_llm_chat(system_prompt, user_message, temperature=temperature)
     if content is None:
         logger.info("social_caption: 没配 LLM 或调用失败，跳过")
         return None
@@ -268,7 +268,7 @@ def _call_llm_json(system_prompt: str, user_message: str, *, temperature: float)
     except Exception as e:
         logger.warning(f"social_caption: 解析 LLM 输出失败，重试一次: {e}")
 
-    content, _usage = call_llm_chat(system_prompt, user_message, temperature=temperature)
+    content = call_llm_chat(system_prompt, user_message, temperature=temperature)
     if content is None:
         return None
     try:

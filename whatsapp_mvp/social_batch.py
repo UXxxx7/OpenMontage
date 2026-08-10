@@ -147,7 +147,7 @@ def generate_social_caption(photo_path: str, platform: str, lang: str = "zh",
     """
     hint = hint or ""
     prompt = _base_photo_prompt(hint, platform, lang)
-    result, _usage = call_vision_chat(prompt, [photo_path])
+    result = call_vision_chat(prompt, [photo_path])
     if not result or not result.strip():
         logger.warning(f"social_batch: {platform} 文案生成失败（视觉 LLM 不可用或无输出）")
         return None

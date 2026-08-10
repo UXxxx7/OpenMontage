@@ -163,7 +163,7 @@ def select_clips(segments: list[dict], duration_seconds: float, *,
     )
     config = get_config()
     raw = _call_llm_json("clip-factory 候选片段筛选", _SELECTION_SYSTEM, user_message,
-                         temperature=0.2, model=config.llm_model_long_output, workdir=workdir)
+                         temperature=0.2, model=config.llm_model_long_output)
     if not raw:
         return {"source_type": None, "candidates": [], "min_clips": min_clips, "max_clips": max_clips,
                 "below_target_reason": "LLM unavailable or call failed"}

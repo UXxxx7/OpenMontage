@@ -187,7 +187,7 @@ def write_script(image_path: str, lang: str = "zh", hint: str = "",
             examples=examples,
         )
 
-    result, _usage = call_vision_chat(prompt, [image_path])
+    result = call_vision_chat(prompt, [image_path])
     if not result or not result.strip():
         logger.warning("croll_script: 视觉 LLM 不可用或未返回内容，C-roll 文案生成失败")
         return None
@@ -219,7 +219,7 @@ def _compress(script: str, limit: int, lang: str) -> str | None:
            f"Compress this spoken script to under {limit} {unit}. Keep the hook, "
            f"the key numbers, and the closing line; cut secondary elaboration:\n\n{script}")
     try:
-        result, _usage = call_llm_chat(system, ask, json_mode=False)
+        result = call_llm_chat(system, ask, json_mode=False)
         result = (result or "").strip()
         return result or None
     except Exception as e:

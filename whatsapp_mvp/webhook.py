@@ -1,13 +1,12 @@
-﻿# WhatsApp MVP - FastAPI Webhook Service (Phase 2)
+# WhatsApp MVP - FastAPI Webhook Service (Phase 2)
 
 from __future__ import annotations
 
-import copy
 import json
 import logging
 import os
-import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import List, Optional
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
@@ -455,12 +454,6 @@ def _enqueue_revise(job_id: str, text: str) -> None:
     revise_plan(job_id, text)
 
 
-def _enqueue_revise_style(job_id: str, text: str) -> None:
-    from .worker import revise_style
-
-    revise_style(job_id, text)
-
-
 def _enqueue_editor_render(job_id: str) -> None:
     from .worker import editor_render
 
@@ -482,11 +475,14 @@ _ASSIGN_SYSTEM = (
     "并用一段或多段文字描述这些视频要怎么剪。请判断：\n"
     "1. 哪个视频是“主视频”（出镜/口播、要加字幕或剪辑的主体）——返回它的编号（1 开始）；"
     "文字里说不清就返回 null。\n"
-    "2. 其余视频是 b-roll 补充素材，为每个 b-roll 提取插入说明（label，如“讲到 VS Code 时插入”）。\n"
-    "3. 提取对主视频的编辑要求 edit_request（如“加字幕、剪掉空白和自我打断”）。\n"
-    "只输出 JSON，不要多余文字：{\"main_index\": <int|null>, "
+    "2. 是否有某个视频是“参考风格视频”——用户想模仿它的剪辑风格/转场/节奏/特效/"
+    "色彩/字幕样式（如“参照这个视频的风格剪”“照这个的转场来”），它本身既不是要剪的"
+    "内容、也不是 b-roll 素材。有就返回它的编号（1 开始，且必须与主视频编号不同），没有返回 null。\n"
+    "3. 其余视频是 b-roll 补充素材，为每个 b-roll 提取插入说明（label，如“讲到 VS Code 时插入”）。\n"
+    "4. 提取对主视频的编辑要求 edit_request（如“加字幕、剪掉空白和自我打断”）。\n"
+    "只输出 JSON，不要多余文字：{\"main_index\": <int|null>, \"reference_index\": <int|null>, "
     "\"labels\": {\"<视频编号>\": \"<说明>\"}, \"edit_request\": \"<字符串>\"}。"
-    "labels 只含 b-roll 视频（不含主视频），键是视频编号的字符串；某段找不到说明就给空字符串。"
+    "labels 只含 b-roll 视频（不含主视频、不含参考风格视频），键是视频编号的字符串；某段找不到说明就给空字符串。"
 )
 
 
@@ -494,14 +490,14 @@ _ASSIGN_SYSTEM = (
 async def assign_endpoint(video_count: int = Form(...), notes: str = Form("")):
     """把“N 个视频（按上传顺序）+ 用户描述文字”解析成 {main_index, labels, edit_request}。
     解析失败或说不清主视频时 main_index=null，由 Node 侧回退到“问编号”。"""
-    result = {"main_index": None, "labels": {}, "edit_request": notes or ""}
+    result = {"main_index": None, "reference_index": None, "labels": {}, "edit_request": notes or ""}
     try:
         from .llm_client import call_llm_chat
         user_msg = (
             f"视频数量：{video_count}（编号 1..{video_count}，按上传顺序）。\n"
             f"用户描述：\n{notes.strip() or '(无)'}"
         )
-        raw, _usage = call_llm_chat(_ASSIGN_SYSTEM, user_msg, temperature=0.0)
+        raw = call_llm_chat(_ASSIGN_SYSTEM, user_msg, temperature=0.0)
         if raw:
             import re as _re
             m = _re.search(r"\{.*\}", raw, _re.S)
@@ -513,6 +509,17 @@ async def assign_endpoint(video_count: int = Form(...), notes: str = Form("")):
                 result["main_index"] = int(mi)
             elif isinstance(mi, str) and mi.strip().isdigit():
                 result["main_index"] = int(mi.strip())
+            ri = data.get("reference_index")
+            if isinstance(ri, bool):
+                ri = None
+            if isinstance(ri, (int, float)):
+                result["reference_index"] = int(ri)
+            elif isinstance(ri, str) and ri.strip().isdigit():
+                result["reference_index"] = int(ri.strip())
+            # 参考视频不能同时是主视频（模型偶尔混淆）——冲突则丢弃参考判断
+            if (result["reference_index"] is not None
+                    and result["reference_index"] == result["main_index"]):
+                result["reference_index"] = None
             if isinstance(data.get("labels"), dict):
                 result["labels"] = {str(k): str(v) for k, v in data["labels"].items()}
             if data.get("edit_request"):
@@ -532,12 +539,61 @@ async def qa_endpoint(text: str = Form(...)):
     return {"answer": answer}
 
 
+@app.post("/transcribe")
+async def transcribe_endpoint(audio: UploadFile = File(...)):
+    """WhatsApp 语音消息转写成文字（架构复审后新增，2026-07-29）——设计上
+    刻意不新建一整套"语音指令"路由：Node 网关下载语音、转写成文字之后，
+    直接把它当成一条普通文字消息，原样喂给 handleMessage 里那一整套已经
+    很成熟的上下文路由逻辑（收集态/等选臂/活跃任务确认/修改意见/问答……）
+    ——同一句话不管是打字还是说出来，理解和路由方式完全一样，不用为语音
+    另外维护一份行为可能悄悄分叉的平行逻辑。
+
+    跟 job 生命周期无关的纯工具调用，不建 job、不落库——复用
+    tools.analysis.transcriber.Transcriber（全项目统一的转写实现，语音消息
+    通常几秒到几十秒，不需要 apply_style 那条链路的缓存/校准这些重量级
+    机制）。转写失败（模型不可用/音频损坏等）返回空文本，Node 侧按"没听清"
+    处理，不阻断整个 webhook 处理流程。
+    """
+    import tempfile
+
+    from tools.analysis.transcriber import Transcriber
+
+    data = await audio.read()
+    ext = (os.path.splitext(audio.filename or "")[1].lstrip(".") or "ogg").lower()
+    with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as tmp:
+        tmp.write(data)
+        tmp_path = tmp.name
+
+    try:
+        result = Transcriber().execute({
+            "input_path": tmp_path,
+            "model_size": get_config().faster_whisper_model,
+        })
+    except Exception as e:
+        logger.warning(f"/transcribe: 转写异常: {e}")
+        return {"text": "", "error": str(e)}
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+    if not result.success:
+        logger.warning(f"/transcribe: 转写失败: {result.error}")
+        return {"text": "", "error": result.error}
+
+    segments = result.data.get("segments") or []
+    text = " ".join(s.get("text", "").strip() for s in segments if s.get("text", "").strip())
+    return {"text": text.strip(), "language": result.data.get("language")}
+
+
 @app.post("/croll")
 async def create_croll_endpoint(
     photo: UploadFile = File(...),
     hint: str = Form(""),
     lang: str = Form("zh"),
     pipeline: str = Form("talking-head"),
+    broll: List[UploadFile] = File(default=[]),
+    broll_labels: List[str] = Form(default=[]),
+    broll_kinds: List[str] = Form(default=[]),
+    wa_number: str = Form("api_user"),
 ):
     """C-roll：一张照片 -> AI 看图写文案 -> HeyGen 数字人说话视频 -> 接入常规
     剪辑管线（后续 confirm/export/retry 跟普通视频任务完全一样）。
@@ -546,8 +602,36 @@ async def create_croll_endpoint(
     input.mp4 的来源——那边是用户直接传视频，这边是后台生成出来的。生成
     这几步（看图写文案 + HeyGen 上传/生成/轮询）合起来能到 1-2 分钟，全部
     放进后台线程，立即返回 job_id，Node 侧照旧轮询 GET /jobs/{id}。
+
+    broll/broll_labels/broll_kinds：跟 POST /jobs 完全同一套参数形状、同一套
+    登记逻辑（架构复审后新增，2026-07-29）——之前这里没有这三个参数，图生
+    视频的 job 上永远不会有 role=="broll" 的资产，insert_broll 这一步因此永
+    远不会被 L2 规划器 emit，不是管线跑不通，是这个入口没给它素材可用。
+    HeyGen 生成完成后 generate_croll() 会把成品当 input.mp4 接入
+    process_incoming_message，从那一步起跟普通视频任务走的是完全同一条路
+    （转写/L2 规划/apply_style/insert_broll 一个都不用改）——L2 规划器读
+    job 上的资产列表（job_manager.get_assets，按 role=="broll" 过滤）来决定
+    要不要 emit insert_broll，这个判断跟 job 的主视频到底是用户直接传的还
+    是这里生成出来的完全无关，只要资产已经登记好、下载到本地即可。这里的
+    落盘/登记顺序特意跟 /jobs 的 broll 处理逐行对齐，避免两处各写一套、日后
+    行为悄悄分叉（Rule 5/13 的教训）。
+
+    注意：这个改动只打通了直接调用这个 API 的路径（比如脚本/未来的其它前
+    端）——Node 网关目前收到照片触发 C-roll 生成时，只会带上这一张照片本
+    身，还没有收集"这条消息之后用户还发了哪些 b-roll 素材"的逻辑（那是
+    server/worker.js 的 crollGenerate，需要照着现有视频上传流程的多消息收
+    集窗口另外接一遍，属于更大的一块改动，不在这次范围内）。WhatsApp 用户
+    今天直接发照片触发 C-roll，还是拿不到 b-roll 合成——这条路目前只对直
+    接打 API 的调用方生效。
+
+    wa_number：真实 WhatsApp 号，不传就退回旧的共享 "api_user"（兼容还没升级
+    的调用方）。2026-08 之前这里硬编码 "api_user"，导致所有艺人在 Python 侧
+    共享同一个 User 行——上线 voice_clone.py 后这是真 bug 不只是"不精确"：
+    User.elevenlabs_voice_id 存在共享行上，等于所有人共用同一个克隆音色，
+    艺人 A 的声音会出现在艺人 B 的视频里。Node 网关这边已经把真实 waNumber
+    传进来了，见 server/worker.js 的 createPythonCrollJob。
     """
-    user = get_or_create_user("api_user")
+    user = get_or_create_user(wa_number)
     job = create_job(user_id=user.id, pipeline=pipeline, input_caption=hint)
 
     job_dir = job.job_dir
@@ -557,12 +641,136 @@ async def create_croll_endpoint(
     photo_path = job_dir / f"source_photo.{ext}"
     photo_path.write_bytes(photo_data)
 
+    # b-roll 素材：跟 POST /jobs 逐行对齐的同一套登记逻辑（见上面 docstring）。
+    _IMAGE_EXTS = ("jpg", "jpeg", "png", "webp", "gif", "bmp")
+    if broll:
+        from .job_manager import set_asset_local_path
+        assets_dir = job_dir / "assets"
+        assets_dir.mkdir(parents=True, exist_ok=True)
+        for i, up in enumerate(broll):
+            data = await up.read()
+            broll_ext = (os.path.splitext(up.filename or "")[1].lstrip(".") or "mp4").lower()
+            dest = assets_dir / f"broll_{i}.{broll_ext}"
+            dest.write_bytes(data)
+            if i < len(broll_kinds) and broll_kinds[i]:
+                kind = broll_kinds[i]
+            else:
+                kind = "image" if broll_ext in _IMAGE_EXTS else "video"
+            label = broll_labels[i] if i < len(broll_labels) else ""
+            media_id = f"local_{i}"
+            append_asset(job.id, media_id, kind, label)          # role=broll, order=i
+            set_asset_local_path(job.id, media_id, str(dest))    # 标记已下载
+
     update_job_status(job.id, JobStatus.DOWNLOADING_MEDIA)
 
     from .worker import generate_croll
     _run_in_background(generate_croll, job.id, str(photo_path), lang, hint)
 
     return {"job_id": job.id, "status": job.status.value}
+
+
+@app.post("/social-batch")
+async def create_social_batch_endpoint(
+    photo: UploadFile = File(...),
+    hint: str = Form(""),
+    lang: str = Form("zh"),
+    wa_number: str = Form("api_user"),
+):
+    """一张照片 -> 一批多平台社媒内容（IG Feed/Reel·TikTok/Story），每个变体
+    各自的文案+hashtag，见 social_batch.py 的设计说明。跟 /croll 的形状类似
+    （立即返回、后台线程跑生成），区别是这里一次产出一批 job（共享 batch_id），
+    不是单条——调用方轮询 GET /batches/{batch_id} 而不是 GET /jobs/{id}。
+
+    wa_number：真实 WhatsApp 号——见 /croll 端点同一处注释，这里同理，是
+    voice_clone.py 能"找对艺人本人的克隆音色"的前提，不是可选的精确化。
+    """
+    import uuid as _uuid
+
+    user = get_or_create_user(wa_number)
+    batch_id = f"batch_{_uuid.uuid4().hex[:12]}"
+
+    # 照片先落到一个临时目录（不属于任何单条 job——这批要生成好几条 job，
+    # 各自的 job_dir 要等 create_job 才存在）。social_batch.generate_batch
+    # 内部会把这张原图复制/裁切进每个变体自己的 job_dir。
+    tmp_dir = Path(get_config().jobs_dir) / f"_batch_upload_{batch_id}"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    photo_data = await photo.read()
+    ext = (os.path.splitext(photo.filename or "")[1].lstrip(".") or "jpg").lower()
+    photo_path = tmp_dir / f"source_photo.{ext}"
+    photo_path.write_bytes(photo_data)
+
+    from .social_batch import generate_batch
+
+    def _run():
+        try:
+            generate_batch(batch_id, user.id, str(photo_path), lang=lang, hint=hint)
+        finally:
+            import shutil as _shutil
+            _shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    _run_in_background(_run)
+    return {"batch_id": batch_id}
+
+
+@app.get("/batches/{batch_id}")
+def get_batch_endpoint(batch_id: str):
+    """Studio 预览页读这个接口拿一批内容的全部变体状态。"""
+    from .job_manager import get_jobs_by_batch
+
+    jobs = get_jobs_by_batch(batch_id)
+    if not jobs:
+        raise HTTPException(status_code=404, detail="Batch not found")
+
+    variants = []
+    for job in jobs:
+        filename = Path(job.final_path).name if job.final_path else None
+        try:
+            hashtags = json.loads(job.social_hashtags) if job.social_hashtags else []
+        except (ValueError, TypeError):
+            hashtags = []
+        variants.append({
+            "job_id": job.id,
+            "platform": job.platform,
+            "status": job.status.value,
+            "caption": job.social_caption or "",
+            "hashtags": hashtags,
+            "filename": filename,
+            "asset_kind": "video" if (filename or "").endswith(".mp4") else "image",
+        })
+    return {"batch_id": batch_id, "variants": variants}
+
+
+@app.post("/voice-clone")
+async def create_voice_clone_endpoint(
+    audio: UploadFile = File(...),
+    wa_number: str = Form(...),
+):
+    """艺人一次性声音入驻：一段语音样本 -> ElevenLabs Instant Voice Clone ->
+    voice_id 存到这个艺人（按真实 wa_number 识别）的 User 行上。之后每次
+    generate_croll/social_batch.generate_batch 都会读这个字段，找到了就用
+    真实克隆音色（走 HeyGen 的音频对口型模式），没有就照旧退回 HeyGen 库存声音。
+
+    跟 /croll、/social-batch 不一样：这个同步做完再返回（IVC 本身就是秒级
+    操作，不像 HeyGen 视频生成要 1-2 分钟，没必要为此再搭一套后台线程+轮询）。
+    """
+    from .voice_clone import create_instant_voice_clone
+
+    user = get_or_create_user(wa_number)
+    audio_data = await audio.read()
+    tmp_path = Path(get_config().jobs_dir) / f"_voice_sample_{user.id}.mp3"
+    tmp_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path.write_bytes(audio_data)
+    try:
+        voice_id = create_instant_voice_clone(tmp_path, name=f"artist_{wa_number}")
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    if not voice_id:
+        raise HTTPException(status_code=502, detail="voice clone creation failed")
+
+    from .job_manager import set_user_voice_clone
+    set_user_voice_clone(user.id, voice_id)
+    return {"voice_id": voice_id}
 
 
 @app.post("/jobs")
@@ -574,6 +782,8 @@ async def create_job_endpoint(
     broll_labels: List[str] = Form(default=[]),
     broll_kinds: List[str] = Form(default=[]),
     arm: str = Form(""),
+    reference: Optional[UploadFile] = File(default=None),
+    reference_kind: str = Form(""),
 ):
     config = get_config()
     user = get_or_create_user("api_user")
@@ -618,6 +828,16 @@ async def create_job_endpoint(
             append_asset(job.id, media_id, kind, label)          # role=broll, order=i
             set_asset_local_path(job.id, media_id, str(dest))    # 标记已下载
 
+    # 参考风格视频（可选，模块4）：模型读它的剪辑风格（转场/节奏/特效/色彩/字幕样式
+    # 等），落盘到 job_dir/style_ref.<ext>；authored 侧 _prepare 会 glob 到它并分析成
+    # style_spec。它既不是要剪的主视频、也不是要合成的 b-roll，故不进 job.assets。
+    if reference is not None:
+        ref_data = await reference.read()
+        if ref_data:
+            ref_ext = (os.path.splitext(reference.filename or "")[1].lstrip(".")
+                       or ("jpg" if (reference_kind or "").lower() == "image" else "mp4")).lower()
+            (job_dir / f"style_ref.{ref_ext}").write_bytes(ref_data)
+
     update_job_status(job.id, JobStatus.RECEIVED)
 
     # 后台跑（下载 + L2 规划耗时可达 1~2 分钟），立即返回；否则会阻塞
@@ -631,9 +851,8 @@ async def create_job_endpoint(
 def _clips_summary(job) -> list:
     """clip-factory 管线的 Clip 子表 -> API 响应用的扁平列表。status 不是
     READY 的（RENDERING/FAILED）也照样列出来，不静默丢弃——跟这个代码库
-    其余地方"如实告知有哪些没成"的一贯做法一致（degraded_operations/
-    quality_warnings 同理），Node 侧靠 error_message 判断要不要显示"第 N
-    条失败了"而不是假装那条从来没存在过。"""
+    其余地方"如实告知有哪些没成"的一贯做法一致，Node 侧靠 error_message
+    判断要不要显示"第 N 条失败了"而不是假装那条从来没存在过。"""
     config = get_config()
     out = []
     for c in get_clips(job.id):
@@ -760,39 +979,16 @@ async def get_job_endpoint(job_id: str):
         # AI 生成累计花费（b-roll/背景音乐等）。Node 侧预览消息靠它如实告知
         # 用户/团队这单实际花了多少钱，不再是"哪儿都看不见"的隐性支出。
         "generation_cost_usd": job.generation_cost_usd or 0.0,
-        # 当前处理阶段短代码（"planning"/"layout_retry"/"qa_retry"/"rendering"）。
-        # Node 网关轮询时把代码翻译成双语文案发给用户，让用户知道管线正在
-        # 做什么，不再只有一句笼统的"还在处理"心跳。
-        "progress_stage": job.progress_stage,
-        # LLM token 用量 + 折算成本（内容规划 + 视觉复审等所有 LLM 调用累计），
-        # 跟 generation_cost_usd 一起构成这条视频的真实总花费。
-        "llm_tokens_input": job.llm_tokens_input or 0,
-        "llm_tokens_output": job.llm_tokens_output or 0,
-        "llm_cost_usd": job.llm_cost_usd or 0.0,
-        # 管线实际耗时（秒）——跟花费一起如实告知用户这条视频花了多久剪辑。
-        "elapsed_seconds": job.elapsed_seconds or 0.0,
-        # 视觉复审重试后仍未解决、但没阻断渲染的质量提示（一句话描述 x N）。
-        # 现在带瑕疵也照常交付品牌模板版本（用户明确要求），这个字段确保
-        # "有瑕疵"这件事仍然被如实告知，不是假装完全没事。
-        "quality_warnings": json.loads(job.quality_warnings) if job.quality_warnings else [],
         # 发帖配文 + hashtag（social_caption.py 生成，可能为 None——没转写/
         # LLM 失败/超时都是正常的"没生成成功"，不是错误，Node 侧据此决定要不要
-        # 发第二条"可直接复制粘贴"的消息）。
+        # 发第二条"可直接复制粘贴"的消息）。命名为 talkinghead_social_caption
+        # 而不是 social_caption——那个字段名已经被 social_batch.py（形状不同，
+        # 纯字符串）占用了。
         "talkinghead_social_caption": json.loads(job.talkinghead_social_caption) if job.talkinghead_social_caption else None,
-        # 之前一直没往外暴露过（确认过：这个字段在 API 响应里全程缺失），
-        # Node 侧要靠它判断 CLIPS_READY 时该不该走 clip 专属的展示逻辑。
+        # clip-factory 管线用——之前一直没往外暴露过，Node 侧要靠它判断
+        # CLIPS_READY 时该不该走 clip 专属的展示逻辑。
         "pipeline": job.pipeline,
         "clips": _clips_summary(job) if job.pipeline == "clip-factory" else [],
-        # 是否正在跑"只重跑样式"的预览修订（_style_revision.json 标记文件是否
-        # 存在）。Node 网关靠它挡并发：同一个 job 上第二条修改意见如果在第一条
-        # 还没跑完时到达，就提示"还在处理上一条"，不再触发第二次并发重跑
-        # （没有 DB 字段的轻量方案，标记文件由 /revise_style 端点同步写入）。
-        "style_revision_in_flight": (job.job_dir / "_style_revision.json").exists(),
-        # 这个 job 是否被预览编辑器手动改过（render_props_directly 保存成功
-        # 后写的标记）。Node 网关靠它决定：用户下次在 WhatsApp 发文字反馈时，
-        # 走会从转写重新生成一切的快速/完整重规划路径之前，要不要先弹一句
-        # "这会覆盖你的手动编辑"警告确认（Stage 7）。
-        "manually_edited": (job.job_dir / "_manual_edit.json").exists(),
         "created_at": job.created_at.isoformat() if job.created_at else None,
         "updated_at": job.updated_at.isoformat() if job.updated_at else None,
     }
@@ -870,41 +1066,28 @@ async def revise_job_endpoint(job_id: str, text: str = Form("")):
     job = get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
+    # 幂等：已经在重新规划中，直接返回，避免 Node 队列重试触发双跑
+    if job.status == JobStatus.PLANNING:
+        return {"job_id": job_id, "status": job.status.value}
+    # 真实事故（2026-07-30，job_64f2d7dd56dd）：这个端点原来没有状态校验——
+    # C-roll 生成期间（HeyGen 还没跑完，input.mp4 还不存在，job.status 还是
+    # DOWNLOADING_MEDIA）用户又发来一条追加语音，被 Node 当成"对当前任务的
+    # 修改意见"直接打到这里、触发重规划：读到的是根本不存在的视频，规划出
+    # 一份"时长 0 秒"的假方案，还把 job 状态提前改成了 WAITING_CONFIRMATION。
+    # 等 HeyGen 真正生成完成、process_incoming_message 跑出本该正确的方案时，
+    # 已经被这次抢跑覆盖/污染，用户之后确认时 input_video_path 对不上真实
+    # 文件，报"找不到输入视频"。跟 /retry、/confirm 一样补上状态校验：只有
+    # 方案阶段或预览阶段才能修订，其余一律拒绝（Node 侧会在发起请求前用已
+    # 经取到的 job 状态提前短路掉，不会真的打到这条 400）。
+    if job.status not in (JobStatus.WAITING_CONFIRMATION, JobStatus.PREVIEW_READY):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Job is in {job.status.value}, cannot revise yet",
+        )
     update_job_status(job_id, JobStatus.PLANNING)
     # 后台带反馈重规划，立即返回；Node 轮询等待新方案（WAITING_CONFIRMATION）
     _run_in_background(_enqueue_revise, job_id, text)
     return {"job_id": job_id, "status": "PLANNING"}
-
-
-@app.post("/jobs/{job_id}/revise_style")
-async def revise_style_endpoint(job_id: str, text: str = Form("")):
-    """预览阶段用户打字提意见的快速路径：worker.revise_style 内部判断这条
-    反馈是不是"只关于模板展示内容"——是就只重跑 apply_style（不碰视频内容/
-    时长，比整单重规划快很多），不是就原样退回完整方案重规划。跟 /revise 的
-    区别：/revise 总是走完整方案重规划；这个端点会先尝试更快的样式专项路径，
-    对调用方（Node 网关）透明——两条路径最终都会落到
-    PREVIEW_READY/WAITING_CONFIRMATION/NEEDS_CLARIFICATION/ERROR 之一。
-    """
-    job = get_job(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="Job not found")
-    # 幂等：已经在跑（这个端点自己、或 /confirm、/retry 触发的管线），直接
-    # 返回当前状态——避免 Node 重试或短时间内两条修改意见触发并发重跑。
-    if job.status in (JobStatus.RUNNING_PIPELINE, JobStatus.RENDERING):
-        return {"job_id": job_id, "status": job.status.value}
-    marker = job.job_dir / "_style_revision.json"
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text(json.dumps({"feedback": text, "started_at": time.time()}), encoding="utf-8")
-    # 必须在 _run_in_background 之前同步落地状态：Node 发完 POST 立刻开始轮询
-    # GET /jobs/{id}，如果这里还是 PREVIEW_READY，Node 会把"旧预览"误当成
-    # "新预览"立刻投递出去（waitForStatus 的目标状态列表本来就包含
-    # PREVIEW_READY，好让它能识别"样式重跑成功、还是 PREVIEW_READY"）。同理
-    # 清空 progress_stage——上一轮可能停在"rendering"，不清掉的话 Node 第一次
-    # 轮询就会立刻播报一句过期的阶段提示。
-    update_job_fields(job_id, status=JobStatus.RUNNING_PIPELINE, error_message=None,
-                      progress_stage=None)
-    _run_in_background(_enqueue_revise_style, job_id, text)
-    return {"job_id": job_id, "status": "RUNNING_PIPELINE"}
 
 
 # ---------------------------------------------------------------------------
@@ -1316,25 +1499,18 @@ def serve_file(job_id: str, filename: str):
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    # 路径穿越防护：filename 直接来自 URL path 参数，Node 网关那侧的代理
-    # （server/index.js /files 路由）用 encodeURIComponent 转发，但它不编码
-    # "."——"../.env" 这类值能原样穿过代理。job.job_dir / filename 本身不做
-    # 任何包含性检查，之前只是因为没有会主动构造恶意 filename 的调用方而没
-    # 暴露；预览编辑器上线后这条路由第一次会被浏览器 fetch 直接命中（props
-    # 文件里如果混进攻击者可控内容，这里就是它能读到仓库任意文件的地方），
-    # 必须在那之前把这个口子堵上。
-    file_path = (job.job_dir / filename).resolve()
-    if not file_path.is_relative_to(job.job_dir.resolve()):
-        raise HTTPException(status_code=404, detail="File not found")
+    file_path = job.job_dir / filename
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
 
     if filename.endswith(".mp4"):
         media_type = "video/mp4"
     elif filename.endswith(".jpg") or filename.endswith(".jpeg"):
-        media_type = "image/jpeg"
+        media_type = "image/jpeg"  # social_batch.py 的 Feed 静态图变体
     elif filename.endswith(".png"):
         media_type = "image/png"
+    elif filename.endswith(".mp3"):
+        media_type = "audio/mpeg"  # voice_clone.py 合成的克隆音色音频，HeyGen 靠这个 URL 抓取
     else:
         media_type = "application/octet-stream"
     return FileResponse(str(file_path), media_type=media_type)

@@ -61,7 +61,7 @@ def answer_question(text: str) -> str:
     一句通用但仍然语言匹配、仍然有用的兜底文案，而不是沉默或答非所问。"""
     lang = detect_lang(text)
     system = _SYSTEM_ZH if lang == "zh" else _SYSTEM_EN
-    reply, _usage = call_llm_chat(system, text, temperature=0.3, json_mode=False)
+    reply = call_llm_chat(system, text, temperature=0.3, json_mode=False)
     if reply and reply.strip():
         return reply.strip()
     logger.warning("qa_answer: LLM 不可用，使用兜底文案")
