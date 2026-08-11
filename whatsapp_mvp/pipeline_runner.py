@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import copy
 import difflib
 import json
 import logging
@@ -3499,6 +3500,9 @@ def _remotion_render_props(props_path: Path, out: Path, remotion_dir: Path, *,
     if last_result is not None:
         logger.error(f"apply_style render stderr: {last_result.stderr[-4000:]}")
         raise RuntimeError(f"apply_style 渲染失败 (exit {last_result.returncode})")
+
+    return str(out) if out.exists() else None
+
 
 _ASSET_PINNED_TOP_LEVEL = ("videoSrc", "durationSeconds")
 
