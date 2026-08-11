@@ -3337,3 +3337,599 @@ def _load_plan(job: Job) -> dict:
         ],
         "summary": "默认编辑：去掉停顿",
     }
+
+# ============================================================================
+# 浏览器编辑器支持 —— props 保存/渲染 + filmstrip/waveform/预览副本
+# ============================================================================
+
+class _EditorPropsInvalid(ValueError):
+    """`render_props_directly`（预览编辑器"保存"路径）在 pin+strip 之后，
+    发现结果不满足 contracts/render_props.schema.json 时抛出——发生在写盘/
+    渲染之前，磁盘上什么都没被动过，调用方（webhook.py）应该直接回 400 +
+    这条异常的错误文本，不需要走后台任务、不需要恢复任何快照。"""
+
+
+class _EditorRenderFailed(RuntimeError):
+    """`render_props_directly` 已经通过校验、真正尝试渲染，但
+    `_remotion_render_props` 本身失败时抛出——语义跟 `_StyleRerunFailed`
+    完全对应（同一类"决定要做、但没做成"），调用方同样必须恢复 props/
+    vision-warnings 快照、保留旧 preview.mp4、状态退回 PREVIEW_READY。"""
+
+
+
+def _finalize_pipeline_tail(job_dir: Path, src: str, *, subtitle_op: Optional[dict],
+                            music_op: Optional[dict], applied: list[str],
+                            degraded: list[str], job_id: str,
+                            reuse_music: bool = False) -> dict[str, Any]:
+    """管线尾段：字幕 -> 背景音乐 -> 定稿 preview.mp4 -> 组装结果 dict。
+
+    从 `run_talking_head_pipeline` 抽出来，供 `rerun_style_only`（只重跑
+    apply_style 的预览修订路径）共用——那条路径同样需要"字幕/音乐要不要重新
+    走一遍、定稿到 preview.mp4、拼出同样形状的结果 dict"这整段逻辑，不能只
+    复制粘贴一份容易跟这边的修复脱节。除了三处必要的参数化替换（preview_path
+    本地计算、job.id -> job_id、reuse_music 分支），逻辑与原
+    run_talking_head_pipeline 的对应片段完全一致，一字未改。
+    """
+    preview_path = job_dir / "preview.mp4"
+
+    if subtitle_op is not None:
+        logger.info("  执行操作: add_subtitles")
+        new_src = _op_add_subtitles(src, subtitle_op, job_dir)
+        if new_src and Path(new_src).exists():
+            src = str(new_src)
+            applied.append("add_subtitles")
+
+    if music_op is not None:
+        if reuse_music:
+            music_op = {**music_op, "_reuse_cached_music": True}
+        logger.info("  执行操作: add_music")
+        try:
+            new_src = _op_add_music(src, music_op, job_dir)
+        except Exception as e:
+            # Pixabay 检索走的是公开搜索页爬取（没有官方 API），失败常是 Cloudflare
+            # 的人机验证挑战（cf-mitigated: challenge）——这类拦截通常几十秒内自行
+            # 放行，立即重试大概率撞在同一个挑战窗口里、白重试一次。等一段再重试，
+            # 成功率明显更高（2026-07-17 实测复现过：403 立即重试仍 403，等待后
+            # 用完全相同的请求参数直接成功）。
+            logger.warning(f"    add_music: 执行失败，{_MUSIC_RETRY_DELAY_S}s 后重试一次。原因: {e}")
+            time.sleep(_MUSIC_RETRY_DELAY_S)
+            try:
+                new_src = _op_add_music(src, music_op, job_dir)
+            except Exception as e2:
+                logger.warning(
+                    f"    add_music: 重试仍失败，降级——保留无背景音乐的版本继续交付"
+                    f"（会显性告知用户，非静默）。原因: {e2}"
+                )
+                new_src = None
+                degraded.append("add_music")
+        if new_src and Path(new_src).exists():
+            src = str(new_src)
+            applied.append("add_music")
+
+    # 定稿为 preview.mp4
+    if Path(src).resolve() != preview_path.resolve():
+        shutil.copyfile(src, preview_path)
+
+    duration = _probe_duration(preview_path)
+    if degraded:
+        logger.warning(f"=== 降级交付: {job_id} 跳过失败的 {degraded}，交付上一步结果 ===")
+    generation_cost = _read_generation_cost(job_dir)
+    from .cost_tracking import read_llm_usage
+    llm_usage = read_llm_usage(job_dir)
+    quality_warnings = _read_vision_qa_warnings(job_dir)
+    logger.info(f"=== 管线完成: {job_id} → {preview_path} ({duration:.1f}s), 应用: {applied} ===")
+    return {
+        "preview_path": str(preview_path),
+        "duration": duration,
+        "applied_operations": applied,
+        "degraded_operations": degraded,
+        "generation_cost_usd": generation_cost,
+        "llm_tokens_input": llm_usage["prompt_tokens"],
+        "llm_tokens_output": llm_usage["completion_tokens"],
+        "llm_cost_usd": llm_usage["cost_usd"],
+        "quality_warnings": quality_warnings,
+    }
+
+
+_VISION_QA_WARNINGS_NAME = "_vision_qa_warnings.json"
+
+
+def _read_vision_qa_warnings(workdir: Path) -> list[str]:
+    """读回 `_op_apply_style` 交付前记下的、未能在重试内解决的视觉复审发现
+    （一句话描述，供交付消息如实告知用户）。没有文件（没发现问题，或走的是
+    `skipQaStills` 路径）就返回空列表——不是失败信号，只是"没有需要说的"。"""
+    ledger_path = workdir / _VISION_QA_WARNINGS_NAME
+    if not ledger_path.exists():
+        return []
+    try:
+        findings = json.loads(ledger_path.read_text(encoding="utf-8"))
+        return [f.get("issue", "") for f in findings if isinstance(f, dict) and f.get("issue")]
+    except Exception:
+        return []
+
+
+def _remotion_render_props(props_path: Path, out: Path, remotion_dir: Path, *,
+                           on_progress: Callable[[str], None] = lambda _s: None,
+                           composition: str = "XiaojinEditorial") -> Optional[str]:
+    """从 `_op_apply_style` 抽出的渲染子进程调用——不依赖 job/转写/内容规划，
+    只要一份已经写盘、已经过 schema 校验的 props 文件，就能渲染。供
+    `render_props_directly`（预览编辑器"保存"路径）复用，让两条路径共享同一份
+    重试/并发/超时逻辑，不必各自维护一份容易漂移的渲染调用。
+
+    props_path/out 必须是绝对路径——这个子进程以 cwd=remotion_dir 运行，
+    相对路径会解析到 remotion-composer/ 而不是仓库根目录，Remotion 会直接
+    拒绝（"neither valid JSON nor a file path to a valid JSON file"）。
+    """
+    npx_bin = shutil.which("npx") or "npx"  # Windows: subprocess needs the resolved npx.cmd, plain "npx" raises WinError 2
+    from .remotion_bundle import ensure_remotion_bundle
+    bundle = ensure_remotion_bundle(remotion_dir)
+    # props_path/out must be absolute — this subprocess runs with cwd=remotion_dir,
+    # so a relative path (e.g. "storage/jobs/<id>/_op_apply_style_props.json")
+    # resolves against remotion-composer/ instead of the repo root, and Remotion
+    # rejects it outright ("neither valid JSON nor a file path to a valid JSON
+    # file"). Confirmed real production bug: apply_style silently degraded to
+    # the bare unstyled cut on every run where workdir happened to be relative,
+    # with qa_stills' own still-renders (same bug, same fix needed there) failing
+    # identically just before it.
+    cmd = [npx_bin, "remotion", "render"] + ([bundle] if bundle else []) + [
+        composition, str(out.resolve()),
+        f"--props={props_path.resolve()}",
+        "--crf=18",
+    ]
+    on_progress("rendering")
+    logger.info(f"  apply_style: rendering via {' '.join(cmd)} (cwd={remotion_dir})")
+    # 重试一次：确认过真实生产 bug——同一份 props/视频独立跑总是成功，只有紧跟在
+    # qa_stills 那几次连续 still 渲染后面立刻起片渲染时才会报 "No frame found at
+    # position N"（Remotion 自己的 asset 缓存/本地 server 在 qa_stills 和整片渲染
+    # 之间交接时的瞬时状态，不是数据或编码问题——独立复现直接 1462/1462 渲染成功）。
+    # 跟这个文件里其它瞬时失败（LLM 调用、口误复核）已有的重试模式一致，不是发明
+    # 新机制。
+    last_result = None
+    for attempt in range(2):
+        with _RENDER_SLOTS:  # Remotion 渲染跨任务串行 + 硬超时防卡死占坑
+            result = subprocess.run(cmd, cwd=str(remotion_dir), capture_output=True, text=True,
+                                    timeout=_RENDER_TIMEOUT_S)
+        if result.returncode == 0:
+            last_result = None
+            break
+        last_result = result
+        if attempt == 0:
+            logger.warning(f"  apply_style: 渲染失败(exit {result.returncode})，重试一次: {result.stderr[-500:]}")
+
+    if last_result is not None:
+        logger.error(f"apply_style render stderr: {last_result.stderr[-4000:]}")
+        raise RuntimeError(f"apply_style 渲染失败 (exit {last_result.returncode})")
+
+_ASSET_PINNED_TOP_LEVEL = ("videoSrc", "durationSeconds")
+
+
+def pin_server_owned_props(user_props: dict, disk_props: dict) -> dict:
+    """预览编辑器"保存"路径的安全闸门：把浏览器提交的这几项资源/时长字段
+    强制换成服务端磁盘上真实的值，绝不信任客户端传来的原始内容。
+
+    不是防御性冗余——`render_props.schema.json` 把 `videoSrc` 定义成一个裸
+    字符串，没有这层覆盖，一次编辑器保存就能把它设成 `file:///…/.env`
+    （本地任意文件读取，读出的内容会被渲染进一帧画面，攻击者下载视频就能
+    拿到）或内网地址（SSRF）；`durationSeconds` 同理——`ceil(d*30)` 没有上限，
+    设成一个极大值会占住唯一的 `RENDER_SLOTS` 信号量整整 `OM_RENDER_TIMEOUT_S`
+    秒，拖垮所有 WhatsApp 任务。
+
+    `videoSrc`/`presenter.src`/`qrContact.qrSrc` 是全部三个真正会被组件当
+    资源加载的字段（`SpeakerCard`/`Presenter`/`QRContactCard`）——锁死这三个
+    + 给 `durationSeconds` 封顶，就彻底堵死这条注入面，不需要逐个校验其它
+    字段。
+
+    `presenter`/`qrContact` 是可选块：磁盘上这个 job 如果从没有过合法的
+    `src`/`qrSrc` 可以拿来钉死（例如这条 job 从没跑过 presenter 模式），就不
+    猜、不放行用户提交的路径，把用户新加的整块直接去掉——总比信任一个未经
+    验证的路径安全。
+    """
+    props = copy.deepcopy(user_props)
+    for key in _ASSET_PINNED_TOP_LEVEL:
+        if key in disk_props:
+            props[key] = disk_props[key]
+
+    disk_presenter_src = (disk_props.get("presenter") or {}).get("src")
+    if "presenter" in props:
+        if disk_presenter_src:
+            props["presenter"] = {**props["presenter"], "src": disk_presenter_src}
+        else:
+            props.pop("presenter", None)
+
+    disk_qr_src = (disk_props.get("qrContact") or {}).get("qrSrc")
+    if "qrContact" in props:
+        if disk_qr_src:
+            props["qrContact"] = {**props["qrContact"], "qrSrc": disk_qr_src}
+        else:
+            props.pop("qrContact", None)
+
+    return props
+
+
+def _clamp_video_cuts(props: dict, disk_props: dict) -> dict:
+    """Clamp client-supplied `videoCuts` against the real on-disk source
+    duration before rendering — same threat model as `durationSeconds` above
+    (a cut referencing frames past the real source video's end, or a huge
+    bogus `toFrame`, would either error out mid-render or hold a
+    `RENDER_SLOTS` slot on a nonsense range). `videoCuts` isn't in
+    `_ASSET_PINNED_TOP_LEVEL` — the editor is meant to set it — so this
+    normalizes/clamps rather than blanket-overwriting. Mirrors
+    `normalizeCuts` in remotion-composer/src/cuts.ts exactly (see
+    video_cuts.py's own header comment on why a Python port exists at all);
+    a client whose source got reprocessed shorter since the editor loaded
+    degrades gracefully (cuts past the new end just clamp down) rather than
+    hard-failing the whole save.
+    """
+    from .content_planner import FPS
+    from .video_cuts import normalize_cuts
+
+    raw_cuts = props.get("videoCuts")
+    if not raw_cuts:
+        return props
+
+    disk_duration = disk_props.get("durationSeconds")
+    if not disk_duration:
+        props.pop("videoCuts", None)
+        return props
+
+    import math
+    src_len = max(1, math.ceil(float(disk_duration) * FPS))
+    cuts = normalize_cuts(raw_cuts if isinstance(raw_cuts, list) else None, src_len)
+
+    if not cuts:
+        props.pop("videoCuts", None)
+    else:
+        props["videoCuts"] = cuts
+    return props
+
+
+def _editor_disk_props(job: Job) -> Optional[dict]:
+    props_path = job.job_dir / "_op_apply_style_props.json"
+    if props_path.exists():
+        try:
+            return json.loads(props_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+    # Arm B (AI-authored) jobs never produce _op_apply_style_props.json —
+    # their render props live at authored/props.json instead, written by
+    # authored_renderer._stage_workspace's own props dict, in a different
+    # shape (durationInFrames + fps, not durationSeconds). Without this
+    # fallback, ensure_editor_filmstrip/ensure_editor_waveform below always
+    # returned empty for every Arm B job (this function's None short-circuits
+    # both), so the editor's Video/Audio reference lanes were silently
+    # always missing on that arm. Normalize into the two keys those two
+    # functions actually read (videoSrc, durationSeconds) rather than
+    # duplicating their logic for a second props source.
+    authored_props_path = job.job_dir / "authored" / "props.json"
+    if not authored_props_path.exists():
+        return None
+    try:
+        authored_props = json.loads(authored_props_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    duration_frames = authored_props.get("durationInFrames")
+    fps = authored_props.get("fps")
+    if not duration_frames or not fps:
+        return None
+    return {
+        "videoSrc": authored_props.get("videoSrc"),
+        "durationSeconds": float(duration_frames) / float(fps),
+    }
+
+
+def _source_video_path(job: Job, disk_props: dict) -> Optional[Path]:
+    """`videoSrc` on disk is always `f"{local_api_base}/files/{job_id}/{filename}"`
+    (see webhook.py's `_rewrite_asset_url` docstring) — resolve it back to the
+    real local file under this job's dir without an HTTP round-trip."""
+    video_src = disk_props.get("videoSrc")
+    if not video_src:
+        return None
+    filename = video_src.rsplit("/", 1)[-1]
+    path = job.job_dir / filename
+    return path if path.exists() else None
+
+
+_FILMSTRIP_COUNT = 10
+
+
+def ensure_editor_filmstrip(job: Job) -> list[Path]:
+    """Generate (once, cached to disk) `_FILMSTRIP_COUNT` evenly-spaced JPEG
+    thumbnails from the job's current source video, for the editor timeline's
+    Video track. Deliberately raw ffmpeg frame-grabs from the source only —
+    no Remotion composition render involved, so none of the "20 full
+    composition renders would be brutal" concern that ruled out a filmstrip
+    in the Phase 3 editor applies here (this thumbnails the raw clip, not the
+    ~40-card composition).
+    """
+    job_dir = job.job_dir
+    existing = [job_dir / f"_editor_filmstrip_{i}.jpg" for i in range(_FILMSTRIP_COUNT)]
+    if all(p.exists() for p in existing):
+        return existing
+
+    disk_props = _editor_disk_props(job)
+    if disk_props is None:
+        return []
+    src = _source_video_path(job, disk_props)
+    duration = disk_props.get("durationSeconds")
+    if src is None or not duration or duration <= 0:
+        return []
+
+    out_paths: list[Path] = []
+    for i in range(_FILMSTRIP_COUNT):
+        # Sample the midpoint of each of N equal slices, not the exact edges
+        # — avoids landing on frame 0 (often a blank pre-roll moment; same
+        # class of "meaningless sample" this codebase already excludes for
+        # QA-still sampling elsewhere) or right at EOF.
+        t = (i + 0.5) * duration / _FILMSTRIP_COUNT
+        out = job_dir / f"_editor_filmstrip_{i}.jpg"
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-ss", f"{t:.3f}", "-i", str(src),
+                 "-frames:v", "1", "-vf", "scale=-2:120", "-q:v", "4", str(out)],
+                capture_output=True, check=True, timeout=30,
+            )
+        except Exception:
+            logger.warning(f"filmstrip 缩略图生成失败 job={job.id} i={i}", exc_info=True)
+            continue
+        if out.exists():
+            out_paths.append(out)
+    return out_paths
+
+
+_WAVEFORM_NAME = "_editor_waveform.png"
+
+
+def ensure_editor_waveform(job: Job) -> Optional[Path]:
+    """Generate (once, cached) a waveform PNG from the job's current source
+    video's audio track via ffmpeg's `showwavespic` filter — one subprocess
+    call. Deliberately server-side, not decoded client-side via
+    @remotion/media-utils: that would mean downloading/decoding the whole
+    audio track on a phone connection just to draw a strip of pixels."""
+    job_dir = job.job_dir
+    out = job_dir / _WAVEFORM_NAME
+    if out.exists():
+        return out
+
+    disk_props = _editor_disk_props(job)
+    if disk_props is None:
+        return None
+    src = _source_video_path(job, disk_props)
+    if src is None:
+        return None
+
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", str(src),
+             "-filter_complex", "showwavespic=s=1600x120:colors=0x6C63FF",
+             "-frames:v", "1", str(out)],
+            capture_output=True, check=True, timeout=30,
+        )
+    except Exception:
+        logger.warning(f"waveform 生成失败 job={job.id}", exc_info=True)
+        return None
+    return out if out.exists() else None
+
+
+_EDITOR_PREVIEW_VIDEO_NAME = "_editor_preview.mp4"
+
+
+def ensure_editor_preview_video(job: Job) -> Optional[Path]:
+    """Generate (once, cached) a small, faststart (moov-at-front) copy of the
+    job's current source video, for the browser editor's `<video>` element to
+    load.
+
+    Two separate bugs stacked here, found in order:
+
+    1. **Root cause of "permanently black, no error".** Every intermediate
+       `_op_*.mp4` this pipeline produces (confirmed: 70/70
+       `_op_audio_enhance.mp4` on disk, the file `videoSrc` actually points at
+       15/15 times on the current code path) has its `moov` atom written
+       LAST — `_op_audio_enhance.mp4` specifically is a pure `-c:v copy`
+       remux (`tools/audio/audio_enhance.py`), and `-c:v copy` does NOT imply
+       faststart. A browser cannot decode a single frame of a non-faststart
+       MP4 until it has fetched essentially the whole file (the moov atom
+       carries the sample tables). Confirmed via direct atom parsing: moov at
+       byte 8,016,184 of 8,070,768 on a real job.
+
+    2. **Root cause of "faststart fixed, still nothing for 17+ seconds".**
+       Confirmed live via a real user's Network tab: with faststart alone
+       (pure `-c copy` remux, same ~8MB as the source), the browser's request
+       for the file transferred only ~3.7MB in 17+ seconds over their actual
+       connection to the ngrok tunnel (~220KB/s) — a direct curl of the exact
+       same URL through the exact same path (ngrok -> Node gateway -> this
+       server) from a different network got the full file in under 5s, so
+       this is that specific user's link to the tunnel being slow, not a
+       server/proxy bug. Faststart alone doesn't help enough at that speed
+       for an ~8MB file. Fix: re-encode down to something that finishes fast
+       even on a slow link — editing (positioning cards, checking caption
+       sync, judging cut points) doesn't need source-quality video.
+
+    Deliberately NOT a pure remux anymore (was `-c copy`, sub-second) — this
+    re-encodes, which costs a few seconds of one-time generation (cached
+    after) in exchange for a file roughly an order of magnitude smaller.
+
+    It intentionally does NOT touch the original file: `render_props_directly`
+    always renders from the real `videoSrc` on disk (this copy is
+    browser-facing only, see `webhook._rewrite_props_for_browser`), and
+    `pin_server_owned_props` overwrites whatever `videoSrc` a save
+    round-trips back before it's ever persisted, so this cannot leak into
+    what actually gets rendered or delivered.
+    """
+    job_dir = job.job_dir
+    out = job_dir / _EDITOR_PREVIEW_VIDEO_NAME
+    if out.exists():
+        return out
+
+    disk_props = _editor_disk_props(job)
+    if disk_props is None:
+        return None
+    src = _source_video_path(job, disk_props)
+    if src is None:
+        return None
+
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", str(src),
+             # Portrait source (~478x850 typical) -> cap width at 360,
+             # height auto (kept even, "-2") — plenty for judging card
+             # position/timing/captions on a phone or laptop screen; not
+             # meant to represent final delivered quality.
+             "-vf", "scale=360:-2",
+             "-c:v", "libx264", "-crf", "30", "-preset", "veryfast",
+             # -ar 44100 is load-bearing, not cosmetic: this pipeline's
+             # source audio is 96kHz (confirmed via ffprobe), and at a small
+             # bitrate that combination made Chrome's WebAudio pipeline
+             # (which Remotion's Player routes audio through for volume
+             # control) throw a real, reproducible error mid-playback —
+             # "Code 3 - PipelineStatus::AUDIO_RENDERER_ERROR" — confirmed
+             # live via a real user's console, right around the 1s mark.
+             # 44.1kHz is the standard, universally-supported web audio rate.
+             "-c:a", "aac", "-ar", "44100", "-b:a", "128k",
+             "-movflags", "+faststart",
+             str(out)],
+            capture_output=True, check=True, timeout=120,
+        )
+    except Exception:
+        logger.warning(f"编辑器预览副本生成失败 job={job.id}——编辑器会退回原始文件（可能仍然黑屏/很慢）", exc_info=True)
+        return None
+    return out if out.exists() else None
+
+def validate_render_props(props: dict) -> tuple[Optional[bool], Optional[str]]:
+    """按 contracts/render_props.schema.json 校验渲染 props。返回
+    (True/False/None, err)——跟同文件里 `validate_artifact` 同一套约定
+    （None 表示 jsonschema 没装，不是校验失败；False 才是真的没通过）。"""
+    try:
+        import jsonschema
+    except ImportError:
+        return None, "jsonschema 未安装"
+    try:
+        schema_path = Path(get_config().openmontage_root) / "contracts" / "render_props.schema.json"
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        jsonschema.validate(props, schema)
+        return True, None
+    except jsonschema.ValidationError as e:
+        return False, e.message
+    except Exception as e:
+        return False, str(e)[:300]
+
+
+def apply_editor_music_volume(music_op: Optional[dict], music_volume: Any) -> Optional[dict]:
+    """Editor-authored musicVolume override (Phase C) for the render_props_directly
+    save path. `music_volume` absent/non-numeric (the overwhelming majority
+    of saves, and every job before this field existed) returns `music_op`
+    untouched — unchanged behavior. `music_volume <= 0` means "drop the
+    music bed" rather than passing 0 through: _op_add_music's own volume
+    read (`vol = _num(op.get("volume")); vol = ... if vol else 0.18`) treats
+    an explicit 0 as falsy and silently substitutes the 0.18 default, which
+    would be exactly backwards for a user who dragged the slider to mute.
+    Never mutates `music_op` in place."""
+    if not isinstance(music_volume, (int, float)):
+        return music_op
+    if music_volume <= 0:
+        return None
+    if music_op is None:
+        return None
+    return {**music_op, "volume": music_volume}
+
+
+def render_props_directly(job: Job, user_props: dict, *,
+                          on_progress: Optional[Callable[[str], None]] = None) -> dict[str, Any]:
+    """预览编辑器"保存"的渲染路径——用户在浏览器里手改的 props 直接拿去渲染，
+    不经过 `plan_content`、不经过 `_apply_deterministic_guarantees`、不经过
+    props_lint 重试循环、不经过视觉复审。用户的编辑就是最终结果，这几层
+    "自动纠正"机制全都会在用户没要求的情况下悄悄改写内容（详见
+    `_op_apply_style` 内 `_apply_deterministic_guarantees` 和
+    `_recompute_scenes_from_content` 的文档）——编辑器场景下这些改写反而是
+    需要绕开的东西，不是需要复用的保障。
+
+    raises:
+        _EditorPropsInvalid: pin+strip 之后仍不满足 schema——磁盘上什么都
+            没被动过，调用方应直接回 400，不必进后台任务、不必恢复快照。
+        _EditorRenderFailed: 校验通过、真正尝试渲染，但渲染本身失败——旧
+            preview.mp4 未被触碰，props/vision-warnings 快照已恢复。
+    """
+    job_dir = job.job_dir
+    disk_props_path = job_dir / "_op_apply_style_props.json"
+    disk_props: dict = {}
+    if disk_props_path.exists():
+        try:
+            disk_props = json.loads(disk_props_path.read_text(encoding="utf-8"))
+        except Exception:
+            disk_props = {}
+
+    props = pin_server_owned_props(user_props, disk_props)
+    props = _clamp_video_cuts(props, disk_props)
+    # contentBeats 在 XiaojinEditorial.tsx 里被解构读取，但从未被加进 schema
+    # （schema 是 additionalProperties:false）——任何带着它的 props 都会在
+    # jsonschema 这一步被直接拒绝。防御性剔除，不让这个历史遗留字段挡路。
+    props.pop("contentBeats", None)
+
+    ok, err = validate_render_props(props)
+    if ok is False:
+        raise _EditorPropsInvalid(f"props failed contract② validation: {err}")
+
+    # 快照当前 props/视觉复审警告，供渲染失败时恢复——跟 rerun_style_only
+    # 同一个理由：`_animations_summary`（webhook.py）不能读到一份从未真正
+    # 渲染成功的 props，向用户播报假动画清单；_vision_qa_warnings.json 只在
+    # 非空时被覆写，干净的保存必须显式清掉旧账。
+    warnings_path = job_dir / _VISION_QA_WARNINGS_NAME
+    prev_props_text = disk_props_path.read_text(encoding="utf-8") if disk_props_path.exists() else None
+    prev_warnings_text = warnings_path.read_text(encoding="utf-8") if warnings_path.exists() else None
+
+    def _restore_snapshots() -> None:
+        if prev_props_text is not None:
+            disk_props_path.write_text(prev_props_text, encoding="utf-8")
+        else:
+            disk_props_path.unlink(missing_ok=True)
+        if prev_warnings_text is not None:
+            warnings_path.write_text(prev_warnings_text, encoding="utf-8")
+        else:
+            warnings_path.unlink(missing_ok=True)
+
+    disk_props_path.write_text(json.dumps(props, ensure_ascii=False), encoding="utf-8")
+
+    remotion_dir = Path(get_config().openmontage_root) / "remotion-composer"
+    out = job_dir / "_op_styled.mp4"
+    try:
+        styled = _remotion_render_props(disk_props_path, out, remotion_dir,
+                                        on_progress=on_progress or (lambda _s: None))
+    except Exception as e:
+        _restore_snapshots()
+        raise _EditorRenderFailed(f"editor render failed: {e}") from e
+    if not styled or not Path(styled).exists():
+        _restore_snapshots()
+        raise _EditorRenderFailed("editor render produced no output")
+
+    # 没有跑过视觉复审——必须在 _finalize_pipeline_tail 之前清掉，不能等它
+    # 之后再删：_finalize_pipeline_tail 内部会调用 _read_vision_qa_warnings
+    # 读这个文件算 quality_warnings（Fix，2026-07-27 真实复现——这里原来写
+    # 在 _finalize_pipeline_tail 之后，导致一次编辑器保存的 quality_warnings
+    # 里混进了这个 job 更早一轮、完全无关的旧视觉复审发现，读的时候已经
+    # 来不及了）。
+    warnings_path.unlink(missing_ok=True)
+
+    plan = _load_plan(job)
+    operations = plan.get("edit_operations", [])
+    music_op = next((o for o in operations if o.get("type") == "add_music"), None)
+    subtitle_op = next((o for o in operations if o.get("type") == "add_subtitles"), None)
+    music_op = apply_editor_music_volume(music_op, props.get("musicVolume"))
+    result = _finalize_pipeline_tail(job_dir, styled, subtitle_op=subtitle_op, music_op=music_op,
+                                     applied=["apply_style"], degraded=[], job_id=job.id,
+                                     reuse_music=True)
+
+    # 标记这个 job 已经被手动编辑过——server/worker.js 的 reviseJob 靠它决定
+    # 要不要在 WhatsApp 文字反馈快速路径（会从转写重新生成一切）覆盖用户的
+    # 手动改动前先弹一句警告确认（Stage 7）。只在这里（保存成功）写，不在
+    # 校验失败/渲染失败的分支写——那些情况用户的手动编辑其实没有真正生效。
+    (job_dir / "_manual_edit.json").write_text(
+        json.dumps({"edited_at": time.time()}), encoding="utf-8")
+
+    prev_degraded: list[str] = []
+    try:
+        prev_degraded = json.loads(job.degraded_operations) if job.degraded_operations else []
+    except Exception:
+        prev_degraded = []
+    carried_over = [d for d in prev_degraded if d not in ("apply_style", "add_music", "add_subtitles")]
+    result["degraded_operations"] = list(dict.fromkeys(result["degraded_operations"] + carried_over))
+    return result
+

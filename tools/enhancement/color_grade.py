@@ -163,6 +163,8 @@ class ColorGrade(BaseTool):
             "-c:v", codec, "-crf", str(crf), "-preset", "fast",
             "-fps_mode", "cfr", "-r", str(fps), "-g", str(int(fps)),
             "-c:a", "copy",
+            # moov-at-front — see audio_enhance.py's matching comment.
+            "-movflags", "+faststart",
             str(output_path),
         ]
 

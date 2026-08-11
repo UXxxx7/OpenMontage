@@ -129,6 +129,12 @@ class VideoTrimmer(BaseTool):
             cmd.extend(["-c", "copy"])
         else:
             cmd.extend(["-c:v", codec, "-c:a", "aac"])
+        # moov-at-front — a browser <video> can't play a single frame of a
+        # moov-at-end file until it's downloaded almost entirely (confirmed
+        # real symptom: the live editor preview was permanently black). Free
+        # here regardless of codec branch — same remux/encode, different
+        # atom order.
+        cmd.extend(["-movflags", "+faststart"])
         cmd.append(str(output_path))
 
         self.run_command(cmd)
@@ -167,6 +173,7 @@ class VideoTrimmer(BaseTool):
             "-filter:a", audio_filters,
             "-c:v", "libx264", "-preset", "fast",
             "-c:a", "aac",
+            "-movflags", "+faststart",
             str(output_path),
         ]
 
@@ -296,6 +303,9 @@ class VideoTrimmer(BaseTool):
                 "-i", str(list_path),
                 "-fps_mode", "cfr", "-r", str(fps), "-g", str(int(fps)),
                 "-c:v", "libx264", "-preset", "fast", "-c:a", "aac",
+                # moov-at-front — see this file's _cut() for the confirmed
+                # real symptom this fixes.
+                "-movflags", "+faststart",
                 str(output_path),
             ]
             self.run_command(cmd)

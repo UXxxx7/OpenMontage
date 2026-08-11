@@ -176,6 +176,10 @@ class FaceEnhance(BaseTool):
             "-c:v", codec, "-crf", str(crf), "-preset", "fast",
             "-fps_mode", "cfr", "-r", str(fps), "-g", str(int(fps)),
             "-c:a", "copy",
+            # moov-at-front so a browser <video> can play the file without
+            # downloading it almost entirely first — see audio_enhance.py's
+            # matching comment for the confirmed real-world symptom.
+            "-movflags", "+faststart",
             str(output_path),
         ]
 

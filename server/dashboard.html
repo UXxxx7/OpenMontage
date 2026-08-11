@@ -160,7 +160,7 @@
   <div class="brand">OpenMontage <span>Dashboard</span></div>
   <div class="navlinks">
     <a href="/dashboard" class="active">Dashboard</a>
-    <a class="soon" title="Editor ships once PR #51 is wired up">Editor</a>
+    <a href="#" id="editorNavLink" title="Opens the editor for your most recent video result">Editor</a>
     <a href="/publish-flow-demo">Publish Flow</a>
     <a href="/upgrade">Upgrade</a>
   </div>
@@ -209,6 +209,13 @@ let pendingPhoto = null;
 
 identityInput.value = localStorage.getItem("om_identity") || "";
 identityInput.addEventListener("change", () => localStorage.setItem("om_identity", identityInput.value.trim()));
+
+document.getElementById("editorNavLink").addEventListener("click", (e) => {
+  e.preventDefault();
+  const jobId = localStorage.getItem("om_last_video_job_id");
+  if (!jobId) { showToast("Generate a video result first, then Editor will open it."); return; }
+  openEditor(e.currentTarget, jobId);
+});
 
 attachBtn.addEventListener("click", () => photoInput.click());
 photoInput.addEventListener("change", () => {
@@ -288,6 +295,7 @@ function cardHtml(v) {
           <a href="${fileUrl}" download>Download</a>
         </div>
         <div class="vcard-actions">
+          ${v.asset_kind === "video" ? `<button onclick="openEditor(this, '${v.job_id}')">Edit</button>` : ""}
           <select onchange="publishTo(this)" data-caption="${captionAttr}">
             <option value="">Publish to…</option>
             ${options}
@@ -296,6 +304,28 @@ function cardHtml(v) {
       </div>
     </div>`;
 }
+
+// "Edit" on a video result — mints a per-job editor link (server/index.js
+// re-hosts Python's token onto this same origin) and opens the Arm A/B
+// visual editor in a new tab. Feed variants are a static image, not a
+// timeline — no Edit action for those (see cardHtml's asset_kind check).
+async function openEditor(btn, jobId) {
+  const old = btn.textContent;
+  btn.textContent = "Opening…";
+  btn.disabled = true;
+  try {
+    const resp = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/editor-link`, { method: "POST" });
+    if (!resp.ok) throw new Error(`editor link failed (${resp.status})`);
+    const { editor_url } = await resp.json();
+    window.open(editor_url, "_blank", "noopener");
+  } catch (err) {
+    showToast(`Couldn't open the editor: ${err.message}`);
+  } finally {
+    btn.textContent = old;
+    btn.disabled = false;
+  }
+}
+window.openEditor = openEditor;
 
 function publishTo(selectEl) {
   const platform = selectEl.value;
@@ -368,6 +398,8 @@ async function pollBatch(batchId, botEl) {
       const allTerminal = variants.length > 0 && variants.every((v) => TERMINAL.has(v.status));
       if (allTerminal) {
         const doneCount = variants.filter((v) => v.status === "DONE").length;
+        const videoVariant = variants.find((v) => v.status === "DONE" && v.asset_kind === "video");
+        if (videoVariant) localStorage.setItem("om_last_video_job_id", videoVariant.job_id);
         botEl.querySelector(".bubble").innerHTML =
           `${doneCount}/${variants.length} versions ready:`
           + `<div class="result-grid">${variants.map(cardHtml).join("")}</div>`

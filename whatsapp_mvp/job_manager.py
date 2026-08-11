@@ -38,21 +38,6 @@ def get_or_create_user(whatsapp_id: str) -> User:
         session.close()
 
 
-def set_user_voice_clone(user_id: int, voice_id: Optional[str]) -> Optional[User]:
-    """写入/清空这个用户的 ElevenLabs 克隆音色 id。voice_id=None 用于以后要支持
-    "重新录一次覆盖旧克隆"时先清空（当前调用方总是传新 id，不传 None）。"""
-    session = get_session()
-    try:
-        user = session.query(User).filter(User.id == user_id).first()
-        if user:
-            user.elevenlabs_voice_id = voice_id
-            session.commit()
-            session.refresh(user)
-        return user
-    finally:
-        session.close()
-
-
 # ---------------------------------------------------------------------------
 # Job CRUD
 # ---------------------------------------------------------------------------
@@ -81,24 +66,6 @@ def create_job(
         config = get_config()
         job.job_dir.mkdir(parents=True, exist_ok=True)
         return job
-    finally:
-        session.close()
-
-
-def get_jobs_by_batch(batch_id: str) -> list[Job]:
-    """一个批次下的所有平台变体，按创建顺序（跟 social_batch.PLATFORM_SPECS 里
-    声明的顺序一致，因为是依次 create_job 出来的）。给 Studio 预览页用。"""
-    session = get_session()
-    try:
-        jobs = (
-            session.query(Job)
-            .filter(Job.batch_id == batch_id)
-            .order_by(Job.created_at.asc())
-            .all()
-        )
-        for job in jobs:
-            session.expunge(job)
-        return jobs
     finally:
         session.close()
 

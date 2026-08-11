@@ -157,7 +157,13 @@ class AudioEnhance(BaseTool):
             "-af", af,
         ]
         if is_video:
-            cmd.extend(["-c:v", "copy"])
+            # -c:v copy remuxes but does NOT relocate the moov atom — ffmpeg
+            # still writes it after the (large) mdat by default, so a browser
+            # <video> can't play a single frame until it has downloaded
+            # essentially the whole file (confirmed: this is exactly what was
+            # making the live editor preview permanently black). +faststart
+            # is free here — same remux, no re-encode, just atom order.
+            cmd.extend(["-c:v", "copy", "-movflags", "+faststart"])
         cmd.extend(["-c:a", audio_codec, "-b:a", audio_bitrate])
         cmd.append(str(output_path))
 

@@ -343,6 +343,10 @@ class SilenceCutter(BaseTool):
                 "-f", "concat", "-safe", "0",
                 "-i", str(list_path),
                 "-c", "copy",
+                # moov-at-front — -c copy remuxes but doesn't relocate moov by
+                # default, so a browser <video> can't play a frame until it's
+                # downloaded almost the whole file (confirmed real symptom).
+                "-movflags", "+faststart",
                 str(output_path),
             ]
             self.run_command(cmd, timeout=120)
@@ -445,6 +449,10 @@ class SilenceCutter(BaseTool):
                 "-f", "concat", "-safe", "0",
                 "-i", str(list_path),
                 "-c", "copy",
+                # moov-at-front — -c copy remuxes but doesn't relocate moov by
+                # default, so a browser <video> can't play a frame until it's
+                # downloaded almost the whole file (confirmed real symptom).
+                "-movflags", "+faststart",
                 str(output_path),
             ]
             self.run_command(cmd, timeout=120)
