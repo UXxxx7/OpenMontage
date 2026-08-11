@@ -295,7 +295,13 @@ def build_export_ffmpeg_cmd(src: Path, dst: Path, *, resolution: str, quality: s
     cmd += ["-c:a", "aac", "-b:a", f"{q['audio_kbps']}k", "-movflags", "+faststart"]
     if progress:
         cmd += ["-progress", "pipe:1", "-nostats", "-loglevel", "error"]
-    cmd += [str(dst)]
+    # -f mp4 explicit, not inferred from dst's extension — run_editor_export
+    # writes to a "<name>.mp4.part" tmp path (atomic os.replace() once done,
+    # see its own docstring), and ffmpeg's muxer auto-detection only looks at
+    # the LAST extension, so ".part" makes it fail with "Unable to choose an
+    # output format" (confirmed live). Harmless for run_final_export's own
+    # "*.mp4" direct output — same muxer either way, just no longer implicit.
+    cmd += ["-f", "mp4", str(dst)]
     return cmd
 
 

@@ -1,10 +1,14 @@
 # 导出转码命令/预估的单元测试。
 #
 # build_export_ffmpeg_cmd(resolution="1080p", quality="high") 跟
-# run_final_export 原来的裸命令刻意逐位一致（除了新增的 -nostdin）——这是
-# 重构安全性的证明，不是巧合：run_final_export 现在就是调用这个函数构造出
-# 同一条命令。第一条测试就是这个不变量的回归防护——它变了，就说明 WhatsApp
-# 最终导出的行为被意外改动了。
+# run_final_export 原来的裸命令刻意逐位一致（除了新增的 -nostdin 和 -f mp4）——
+# 这是重构安全性的证明，不是巧合：run_final_export 现在就是调用这个函数构造出
+# 同一条命令。-f mp4 是活着的产品修复，不是巧合添加：run_editor_export 写到
+# "<name>.mp4.part" 临时路径再 os.replace()（见其自身文档的 atomic-write
+# 理由），ffmpeg 的输出格式自动探测只看最后一段扩展名，".part" 会让它报
+# "Unable to choose an output format" 直接失败——2026-08-11 对 job_d7d5c007bbc0
+# 的真实导出请求复现过。第一条测试就是这两个不变量的回归防护——它们变了，
+# 就说明 WhatsApp 最终导出的行为被意外改动了，或者刚修的这个 bug 又回来了。
 #
 # 都是纯函数测试，不跑真实 ffmpeg（不需要网络/子进程/真实素材）。
 
@@ -24,7 +28,7 @@ from whatsapp_mvp.pipeline_runner import (
 def test_1080p_high_matches_run_final_export_original_command():
     """WhatsApp 最终导出用的正是 resolution=1080p quality=high 这一档——
     这条命令必须跟改动前 run_final_export 里硬编码的裸命令逐位一致（除了
-    新增的 -nostdin），否则就是一次静默的行为改动。"""
+    新增的 -nostdin 和 -f mp4），否则就是一次静默的行为改动。"""
     cmd = build_export_ffmpeg_cmd(
         "preview.mp4", "final.mp4", resolution="1080p", quality="high",
         src_w=1080, src_h=1920,
@@ -33,7 +37,7 @@ def test_1080p_high_matches_run_final_export_original_command():
         "ffmpeg", "-nostdin", "-y", "-i", "preview.mp4",
         "-c:v", "libx264", "-crf", "18", "-preset", "medium",
         "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
-        "final.mp4",
+        "-f", "mp4", "final.mp4",
     ]
 
 
