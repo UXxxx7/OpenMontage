@@ -69,7 +69,13 @@ app.get("/privacy", (_req, res) => {
 });
 
 app.get("/files/:jobId/:filename", async (req, res) => {
-  const upstream = `${PYTHON_API_BASE}/files/${encodeURIComponent(req.params.jobId)}/${encodeURIComponent(req.params.filename)}`;
+  let upstream = `${PYTHON_API_BASE}/files/${encodeURIComponent(req.params.jobId)}/${encodeURIComponent(req.params.filename)}`;
+  // ?download=1 forwarded verbatim — Python's serve_file uses it to set
+  // Content-Disposition: attachment, which iOS Safari needs since it ignores
+  // the <a download> HTML attribute for a same-tab navigation.
+  if (req.query.download) {
+    upstream += `?download=${encodeURIComponent(req.query.download)}`;
+  }
   try {
     // 必须把客户端的 Range 头转发给 Python，也要把 Python 回的 range 相关响应头
     // 转发回去——不转发的后果不是"慢一点"，是浏览器 <video> 标签直接播放不了：
@@ -84,7 +90,7 @@ app.get("/files/:jobId/:filename", async (req, res) => {
       headers: req.headers.range ? { range: req.headers.range } : {},
     });
     res.status(upstreamRes.status);
-    const forwardHeaders = ["content-type", "content-length", "accept-ranges", "content-range", "etag", "last-modified"];
+    const forwardHeaders = ["content-type", "content-length", "accept-ranges", "content-range", "etag", "last-modified", "content-disposition"];
     for (const h of forwardHeaders) {
       if (upstreamRes.headers[h]) res.setHeader(h, upstreamRes.headers[h]);
     }
@@ -175,7 +181,8 @@ app.get("/editor/:jobId", (req, res) => {
 
 app.get(["/api/editor/:jobId/props", "/api/editor/:jobId/status",
          "/api/editor/:jobId/filmstrip", "/api/editor/:jobId/waveform",
-         "/api/editor/:jobId/authored"], async (req, res) => {
+         "/api/editor/:jobId/authored", "/api/editor/:jobId/export/options",
+         "/api/editor/:jobId/export/status"], async (req, res) => {
   // req.path 已经是 /api/editor/:jobId/props 这类完整路径，去掉 /api 前缀
   // 直接对应 Python 那边的 /editor/:jobId/props 路由。
   const upstream = `${PYTHON_API_BASE}${req.path.replace(/^\/api/, "")}?token=${encodeURIComponent(req.query.token || "")}`;
@@ -196,6 +203,22 @@ app.post("/api/editor/:jobId/relayout", async (req, res) => {
     res.status(upstreamRes.status).json(upstreamRes.data);
   } catch (err) {
     console.error("[editor-api] relayout failed:", err.message);
+    res.sendStatus(502);
+  }
+});
+
+// 导出——preview.mp4 的 ffmpeg 转码下载，不是走 BullMQ 投递给 WhatsApp
+// 的"保存"。跟 /relayout 同一个薄代理形状（原样转发 body、原样回传状态码/
+// JSON），刻意不是 /props 那个形状：没有 wa_number，也不触发 editor-save
+// 入队——不要把这条路由改成 /props 的样子。
+app.post("/api/editor/:jobId/export", async (req, res) => {
+  const upstream = `${PYTHON_API_BASE}/editor/${encodeURIComponent(req.params.jobId)}/export`
+    + `?token=${encodeURIComponent(req.query.token || "")}`;
+  try {
+    const upstreamRes = await axios.post(upstream, req.body, { validateStatus: () => true });
+    res.status(upstreamRes.status).json(upstreamRes.data);
+  } catch (err) {
+    console.error("[editor-api] export failed:", err.message);
     res.sendStatus(502);
   }
 });
