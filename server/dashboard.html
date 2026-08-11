@@ -412,6 +412,24 @@ async function pollBatch(batchId, botEl) {
   botEl.querySelector(".bubble").innerHTML = "This is taking longer than expected — check back at the "
     + `<a class="studio-link" href="/studio/${batchId}" target="_blank">Studio page</a> in a few minutes.`;
 }
+
+// Demo seed: ?demo=<job_id> renders one real, already-rendered video as a
+// result card using the exact same cardHtml()/openEditor() path a live
+// generation would — skips the multi-minute HeyGen wait for demo purposes
+// only, doesn't fabricate anything about how Edit/Editor actually work.
+const demoJobId = new URLSearchParams(location.search).get("demo");
+if (demoJobId) {
+  const demoVariant = {
+    platform: "instagram_reel", status: "DONE", job_id: demoJobId,
+    filename: "preview.mp4", asset_kind: "video",
+    caption: "Your policy renews in 30 days — lock in your rate before it changes.",
+    hashtags: ["insurance", "renewal"],
+  };
+  localStorage.setItem("om_last_video_job_id", demoJobId);
+  const el = addBotMessage(
+    `1/1 versions ready (demo):<div class="result-grid">${cardHtml(demoVariant)}</div>`
+  );
+}
 </script>
 </body>
 </html>
