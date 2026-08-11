@@ -1499,8 +1499,21 @@ def serve_file(job_id: str, filename: str):
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    file_path = job.job_dir / filename
-    if not file_path.exists():
+    # Containment check — {filename} compiles to [^/]+ (no forward slash), but
+    # that does NOT block a backslash, and on Windows pathlib treats \ as a
+    # separator too. filename="..\\..\\..\\.env" resolves clean outside
+    # job_dir and was confirmed live to read this repo's real .env (API keys)
+    # and the sqlite DB (every user's WhatsApp number) through this route,
+    # unauthenticated, reachable through the ngrok tunnel. resolve() collapses
+    # ../, both separator styles, and 8.3 short names; the parents check is
+    # the actual containment assertion (stays correct for a future nested
+    # path like assets/broll_0.mp4, unlike a substring/startswith check).
+    job_root = job.job_dir.resolve()
+    try:
+        file_path = (job_root / filename).resolve()
+    except (OSError, ValueError):
+        raise HTTPException(status_code=404, detail="File not found")
+    if not file_path.is_file() or job_root not in file_path.parents:
         raise HTTPException(status_code=404, detail="File not found")
 
     if filename.endswith(".mp4"):
