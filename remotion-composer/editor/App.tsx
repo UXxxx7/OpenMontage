@@ -23,6 +23,8 @@ import { computeOutputDuration, normalizeCuts, outputToSource, type VideoCut } f
 import { FPS, cutsRef, frameRef, framesToMs } from "./state/playhead";
 import { broadcastSelection } from "./state/selectionBridge";
 import { apiGet, apiPost } from "./api";
+import { useExport } from "./state/useExport";
+import { ExportDialog } from "./components/Export/ExportDialog";
 
 /** Width threshold for the phone shell. Must match styles.css's own
  *  `@media (max-width: 860px)` breakpoint by hand — CSS and this JS string
@@ -547,6 +549,8 @@ function Editor({
     }
   }, [jobId, token, props, commit, showToast]);
 
+  const exportX = useExport({ jobId, token, isDirty, saveState, onSave: handleSave, onDone: showToast });
+
   // ── Keyboard shortcuts ──────────────────────────────────────────────
 
   useEffect(() => {
@@ -651,6 +655,8 @@ function Editor({
           hasItemError={(section, index) => errIdx.forItem(section, index)}
           filmstripUrls={filmstripUrls}
           waveformUrl={waveformUrl}
+          exportX={exportX}
+          token={token}
         />
         {banner}
       </>
@@ -674,7 +680,12 @@ function Editor({
         savesThisHour={savesThisHour}
         savesPerHour={DEFAULT_SAVES_PER_HOUR}
         slotBusy={slotBusy}
+        onExport={exportX.openDialog}
       />
+
+      {exportX.dialogOpen && (
+        <ExportDialog x={exportX} jobId={jobId} token={token} isDirty={isDirty} onClose={exportX.closeDialog} />
+      )}
 
       <LibraryPanel onAdd={handleAddItem} isTouch={!isDesktopPointer} />
 

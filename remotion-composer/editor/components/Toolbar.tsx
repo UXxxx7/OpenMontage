@@ -17,6 +17,7 @@ export function Toolbar({
   savesThisHour,
   savesPerHour,
   slotBusy,
+  onExport,
 }: {
   jobId: string;
   jobStatus: string;
@@ -32,6 +33,7 @@ export function Toolbar({
   savesThisHour: number | null;
   savesPerHour: number;
   slotBusy: boolean;
+  onExport: () => void;
 }) {
   const busy = saveState === "saving" || saveState === "rendering";
   const remaining = savesThisHour === null ? null : Math.max(0, savesPerHour - savesThisHour);
@@ -72,6 +74,15 @@ export function Toolbar({
           queue busy
         </span>
       )}
+
+      <button
+        type="button"
+        className="btn"
+        onClick={onExport}
+        title="Download the finished video directly — pick resolution and file size"
+      >
+        Export
+      </button>
 
       <button
         type="button"

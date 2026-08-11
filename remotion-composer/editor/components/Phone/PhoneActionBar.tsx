@@ -11,6 +11,7 @@ export const ARM_A_SHEET_ITEMS: PhoneActionItem[] = [
   { kind: "cut", icon: "✂", label: "Cut" },
   { kind: "edit", icon: "🎛", label: "Edit" },
   { kind: "audio", icon: "🔊", label: "Audio" },
+  { kind: "export", icon: "⤓", label: "Export" },
 ];
 
 /**
