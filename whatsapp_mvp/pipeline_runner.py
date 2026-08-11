@@ -13,7 +13,9 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -31,6 +33,9 @@ logger = logging.getLogger(__name__)
 # 机器的现实是"重活永远只有 N 个在跑"。槽位数可用环境变量按机器调。
 from .concurrency import (
     ENHANCE_SLOTS as _ENHANCE_SLOTS,
+    EXPORT_SLOTS as _EXPORT_SLOTS,
+    EXPORT_THREADS as _EXPORT_THREADS,
+    EXPORT_TIMEOUT_S as _EXPORT_TIMEOUT_S,
     RENDER_SLOTS as _RENDER_SLOTS,
     RENDER_TIMEOUT_S as _RENDER_TIMEOUT_S,
     TRANSCRIBE_SLOTS as _TRANSCRIBE_SLOTS,
@@ -323,6 +328,127 @@ def run_final_export(job: Job) -> dict[str, Any]:
     subprocess.run(cmd, capture_output=True, check=True)
     logger.info(f"最终导出完成: {final_path}")
     return {"final_path": str(final_path)}
+
+
+def _cleanup_old_exports(job_dir: Path, keep: int = 3) -> None:
+    """LRU 淘汰——一个 job 最多 6 种档位组合（2 分辨率 x 3 画质）全留大约
+    45MB 顶天，但没必要真的六份都留着；只保留最近用过的 keep 份，按 mtime
+    从旧到新删多余的。"""
+    exports = sorted(job_dir.glob("export_*.mp4"), key=lambda p: p.stat().st_mtime)
+    while len(exports) > keep:
+        exports.pop(0).unlink(missing_ok=True)
+
+
+def run_editor_export(job: Job, resolution: str, quality: str, *,
+                      on_progress: Optional[Callable[[int], None]] = None) -> dict[str, Any]:
+    """浏览器编辑器"导出"——转码 job_dir/preview.mp4 到指定分辨率/画质的
+    export_{resolution}_{quality}.mp4，供用户直接下载。
+
+    缓存判断（"这一档是不是已经有新鲜结果了"）是调用方（webhook.py 的
+    POST /export）的责任，不是这个函数的——这个函数被调用就意味着"确实要
+    转码一次"，调用方应该已经检查过 mtime。
+
+    resolution/quality 必须是 EXPORT_RESOLUTIONS/EXPORT_QUALITIES 里的合法
+    键——这两个值最终会拼进文件名（export_{resolution}_{quality}.mp4），
+    ValueError 早退保证不会有客户端字符串流进文件系统路径。
+    """
+    if resolution not in EXPORT_RESOLUTIONS:
+        raise ValueError(f"unknown export resolution: {resolution!r}")
+    if quality not in EXPORT_QUALITIES:
+        raise ValueError(f"unknown export quality: {quality!r}")
+
+    job_dir = job.job_dir
+    preview_path = job_dir / "preview.mp4"
+    if not preview_path.exists():
+        raise FileNotFoundError(f"job 还没有可导出的预览: {preview_path}")
+
+    out_name = f"export_{resolution}_{quality}.mp4"
+    out_path = job_dir / out_name
+    tmp_path = job_dir / f"{out_name}.part"
+    tmp_path.unlink(missing_ok=True)  # 上一次被杀掉/失败留下的半成品，先清干净
+
+    src_w, src_h = _probe_dimensions(preview_path)
+    duration_s = _probe_duration(preview_path) or 1.0
+    before_stat = preview_path.stat()
+
+    cmd = build_export_ffmpeg_cmd(preview_path, tmp_path, resolution=resolution, quality=quality,
+                                  src_w=src_w, src_h=src_h, threads=_EXPORT_THREADS, progress=True)
+    logger.info(f"  editor export: {' '.join(str(c) for c in cmd)}")
+
+    # -progress pipe:1 把进度写 stdout；stderr 单独用一个 daemon 线程持续
+    # 读走——只读 stdout、放着 stderr 的管道缓冲区不读，缓冲区写满后子进程
+    # 会卡死在写 stderr 上，是经典的 subprocess 死锁陷阱。deque(maxlen=200)
+    # 只留尾部，失败时够拼错误信息，不需要无限攒。
+    stderr_tail: deque = deque(maxlen=200)
+
+    def _drain_stderr(pipe) -> None:
+        for line in iter(pipe.readline, ""):
+            stderr_tail.append(line)
+        pipe.close()
+
+    with _EXPORT_SLOTS:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, bufsize=1)
+        stderr_thread = threading.Thread(target=_drain_stderr, args=(proc.stderr,), daemon=True)
+        stderr_thread.start()
+
+        last_reported = 0.0
+        try:
+            for line in iter(proc.stdout.readline, ""):
+                line = line.strip()
+                if line.startswith("out_time_us="):
+                    try:
+                        out_us = int(line.split("=", 1)[1])
+                        pct = min(99, max(0, int(out_us / 1_000_000 / duration_s * 100)))
+                    except (ValueError, ZeroDivisionError):
+                        continue
+                    now = time.monotonic()
+                    if on_progress and now - last_reported >= 1.0:
+                        on_progress(pct)
+                        last_reported = now
+            proc.wait(timeout=_EXPORT_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            tmp_path.unlink(missing_ok=True)
+            raise RuntimeError("editor export timed out")
+        finally:
+            stderr_thread.join(timeout=5)
+
+    if proc.returncode != 0:
+        tmp_path.unlink(missing_ok=True)
+        tail = "".join(stderr_tail)[-2000:]
+        raise RuntimeError(f"editor export failed (exit {proc.returncode}): {tail}")
+
+    if not tmp_path.exists() or tmp_path.stat().st_size == 0:
+        tmp_path.unlink(missing_ok=True)
+        raise RuntimeError("editor export produced no output")
+
+    # 转码这几十秒里 preview.mp4 被一次新的保存覆盖了——刚转出来的这份基于
+    # 已经过时的素材，绝不能冒充"新鲜结果"糊弄调用方（调用方靠 mtime 判断
+    # 缓存是否还新鲜，写一份基于旧素材、mtime 却是新的文件出去，会让下一次
+    # 请求误判成"已经是最新的"）。
+    after_stat = preview_path.stat()
+    if (after_stat.st_mtime_ns, after_stat.st_size) != (before_stat.st_mtime_ns, before_stat.st_size):
+        tmp_path.unlink(missing_ok=True)
+        raise RuntimeError("The video changed while you were exporting — try again.")
+
+    os.replace(tmp_path, out_path)
+    if on_progress:
+        on_progress(100)
+
+    _cleanup_old_exports(job_dir, keep=int(os.getenv("OM_EDITOR_EXPORT_KEEP", "3")))
+
+    out_w, out_h = resolve_export_dimensions(src_w, src_h, resolution)
+    return {
+        "filename": out_name,
+        "path": str(out_path),
+        "bytes": out_path.stat().st_size,
+        "width": out_w,
+        "height": out_h,
+        "resolution": resolution,
+        "quality": quality,
+    }
 
 
 # ============================================================================
