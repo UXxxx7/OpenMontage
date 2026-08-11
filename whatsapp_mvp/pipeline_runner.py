@@ -1515,7 +1515,18 @@ def _op_add_music(src: str, op: dict, workdir: Path) -> Optional[str]:
 
     from .music_providers import fetch_music_via
     music_path = workdir / "_bgm_source.mp3"
-    result = fetch_music_via(op.get("provider", "pixabay"), query, music_path)
+    # 编辑器保存（_finalize_pipeline_tail(..., reuse_music=True)）给 op 打上
+    # _reuse_cached_music 标记，表示同一个 job 之前已经成功配过一次这段
+    # BGM——直接复用磁盘上那份，不重新打一次 Pixabay 的 API（有 30s 量级的
+    # Cloudflare 重试，编辑器里改个字幕颜色这种无关改动也会白等这一下）。
+    # 一次全新的管线运行永远走 else 分支重新抓取。
+    if op.get("_reuse_cached_music") and music_path.exists() and music_path.stat().st_size > 0:
+        # 复用磁盘上现成的文件——没有新的抓取开销，cost_usd 记 0，同时保持
+        # 跟 fetch_music_via 一样的 {path, cost_usd} 字典形状（下面
+        # result.get("cost_usd") 依赖这个形状）。
+        result = {"path": music_path, "cost_usd": 0.0}
+    else:
+        result = fetch_music_via(op.get("provider", "pixabay"), query, music_path)
     if not result:
         raise RuntimeError(f"add_music: 没找到匹配「{query}」的背景音乐")
 
