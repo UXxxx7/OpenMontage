@@ -204,6 +204,107 @@ def run_talking_head_pipeline(job: Job) -> dict[str, Any]:
     }
 
 
+# ============================================================================
+# 浏览器编辑器"导出"——preview.mp4 的 ffmpeg 转码，不是重新走 Remotion 渲染。
+#
+# 两条臂产出的 preview.mp4 都已经是定稿画面（_finalize_pipeline_tail /
+# editor_render_authored 分别落的），下游只需要按分辨率/画质转码——不需要
+# 也不应该重新渲染：Arm A 的卡片几何是相对 1080 宽画布的绝对像素
+# （XiaojinEditorial.tsx 硬编码 fps/width/height，props 传了也不认），
+# Remotion 的 --width/--height 会把整个版式重新排一遍；转码只缩放已经定稿
+# 的像素，版式不变。转码也只需要 14-41s（实测），不占用 RENDER_SLOTS
+# 这个全局单槽信号量——那是给分钟级的 Remotion 渲染用的，见
+# whatsapp_mvp/concurrency.py 的 EXPORT_SLOTS 注释。
+# ============================================================================
+
+EXPORT_RESOLUTIONS = {"1080p": 1920, "720p": 1280}  # 目标长边（像素）
+EXPORT_QUALITIES = {
+    "high": {"crf": 18, "audio_kbps": 192},
+    "balanced": {"crf": 23, "audio_kbps": 128},
+    "small": {"crf": 28, "audio_kbps": 128},
+}
+EXPORT_PRESET = os.getenv("OM_EXPORT_PRESET", "medium")
+# 实测（job_d7d5c007bbc0，1080x1920/30fps/44.83s 真实 Remotion 输出）：固定
+# CRF 下 bits-per-pixel-per-frame 在两种分辨率间几乎不变（crf18: 0.0399 vs
+# 0.0438；crf23: 0.0222 vs 0.0224；crf28: 0.0114 vs 0.0115）——一张表能同时
+# 估两种分辨率，供 /export/options 在真正转码前给出可信的文件大小预估。
+EXPORT_BPP = {"high": 0.042, "balanced": 0.0225, "small": 0.0115}
+WHATSAPP_INLINE_LIMIT_BYTES = 16 * 1000 * 1000  # 十进制 MB 口径，跟 UI 显示一致
+
+
+def resolve_export_dimensions(src_w: int, src_h: int, resolution: str) -> tuple[int, int]:
+    """按目标分辨率的长边缩放源画幅，绝不放大，两边都保证是偶数（h264 +
+    yuv420p 色度采样要求）。估算器/命令构造/API 响应三处共用这一个函数，
+    保证它们对"最终到底是多少像素"永远不会各说各话。"""
+    if src_w <= 0 or src_h <= 0:
+        src_w, src_h = 1080, 1920
+    long_edge = max(src_w, src_h)
+    target = EXPORT_RESOLUTIONS[resolution]
+    if long_edge <= target:
+        w, h = src_w, src_h  # 源本来就更小/相等——绝不放大
+    else:
+        ratio = target / long_edge
+        if src_h >= src_w:  # 竖屏/方形：长边是高
+            w, h = round(src_w * ratio), target
+        else:  # 横屏：长边是宽
+            w, h = target, round(src_h * ratio)
+
+    def _even(n: int) -> int:
+        return max(2, n - (n % 2))
+
+    return _even(w), _even(h)
+
+
+def build_export_ffmpeg_cmd(src: Path, dst: Path, *, resolution: str, quality: str,
+                            src_w: int, src_h: int, threads: Optional[int] = None,
+                            progress: bool = False) -> list[str]:
+    """构造一次导出转码的完整 ffmpeg 命令。`resolution="1080p", quality="high"`
+    时刻意跟 run_final_export 原来的裸命令逐位一致（除了新增的 -nostdin）——
+    这就是重构安全性的证明：默认档位字节级不变，不是"看起来差不多"。
+
+    刻意不加的三个 flag，都是真实教训：
+    - 不加 -pix_fmt：Remotion 出的 preview.mp4 是 yuvj420p（full-range）,
+      强转 yuv420p 会让 swscale 做一次 full→limited 的电平转换，下载下来
+      的版本亮度/对比度会跟用户在预览里看到的那版肉眼可见地不一样。
+    - 不加 -r：源是恒定 30/1 fps，-r 会插一层帧率滤镜，非整数倍时机 duplicate/
+      drop 帧，"不提供 fps 选项"这个产品决定的自然推论是"也别悄悄改 fps"。
+    - 不加 -ar：ensure_editor_preview_video 的 44100 是给浏览器 Player 绕
+      Chrome WebAudio 的 bug，源本身是 48kHz——对一份要下载走的母版重采样
+      纯粹是信号损失，没有对应的收益。
+    """
+    if resolution not in EXPORT_RESOLUTIONS:
+        raise ValueError(f"unknown export resolution: {resolution!r}")
+    if quality not in EXPORT_QUALITIES:
+        raise ValueError(f"unknown export quality: {quality!r}")
+
+    q = EXPORT_QUALITIES[quality]
+    out_w, out_h = resolve_export_dimensions(src_w, src_h, resolution)
+    cmd = ["ffmpeg", "-nostdin", "-y", "-i", str(src)]
+    if (out_w, out_h) != (src_w, src_h):
+        # lanczos 而不是默认 bicubic——这条流水线的画面是文字卡片为主，
+        # 1080->720 下采样时 bicubic 会明显软化文字边缘。
+        cmd += ["-vf", f"scale={out_w}:{out_h}:flags=lanczos"]
+    cmd += ["-c:v", "libx264", "-crf", str(q["crf"]), "-preset", EXPORT_PRESET]
+    if threads:
+        cmd += ["-threads", str(threads)]
+    cmd += ["-c:a", "aac", "-b:a", f"{q['audio_kbps']}k", "-movflags", "+faststart"]
+    if progress:
+        cmd += ["-progress", "pipe:1", "-nostats", "-loglevel", "error"]
+    cmd += [str(dst)]
+    return cmd
+
+
+def estimate_export_bytes(*, resolution: str, quality: str, src_w: int, src_h: int,
+                          fps: float, duration_s: float) -> int:
+    """转码前的文件大小预估——纯算术，不跑 ffmpeg。见 EXPORT_BPP 头部注释，
+    误差带在实测数据上验证过在 ±25% 以内（test_export.py）。"""
+    out_w, out_h = resolve_export_dimensions(src_w, src_h, resolution)
+    bpp = EXPORT_BPP[quality]
+    video_bits = bpp * out_w * out_h * fps * duration_s
+    audio_bits = EXPORT_QUALITIES[quality]["audio_kbps"] * 1000 * duration_s
+    return int((video_bits + audio_bits) / 8)
+
+
 def run_final_export(job: Job) -> dict[str, Any]:
     """最终导出：基于预览重新编码为 final.mp4（+faststart 便于流式播放）。"""
     job_dir = job.job_dir
@@ -216,13 +317,10 @@ def run_final_export(job: Job) -> dict[str, Any]:
         preview_path = Path(result["preview_path"])
 
     logger.info(f"最终导出: {preview_path} → {final_path}")
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", str(preview_path),
-         "-c:v", "libx264", "-crf", "18", "-preset", "medium",
-         "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
-         str(final_path)],
-        capture_output=True, check=True,
-    )
+    src_w, src_h = _probe_dimensions(preview_path)
+    cmd = build_export_ffmpeg_cmd(preview_path, final_path, resolution="1080p", quality="high",
+                                  src_w=src_w, src_h=src_h)
+    subprocess.run(cmd, capture_output=True, check=True)
     logger.info(f"最终导出完成: {final_path}")
     return {"final_path": str(final_path)}
 
