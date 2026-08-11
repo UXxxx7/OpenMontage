@@ -61,6 +61,7 @@ const worker = new Worker(queueName, async (job) => {
       case "voice-clone-create": return voiceCloneCreate(job.data);
       case "confirm-job": return confirmJob(job.data);
       case "render-job": return renderJob(job.data);
+      case "editor-save": return editorSave(job.data);
       case "cancel-job": return cancelJob(job.data);
       case "retry-job": return retryJob(job.data);
       case "revise-job": return reviseJob(job.data);
@@ -363,6 +364,27 @@ async function renderJob({ waNumber, jobId }) {
     throw new Error(status.error_message || "Python render failed");
   }
   // 成品通常 > 16MB，超出 WhatsApp 视频消息上限，统一以链接投递（走 PUBLIC_BASE_URL）
+  await deliverStageResult(waNumber, jobId, status, lang);
+}
+
+// 浏览器编辑器"保存"触发的渲染完成后投递——跟 confirmJob/renderJob 不同，
+// 渲染本身已经由 index.js 的 POST /api/editor/:jobId/props(或 /overrides)
+// 处理器同步触发过了（浏览器端已经在展示"渲染中"），这里只负责等它跑完、
+// 把结果发回 WhatsApp，不重复发起、不发"已开始"提示、也不碰 disarmIdle/
+// activeJobKey——那些是对话式流程（确认/导出）的概念，编辑器保存跟当前
+// 会话状态无关。webhook.py 的 editor_post_props 在后台线程起跑前已经同步
+// 把状态设成 RUNNING_PIPELINE（见其自身注释），所以这里等到的
+// PREVIEW_READY 不可能是渲染前残留的旧状态。
+async function editorSave({ waNumber, jobId }) {
+  const before = await getPythonJob(jobId).catch(() => null);
+  const lang = resolveLang(DEFAULT_LANG, before?.edit_request);
+  const status = await waitForStatus(jobId,
+    ["PREVIEW_READY", "ERROR"],
+    Number(env("WA_EDITOR_SAVE_TIMEOUT_MS", "1200000")), { waNumber, lang });
+  if (!status) return;
+  if (status.status === "ERROR") {
+    throw new Error(status.error_message || "Editor save render failed");
+  }
   await deliverStageResult(waNumber, jobId, status, lang);
 }
 
