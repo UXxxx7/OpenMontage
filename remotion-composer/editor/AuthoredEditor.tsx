@@ -19,6 +19,7 @@ import { AuthoredPreview } from "./components/Authored/AuthoredPreview";
 import { AuthoredInspectorBody } from "./components/Authored/AuthoredInspectorBody";
 import { AuthoredPhoneShell } from "./components/Phone/AuthoredPhoneShell";
 import { useMediaQuery } from "./state/useMediaQuery";
+import { apiGet, apiPost } from "./api";
 
 // Matches App.tsx's own PHONE_BREAKPOINT_QUERY exactly — a mismatch would
 // size touch-target rules for the wrong shell right at the boundary.
@@ -58,28 +59,6 @@ type AuthoredData = {
 };
 
 type SaveState = "idle" | "saving" | "rendering" | "done" | "failed";
-
-async function apiGet(path: string, token: string) {
-  const resp = await fetch(`${path}?token=${encodeURIComponent(token)}`);
-  const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error(data?.detail || `HTTP ${resp.status}`);
-  return data;
-}
-
-async function apiPost(path: string, token: string, body: unknown): Promise<any> {
-  const resp = await fetch(`${path}?token=${encodeURIComponent(token)}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) {
-    const err = new Error(data?.detail || `HTTP ${resp.status}`) as Error & { status?: number };
-    err.status = resp.status;
-    throw err;
-  }
-  return data;
-}
 
 const NATIVE_W = 1080;
 const NATIVE_H = 1920;
