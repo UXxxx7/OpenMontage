@@ -200,6 +200,39 @@ app.post("/api/editor/:jobId/relayout", async (req, res) => {
   }
 });
 
+// 上传自己的背景音乐——跟 /api/social-batch 同一个"原样转发请求流"模式
+// （见那条路由自己的注释），不是 /props 那种先解析 JSON 再转发的形状：
+// multipart 请求体必须原封不动地带着它的 boundary 一路转发给 Python 的
+// UploadFile 自己解析，Express 这层完全不碰它。
+app.post("/api/editor/:jobId/music", async (req, res) => {
+  const upstream = `${PYTHON_API_BASE}/editor/${encodeURIComponent(req.params.jobId)}/music`
+    + `?token=${encodeURIComponent(req.query.token || "")}`;
+  try {
+    const upstreamRes = await axios.post(upstream, req, {
+      headers: { "content-type": req.headers["content-type"] },
+      maxBodyLength: Infinity, maxContentLength: Infinity,
+      timeout: Number(env("WA_PYTHON_CREATE_TIMEOUT_MS", "180000")),
+      validateStatus: () => true,
+    });
+    res.status(upstreamRes.status).json(upstreamRes.data);
+  } catch (err) {
+    console.error("[editor-api] music upload failed:", err.message);
+    res.sendStatus(502);
+  }
+});
+
+app.delete("/api/editor/:jobId/music", async (req, res) => {
+  const upstream = `${PYTHON_API_BASE}/editor/${encodeURIComponent(req.params.jobId)}/music`
+    + `?token=${encodeURIComponent(req.query.token || "")}`;
+  try {
+    const upstreamRes = await axios.delete(upstream, { validateStatus: () => true });
+    res.status(upstreamRes.status).json(upstreamRes.data);
+  } catch (err) {
+    console.error("[editor-api] music delete failed:", err.message);
+    res.sendStatus(502);
+  }
+});
+
 app.post("/api/editor/:jobId/props", async (req, res) => {
   const jobId = req.params.jobId;
   const upstream = `${PYTHON_API_BASE}/editor/${encodeURIComponent(jobId)}/props`
