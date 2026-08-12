@@ -27,7 +27,7 @@ import Ajv2020 from "ajv/dist/2020";
 import { useMemo } from "react";
 import { loadFont as loadInter } from "@remotion/google-fonts/Inter";
 import { loadFont as loadNotoSansTC } from "@remotion/google-fonts/NotoSansTC";
-import { AbsoluteFill, CalculateMetadataFunction, getRemotionEnvironment } from "remotion";
+import { AbsoluteFill, Audio, CalculateMetadataFunction, getRemotionEnvironment } from "remotion";
 import { computeOutputDuration, mapPropsForCuts, normalizeCuts } from "./cuts";
 import renderPropsSchema from "../../contracts/render_props.schema.json";
 
@@ -197,8 +197,12 @@ export interface XiaojinEditorialProps extends Record<string, unknown> {
   durationSeconds: number;
   /** Editor-authored razor cuts (source-video frames). Absent/empty = untrimmed. See ./cuts.ts. */
   videoCuts?: import("./cuts").VideoCut[];
-  /** Speaker video playback volume, 0-1. Absent/undefined = full volume (every job before this field existed is unaffected). Does not affect the music bed — that's mixed post-render, see whatsapp_mvp/pipeline_runner.py's musicVolume handling. */
+  /** Speaker video playback volume, 0-1. Absent/undefined = full volume (every job before this field existed is unaffected). Does not affect the music bed — see musicSrc/musicVolume. */
   videoVolume?: number;
+  /** URL of a user-uploaded background music track (editor's Audio panel) — rendered live via a real <Audio> element below, so it IS audible both in the editor Player and in the final render. Server-pinned (whatsapp_mvp/pipeline_runner.py's pin_music_src_prop); a client can never set this to an arbitrary URL that survives a save. Absent = no uploaded track; the AI planner's Pixabay-query music bed (a completely separate mechanism, mixed post-render by ffmpeg) may still apply and is NOT reflected here. */
+  musicSrc?: string;
+  /** Volume for whichever music bed is active, 0-0.4. When musicSrc is set this is this component's own <Audio volume>; when it's absent it only affects the post-render Pixabay mix (see whatsapp_mvp/pipeline_runner.py's _op_add_music) and has no effect in this component. */
+  musicVolume?: number;
   colorMode: ColorMode;
   /** Calibrated per source video — see SpeakerCard's doc comment. Required, no safe default. */
   speakerObjectPosition: string;
@@ -341,6 +345,8 @@ export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = (rawProps) => {
   const {
     videoSrc,
     videoVolume,
+    musicSrc,
+    musicVolume,
     colorMode,
     speakerObjectPosition,
     scenes,
@@ -411,6 +417,14 @@ export const XiaojinEditorial: React.FC<XiaojinEditorialProps> = (rawProps) => {
 
   return (
     <AbsoluteFill style={{ background: bg }}>
+      {/* User-uploaded background music (editor Audio panel) — a real
+          <Audio> element so it's audible live in the editor Player, not
+          just baked in at the very end like the AI planner's Pixabay-query
+          bed (see musicSrc's own doc comment on XiaojinEditorialProps).
+          0.18 default matches whatsapp_mvp/pipeline_runner.py's
+          _op_add_music default exactly, so switching between an uploaded
+          track and the Pixabay bed doesn't also silently jump the volume. */}
+      {musicSrc ? <Audio src={musicSrc} volume={musicVolume ?? 0.18} /> : null}
       {/* Full-canvas section takeovers render FIRST — they are backgrounds;
           the card, graphics and chrome all sit above them. */}
       {sections?.length ? (

@@ -23,6 +23,8 @@ export function ProjectInspector({
   cuts,
   sourceDurationFrames,
   onCutsChange,
+  jobId,
+  token,
 }: {
   schema: JSONSchema;
   props: Record<string, unknown>;
@@ -32,6 +34,8 @@ export function ProjectInspector({
   cuts: VideoCut[];
   sourceDurationFrames: number;
   onCutsChange: (next: VideoCut[]) => void;
+  jobId: string;
+  token: string;
 }) {
   const [openGroup, setOpenGroup] = useState<string | null>(null);
 
@@ -85,7 +89,7 @@ export function ProjectInspector({
 
         <div className="section">
           <div className="section__title">Audio</div>
-          <AudioPanel props={props} onChange={onChange} />
+          <AudioPanel props={props} onChange={onChange} jobId={jobId} token={token} />
         </div>
 
         <div className="section">

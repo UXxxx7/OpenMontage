@@ -544,6 +544,9 @@ body {
 .volume-row input[type="range"] { flex: 1; accent-color: var(--accent); }
 .volume-row__value { min-width: 36px; text-align: right; font-family: var(--mono); font-size: 11px; color: var(--fg-1); }
 
+.audio-upload { display: flex; align-items: center; gap: 8px; }
+.audio-upload__player { flex: 1; height: 32px; min-width: 0; }
+
 .field__error {
   font-size: 10px;
   color: var(--danger);

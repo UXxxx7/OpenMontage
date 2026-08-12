@@ -35,6 +35,7 @@ import { PhoneSheet } from "./PhoneSheet";
  */
 export function PhoneShell({
   jobId,
+  token,
   jobStatus,
   schema,
   props,
@@ -75,6 +76,8 @@ export function PhoneShell({
   waveformUrl,
 }: {
   jobId: string;
+  /** Threaded down to AudioPanel for the music upload control's routes. */
+  token: string;
   jobStatus: string;
   schema: JSONSchema;
   props: Record<string, unknown>;
@@ -299,7 +302,7 @@ export function PhoneShell({
 
       {activeSheet === "audio" && (
         <PhoneSheet title="Audio" onClose={() => setActiveSheet(null)}>
-          <AudioPanel props={props} onChange={onFieldChange} />
+          <AudioPanel props={props} onChange={onFieldChange} jobId={jobId} token={token} />
         </PhoneSheet>
       )}
     </div>

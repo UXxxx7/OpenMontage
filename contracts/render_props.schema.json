@@ -105,13 +105,17 @@
       "minimum": 0,
       "maximum": 1,
       "default": 1,
-      "description": "Playback volume of the source speaker video, 0-1. Absent or 1 = unchanged — every job before this field existed rendered at full volume, and this is a no-op default. Live in the editor Player (a real <OffthreadVideo volume> prop). Does not affect the background music bed — see musicVolume, which is mixed post-render by ffmpeg and NOT audible in the editor preview."
+      "description": "Playback volume of the source speaker video, 0-1. Absent or 1 = unchanged — every job before this field existed rendered at full volume, and this is a no-op default. Live in the editor Player (a real <OffthreadVideo volume> prop). Does not affect the background music bed — see musicVolume/musicSrc."
+    },
+    "musicSrc": {
+      "type": "string",
+      "description": "URL of a user-uploaded background music track (browser editor's Audio panel). Rendered live via a real <Audio> element, so IS audible in the editor preview — unlike the AI planner's Pixabay-query music bed, which is mixed post-render by ffmpeg and never reaches this field. Server-pinned: whatsapp_mvp/pipeline_runner.py's pin_music_src_prop always overwrites whatever a client submits with the actual on-disk uploaded file's URL (or drops the field if nothing was uploaded) — the same trust model as videoSrc. Never set this by hand from client code; it only round-trips through the editor's upload/GET-props flow."
     },
     "musicVolume": {
       "type": "number",
       "minimum": 0,
       "maximum": 0.4,
-      "description": "Background music level for the editor save path, 0-0.4. Absent = leave the content-planning pipeline's own music choice untouched. 0 = drop the music bed entirely. Mixed post-render by ffmpeg (whatsapp_mvp/pipeline_runner.py's _op_add_music), so it is NOT audible in the editor's live preview — the editor UI must say so explicitly."
+      "description": "Background music level, 0-0.4. Absent = leave the content-planning pipeline's own music choice untouched. 0 = drop the music bed entirely. Applies to whichever bed is actually active: if musicSrc is set (a user upload), this is the live <Audio volume> and IS audible in the editor preview; otherwise it's the AI-planned Pixabay track, mixed post-render by ffmpeg (whatsapp_mvp/pipeline_runner.py's _op_add_music) and NOT audible in the editor's live preview."
     },
     "colorMode": {
       "type": "string",

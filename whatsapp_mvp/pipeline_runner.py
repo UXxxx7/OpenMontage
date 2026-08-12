@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import copy
 import difflib
 import json
 import logging
@@ -3500,6 +3501,9 @@ def _remotion_render_props(props_path: Path, out: Path, remotion_dir: Path, *,
         logger.error(f"apply_style render stderr: {last_result.stderr[-4000:]}")
         raise RuntimeError(f"apply_style 渲染失败 (exit {last_result.returncode})")
 
+    return str(out) if out.exists() else None
+
+
 _ASSET_PINNED_TOP_LEVEL = ("videoSrc", "durationSeconds")
 
 
@@ -3543,6 +3547,31 @@ def pin_server_owned_props(user_props: dict, disk_props: dict) -> dict:
         else:
             props.pop("qrContact", None)
 
+    return props
+
+
+def pin_music_src_prop(props: dict, job_dir: Path, job_id: str) -> dict:
+    """`musicSrc`（浏览器上传的背景音乐）的钉死规则，跟上面
+    `pin_server_owned_props` 那几个字段是不同的信任来源——那几个信的是
+    "服务端自己上一次写盘的 `disk_props`"，这个信的是"`job_dir` 底下现在
+    到底有没有一份真实上传的音乐文件"（`editor_post_music`/
+    `editor_delete_music` 是唯一能改变这个磁盘事实的两个入口，两者都在
+    `_require_editor_token` 之后）。客户端提交的 `musicSrc` 不管是什么，
+    这里都会被直接覆盖或整个丢弃——理由跟 `videoSrc` 完全一致：这个字符串
+    最终会被 Remotion 组合当资源 URL 加载（`<Audio src=...>`），不锁死就是
+    又一条本地任意文件读取/SSRF 通道。
+
+    独立成一个函数、不塞进 `pin_server_owned_props`：那个函数的"钉死"全部
+    来自内存里已经有的 `disk_props` 字典，这个需要一次真实的 glob 磁盘
+    调用，混在一起会让"这个字段到底信什么"变得不直观。
+    """
+    props = dict(props)
+    music_file = next((p for p in job_dir.glob("_editor_music.*") if p.is_file()), None)
+    if music_file is not None:
+        base = get_config().local_api_base.rstrip("/")
+        props["musicSrc"] = f"{base}/files/{job_id}/{music_file.name}"
+    else:
+        props.pop("musicSrc", None)
     return props
 
 
@@ -3858,6 +3887,7 @@ def render_props_directly(job: Job, user_props: dict, *,
             disk_props = {}
 
     props = pin_server_owned_props(user_props, disk_props)
+    props = pin_music_src_prop(props, job_dir, job.id)
     props = _clamp_video_cuts(props, disk_props)
     # contentBeats 在 XiaojinEditorial.tsx 里被解构读取，但从未被加进 schema
     # （schema 是 additionalProperties:false）——任何带着它的 props 都会在
@@ -3910,9 +3940,17 @@ def render_props_directly(job: Job, user_props: dict, *,
 
     plan = _load_plan(job)
     operations = plan.get("edit_operations", [])
-    music_op = next((o for o in operations if o.get("type") == "add_music"), None)
     subtitle_op = next((o for o in operations if o.get("type") == "add_subtitles"), None)
-    music_op = apply_editor_music_volume(music_op, props.get("musicVolume"))
+    if props.get("musicSrc"):
+        # 用户上传了自己的背景音乐——已经作为 <Audio> 元素烘焙进刚刚渲染的
+        # styled.mp4 本身（Remotion 组合层面），不能再叠加跑一遍下面这段
+        # AI 规划器的 Pixabay 关键词配乐后期混音，否则会是两条互不相关的
+        # 背景音乐同时在响。上传音乐在这条编辑器保存路径上完全取代旧的
+        # add_music op，而不是与它共存。
+        music_op = None
+    else:
+        music_op = next((o for o in operations if o.get("type") == "add_music"), None)
+        music_op = apply_editor_music_volume(music_op, props.get("musicVolume"))
     result = _finalize_pipeline_tail(job_dir, styled, subtitle_op=subtitle_op, music_op=music_op,
                                      applied=["apply_style"], degraded=[], job_id=job.id,
                                      reuse_music=True)

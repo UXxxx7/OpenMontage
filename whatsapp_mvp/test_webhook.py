@@ -30,7 +30,7 @@ import pytest
 from starlette.datastructures import UploadFile
 
 import whatsapp_mvp.webhook as webhook
-from whatsapp_mvp.job_manager import get_assets, get_job, get_session
+from whatsapp_mvp.job_manager import create_job, get_assets, get_job, get_or_create_user, get_session
 from whatsapp_mvp.database import Job
 
 
@@ -185,3 +185,69 @@ def test_transcribe_endpoint_handles_empty_transcription_result():
         result = asyncio.run(webhook.transcribe_endpoint(audio=_upload("voice.ogg", b"fake-ogg-bytes")))
 
     assert result["text"] == ""
+
+
+# GET /files/{job_id}/{filename} 路径穿越回归测试。
+#
+# 确认过真实可复现：file_path = job.job_dir / filename 没有任何包含性检查，
+# {filename} 编译成 [^/]+（不允许正斜杠），但不挡反斜杠——Windows 上
+# pathlib 把反斜杠当成路径分隔符处理，filename="..\\..\\..\\.env" 能干净地
+# 解析到 job_dir 之外，实测直接读出了这个仓库真正的 .env（API key）和
+# sqlite 数据库（每个用户的 WhatsApp 号码）。这条路由本身无鉴权（job_id
+# 就是唯一的"能力凭证"），经 ngrok 隧道对外可达。
+
+@pytest.fixture
+def real_job(cleanup_jobs):
+    """跟其它端点测试一样直接建一条真实 job（不 mock get_job），因为
+    serve_file 的漏洞就在 job.job_dir 之外那一层，必须是真实磁盘路径。"""
+    user = get_or_create_user("traversal_test_user")
+    job = create_job(user_id=user.id)
+    cleanup_jobs.append(job.id)
+    return job
+
+
+def test_serve_file_rejects_windows_backslash_traversal(real_job):
+    with pytest.raises(webhook.HTTPException) as exc_info:
+        webhook.serve_file(real_job.id, "..\\..\\..\\.env")
+    assert exc_info.value.status_code == 404
+
+
+def test_serve_file_rejects_forward_slash_traversal(real_job):
+    with pytest.raises(webhook.HTTPException) as exc_info:
+        webhook.serve_file(real_job.id, "../../../.env")
+    assert exc_info.value.status_code == 404
+
+
+def test_serve_file_rejects_absolute_windows_path(real_job):
+    with pytest.raises(webhook.HTTPException) as exc_info:
+        webhook.serve_file(real_job.id, "C:\\Windows\\win.ini")
+    assert exc_info.value.status_code == 404
+
+
+def test_serve_file_rejects_traversal_to_the_database(real_job):
+    """.env 之外，第二个真实敏感目标：sqlite 数据库本身。"""
+    with pytest.raises(webhook.HTTPException) as exc_info:
+        webhook.serve_file(real_job.id, "..\\..\\..\\openmontage_whatsapp.db")
+    assert exc_info.value.status_code == 404
+
+
+def test_serve_file_still_serves_a_real_file_inside_job_dir(real_job):
+    """安全修复不能连正常路径一起挡掉——这是回归防护，不是新增行为。"""
+    (real_job.job_dir / "preview.mp4").write_bytes(b"fake-mp4-bytes")
+    response = webhook.serve_file(real_job.id, "preview.mp4")
+    assert response.media_type == "video/mp4"
+
+
+def test_serve_file_rejects_nonexistent_file(real_job):
+    with pytest.raises(webhook.HTTPException) as exc_info:
+        webhook.serve_file(real_job.id, "does_not_exist.mp4")
+    assert exc_info.value.status_code == 404
+
+
+def test_serve_file_rejects_a_directory(real_job):
+    """filename 指向一个目录（而不是文件）也必须 404，不能让 FileResponse
+    拿一个目录路径去尝试打开报出别的错误类型。"""
+    (real_job.job_dir / "assets").mkdir(parents=True, exist_ok=True)
+    with pytest.raises(webhook.HTTPException) as exc_info:
+        webhook.serve_file(real_job.id, "assets")
+    assert exc_info.value.status_code == 404
