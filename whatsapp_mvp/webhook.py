@@ -1165,6 +1165,8 @@ def _rewrite_props_for_browser(props: dict, job=None) -> dict:
     if props.get("qrContact"):
         props["qrContact"] = {**props["qrContact"],
                               "qrSrc": _rewrite_asset_url(props["qrContact"].get("qrSrc"))}
+    if props.get("musicSrc"):
+        props["musicSrc"] = _rewrite_asset_url(props["musicSrc"])
     # Seed the editor's music-volume slider from the plan's own add_music op
     # — musicVolume isn't part of render_props on disk (it's an editor-only
     # override consumed by render_props_directly), so without this the
@@ -1461,6 +1463,92 @@ def editor_waveform(job_id: str, token: str = Query("")):
     return {"waveform": _rewrite_asset_url(f"{base}/files/{job_id}/{path.name}")}
 
 
+_EDITOR_MUSIC_MAX_BYTES = int(os.getenv("OM_EDITOR_MUSIC_MAX_BYTES", str(20 * 1000 * 1000)))
+# content-type -> 落盘扩展名。浏览器有时候猜不准（尤其 .m4a/.aac 这类容器
+# 格式），下面 editor_post_music 会在这张表未命中时退一步看文件名自带的
+# 扩展名，只要落在同一份白名单集合里就放行——两条路径共用同一个允许集，
+# 不会出现"文件名判定通过了但 content-type 判定的白名单更窄"这种缝隙。
+_EDITOR_MUSIC_CONTENT_TYPES = {
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/wave": ".wav",
+    "audio/mp4": ".m4a",
+    "audio/x-m4a": ".m4a",
+    "audio/aac": ".aac",
+    "audio/ogg": ".ogg",
+}
+_EDITOR_MUSIC_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".ogg"}
+
+
+def _find_editor_music_file(job_dir: Path) -> Optional[Path]:
+    """一个 job 同时最多一份上传的背景音乐——`_editor_music.*`，任何一次新
+    上传都会先删掉这一份再写新的（editor_post_music），所以这里最多只会
+    匹配到 0 或 1 个文件；用 glob 而不是硬编码某个扩展名，是因为上传格式
+    可以在两次上传之间变化（这次是 .mp3，下次换成 .wav）。"""
+    for p in job_dir.glob("_editor_music.*"):
+        if p.is_file():
+            return p
+    return None
+
+
+@app.post("/editor/{job_id}/music")
+async def editor_post_music(job_id: str, token: str = Query(""), file: UploadFile = File(...)):
+    """浏览器编辑器上传自己的背景音乐——跟 AI 规划器的 Pixabay 关键词配乐
+    完全独立的第二条路径（那条是 `_op_add_music`，按查询词搜索 + 渲染后
+    ffmpeg 混音，预览里听不见）。上传的这份改为渲染进 Remotion 合成本身的
+    一个 `<Audio>` 元素——预览里就能听见，也没有理由再跑一遍旧的
+    post-render 混音（见 pin_music_src_prop / render_props_directly 里
+    "musicSrc 存在时跳过 music_op" 的分支）。
+
+    一个 job 同时只保留一份上传：新上传直接顶替旧的（`_find_editor_music_file`
+    先删再写），不是一个多曲目素材库——多轨管理是這个功能明显超出范围的
+    下一步，不是这一版要做的事。
+    """
+    job = _require_editor_token(job_id, token)
+
+    ext = _EDITOR_MUSIC_CONTENT_TYPES.get((file.content_type or "").lower())
+    if ext is None:
+        suffix = Path(file.filename or "").suffix.lower()
+        if suffix in _EDITOR_MUSIC_EXTENSIONS:
+            ext = suffix
+    if ext is None:
+        raise HTTPException(status_code=400,
+                            detail="Unsupported audio format — use MP3, WAV, M4A, AAC, or OGG")
+
+    # 读取时就地封顶，不是先整个吃进内存再检查长度——恶意/失误的超大文件
+    # 不该先把请求体全読完才报错。多读 1 字节纯粹是用来判断"是否超限"，
+    # 不代表真的允许这 1 字节落盘。
+    data = await file.read(_EDITOR_MUSIC_MAX_BYTES + 1)
+    if len(data) > _EDITOR_MUSIC_MAX_BYTES:
+        raise HTTPException(status_code=413,
+                            detail=f"File too large — max {_EDITOR_MUSIC_MAX_BYTES // 1_000_000} MB")
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    job.job_dir.mkdir(parents=True, exist_ok=True)
+    existing = _find_editor_music_file(job.job_dir)
+    if existing is not None:
+        existing.unlink(missing_ok=True)
+
+    dest = job.job_dir / f"_editor_music{ext}"
+    dest.write_bytes(data)
+
+    base = get_config().local_api_base.rstrip("/")
+    music_url = _rewrite_asset_url(f"{base}/files/{job_id}/{dest.name}")
+    return {"filename": dest.name, "music_url": music_url, "bytes": len(data)}
+
+
+@app.delete("/editor/{job_id}/music")
+def editor_delete_music(job_id: str, token: str = Query("")):
+    job = _require_editor_token(job_id, token)
+    existing = _find_editor_music_file(job.job_dir)
+    if existing is not None:
+        existing.unlink(missing_ok=True)
+    return {"deleted": existing is not None}
+
+
 @app.post("/jobs/{job_id}/editor_token")
 async def create_editor_token_endpoint(job_id: str):
     """给 Node 网关用：预览就绪时调一次，拿一条可以直接发给用户的编辑器
@@ -1526,6 +1614,14 @@ def serve_file(job_id: str, filename: str):
         media_type = "image/png"
     elif filename.endswith(".mp3"):
         media_type = "audio/mpeg"  # voice_clone.py 合成的克隆音色音频，HeyGen 靠这个 URL 抓取
+    elif filename.endswith(".wav"):
+        media_type = "audio/wav"
+    elif filename.endswith(".m4a"):
+        media_type = "audio/mp4"
+    elif filename.endswith(".aac"):
+        media_type = "audio/aac"
+    elif filename.endswith(".ogg"):
+        media_type = "audio/ogg"
     else:
         media_type = "application/octet-stream"
     return FileResponse(str(file_path), media_type=media_type)
