@@ -29,6 +29,8 @@ export function Inspector({
   cuts,
   sourceDurationFrames,
   onCutsChange,
+  jobId,
+  token,
 }: {
   schema: JSONSchema;
   props: Record<string, unknown>;
@@ -46,6 +48,9 @@ export function Inspector({
   cuts: VideoCut[];
   sourceDurationFrames: number;
   onCutsChange: (next: VideoCut[]) => void;
+  /** Threaded down to ProjectInspector -> AudioPanel for the music upload control. */
+  jobId: string;
+  token: string;
 }) {
   const rootClass = `inspector app__inspector${className ? ` ${className}` : ""}`;
 
@@ -70,6 +75,8 @@ export function Inspector({
             cuts={cuts}
             sourceDurationFrames={sourceDurationFrames}
             onCutsChange={onCutsChange}
+            jobId={jobId}
+            token={token}
           />
         </div>
       );
@@ -108,6 +115,8 @@ export function Inspector({
         cuts={cuts}
         sourceDurationFrames={sourceDurationFrames}
         onCutsChange={onCutsChange}
+        jobId={jobId}
+        token={token}
       />
     </div>
   );

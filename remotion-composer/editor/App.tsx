@@ -634,6 +634,7 @@ function Editor({
       <>
         <PhoneShell
           jobId={jobId}
+          token={token}
           jobStatus={jobStatus}
           schema={schema}
           props={props}
@@ -724,6 +725,8 @@ function Editor({
         cuts={cuts}
         sourceDurationFrames={sourceDurationFrames}
         onCutsChange={handleCutsChange}
+        jobId={jobId}
+        token={token}
       />
 
       <div
