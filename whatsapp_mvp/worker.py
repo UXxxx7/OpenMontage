@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -527,6 +528,75 @@ def editor_render_authored(job_id: str) -> None:
             marker["state"] = "idle"
             marker["pending_overrides"] = None
             _write_editor_marker(job2, marker)
+
+
+def editor_export(job_id: str) -> None:
+    """预览编辑器"导出"的后台执行入口。跟 editor_render 同样的合并
+    （coalescing）结构，取的是 editor_markers.json 的 pending（一份
+    {"resolution","quality"}），但状态机故意窄很多——导出不是管线阶段，
+    从不调 update_job_fields/update_job_status：Node 的 waitForStatus 只认
+    job 状态的变化来决定要不要给用户发消息，导出这种纯粹的"转码一份下载
+    文件"动作去改 job 状态，会被误当成一次新的预览就绪而重复推送。"""
+    logger.info(f"预览编辑器导出 {job_id}")
+    job = get_job(job_id)
+    if job is None:
+        return
+
+    from .editor_markers import read_export_marker, write_export_marker
+    from .pipeline_runner import run_editor_export
+
+    try:
+        while True:
+            marker = read_export_marker(job.job_dir)
+            combo = marker["pending"]
+            if combo is None:
+                break
+            # 同样先摘掉再编码：编码完成时才能干净区分"刚取出的这份"和
+            # "编码期间又被新请求刷新过"。
+            marker["pending"] = None
+            marker["state"] = "encoding"
+            marker["current"] = combo
+            marker["progress"] = 0
+            marker["error"] = None
+            marker["started_at"] = time.time()
+            write_export_marker(job.job_dir, marker)
+
+            job = get_job(job_id)
+            if job is None:
+                return
+
+            def _report_progress(pct: int) -> None:
+                m = read_export_marker(job.job_dir)
+                m["progress"] = pct
+                write_export_marker(job.job_dir, m)
+
+            try:
+                run_editor_export(job, combo["resolution"], combo["quality"],
+                                  on_progress=_report_progress)
+            except Exception as e:
+                logger.exception(f"预览编辑器导出出错 {job_id}: {e}")
+                marker = read_export_marker(job.job_dir)
+                marker["state"] = "failed"
+                marker["error"] = str(e)[:500]
+                write_export_marker(job.job_dir, marker)
+                continue
+
+            marker = read_export_marker(job.job_dir)
+            marker["state"] = "done"
+            marker["progress"] = 100
+            write_export_marker(job.job_dir, marker)
+    finally:
+        # 循环退出时一律把状态收回 idle——理由同 editor_render：POST /export
+        # 靠 state=="encoding" 判断要不要合并而不是起新任务，这里不收回的话
+        # 下一次导出请求会永远走合并分支，实际上再也不会真正触发编码。
+        job2 = get_job(job_id)
+        if job2 is not None:
+            marker = read_export_marker(job2.job_dir)
+            if marker["state"] == "encoding":
+                marker["state"] = "idle"
+            marker["pending"] = None
+            write_export_marker(job2.job_dir, marker)
+
 
 # ---------------------------------------------------------------------------
 # C-roll：照片 -> AI 文案 -> HeyGen 数字人说话视频 -> 接入常规剪辑管线

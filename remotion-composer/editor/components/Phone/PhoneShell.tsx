@@ -17,6 +17,8 @@ import { AudioPanel } from "../Inspector/AudioPanel";
 import { PhoneTopBar } from "./PhoneTopBar";
 import { PhoneActionBar, ARM_A_SHEET_ITEMS, type PhoneSheetKind } from "./PhoneActionBar";
 import { PhoneSheet } from "./PhoneSheet";
+import { ExportDialogBody } from "../Export/ExportDialogBody";
+import type { UseExportReturn } from "../../state/useExport";
 
 /**
  * Phone-first shell (Phase 6, F2) — a dedicated portrait layout, not a
@@ -73,6 +75,8 @@ export function PhoneShell({
   hasItemError,
   filmstripUrls,
   waveformUrl,
+  exportX,
+  token,
 }: {
   jobId: string;
   jobStatus: string;
@@ -113,6 +117,8 @@ export function PhoneShell({
   hasItemError: (section: string, index: number) => boolean;
   filmstripUrls: string[];
   waveformUrl: string | null;
+  exportX: UseExportReturn;
+  token: string;
 }) {
   const [activeSheet, setActiveSheet] = useState<PhoneSheetKind>(null);
   const [timelineViewMode, setTimelineViewMode] = useState<"type" | "layers">("type");
@@ -164,6 +170,10 @@ export function PhoneShell({
 
   const openSheet = (kind: Exclude<PhoneSheetKind, null>) => {
     setActiveSheet((cur) => (cur === kind ? null : kind));
+    // "export" sheet visibility is driven by activeSheet, same as every
+    // other sheet — but useExport.openDialog() is what actually fetches
+    // /export/options, so it still needs calling here.
+    if (kind === "export") exportX.openDialog();
   };
 
   // Selecting a clip (from the video or the timeline) is the natural moment
@@ -300,6 +310,12 @@ export function PhoneShell({
       {activeSheet === "audio" && (
         <PhoneSheet title="Audio" onClose={() => setActiveSheet(null)}>
           <AudioPanel props={props} onChange={onFieldChange} />
+        </PhoneSheet>
+      )}
+
+      {activeSheet === "export" && (
+        <PhoneSheet title="Export" onClose={() => setActiveSheet(null)}>
+          <ExportDialogBody x={exportX} jobId={jobId} token={token} isDirty={isDirty} />
         </PhoneSheet>
       )}
     </div>

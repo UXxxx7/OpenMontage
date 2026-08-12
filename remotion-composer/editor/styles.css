@@ -989,6 +989,115 @@ body {
 
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
 
+/* ── Export dialog ──────────────────────────────────────────────────────
+ * z-index 40: above .phone-sheet (30) — though ExportDialog itself is
+ * desktop-only and never mounts alongside the phone sheet — below .toast
+ * (50) so a save-error toast stays legible over an open dialog. */
+
+.modal__backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  z-index: 40;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+}
+.modal__panel {
+  background: var(--bg-1);
+  border: 1px solid var(--bg-4);
+  border-radius: var(--radius);
+  width: 100%;
+  max-width: 460px;
+  max-height: min(640px, 90vh);
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
+}
+.modal__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+.modal__title { font-size: 14px; font-weight: 600; color: var(--fg-0); }
+.modal__body {
+  padding: 16px;
+  overflow-y: auto;
+  flex: 1 1 auto;
+}
+.modal__footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+
+.export-dialog { display: flex; flex-direction: column; gap: 14px; }
+
+.exportgrid { display: grid; gap: 8px; }
+.exportgrid--resolution { grid-template-columns: 1fr 1fr; }
+.exportgrid--quality { grid-template-columns: repeat(3, 1fr); }
+.exportgrid__cell {
+  background: var(--bg-2);
+  border: 1px solid var(--bg-4);
+  border-radius: var(--radius-sm);
+  padding: 10px 8px;
+  color: var(--fg-1);
+  font-size: 12px;
+  text-align: center;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+}
+.exportgrid__cell:hover:not(:disabled) { border-color: var(--accent-dim); }
+.exportgrid__cell:disabled { opacity: 0.5; cursor: not-allowed; }
+.exportgrid__cell[aria-pressed="true"] {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+  color: var(--fg-0);
+}
+.exportgrid__label { font-weight: 600; color: var(--fg-0); }
+.exportgrid__size { font-variant-numeric: tabular-nums; color: var(--fg-2); font-size: 11px; }
+.exportgrid__cell--toobig .exportgrid__size { color: var(--warn); }
+.exportgrid__chip {
+  font-size: 9px;
+  letter-spacing: 0.03em;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(62, 207, 142, 0.13);
+  color: var(--ok);
+}
+.exportgrid__chip--warn { background: var(--warn-dim); color: var(--warn); }
+
+.export-summary {
+  font-size: 11px;
+  color: var(--fg-1);
+  font-variant-numeric: tabular-nums;
+  padding: 8px 10px;
+  background: var(--bg-2);
+  border-radius: var(--radius-sm);
+}
+
+.progressbar {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--bg-3);
+  overflow: hidden;
+}
+.progressbar__fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.2s ease;
+}
+
 .center-msg {
   display: grid;
   place-items: center;

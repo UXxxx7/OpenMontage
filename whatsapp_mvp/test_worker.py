@@ -135,3 +135,111 @@ def test_send_confirmation_skips_availability_check_when_no_broll_generation_pla
     updated = get_job(real_job)
     persisted_plan = json.loads(updated.planned_edit)
     assert "broll_generation_warning" not in persisted_plan
+
+
+# ─────────────────────────── editor_export ───────────────────────────
+# 导出是 preview.mp4 的 ffmpeg 转码，不是管线阶段——跟 editor_render 共用
+# 合并（coalescing）结构，但状态机故意窄很多：从不碰 job 的 DB 状态，见
+# worker.editor_export 自己的文档。
+
+def _seed_export_marker(job_dir, pending):
+    from whatsapp_mvp.editor_markers import write_export_marker
+    write_export_marker(job_dir, {
+        "state": "idle", "pending": pending, "current": None, "progress": 0,
+        "started_at": None, "error": None, "export_timestamps": [],
+    })
+
+
+def test_editor_export_never_touches_job_db_status(real_job):
+    """导出绝不能调 update_job_fields/update_job_status——不然 Node 的
+    waitForStatus 会把一次纯粹的转码误当成新预览就绪，重复推送消息。"""
+    job = get_job(real_job)
+    (job.job_dir / "preview.mp4").write_bytes(b"fake preview bytes")
+    _seed_export_marker(job.job_dir, {"resolution": "720p", "quality": "balanced"})
+
+    with mock.patch("whatsapp_mvp.pipeline_runner.run_editor_export",
+                     return_value={"filename": "export_720p_balanced.mp4", "bytes": 123,
+                                   "width": 720, "height": 1280, "resolution": "720p",
+                                   "quality": "balanced"}) as mock_export, \
+         mock.patch("whatsapp_mvp.worker.update_job_fields") as mock_update_fields, \
+         mock.patch("whatsapp_mvp.worker.update_job_status") as mock_update_status:
+        worker.editor_export(real_job)
+
+    mock_export.assert_called_once()
+    mock_update_fields.assert_not_called()
+    mock_update_status.assert_not_called()
+
+    from whatsapp_mvp.editor_markers import read_export_marker
+    marker = read_export_marker(job.job_dir)
+    assert marker["state"] == "done"
+    assert marker["progress"] == 100
+    assert marker["pending"] is None
+    assert marker["current"] == {"resolution": "720p", "quality": "balanced"}
+
+
+def test_editor_export_coalesces_pending_refreshed_mid_encode(real_job):
+    """一份导出正在编码时 pending 被新请求刷新过——编码完成后应该接着编码
+    最新那份，而不是当成结束（跟 editor_render 对 pending_props 的处理
+    是同一个道理）。"""
+    job = get_job(real_job)
+    (job.job_dir / "preview.mp4").write_bytes(b"fake preview bytes")
+    _seed_export_marker(job.job_dir, {"resolution": "720p", "quality": "balanced"})
+
+    from whatsapp_mvp.editor_markers import read_export_marker, write_export_marker
+
+    calls = []
+
+    def _fake_run_editor_export(job_arg, resolution, quality, on_progress=None):
+        calls.append((resolution, quality))
+        if len(calls) == 1:
+            marker = read_export_marker(job.job_dir)
+            marker["pending"] = {"resolution": "1080p", "quality": "high"}
+            write_export_marker(job.job_dir, marker)
+        return {"filename": f"export_{resolution}_{quality}.mp4", "bytes": 1,
+               "width": 1, "height": 1, "resolution": resolution, "quality": quality}
+
+    with mock.patch("whatsapp_mvp.pipeline_runner.run_editor_export",
+                     side_effect=_fake_run_editor_export):
+        worker.editor_export(real_job)
+
+    assert calls == [("720p", "balanced"), ("1080p", "high")]
+    marker = read_export_marker(job.job_dir)
+    assert marker["state"] == "done"
+    assert marker["current"] == {"resolution": "1080p", "quality": "high"}
+    assert marker["pending"] is None
+
+
+def test_editor_export_records_error_state_on_failure(real_job):
+    """失败不设 job ERROR（导出不是管线阶段），标记文件本身进 failed，
+    error 字段留下原因供 /export/status 展示。"""
+    job = get_job(real_job)
+    (job.job_dir / "preview.mp4").write_bytes(b"fake preview bytes")
+    _seed_export_marker(job.job_dir, {"resolution": "720p", "quality": "balanced"})
+
+    with mock.patch("whatsapp_mvp.pipeline_runner.run_editor_export",
+                     side_effect=RuntimeError("ffmpeg exploded")), \
+         mock.patch("whatsapp_mvp.worker.update_job_status") as mock_update_status:
+        worker.editor_export(real_job)
+
+    mock_update_status.assert_not_called()
+    from whatsapp_mvp.editor_markers import read_export_marker
+    marker = read_export_marker(job.job_dir)
+    assert marker["state"] == "failed"
+    assert "ffmpeg exploded" in marker["error"]
+    assert marker["pending"] is None
+
+
+def test_editor_export_noop_when_no_pending(real_job):
+    """没有排队的导出请求——不该调用 run_editor_export，标记文件保持
+    idle 不动。"""
+    job = get_job(real_job)
+    (job.job_dir / "preview.mp4").write_bytes(b"fake preview bytes")
+    _seed_export_marker(job.job_dir, None)
+
+    with mock.patch("whatsapp_mvp.pipeline_runner.run_editor_export") as mock_export:
+        worker.editor_export(real_job)
+
+    assert not mock_export.called
+    from whatsapp_mvp.editor_markers import read_export_marker
+    marker = read_export_marker(job.job_dir)
+    assert marker["state"] == "idle"

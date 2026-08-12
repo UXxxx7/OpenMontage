@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import copy
 import difflib
 import json
 import logging
@@ -12,7 +13,9 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -30,6 +33,9 @@ logger = logging.getLogger(__name__)
 # 机器的现实是"重活永远只有 N 个在跑"。槽位数可用环境变量按机器调。
 from .concurrency import (
     ENHANCE_SLOTS as _ENHANCE_SLOTS,
+    EXPORT_SLOTS as _EXPORT_SLOTS,
+    EXPORT_THREADS as _EXPORT_THREADS,
+    EXPORT_TIMEOUT_S as _EXPORT_TIMEOUT_S,
     RENDER_SLOTS as _RENDER_SLOTS,
     RENDER_TIMEOUT_S as _RENDER_TIMEOUT_S,
     TRANSCRIBE_SLOTS as _TRANSCRIBE_SLOTS,
@@ -203,6 +209,113 @@ def run_talking_head_pipeline(job: Job) -> dict[str, Any]:
     }
 
 
+# ============================================================================
+# 浏览器编辑器"导出"——preview.mp4 的 ffmpeg 转码，不是重新走 Remotion 渲染。
+#
+# 两条臂产出的 preview.mp4 都已经是定稿画面（_finalize_pipeline_tail /
+# editor_render_authored 分别落的），下游只需要按分辨率/画质转码——不需要
+# 也不应该重新渲染：Arm A 的卡片几何是相对 1080 宽画布的绝对像素
+# （XiaojinEditorial.tsx 硬编码 fps/width/height，props 传了也不认），
+# Remotion 的 --width/--height 会把整个版式重新排一遍；转码只缩放已经定稿
+# 的像素，版式不变。转码也只需要 14-41s（实测），不占用 RENDER_SLOTS
+# 这个全局单槽信号量——那是给分钟级的 Remotion 渲染用的，见
+# whatsapp_mvp/concurrency.py 的 EXPORT_SLOTS 注释。
+# ============================================================================
+
+EXPORT_RESOLUTIONS = {"1080p": 1920, "720p": 1280}  # 目标长边（像素）
+EXPORT_QUALITIES = {
+    "high": {"crf": 18, "audio_kbps": 192},
+    "balanced": {"crf": 23, "audio_kbps": 128},
+    "small": {"crf": 28, "audio_kbps": 128},
+}
+EXPORT_PRESET = os.getenv("OM_EXPORT_PRESET", "medium")
+# 实测（job_d7d5c007bbc0，1080x1920/30fps/44.83s 真实 Remotion 输出）：固定
+# CRF 下 bits-per-pixel-per-frame 在两种分辨率间几乎不变（crf18: 0.0399 vs
+# 0.0438；crf23: 0.0222 vs 0.0224；crf28: 0.0114 vs 0.0115）——一张表能同时
+# 估两种分辨率，供 /export/options 在真正转码前给出可信的文件大小预估。
+EXPORT_BPP = {"high": 0.042, "balanced": 0.0225, "small": 0.0115}
+WHATSAPP_INLINE_LIMIT_BYTES = 16 * 1000 * 1000  # 十进制 MB 口径，跟 UI 显示一致
+
+
+def resolve_export_dimensions(src_w: int, src_h: int, resolution: str) -> tuple[int, int]:
+    """按目标分辨率的长边缩放源画幅，绝不放大，两边都保证是偶数（h264 +
+    yuv420p 色度采样要求）。估算器/命令构造/API 响应三处共用这一个函数，
+    保证它们对"最终到底是多少像素"永远不会各说各话。"""
+    if src_w <= 0 or src_h <= 0:
+        src_w, src_h = 1080, 1920
+    long_edge = max(src_w, src_h)
+    target = EXPORT_RESOLUTIONS[resolution]
+    if long_edge <= target:
+        w, h = src_w, src_h  # 源本来就更小/相等——绝不放大
+    else:
+        ratio = target / long_edge
+        if src_h >= src_w:  # 竖屏/方形：长边是高
+            w, h = round(src_w * ratio), target
+        else:  # 横屏：长边是宽
+            w, h = target, round(src_h * ratio)
+
+    def _even(n: int) -> int:
+        return max(2, n - (n % 2))
+
+    return _even(w), _even(h)
+
+
+def build_export_ffmpeg_cmd(src: Path, dst: Path, *, resolution: str, quality: str,
+                            src_w: int, src_h: int, threads: Optional[int] = None,
+                            progress: bool = False) -> list[str]:
+    """构造一次导出转码的完整 ffmpeg 命令。`resolution="1080p", quality="high"`
+    时刻意跟 run_final_export 原来的裸命令逐位一致（除了新增的 -nostdin）——
+    这就是重构安全性的证明：默认档位字节级不变，不是"看起来差不多"。
+
+    刻意不加的三个 flag，都是真实教训：
+    - 不加 -pix_fmt：Remotion 出的 preview.mp4 是 yuvj420p（full-range）,
+      强转 yuv420p 会让 swscale 做一次 full→limited 的电平转换，下载下来
+      的版本亮度/对比度会跟用户在预览里看到的那版肉眼可见地不一样。
+    - 不加 -r：源是恒定 30/1 fps，-r 会插一层帧率滤镜，非整数倍时机 duplicate/
+      drop 帧，"不提供 fps 选项"这个产品决定的自然推论是"也别悄悄改 fps"。
+    - 不加 -ar：ensure_editor_preview_video 的 44100 是给浏览器 Player 绕
+      Chrome WebAudio 的 bug，源本身是 48kHz——对一份要下载走的母版重采样
+      纯粹是信号损失，没有对应的收益。
+    """
+    if resolution not in EXPORT_RESOLUTIONS:
+        raise ValueError(f"unknown export resolution: {resolution!r}")
+    if quality not in EXPORT_QUALITIES:
+        raise ValueError(f"unknown export quality: {quality!r}")
+
+    q = EXPORT_QUALITIES[quality]
+    out_w, out_h = resolve_export_dimensions(src_w, src_h, resolution)
+    cmd = ["ffmpeg", "-nostdin", "-y", "-i", str(src)]
+    if (out_w, out_h) != (src_w, src_h):
+        # lanczos 而不是默认 bicubic——这条流水线的画面是文字卡片为主，
+        # 1080->720 下采样时 bicubic 会明显软化文字边缘。
+        cmd += ["-vf", f"scale={out_w}:{out_h}:flags=lanczos"]
+    cmd += ["-c:v", "libx264", "-crf", str(q["crf"]), "-preset", EXPORT_PRESET]
+    if threads:
+        cmd += ["-threads", str(threads)]
+    cmd += ["-c:a", "aac", "-b:a", f"{q['audio_kbps']}k", "-movflags", "+faststart"]
+    if progress:
+        cmd += ["-progress", "pipe:1", "-nostats", "-loglevel", "error"]
+    # -f mp4 explicit, not inferred from dst's extension — run_editor_export
+    # writes to a "<name>.mp4.part" tmp path (atomic os.replace() once done,
+    # see its own docstring), and ffmpeg's muxer auto-detection only looks at
+    # the LAST extension, so ".part" makes it fail with "Unable to choose an
+    # output format" (confirmed live). Harmless for run_final_export's own
+    # "*.mp4" direct output — same muxer either way, just no longer implicit.
+    cmd += ["-f", "mp4", str(dst)]
+    return cmd
+
+
+def estimate_export_bytes(*, resolution: str, quality: str, src_w: int, src_h: int,
+                          fps: float, duration_s: float) -> int:
+    """转码前的文件大小预估——纯算术，不跑 ffmpeg。见 EXPORT_BPP 头部注释，
+    误差带在实测数据上验证过在 ±25% 以内（test_export.py）。"""
+    out_w, out_h = resolve_export_dimensions(src_w, src_h, resolution)
+    bpp = EXPORT_BPP[quality]
+    video_bits = bpp * out_w * out_h * fps * duration_s
+    audio_bits = EXPORT_QUALITIES[quality]["audio_kbps"] * 1000 * duration_s
+    return int((video_bits + audio_bits) / 8)
+
+
 def run_final_export(job: Job) -> dict[str, Any]:
     """最终导出：基于预览重新编码为 final.mp4（+faststart 便于流式播放）。"""
     job_dir = job.job_dir
@@ -215,15 +328,133 @@ def run_final_export(job: Job) -> dict[str, Any]:
         preview_path = Path(result["preview_path"])
 
     logger.info(f"最终导出: {preview_path} → {final_path}")
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", str(preview_path),
-         "-c:v", "libx264", "-crf", "18", "-preset", "medium",
-         "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
-         str(final_path)],
-        capture_output=True, check=True,
-    )
+    src_w, src_h = _probe_dimensions(preview_path)
+    cmd = build_export_ffmpeg_cmd(preview_path, final_path, resolution="1080p", quality="high",
+                                  src_w=src_w, src_h=src_h)
+    subprocess.run(cmd, capture_output=True, check=True)
     logger.info(f"最终导出完成: {final_path}")
     return {"final_path": str(final_path)}
+
+
+def _cleanup_old_exports(job_dir: Path, keep: int = 3) -> None:
+    """LRU 淘汰——一个 job 最多 6 种档位组合（2 分辨率 x 3 画质）全留大约
+    45MB 顶天，但没必要真的六份都留着；只保留最近用过的 keep 份，按 mtime
+    从旧到新删多余的。"""
+    exports = sorted(job_dir.glob("export_*.mp4"), key=lambda p: p.stat().st_mtime)
+    while len(exports) > keep:
+        exports.pop(0).unlink(missing_ok=True)
+
+
+def run_editor_export(job: Job, resolution: str, quality: str, *,
+                      on_progress: Optional[Callable[[int], None]] = None) -> dict[str, Any]:
+    """浏览器编辑器"导出"——转码 job_dir/preview.mp4 到指定分辨率/画质的
+    export_{resolution}_{quality}.mp4，供用户直接下载。
+
+    缓存判断（"这一档是不是已经有新鲜结果了"）是调用方（webhook.py 的
+    POST /export）的责任，不是这个函数的——这个函数被调用就意味着"确实要
+    转码一次"，调用方应该已经检查过 mtime。
+
+    resolution/quality 必须是 EXPORT_RESOLUTIONS/EXPORT_QUALITIES 里的合法
+    键——这两个值最终会拼进文件名（export_{resolution}_{quality}.mp4），
+    ValueError 早退保证不会有客户端字符串流进文件系统路径。
+    """
+    if resolution not in EXPORT_RESOLUTIONS:
+        raise ValueError(f"unknown export resolution: {resolution!r}")
+    if quality not in EXPORT_QUALITIES:
+        raise ValueError(f"unknown export quality: {quality!r}")
+
+    job_dir = job.job_dir
+    preview_path = job_dir / "preview.mp4"
+    if not preview_path.exists():
+        raise FileNotFoundError(f"job 还没有可导出的预览: {preview_path}")
+
+    out_name = f"export_{resolution}_{quality}.mp4"
+    out_path = job_dir / out_name
+    tmp_path = job_dir / f"{out_name}.part"
+    tmp_path.unlink(missing_ok=True)  # 上一次被杀掉/失败留下的半成品，先清干净
+
+    src_w, src_h = _probe_dimensions(preview_path)
+    duration_s = _probe_duration(preview_path) or 1.0
+    before_stat = preview_path.stat()
+
+    cmd = build_export_ffmpeg_cmd(preview_path, tmp_path, resolution=resolution, quality=quality,
+                                  src_w=src_w, src_h=src_h, threads=_EXPORT_THREADS, progress=True)
+    logger.info(f"  editor export: {' '.join(str(c) for c in cmd)}")
+
+    # -progress pipe:1 把进度写 stdout；stderr 单独用一个 daemon 线程持续
+    # 读走——只读 stdout、放着 stderr 的管道缓冲区不读，缓冲区写满后子进程
+    # 会卡死在写 stderr 上，是经典的 subprocess 死锁陷阱。deque(maxlen=200)
+    # 只留尾部，失败时够拼错误信息，不需要无限攒。
+    stderr_tail: deque = deque(maxlen=200)
+
+    def _drain_stderr(pipe) -> None:
+        for line in iter(pipe.readline, ""):
+            stderr_tail.append(line)
+        pipe.close()
+
+    with _EXPORT_SLOTS:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, bufsize=1)
+        stderr_thread = threading.Thread(target=_drain_stderr, args=(proc.stderr,), daemon=True)
+        stderr_thread.start()
+
+        last_reported = 0.0
+        try:
+            for line in iter(proc.stdout.readline, ""):
+                line = line.strip()
+                if line.startswith("out_time_us="):
+                    try:
+                        out_us = int(line.split("=", 1)[1])
+                        pct = min(99, max(0, int(out_us / 1_000_000 / duration_s * 100)))
+                    except (ValueError, ZeroDivisionError):
+                        continue
+                    now = time.monotonic()
+                    if on_progress and now - last_reported >= 1.0:
+                        on_progress(pct)
+                        last_reported = now
+            proc.wait(timeout=_EXPORT_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            tmp_path.unlink(missing_ok=True)
+            raise RuntimeError("editor export timed out")
+        finally:
+            stderr_thread.join(timeout=5)
+
+    if proc.returncode != 0:
+        tmp_path.unlink(missing_ok=True)
+        tail = "".join(stderr_tail)[-2000:]
+        raise RuntimeError(f"editor export failed (exit {proc.returncode}): {tail}")
+
+    if not tmp_path.exists() or tmp_path.stat().st_size == 0:
+        tmp_path.unlink(missing_ok=True)
+        raise RuntimeError("editor export produced no output")
+
+    # 转码这几十秒里 preview.mp4 被一次新的保存覆盖了——刚转出来的这份基于
+    # 已经过时的素材，绝不能冒充"新鲜结果"糊弄调用方（调用方靠 mtime 判断
+    # 缓存是否还新鲜，写一份基于旧素材、mtime 却是新的文件出去，会让下一次
+    # 请求误判成"已经是最新的"）。
+    after_stat = preview_path.stat()
+    if (after_stat.st_mtime_ns, after_stat.st_size) != (before_stat.st_mtime_ns, before_stat.st_size):
+        tmp_path.unlink(missing_ok=True)
+        raise RuntimeError("The video changed while you were exporting — try again.")
+
+    os.replace(tmp_path, out_path)
+    if on_progress:
+        on_progress(100)
+
+    _cleanup_old_exports(job_dir, keep=int(os.getenv("OM_EDITOR_EXPORT_KEEP", "3")))
+
+    out_w, out_h = resolve_export_dimensions(src_w, src_h, resolution)
+    return {
+        "filename": out_name,
+        "path": str(out_path),
+        "bytes": out_path.stat().st_size,
+        "width": out_w,
+        "height": out_h,
+        "resolution": resolution,
+        "quality": quality,
+    }
 
 
 # ============================================================================
@@ -1290,7 +1521,18 @@ def _op_add_music(src: str, op: dict, workdir: Path) -> Optional[str]:
 
     from .music_providers import fetch_music_via
     music_path = workdir / "_bgm_source.mp3"
-    result = fetch_music_via(op.get("provider", "pixabay"), query, music_path)
+    # 编辑器保存（_finalize_pipeline_tail(..., reuse_music=True)）给 op 打上
+    # _reuse_cached_music 标记，表示同一个 job 之前已经成功配过一次这段
+    # BGM——直接复用磁盘上那份，不重新打一次 Pixabay 的 API（有 30s 量级的
+    # Cloudflare 重试，编辑器里改个字幕颜色这种无关改动也会白等这一下）。
+    # 一次全新的管线运行永远走 else 分支重新抓取。
+    if op.get("_reuse_cached_music") and music_path.exists() and music_path.stat().st_size > 0:
+        # 复用磁盘上现成的文件——没有新的抓取开销，cost_usd 记 0，同时保持
+        # 跟 fetch_music_via 一样的 {path, cost_usd} 字典形状（下面
+        # result.get("cost_usd") 依赖这个形状）。
+        result = {"path": music_path, "cost_usd": 0.0}
+    else:
+        result = fetch_music_via(op.get("provider", "pixabay"), query, music_path)
     if not result:
         raise RuntimeError(f"add_music: 没找到匹配「{query}」的背景音乐")
 
@@ -3499,6 +3741,9 @@ def _remotion_render_props(props_path: Path, out: Path, remotion_dir: Path, *,
     if last_result is not None:
         logger.error(f"apply_style render stderr: {last_result.stderr[-4000:]}")
         raise RuntimeError(f"apply_style 渲染失败 (exit {last_result.returncode})")
+
+    return str(out) if out.exists() else None
+
 
 _ASSET_PINNED_TOP_LEVEL = ("videoSrc", "durationSeconds")
 

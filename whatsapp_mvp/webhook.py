@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import List, Optional
@@ -464,6 +466,12 @@ def _enqueue_editor_render_authored(job_id: str) -> None:
     from .worker import editor_render_authored
 
     editor_render_authored(job_id)
+
+
+def _enqueue_editor_export(job_id: str) -> None:
+    from .worker import editor_export
+
+    editor_export(job_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1104,6 +1112,11 @@ _EDITOR_RENDER_MARKER_NAME = "_editor_render.json"
 _EDITOR_SAVES_PER_HOUR = int(os.getenv("OM_EDITOR_SAVES_PER_HOUR", "12"))
 _EDITOR_SAVE_WINDOW_S = 3600
 
+# 导出比保存便宜 30-100 倍（转码 14-41s vs. 渲染分钟级），预期用法也是
+# "试一下 Balanced，看看大小，再试试 Small"——配额给得比保存宽松很多。
+# 缓存命中（同一档已经是最新）不消耗配额，见 editor_post_export。
+_EDITOR_EXPORTS_PER_HOUR = int(os.getenv("OM_EDITOR_EXPORTS_PER_HOUR", "20"))
+
 
 def _require_editor_token(job_id: str, token: str):
     """校验预览编辑器链接的 token，失败一律 403（不区分"job 不存在"和"token
@@ -1432,6 +1445,196 @@ async def editor_status(job_id: str, token: str = Query("")):
     }
 
 
+# ---------------------------------------------------------------------------
+# 浏览器编辑器"导出"——preview.mp4 的 ffmpeg 转码下载，不是 Remotion
+# 重新渲染（见 pipeline_runner.run_editor_export 的文档）。独立的标记文件
+# （editor_markers.py 的 _editor_export.json）、独立的并发闸门
+# （concurrency.EXPORT_SLOTS）、独立的每小时配额——跟"保存"是完全独立的
+# 状态机，唯一的交叉点是：保存正在渲染时不能开始导出（见下面的 409）。
+# ---------------------------------------------------------------------------
+
+@app.get("/editor/{job_id}/export/options")
+def editor_export_options(job_id: str, token: str = Query("")):
+    # Plain `def` — 跟 editor_filmstrip/editor_waveform 一样，ffprobe 走
+    # subprocess.run 会阻塞，async def 会冻结 FastAPI 的单一事件循环。
+    job = _require_editor_token(job_id, token)
+    preview_path = job.job_dir / "preview.mp4"
+    if not preview_path.exists():
+        raise HTTPException(status_code=404, detail="This job has no preview to export yet")
+
+    from .editor_markers import read_export_marker
+    from .pipeline_runner import (
+        EXPORT_QUALITIES,
+        EXPORT_RESOLUTIONS,
+        WHATSAPP_INLINE_LIMIT_BYTES,
+        _probe_dimensions,
+        _probe_duration,
+        estimate_export_bytes,
+        resolve_export_dimensions,
+    )
+
+    src_w, src_h = _probe_dimensions(preview_path)
+    duration_s = _probe_duration(preview_path)
+    preview_stat = preview_path.stat()
+    # 全片统一 30fps 母版（见 CLAUDE.md）——不额外探测帧率，跟导出对话框
+    # "陈述 30fps 而不是当成一个可选项"的产品决定保持一致。
+    fps = 30
+
+    combos = []
+    for resolution in EXPORT_RESOLUTIONS:
+        for quality in EXPORT_QUALITIES:
+            out_w, out_h = resolve_export_dimensions(src_w, src_h, resolution)
+            estimated_bytes = estimate_export_bytes(
+                resolution=resolution, quality=quality, src_w=src_w, src_h=src_h,
+                fps=fps, duration_s=duration_s)
+            filename = f"export_{resolution}_{quality}.mp4"
+            out_path = job.job_dir / filename
+            cached = False
+            cached_bytes = None
+            if out_path.exists():
+                out_stat = out_path.stat()
+                cached = out_stat.st_mtime_ns >= preview_stat.st_mtime_ns
+                if cached:
+                    cached_bytes = out_stat.st_size
+            combos.append({
+                "resolution": resolution,
+                "quality": quality,
+                "width": out_w,
+                "height": out_h,
+                "estimated_bytes": cached_bytes if cached else estimated_bytes,
+                "fits_whatsapp": (cached_bytes if cached else estimated_bytes) <= WHATSAPP_INLINE_LIMIT_BYTES,
+                "filename": filename,
+                "cached": cached,
+                "cached_bytes": cached_bytes,
+            })
+
+    render_marker = _read_editor_marker(job.job_dir)
+    export_marker = read_export_marker(job.job_dir)
+    now = time.time()
+    recent_exports = [t for t in export_marker["export_timestamps"] if now - t < _EDITOR_SAVE_WINDOW_S]
+
+    from .concurrency import EXPORT_SLOTS
+
+    return {
+        "source": {
+            "width": src_w,
+            "height": src_h,
+            "fps": fps,
+            "duration_seconds": duration_s,
+            "bytes": preview_stat.st_size,
+            "modified_at": preview_stat.st_mtime,
+        },
+        "whatsapp_limit_bytes": WHATSAPP_INLINE_LIMIT_BYTES,
+        "combos": combos,
+        "save_state": render_marker["state"],
+        "exports_this_hour": len(recent_exports),
+        "exports_per_hour": _EDITOR_EXPORTS_PER_HOUR,
+        "export_slot_busy": getattr(EXPORT_SLOTS, "_value", 1) <= 0,
+    }
+
+
+@app.post("/editor/{job_id}/export")
+async def editor_post_export(job_id: str, request: Request, token: str = Query("")):
+    job = _require_editor_token(job_id, token)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object")
+
+    from .pipeline_runner import EXPORT_QUALITIES, EXPORT_RESOLUTIONS
+
+    resolution = body.get("resolution")
+    quality = body.get("quality")
+    # 客户端字符串在这里就必须落在服务端固定的枚举里——它们最终会拼进
+    # 文件名（export_{resolution}_{quality}.mp4），威胁模型跟
+    # pin_server_owned_props 一样：客户端字符串只能选服务端常量，绝不能
+    # 直接流进文件系统路径或子进程 argv。
+    if resolution not in EXPORT_RESOLUTIONS or quality not in EXPORT_QUALITIES:
+        raise HTTPException(status_code=400, detail="Invalid resolution or quality")
+
+    preview_path = job.job_dir / "preview.mp4"
+    if not preview_path.exists():
+        raise HTTPException(status_code=404, detail="This job has no preview to export yet")
+
+    render_marker = _read_editor_marker(job.job_dir)
+    if render_marker["state"] == "rendering":
+        raise HTTPException(
+            status_code=409,
+            detail="A save is still rendering — export once it finishes so you get the new version.")
+
+    filename = f"export_{resolution}_{quality}.mp4"
+    out_path = job.job_dir / filename
+    if out_path.exists() and out_path.stat().st_mtime_ns >= preview_path.stat().st_mtime_ns:
+        # 缓存命中——这一档已经是基于当前 preview.mp4 转码出来的最新结果，
+        # 不用再编码一次，也不消耗每小时配额（配额是为了限制真实编码开销，
+        # 命中缓存的请求几乎零开销）。
+        return {"job_id": job_id, "state": "done", "filename": filename,
+               "bytes": out_path.stat().st_size}
+
+    from .editor_markers import read_export_marker, write_export_marker
+
+    export_marker = read_export_marker(job.job_dir)
+    now = time.time()
+    recent_exports = [t for t in export_marker["export_timestamps"] if now - t < _EDITOR_SAVE_WINDOW_S]
+    if len(recent_exports) >= _EDITOR_EXPORTS_PER_HOUR:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Hourly export limit reached ({_EDITOR_EXPORTS_PER_HOUR}/hour) — try again later")
+    recent_exports.append(now)
+
+    # 合并（coalesce），不排队——同一份道理见 editor_post_props：一次导出
+    # 已经在编码时，新请求直接替换 pending 并返回，worker.editor_export
+    # 编码完成后会检查 pending 有没有被刷新过。
+    was_encoding = export_marker["state"] == "encoding"
+    export_marker["pending"] = {"resolution": resolution, "quality": quality}
+    export_marker["export_timestamps"] = recent_exports
+    write_export_marker(job.job_dir, export_marker)
+
+    if was_encoding:
+        return {"job_id": job_id, "state": "coalesced"}
+
+    _run_in_background(_enqueue_editor_export, job_id)
+    return {"job_id": job_id, "state": "queued"}
+
+
+@app.get("/editor/{job_id}/export/status")
+def editor_export_status(job_id: str, token: str = Query("")):
+    job = _require_editor_token(job_id, token)
+
+    from .editor_markers import read_export_marker
+    from .pipeline_runner import WHATSAPP_INLINE_LIMIT_BYTES
+
+    marker = read_export_marker(job.job_dir)
+    now = time.time()
+    recent_exports = [t for t in marker["export_timestamps"] if now - t < _EDITOR_SAVE_WINDOW_S]
+
+    from .concurrency import EXPORT_SLOTS
+
+    combo = marker["current"]
+    file_bytes = None
+    filename = None
+    fits_whatsapp = None
+    if marker["state"] == "done" and combo:
+        filename = f"export_{combo['resolution']}_{combo['quality']}.mp4"
+        out_path = job.job_dir / filename
+        if out_path.exists():
+            file_bytes = out_path.stat().st_size
+            fits_whatsapp = file_bytes <= WHATSAPP_INLINE_LIMIT_BYTES
+
+    return {
+        "state": marker["state"],
+        "progress": marker["progress"],
+        "combo": combo,
+        "filename": filename,
+        "bytes": file_bytes,
+        "fits_whatsapp": fits_whatsapp,
+        "whatsapp_limit_bytes": WHATSAPP_INLINE_LIMIT_BYTES,
+        "error": marker["error"],
+        "exports_this_hour": len(recent_exports),
+        "exports_per_hour": _EDITOR_EXPORTS_PER_HOUR,
+        "export_slot_busy": getattr(EXPORT_SLOTS, "_value", 1) <= 0,
+    }
+
+
 @app.get("/editor/{job_id}/filmstrip")
 def editor_filmstrip(job_id: str, token: str = Query("")):
     # Plain `def`, not `async def` — this calls ffmpeg via subprocess.run,
@@ -1483,7 +1686,7 @@ async def create_editor_token_endpoint(job_id: str):
 # ---------------------------------------------------------------------------
 
 @app.get("/files/{job_id}/{filename}")
-def serve_file(job_id: str, filename: str):
+def serve_file(job_id: str, filename: str, download: int = Query(0)):
     # Deliberately a plain `def`, not `async def`: get_job() is a blocking
     # SQLAlchemy query (a JOIN across user+messages), and this route is the
     # one Remotion's renderer hits repeatedly and CONCURRENTLY (6-way tab
@@ -1499,8 +1702,21 @@ def serve_file(job_id: str, filename: str):
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    file_path = job.job_dir / filename
-    if not file_path.exists():
+    # Containment check — {filename} compiles to [^/]+ (no forward slash), but
+    # that does NOT block a backslash, and on Windows pathlib treats \ as a
+    # separator too. filename="..\\..\\..\\.env" resolves clean outside
+    # job_dir and was confirmed live to read this repo's real .env (API keys)
+    # and the sqlite DB (every user's WhatsApp number) through this route,
+    # unauthenticated, reachable through the ngrok tunnel. resolve() collapses
+    # ../, both separator styles, and 8.3 short names; the parents check is
+    # the actual containment assertion (stays correct for a future nested
+    # path like assets/broll_0.mp4, unlike a substring/startswith check).
+    job_root = job.job_dir.resolve()
+    try:
+        file_path = (job_root / filename).resolve()
+    except (OSError, ValueError):
+        raise HTTPException(status_code=404, detail="File not found")
+    if not file_path.is_file() or job_root not in file_path.parents:
         raise HTTPException(status_code=404, detail="File not found")
 
     if filename.endswith(".mp4"):
@@ -1513,4 +1729,10 @@ def serve_file(job_id: str, filename: str):
         media_type = "audio/mpeg"  # voice_clone.py 合成的克隆音色音频，HeyGen 靠这个 URL 抓取
     else:
         media_type = "application/octet-stream"
+    # download=1 sets Content-Disposition: attachment — iOS Safari ignores
+    # the <a download> HTML attribute for a same-tab navigation, so a real
+    # export needs the header to actually save the file instead of just
+    # playing it inline.
+    if download:
+        return FileResponse(str(file_path), media_type=media_type, filename=file_path.name)
     return FileResponse(str(file_path), media_type=media_type)

@@ -19,6 +19,9 @@ import { AuthoredPreview } from "./components/Authored/AuthoredPreview";
 import { AuthoredInspectorBody } from "./components/Authored/AuthoredInspectorBody";
 import { AuthoredPhoneShell } from "./components/Phone/AuthoredPhoneShell";
 import { useMediaQuery } from "./state/useMediaQuery";
+import { apiGet, apiPost } from "./api";
+import { useExport } from "./state/useExport";
+import { ExportDialog } from "./components/Export/ExportDialog";
 
 // Matches App.tsx's own PHONE_BREAKPOINT_QUERY exactly — a mismatch would
 // size touch-target rules for the wrong shell right at the boundary.
@@ -58,28 +61,6 @@ type AuthoredData = {
 };
 
 type SaveState = "idle" | "saving" | "rendering" | "done" | "failed";
-
-async function apiGet(path: string, token: string) {
-  const resp = await fetch(`${path}?token=${encodeURIComponent(token)}`);
-  const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error(data?.detail || `HTTP ${resp.status}`);
-  return data;
-}
-
-async function apiPost(path: string, token: string, body: unknown): Promise<any> {
-  const resp = await fetch(`${path}?token=${encodeURIComponent(token)}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) {
-    const err = new Error(data?.detail || `HTTP ${resp.status}`) as Error & { status?: number };
-    err.status = resp.status;
-    throw err;
-  }
-  return data;
-}
 
 const NATIVE_W = 1080;
 const NATIVE_H = 1920;
@@ -486,6 +467,8 @@ function AuthoredEditorInner({
     }
   }, [jobId, token, overrides]);
 
+  const exportX = useExport({ jobId, token, isDirty, saveState, onSave: handleSave });
+
   // ── Keyboard shortcuts ──────────────────────────────────────────────
   // Ported from App.tsx's own onKeyDown block. Skips Delete/Backspace —
   // Arm B can't delete model-authored elements, only reset their overrides.
@@ -630,6 +613,8 @@ function AuthoredEditorInner({
         onVideoVolumeChange={(value) => handleOverrideChange("__scene", { videoVolume: value }, "scene:videoVolume")}
         cuts={cuts}
         onCutsChange={handleCutsChange}
+        exportX={exportX}
+        token={token}
       />
     );
   }
@@ -651,6 +636,15 @@ function AuthoredEditorInner({
         </span>
         <button
           type="button"
+          className="btn"
+          onClick={exportX.openDialog}
+          title="Download the finished video directly — pick resolution and file size"
+        >
+          Export
+        </button>
+
+        <button
+          type="button"
           className="btn btn--primary"
           onClick={handleSave}
           disabled={!isDirty || busy || !validation.valid}
@@ -665,6 +659,10 @@ function AuthoredEditorInner({
           {busy ? "Working…" : "Save & send to WhatsApp"}
         </button>
       </div>
+
+      {exportX.dialogOpen && (
+        <ExportDialog x={exportX} jobId={jobId} token={token} isDirty={isDirty} onClose={exportX.closeDialog} />
+      )}
 
       {!validation.valid && !busy && (
         <div className="banner banner--warn" style={{ position: "fixed", bottom: 12, left: "50%", transform: "translateX(-50%)", zIndex: 50, maxWidth: 520 }}>

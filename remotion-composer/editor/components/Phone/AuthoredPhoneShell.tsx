@@ -12,9 +12,12 @@ import { PhoneTopBar } from "./PhoneTopBar";
 import { PhoneActionBar, type PhoneActionItem, type PhoneSheetKind } from "./PhoneActionBar";
 import { PhoneSheet } from "./PhoneSheet";
 import type { SaveState } from "../Toolbar";
+import { ExportDialogBody } from "../Export/ExportDialogBody";
+import type { UseExportReturn } from "../../state/useExport";
 
 const ARM_B_SHEET_ITEMS: PhoneActionItem[] = [
   { kind: "edit", icon: "🎛", label: "Edit" },
+  { kind: "export", icon: "⤓", label: "Export" },
 ];
 
 /**
@@ -101,6 +104,8 @@ export function AuthoredPhoneShell({
   onVideoVolumeChange,
   cuts,
   onCutsChange,
+  exportX,
+  token,
 }: {
   jobId: string;
   jobStatus: string;
@@ -162,6 +167,8 @@ export function AuthoredPhoneShell({
   onVideoVolumeChange: (value: number) => void;
   cuts: VideoCut[];
   onCutsChange: (next: VideoCut[]) => void;
+  exportX: UseExportReturn;
+  token: string;
 }) {
   const [activeSheet, setActiveSheet] = useState<PhoneSheetKind>(null);
   const [timelineViewMode, setTimelineViewMode] = useState<"type" | "layers">("type");
@@ -179,6 +186,7 @@ export function AuthoredPhoneShell({
 
   const openSheet = (kind: Exclude<PhoneSheetKind, null>) => {
     setActiveSheet((cur) => (cur === kind ? null : kind));
+    if (kind === "export") exportX.openDialog();
   };
 
   // Same auto-open-Edit-on-select behavior as Arm A's PhoneShell, and the
@@ -310,6 +318,12 @@ export function AuthoredPhoneShell({
             sourceDurationFrames={durationInFrames}
             onCutsChange={onCutsChange}
           />
+        </PhoneSheet>
+      )}
+
+      {activeSheet === "export" && (
+        <PhoneSheet title="Export" onClose={() => setActiveSheet(null)}>
+          <ExportDialogBody x={exportX} jobId={jobId} token={token} isDirty={isDirty} />
         </PhoneSheet>
       )}
     </div>

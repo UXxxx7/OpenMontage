@@ -69,7 +69,13 @@ app.get("/privacy", (_req, res) => {
 });
 
 app.get("/files/:jobId/:filename", async (req, res) => {
-  const upstream = `${PYTHON_API_BASE}/files/${encodeURIComponent(req.params.jobId)}/${encodeURIComponent(req.params.filename)}`;
+  let upstream = `${PYTHON_API_BASE}/files/${encodeURIComponent(req.params.jobId)}/${encodeURIComponent(req.params.filename)}`;
+  // ?download=1 forwarded verbatim — Python's serve_file uses it to set
+  // Content-Disposition: attachment, which iOS Safari needs since it ignores
+  // the <a download> HTML attribute for a same-tab navigation.
+  if (req.query.download) {
+    upstream += `?download=${encodeURIComponent(req.query.download)}`;
+  }
   try {
     // 必须把客户端的 Range 头转发给 Python，也要把 Python 回的 range 相关响应头
     // 转发回去——不转发的后果不是"慢一点"，是浏览器 <video> 标签直接播放不了：
@@ -84,7 +90,7 @@ app.get("/files/:jobId/:filename", async (req, res) => {
       headers: req.headers.range ? { range: req.headers.range } : {},
     });
     res.status(upstreamRes.status);
-    const forwardHeaders = ["content-type", "content-length", "accept-ranges", "content-range", "etag", "last-modified"];
+    const forwardHeaders = ["content-type", "content-length", "accept-ranges", "content-range", "etag", "last-modified", "content-disposition"];
     for (const h of forwardHeaders) {
       if (upstreamRes.headers[h]) res.setHeader(h, upstreamRes.headers[h]);
     }
@@ -175,7 +181,8 @@ app.get("/editor/:jobId", (req, res) => {
 
 app.get(["/api/editor/:jobId/props", "/api/editor/:jobId/status",
          "/api/editor/:jobId/filmstrip", "/api/editor/:jobId/waveform",
-         "/api/editor/:jobId/authored"], async (req, res) => {
+         "/api/editor/:jobId/authored", "/api/editor/:jobId/export/options",
+         "/api/editor/:jobId/export/status"], async (req, res) => {
   // req.path 已经是 /api/editor/:jobId/props 这类完整路径，去掉 /api 前缀
   // 直接对应 Python 那边的 /editor/:jobId/props 路由。
   const upstream = `${PYTHON_API_BASE}${req.path.replace(/^\/api/, "")}?token=${encodeURIComponent(req.query.token || "")}`;
@@ -200,6 +207,22 @@ app.post("/api/editor/:jobId/relayout", async (req, res) => {
   }
 });
 
+// 导出——preview.mp4 的 ffmpeg 转码下载，不是走 BullMQ 投递给 WhatsApp
+// 的"保存"。跟 /relayout 同一个薄代理形状（原样转发 body、原样回传状态码/
+// JSON），刻意不是 /props 那个形状：没有 wa_number，也不触发 editor-save
+// 入队——不要把这条路由改成 /props 的样子。
+app.post("/api/editor/:jobId/export", async (req, res) => {
+  const upstream = `${PYTHON_API_BASE}/editor/${encodeURIComponent(req.params.jobId)}/export`
+    + `?token=${encodeURIComponent(req.query.token || "")}`;
+  try {
+    const upstreamRes = await axios.post(upstream, req.body, { validateStatus: () => true });
+    res.status(upstreamRes.status).json(upstreamRes.data);
+  } catch (err) {
+    console.error("[editor-api] export failed:", err.message);
+    res.sendStatus(502);
+  }
+});
+
 app.post("/api/editor/:jobId/props", async (req, res) => {
   const jobId = req.params.jobId;
   const upstream = `${PYTHON_API_BASE}/editor/${encodeURIComponent(jobId)}/props`
@@ -211,7 +234,15 @@ app.post("/api/editor/:jobId/props", async (req, res) => {
     console.error("[editor-api] save failed:", err.message);
     return res.sendStatus(502);
   }
-  if (upstreamRes.status !== 202) {
+  // Bug fix: Python's POST /editor/{id}/props actually returns 200, not 202
+  // (webhook.py never sets status_code=202 anywhere on this route) — the old
+  // `!== 202` check therefore always took this early-return branch, which
+  // meant (a) the BullMQ "editor-save" enqueue below never ran, so a save's
+  // rendered result was never delivered to WhatsApp, and (b) it skipped past
+  // the wa_number-stripping code, forwarding the raw upstream body —
+  // including wa_number — straight to the browser. See the comment below on
+  // exactly why that must never happen.
+  if (upstreamRes.status >= 400) {
     return res.status(upstreamRes.status).json(upstreamRes.data);
   }
   // wa_number 只应该在服务器之间传递，绝不能原样透传回浏览器——这条编辑器
@@ -220,17 +251,20 @@ app.post("/api/editor/:jobId/props", async (req, res) => {
   // editorSave 把渲染结果发回真正的 WhatsApp 对话。
   const { wa_number: waNumber, state, job_id: returnedJobId } = upstreamRes.data || {};
   const effectiveJobId = returnedJobId || jobId;
-  if (waNumber) {
+  // state === "coalesced" 意味着已经有一次保存正在渲染中，这次只是把
+  // pending_props 换成了最新版本——那次已经入队的 editor-save 完成后投递
+  // 的就是这份最新内容，这里再入队一次只会造成两条重复的 WhatsApp 消息。
+  if (waNumber && state !== "coalesced") {
     const msgId = `editor-${effectiveJobId}-${Date.now()}`;
     try {
       await videoQueue.add("editor-save", { waNumber, jobId: effectiveJobId, msgId }, queueOptions(msgId));
     } catch (err) {
       console.error("[editor-api] failed to enqueue editor-save:", err.message);
     }
-  } else {
+  } else if (!waNumber) {
     console.warn(`[editor-api] save for ${effectiveJobId} had no wa_number — delivery will not fire`);
   }
-  res.status(202).json({ job_id: effectiveJobId, state });
+  res.status(upstreamRes.status).json({ job_id: effectiveJobId, state });
 });
 
 // Phase 8 — Arm B (AI-authored) manual edits. Mirrors the /props POST
@@ -249,22 +283,24 @@ app.post("/api/editor/:jobId/overrides", async (req, res) => {
     console.error("[editor-api] authored save failed:", err.message);
     return res.sendStatus(502);
   }
-  if (upstreamRes.status !== 202) {
+  // See the matching comment on the /props handler above — same 200-vs-202
+  // bug, same wa_number leak, same fix.
+  if (upstreamRes.status >= 400) {
     return res.status(upstreamRes.status).json(upstreamRes.data);
   }
   const { wa_number: waNumber, state, job_id: returnedJobId } = upstreamRes.data || {};
   const effectiveJobId = returnedJobId || jobId;
-  if (waNumber) {
+  if (waNumber && state !== "coalesced") {
     const msgId = `editor-${effectiveJobId}-${Date.now()}`;
     try {
       await videoQueue.add("editor-save", { waNumber, jobId: effectiveJobId, msgId }, queueOptions(msgId));
     } catch (err) {
       console.error("[editor-api] failed to enqueue editor-save:", err.message);
     }
-  } else {
+  } else if (!waNumber) {
     console.warn(`[editor-api] authored save for ${effectiveJobId} had no wa_number — delivery will not fire`);
   }
-  res.status(202).json({ job_id: effectiveJobId, state });
+  res.status(upstreamRes.status).json({ job_id: effectiveJobId, state });
 });
 
 // Dashboard "Edit" action — mints a token via Python (POST /jobs/:id/editor_token,

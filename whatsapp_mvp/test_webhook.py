@@ -30,7 +30,7 @@ import pytest
 from starlette.datastructures import UploadFile
 
 import whatsapp_mvp.webhook as webhook
-from whatsapp_mvp.job_manager import get_assets, get_job, get_session
+from whatsapp_mvp.job_manager import create_job, get_assets, get_job, get_or_create_user, get_session
 from whatsapp_mvp.database import Job
 
 
@@ -185,3 +185,264 @@ def test_transcribe_endpoint_handles_empty_transcription_result():
         result = asyncio.run(webhook.transcribe_endpoint(audio=_upload("voice.ogg", b"fake-ogg-bytes")))
 
     assert result["text"] == ""
+
+
+# GET /files/{job_id}/{filename} 路径穿越回归测试。
+#
+# 确认过真实可复现：file_path = job.job_dir / filename 没有任何包含性检查，
+# {filename} 编译成 [^/]+（不允许正斜杠），但不挡反斜杠——Windows 上
+# pathlib 把反斜杠当成路径分隔符处理，filename="..\\..\\..\\.env" 能干净地
+# 解析到 job_dir 之外，实测直接读出了这个仓库真正的 .env（API key）和
+# sqlite 数据库（每个用户的 WhatsApp 号码）。这条路由本身无鉴权（job_id
+# 就是唯一的"能力凭证"），经 ngrok 隧道对外可达。
+
+@pytest.fixture
+def real_job(cleanup_jobs):
+    """跟其它端点测试一样直接建一条真实 job（不 mock get_job），因为
+    serve_file 的漏洞就在 job.job_dir 之外那一层，必须是真实磁盘路径。"""
+    user = get_or_create_user("traversal_test_user")
+    job = create_job(user_id=user.id)
+    cleanup_jobs.append(job.id)
+    return job
+
+
+def test_serve_file_rejects_windows_backslash_traversal(real_job):
+    with pytest.raises(webhook.HTTPException) as exc_info:
+        webhook.serve_file(real_job.id, "..\\..\\..\\.env")
+    assert exc_info.value.status_code == 404
+
+
+def test_serve_file_rejects_forward_slash_traversal(real_job):
+    with pytest.raises(webhook.HTTPException) as exc_info:
+        webhook.serve_file(real_job.id, "../../../.env")
+    assert exc_info.value.status_code == 404
+
+
+def test_serve_file_rejects_absolute_windows_path(real_job):
+    with pytest.raises(webhook.HTTPException) as exc_info:
+        webhook.serve_file(real_job.id, "C:\\Windows\\win.ini")
+    assert exc_info.value.status_code == 404
+
+
+def test_serve_file_rejects_traversal_to_the_database(real_job):
+    """.env 之外，第二个真实敏感目标：sqlite 数据库本身。"""
+    with pytest.raises(webhook.HTTPException) as exc_info:
+        webhook.serve_file(real_job.id, "..\\..\\..\\openmontage_whatsapp.db")
+    assert exc_info.value.status_code == 404
+
+
+def test_serve_file_still_serves_a_real_file_inside_job_dir(real_job):
+    """安全修复不能连正常路径一起挡掉——这是回归防护，不是新增行为。"""
+    (real_job.job_dir / "preview.mp4").write_bytes(b"fake-mp4-bytes")
+    response = webhook.serve_file(real_job.id, "preview.mp4")
+    assert response.media_type == "video/mp4"
+
+
+def test_serve_file_rejects_nonexistent_file(real_job):
+    with pytest.raises(webhook.HTTPException) as exc_info:
+        webhook.serve_file(real_job.id, "does_not_exist.mp4")
+    assert exc_info.value.status_code == 404
+
+
+def test_serve_file_rejects_a_directory(real_job):
+    """filename 指向一个目录（而不是文件）也必须 404，不能让 FileResponse
+    拿一个目录路径去尝试打开报出别的错误类型。"""
+    (real_job.job_dir / "assets").mkdir(parents=True, exist_ok=True)
+    with pytest.raises(webhook.HTTPException) as exc_info:
+        webhook.serve_file(real_job.id, "assets")
+    assert exc_info.value.status_code == 404
+
+
+# GET/POST /editor/{job_id}/export* —— 浏览器编辑器"导出"三个路由。
+# 用真实签发的 token（editor_token.make_token）而不是 mock verify_token——
+# 跟 make_token/verify_token 的真实实现走一遍，比 mock 掉鉴权更接近生产
+# 行为。用 mock 顶掉 _run_in_background，实际的 ffmpeg 转码不在这些测试
+# 范围内（那部分由 test_export.py 的纯函数测试覆盖）。
+
+@pytest.fixture
+def export_job(cleanup_jobs):
+    from whatsapp_mvp.editor_token import make_token
+
+    user = get_or_create_user("export_test_user")
+    job = create_job(user_id=user.id)
+    job.job_dir.mkdir(parents=True, exist_ok=True)
+    (job.job_dir / "preview.mp4").write_bytes(b"fake-preview-mp4-bytes" * 100)
+    cleanup_jobs.append(job.id)
+    token = make_token(job.id)
+    return job, token
+
+
+def test_editor_export_options_404_without_preview(cleanup_jobs):
+    from whatsapp_mvp.editor_token import make_token
+
+    user = get_or_create_user("export_test_user_no_preview")
+    job = create_job(user_id=user.id)
+    job.job_dir.mkdir(parents=True, exist_ok=True)
+    cleanup_jobs.append(job.id)
+    token = make_token(job.id)
+
+    with pytest.raises(webhook.HTTPException) as exc_info:
+        webhook.editor_export_options(job.id, token)
+    assert exc_info.value.status_code == 404
+
+
+def test_editor_export_options_lists_six_combos(export_job):
+    job, token = export_job
+    with mock.patch("whatsapp_mvp.pipeline_runner._probe_dimensions", return_value=(1080, 1920)), \
+         mock.patch("whatsapp_mvp.pipeline_runner._probe_duration", return_value=45.0):
+        result = webhook.editor_export_options(job.id, token)
+
+    assert result["source"]["width"] == 1080
+    assert result["source"]["height"] == 1920
+    assert result["source"]["fps"] == 30
+    assert len(result["combos"]) == 6
+    assert all(c["cached"] is False for c in result["combos"])
+    resolutions = {(c["resolution"], c["quality"]) for c in result["combos"]}
+    assert ("1080p", "high") in resolutions
+    assert ("720p", "small") in resolutions
+
+
+def test_editor_export_options_reports_cache_hit(export_job):
+    """已经转出来的一档、且比 preview.mp4 新——上报 cached:true 和精确的
+    cached_bytes，不该再让前端拿估算值。"""
+    job, token = export_job
+    export_path = job.job_dir / "export_720p_balanced.mp4"
+    export_path.write_bytes(b"already-exported" * 1000)
+
+    with mock.patch("whatsapp_mvp.pipeline_runner._probe_dimensions", return_value=(1080, 1920)), \
+         mock.patch("whatsapp_mvp.pipeline_runner._probe_duration", return_value=45.0):
+        result = webhook.editor_export_options(job.id, token)
+
+    combo = next(c for c in result["combos"] if c["resolution"] == "720p" and c["quality"] == "balanced")
+    assert combo["cached"] is True
+    assert combo["cached_bytes"] == export_path.stat().st_size
+    assert combo["estimated_bytes"] == export_path.stat().st_size
+
+
+def test_editor_export_post_rejects_invalid_enum(export_job):
+    job, token = export_job
+    request = mock.MagicMock()
+    request.json = mock.AsyncMock(return_value={"resolution": "4k", "quality": "lossless"})
+    with pytest.raises(webhook.HTTPException) as exc_info:
+        asyncio.run(webhook.editor_post_export(job.id, request, token))
+    assert exc_info.value.status_code == 400
+
+
+def test_editor_export_post_404_without_preview(cleanup_jobs):
+    from whatsapp_mvp.editor_token import make_token
+
+    user = get_or_create_user("export_test_user_post_no_preview")
+    job = create_job(user_id=user.id)
+    job.job_dir.mkdir(parents=True, exist_ok=True)
+    cleanup_jobs.append(job.id)
+    token = make_token(job.id)
+
+    request = mock.MagicMock()
+    request.json = mock.AsyncMock(return_value={"resolution": "720p", "quality": "balanced"})
+    with pytest.raises(webhook.HTTPException) as exc_info:
+        asyncio.run(webhook.editor_post_export(job.id, request, token))
+    assert exc_info.value.status_code == 404
+
+
+def test_editor_export_post_409_while_save_rendering(export_job):
+    """跟 /save 唯一的交叉点：保存正在渲染时不能开始导出——preview.mp4
+    这时候正在被 render_props_directly 改写，转码一份正在写入的文件不
+    安全，也没有意义（马上就会过时）。"""
+    job, token = export_job
+    webhook._write_editor_marker(job.job_dir, {
+        "state": "rendering", "pending_props": None, "started_at": None,
+        "error": None, "save_timestamps": [], "pending_overrides": None,
+    })
+
+    request = mock.MagicMock()
+    request.json = mock.AsyncMock(return_value={"resolution": "720p", "quality": "balanced"})
+    with pytest.raises(webhook.HTTPException) as exc_info:
+        asyncio.run(webhook.editor_post_export(job.id, request, token))
+    assert exc_info.value.status_code == 409
+
+
+def test_editor_export_post_does_not_leak_wa_number(export_job):
+    """导出响应体绝不能带 wa_number——这不是 WhatsApp 投递流程，跟
+    editor_post_props 的 /revise_style 场景完全不同。"""
+    job, token = export_job
+    request = mock.MagicMock()
+    request.json = mock.AsyncMock(return_value={"resolution": "720p", "quality": "balanced"})
+    with mock.patch.object(webhook, "_run_in_background") as fake_bg:
+        result = asyncio.run(webhook.editor_post_export(job.id, request, token))
+
+    assert fake_bg.called
+    assert "wa_number" not in result
+    assert result["state"] == "queued"
+
+
+def test_editor_export_post_cache_hit_skips_encoding(export_job):
+    """这一档已经是基于当前 preview.mp4 转码出的最新结果——直接回
+    state:"done"，不排队后台任务，也不消耗配额。"""
+    job, token = export_job
+    export_path = job.job_dir / "export_720p_balanced.mp4"
+    export_path.write_bytes(b"already-exported" * 1000)
+
+    request = mock.MagicMock()
+    request.json = mock.AsyncMock(return_value={"resolution": "720p", "quality": "balanced"})
+    with mock.patch.object(webhook, "_run_in_background") as fake_bg:
+        result = asyncio.run(webhook.editor_post_export(job.id, request, token))
+
+    assert not fake_bg.called
+    assert result["state"] == "done"
+    assert result["filename"] == "export_720p_balanced.mp4"
+    assert result["bytes"] == export_path.stat().st_size
+
+
+def test_editor_export_post_coalesces_when_already_encoding(export_job):
+    job, token = export_job
+    from whatsapp_mvp.editor_markers import write_export_marker
+
+    write_export_marker(job.job_dir, {
+        "state": "encoding", "pending": None, "current": {"resolution": "1080p", "quality": "high"},
+        "progress": 40, "started_at": None, "error": None, "export_timestamps": [],
+    })
+
+    request = mock.MagicMock()
+    request.json = mock.AsyncMock(return_value={"resolution": "720p", "quality": "balanced"})
+    with mock.patch.object(webhook, "_run_in_background") as fake_bg:
+        result = asyncio.run(webhook.editor_post_export(job.id, request, token))
+
+    assert not fake_bg.called
+    assert result["state"] == "coalesced"
+
+    from whatsapp_mvp.editor_markers import read_export_marker
+    marker = read_export_marker(job.job_dir)
+    assert marker["pending"] == {"resolution": "720p", "quality": "balanced"}
+
+
+def test_editor_export_post_429_past_hourly_cap(export_job):
+    job, token = export_job
+    from whatsapp_mvp.editor_markers import write_export_marker
+
+    write_export_marker(job.job_dir, {
+        "state": "idle", "pending": None, "current": None, "progress": 0,
+        "started_at": None, "error": None,
+        "export_timestamps": [webhook.time.time()] * webhook._EDITOR_EXPORTS_PER_HOUR,
+    })
+
+    request = mock.MagicMock()
+    request.json = mock.AsyncMock(return_value={"resolution": "720p", "quality": "balanced"})
+    with pytest.raises(webhook.HTTPException) as exc_info:
+        asyncio.run(webhook.editor_post_export(job.id, request, token))
+    assert exc_info.value.status_code == 429
+
+
+def test_editor_export_status_reports_marker_state(export_job):
+    job, token = export_job
+    from whatsapp_mvp.editor_markers import write_export_marker
+
+    write_export_marker(job.job_dir, {
+        "state": "encoding", "pending": None, "current": {"resolution": "720p", "quality": "balanced"},
+        "progress": 55, "started_at": None, "error": None, "export_timestamps": [],
+    })
+
+    result = webhook.editor_export_status(job.id, token)
+    assert result["state"] == "encoding"
+    assert result["progress"] == 55
+    assert result["combo"] == {"resolution": "720p", "quality": "balanced"}
+    assert "wa_number" not in result

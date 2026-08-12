@@ -22,6 +22,9 @@ import { buildLayerRows, type LayerClipItem } from "./state/layers";
 import { computeOutputDuration, normalizeCuts, outputToSource, type VideoCut } from "../src/cuts";
 import { FPS, cutsRef, frameRef, framesToMs } from "./state/playhead";
 import { broadcastSelection } from "./state/selectionBridge";
+import { apiGet, apiPost } from "./api";
+import { useExport } from "./state/useExport";
+import { ExportDialog } from "./components/Export/ExportDialog";
 
 /** Width threshold for the phone shell. Must match styles.css's own
  *  `@media (max-width: 860px)` breakpoint by hand — CSS and this JS string
@@ -89,28 +92,6 @@ function useJobIdAndToken(): { jobId: string; token: string } {
     const token = new URLSearchParams(window.location.search).get("token") || "";
     return { jobId, token };
   }, []);
-}
-
-async function apiGet(path: string, token: string) {
-  const resp = await fetch(`${path}?token=${encodeURIComponent(token)}`);
-  const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error(data?.detail || `HTTP ${resp.status}`);
-  return data;
-}
-
-async function apiPost(path: string, token: string, body: unknown): Promise<any> {
-  const resp = await fetch(`${path}?token=${encodeURIComponent(token)}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) {
-    const err = new Error(data?.detail || `HTTP ${resp.status}`) as Error & { status?: number };
-    err.status = resp.status;
-    throw err;
-  }
-  return data;
 }
 
 /** 桌面 vs 触屏——按能力检测，不是按屏幕宽度。拖拽在桌面窄窗口也该可用，
@@ -568,6 +549,8 @@ function Editor({
     }
   }, [jobId, token, props, commit, showToast]);
 
+  const exportX = useExport({ jobId, token, isDirty, saveState, onSave: handleSave, onDone: showToast });
+
   // ── Keyboard shortcuts ──────────────────────────────────────────────
 
   useEffect(() => {
@@ -672,6 +655,8 @@ function Editor({
           hasItemError={(section, index) => errIdx.forItem(section, index)}
           filmstripUrls={filmstripUrls}
           waveformUrl={waveformUrl}
+          exportX={exportX}
+          token={token}
         />
         {banner}
       </>
@@ -695,7 +680,12 @@ function Editor({
         savesThisHour={savesThisHour}
         savesPerHour={DEFAULT_SAVES_PER_HOUR}
         slotBusy={slotBusy}
+        onExport={exportX.openDialog}
       />
+
+      {exportX.dialogOpen && (
+        <ExportDialog x={exportX} jobId={jobId} token={token} isDirty={isDirty} onClose={exportX.closeDialog} />
+      )}
 
       <LibraryPanel onAdd={handleAddItem} isTouch={!isDesktopPointer} />
 
